@@ -29,6 +29,17 @@ def test_download_file_saves_bytes(monkeypatch, tmp_path):
     assert dest.read_bytes() == b"col\n1\n2\n"
 
 
+def test_download_file_auth_required_message(monkeypatch, tmp_path):
+    import urllib.error
+    def boom(req, timeout=None):
+        raise urllib.error.HTTPError("https://x/t.csv", 401, "Unauthorized", {}, None)
+    monkeypatch.setattr(_download.urllib.request, "urlopen", boom)
+    res = _download.download_file("https://x/t.csv", str(tmp_path / "t.csv"))
+    assert res["ok"] is False
+    assert "auth" in res["skipped_reason"].lower()
+    assert not (tmp_path / "t.csv").exists()
+
+
 def test_download_candidate_tabular_only(monkeypatch, tmp_path):
     saved = []
     def fake_dl(url, dest, **kw):

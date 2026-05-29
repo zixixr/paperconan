@@ -93,7 +93,7 @@ paperconan fetch "10.xxxx/your.doi" --download zenodo:123456 --out data/
 paperconan data/                                # 再照常分析
 ```
 
-只覆盖开放仓库、不绕付费墙；很多论文没把数据存进可机读仓库，抓不到会如实告知。
+只覆盖开放仓库、不绕付费墙。Zenodo / Figshare 可直接下载；Dryad 仅做检索（其下载接口需鉴权，命中后请到 Dryad 数据集页面手动下载）。很多论文没把数据存进可机读仓库，抓不到会如实告知。
 
 **report.html** 长这样（单文件、无外部依赖、可直接邮件/PubPeer 附件分享）：
 

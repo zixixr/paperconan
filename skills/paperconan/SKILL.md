@@ -79,6 +79,9 @@ Workflow:
 - If nothing matches, tell the user the data may be in journal supplementary
   (paywalled) or simply not deposited — never imply "checked = clean".
 - Do not bypass paywalls or scrape publisher sites.
+- Download works keyless for **Zenodo and Figshare**. **Dryad** is discovery/listing only —
+  its download API needs authentication, so report Dryad hits to the user and point them to
+  the Dryad dataset page to download the files manually.
 
 ## How to read the output
 

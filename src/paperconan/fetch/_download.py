@@ -2,6 +2,7 @@
 content-type sniffing so an HTML error page is never saved as data."""
 from __future__ import annotations
 import os
+import urllib.error
 import urllib.request
 
 _UA = "paperconan-fetch/0.4 (+https://github.com/zixixr/paperconan)"
@@ -17,6 +18,13 @@ def download_file(url, dest_path, timeout=60, max_bytes=_DEFAULT_MAX):
                 return {"ok": False, "path": dest_path,
                         "skipped_reason": f"server returned HTML ({ctype}), not a data file"}
             data = resp.read(max_bytes + 1)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return {"ok": False, "path": dest_path,
+                    "skipped_reason": (f"requires authentication (HTTP {e.code}); "
+                                       "download this file manually from the dataset page")}
+        return {"ok": False, "path": dest_path,
+                "skipped_reason": f"HTTP {e.code}: {e.reason}"}
     except Exception as e:
         return {"ok": False, "path": dest_path, "skipped_reason": f"download error: {e}"}
     if len(data) > max_bytes:
