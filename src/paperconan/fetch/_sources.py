@@ -50,3 +50,41 @@ def search_figshare(query, size=5):
             "figshare", aid, full.get("doi") or None, full.get("title"),
             authors, full.get("published_date"), all_files, []))
     return out
+
+
+import urllib.parse as _urlparse
+
+_DRYAD = "https://datadryad.org"
+
+
+def _dryad_candidate(doi):
+    enc = _urlparse.quote(doi, safe="")
+    ds = _http.get_json(f"{_DRYAD}/api/v2/datasets/{enc}")
+    vhref = ds.get("_links", {}).get("stash:version", {}).get("href")
+    all_files = []
+    if vhref:
+        files = _http.get_json(f"{_DRYAD}{vhref}/files")
+        for f in files.get("_embedded", {}).get("stash:files", []):
+            dl = f.get("_links", {}).get("stash:download", {}).get("href")
+            all_files.append(make_fileref(f.get("path"), f.get("size"),
+                                          f"{_DRYAD}{dl}" if dl else None))
+    authors = [f"{a.get('firstName','')} {a.get('lastName','')}".strip()
+               for a in ds.get("authors", [])]
+    related = [w.get("identifier") for w in ds.get("relatedWorks", []) if w.get("identifier")]
+    bare = doi[4:] if doi.startswith("doi:") else doi
+    return _candidate("dryad", bare, bare, ds.get("title"), authors,
+                      ds.get("publicationDate"), all_files, related)
+
+
+def search_dryad(query, size=5):
+    data = _http.get_json(f"{_DRYAD}/api/v2/search", params={"q": query, "per_page": size})
+    out = []
+    for ds in data.get("_embedded", {}).get("stash:datasets", [])[:size]:
+        ident = ds.get("identifier")
+        if not ident:
+            continue
+        try:
+            out.append(_dryad_candidate(ident))
+        except Exception:
+            continue
+    return out
