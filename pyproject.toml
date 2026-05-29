@@ -38,3 +38,6 @@ paperconan = "paperconan._audit:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+markers = ["network: live network test, skipped unless PAPERCONAN_LIVE=1"]
