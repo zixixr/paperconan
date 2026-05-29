@@ -11,10 +11,12 @@ def test_search_zenodo_normalizes_candidate(monkeypatch, fixture, fake_http):
     c = cands[0]
     assert c["source"] == "zenodo"
     assert c["cand_id"] == "zenodo:10277693"
+    assert c["id"] == "10277693"
     assert c["doi"] == "10.5281/zenodo.10277693"
     assert c["authors"] == ["Doe, Jane", "Roe, Richard"]
     assert c["published"] == "2023-12-07"
     assert c["all_files_count"] == 2
+    assert len(c["all_files"]) == 2
     assert [f["name"] for f in c["tabular_files"]] == ["BASE_INFO.xlsx"]
     assert c["tabular_files"][0]["download_url"].endswith("/content")
     assert "10.15761/JTS.1000455" in c["related_dois"]

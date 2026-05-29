@@ -3,6 +3,8 @@
 monkeypatch them."""
 from __future__ import annotations
 
+import urllib.parse as _urlparse
+
 from . import _http
 from ._files import TABULAR_EXTS, make_fileref
 
@@ -42,17 +44,18 @@ def search_figshare(query, size=5):
         aid = a.get("id")
         if aid is None:
             continue
-        full = _http.get_json(f"https://api.figshare.com/v2/articles/{aid}")
-        all_files = [make_fileref(f.get("name"), f.get("size"), f.get("download_url"))
-                     for f in full.get("files", [])]
-        authors = [au.get("full_name") for au in full.get("authors", []) if au.get("full_name")]
-        out.append(_candidate(
-            "figshare", aid, full.get("doi") or None, full.get("title"),
-            authors, full.get("published_date"), all_files, []))
+        try:
+            full = _http.get_json(f"https://api.figshare.com/v2/articles/{aid}")
+            all_files = [make_fileref(f.get("name"), f.get("size"), f.get("download_url"))
+                         for f in full.get("files", [])]
+            authors = [au.get("full_name") for au in full.get("authors", []) if au.get("full_name")]
+            out.append(_candidate(
+                "figshare", aid, full.get("doi") or None, full.get("title"),
+                authors, full.get("published_date"), all_files, []))
+        except Exception:
+            continue
     return out
 
-
-import urllib.parse as _urlparse
 
 _DRYAD = "https://datadryad.org"
 
