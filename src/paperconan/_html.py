@@ -177,6 +177,10 @@ def _render_finding_card(item: dict) -> str:
         str(file_), str(sheet), str(kind), str(rule),
     ]).lower()
 
+    benign = f.get("likely_benign")
+    benign_html = (f'<p class="benign">↳ likely benign: {_esc(benign)}</p>'
+                   if benign else "")
+
     open_attr = " open" if sev == "high" else ""
     return (
         f'<details class="finding" data-severity="{sev}" data-kind="{_esc(kind)}" '
@@ -187,6 +191,7 @@ def _render_finding_card(item: dict) -> str:
         f'<span class="loc">{loc}{extra_meta}</span>'
         '</summary>'
         f'<p class="rule"><code>{_esc(rule)}</code></p>'
+        f'{benign_html}'
         f'{evidence_html}'
         '</details>'
     )
@@ -356,6 +361,8 @@ details.finding > p, details.finding > .ev-wrap, details.finding > .shared-value
 .loc { color:var(--muted); font-size:12.5px; }
 p.rule { padding:8px 12px; background:var(--panel-2); border-radius:4px; margin:8px 14px; }
 p.rule code { color:var(--text); }
+p.benign { margin:6px 14px; padding:6px 12px; font-size:13px; color:var(--low);
+           border-left:3px solid var(--low); background:rgba(100,116,139,.08); }
 .ev-wrap { overflow-x:auto; border:1px solid var(--border); border-radius:4px; background:var(--panel-2); }
 table.ev { width:100%; border-collapse:collapse; }
 table.ev th, table.ev td { padding:5px 9px; border-bottom:1px solid var(--border);

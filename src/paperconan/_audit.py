@@ -237,6 +237,43 @@ def _block_evidence(rows, r0, r1, c0, c1, header, highlight_cols, highlight_rows
     }
 
 
+def benign_reason(f):
+    """Return a common innocent explanation for a finding kind, or None.
+
+    Attached to findings as `likely_benign` so the agent always has the
+    false-positive context in hand and the HTML report can show it inline.
+    """
+    kind = f.get("kind")
+    if kind == "arithmetic_progression":
+        step = f.get("step")
+        if step is not None and abs(step - round(step)) < 1e-9:
+            return ("an integer-step progression is usually an axis (day / dose / "
+                    "timepoint), not measured data")
+        return None
+    if kind == "rounded_to_half_or_int":
+        return ("values ending in .0/.5 are common for derived or instrument-rounded "
+                "quantities (cell counts, scores, calibrated readouts)")
+    if kind == "identical_after_rounding":
+        return ("cells share a rounded value but differ at full precision — usually "
+                "display rounding, not duplication")
+    if kind in ("cross_sheet_value_overlap", "cross_sheet_position_identical"):
+        if f.get("same_figure"):
+            return f.get("context")
+        if f.get("same_file") is False:
+            return ("a control/baseline cohort is often reused across a main figure and "
+                    "its extended-data figure — confirm the legend discloses the reuse")
+    return None
+
+
+def _attach_benign(findings):
+    """Mutate findings in-place to add a `likely_benign` note where one applies."""
+    for f in findings:
+        reason = benign_reason(f)
+        if reason:
+            f["likely_benign"] = reason
+    return findings
+
+
 def _attach_evidence(findings, rows, r0, r1, c0, c1, header):
     """Mutate each finding in-place to add an `evidence` field, derived from the same
     block coordinates the detector was scanning. Highlight columns come from the
@@ -707,6 +744,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True):
                 if rel or ap or eq or wc or iar:
                     for group in (rel, ap, eq, wc, iar):
                         _attach_evidence(group, rows, r0, r1, c0, c1, header)
+                        _attach_benign(group)
                     report_blocks.append(dict(file=os.path.basename(f), sheet=sn,
                                               block=dict(rows=f"{r0+1}-{r1}", cols=f"{c0+1}-{c1}", header=header),
                                               relations=rel, progressions=ap, equal_pairs=eq,
@@ -715,6 +753,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True):
     # Unified collision pass: every (file, sheet) grid against every other —
     # covers both intra-workbook sheet pairs and cross-file duplicates.
     cross_sheet_findings = detect_collisions(grids)
+    _attach_benign(cross_sheet_findings)
 
     digit_reports, decimal_reports = [], []
     for key, nums in per_sheet_numbers.items():
