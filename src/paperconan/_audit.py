@@ -517,6 +517,31 @@ def _grid_from_rows(rows, min_decimal_places=3, max_rows=200):
     return grid
 
 
+import re as _re
+
+# Matches a figure id inside a sheet name: an optional "extended/ED/ex" marker
+# followed by a figure number, e.g. "Figure 5o", "exFig.6b-e", "ED_Fig8b", " exFig.6i".
+_FIG_RE = _re.compile(r"(ext(?:ended)?|ed|ex)?\s*\.?\s*fig(?:ure)?\s*\.?\s*0*(\d+)", _re.I)
+
+
+def figure_key(sheet_name):
+    """Normalize a sheet name into a figure identity like 'main:5' or 'ext:6'.
+
+    Returns None when no figure number can be parsed (e.g. 'Sheet1'). Two sheets
+    with the SAME key are panels of the same display item — sharing data between
+    them (a combined growth curve and its per-replicate breakdown) is expected and
+    should not read as a cross-experiment duplication.
+    """
+    if not sheet_name:
+        return None
+    m = _FIG_RE.search(str(sheet_name))
+    if not m:
+        return None
+    prefix = (m.group(1) or "").lower()
+    namespace = "ext" if prefix else "main"
+    return f"{namespace}:{m.group(2)}"
+
+
 def detect_collisions(grids):
     """Find pairs of tables (sheets and/or flat files) with many bit-identical decimal
     values at the SAME (row, col). Catches "copy a table, then tweak a few values" fraud,
@@ -525,6 +550,11 @@ def detect_collisions(grids):
     `grids` maps (file, sheet) -> grid (from _grid_from_rows). Returns one dict per
     suspicious pair, with file_a/file_b set so same-file and cross-file pairs are
     distinguishable.
+
+    Severity is context-aware: when both sheets resolve to the SAME figure id
+    (e.g. exFig.6i ↔ exFig.6k-n), the overlap is the expected combined-vs-individual
+    re-plot and is downgraded to "low" with an explanatory `context`. Cross-figure /
+    cross-file overlaps (e.g. main Fig 5o ↔ Extended Fig 6b-e) keep their base severity.
     """
     findings = []
     keys = list(grids.keys())
@@ -542,9 +572,21 @@ def detect_collisions(grids):
             lb = sb if same_file else f"{fb}::{sb}"
             scope = "sheets" if same_file else "files"
 
+            fig_a, fig_b = figure_key(sa), figure_key(sb)
+            same_figure = bool(fig_a and fig_b and fig_a == fig_b)
+            context = None
+            if same_figure:
+                context = (f"both sheets belong to the same display item ({fig_a}); "
+                           f"a combined panel and its per-replicate breakdown share data "
+                           f"by design, so this overlap is expected, not a cross-experiment reuse")
+
             same_pos = sum(1 for k, v in ga.items() if k in gb and gb[k] == v)
             vals_a, vals_b = set(ga.values()), set(gb.values())
             same_val = len(vals_a & vals_b)
+
+            ctx_fields = dict(figure_a=fig_a, figure_b=fig_b, same_figure=same_figure)
+            if context:
+                ctx_fields["context"] = context
 
             if same_pos >= max(6, smaller * 0.15):
                 examples = [(k, v) for k, v in ga.items() if k in gb and gb[k] == v][:5]
@@ -557,7 +599,8 @@ def detect_collisions(grids):
                     same_position_count=same_pos,
                     fraction_of_smaller=same_pos / smaller,
                     examples=[dict(row=k[0] + 1, col=k[1] + 1, value=v) for k, v in examples],
-                    severity="high",
+                    severity="low" if same_figure else "high",
+                    **ctx_fields,
                     rule=f"{la} and {lb} share {same_pos}/{smaller} ({same_pos/smaller*100:.0f}%) decimal values at SAME (row,col) across 2 {scope}",
                 ))
             elif same_val >= max(8, smaller * 0.4):
@@ -571,7 +614,8 @@ def detect_collisions(grids):
                     shared_value_count=same_val,
                     fraction_of_smaller=same_val / smaller,
                     examples=examples,
-                    severity="medium",
+                    severity="low" if same_figure else "medium",
+                    **ctx_fields,
                     rule=f"{la} and {lb} share {same_val} bit-identical decimal values ({same_val/smaller*100:.0f}% of smaller) across 2 {scope}",
                 ))
     return findings
