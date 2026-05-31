@@ -49,6 +49,8 @@
 
 每条命中都带 severity (`high` / `medium` / `low`) + 涉及的文件 / sheet / block 行范围 / 规则字符串，方便人工复核时直接定位。
 
+> 密集 / 相关矩阵（相关系数表、归一化重复样本面板）会按 O(列²) 刷出成千上万条 `identical_column` / `exact_linear`——这类列关系是数据形态的结构性产物，不是造假指纹。工具按 **(file, sheet) 整张表**的关系总数判定洪泛，超阈值时整体**自动降级为 `low`** 并打 `dense_block` 标记（保留可见、不丢弃），不让它淹没真正的跨 sheet 重复信号。
+
 **跨 sheet 重复**还会额外给出上下文，降低误读：
 
 - **按图号分级**：解析 sheet 名里的图号（`Figure 5o` → `main:5`、`exFig.6i` → `ext:6`）。同一图号两个 panel 共享数据（合并曲线 vs 个体曲线的预期重画）自动**降级为 `low`**；只有跨图/跨文件的重复才保持 `high`/`medium`——让真正值得查的那条不被同图噪音淹没。
@@ -96,15 +98,16 @@ paperconan path/to/paper_dir/ --out /tmp/audit-of-this-paper
 ```bash
 paperconan fetch "10.xxxx/your.doi"            # 列出 Zenodo/Figshare/Dryad/Europe PMC 候选 + 匹配信号
 paperconan fetch "10.xxxx/your.doi" --download zenodo:123456 --out data/
-paperconan fetch "10.xxxx/your.doi" --auto --out data/   # 直接下载排名最高的候选
+paperconan fetch "10.xxxx/your.doi" --auto --out data/   # 仅当有候选确属本文时才下载
 paperconan data/                                # 再照常分析
 ```
 
 只覆盖开放数据源、**不绕付费墙、不抓取出版商页面**：
 
 - **Zenodo / Figshare**：keyless 直接下载。
-- **Europe PMC**：keyless。开放获取论文（很多 NIH/Wellcome 资助的 Nature 论文都在内）的补充材料以一个 zip 提供，`fetch` 会自动下载并解压出其中的 `.xlsx/.csv/.tsv`。
+- **Europe PMC**：keyless。开放获取论文（很多 NIH/Wellcome 资助的 Nature 论文都在内）的补充材料以一个 zip 提供，`fetch` 会自动下载并解压出其中的 `.xlsx/.csv/.tsv`。整包档案按 250MB 上限下载（单张表仍限 50MB），避免"体积大但内含小表格"的档案被截断丢弃。
 - **Dryad**：仅做检索（下载接口需鉴权），命中后请到 Dryad 数据集页面手动下载。
+- **匹配可信度门槛**：仓库全文检索（尤其 figshare/zenodo）常返回**完全无关的他人数据集**，所以 `--auto` 只在候选 DOI 命中或标题高度重合时才下载，否则拒绝并转期刊指引；`--download` 一个不匹配的候选需加 `--force`；列表里这类候选会标 `⚠ no DOI/title match`。绝不让你误把别人的数据当本文来审。
 - **都没命中**：`fetch` 会按 DOI 输出一段期刊指引（出版商 + `doi.org` 文章链接 + 该刊 source data 的常见位置，如 Nature 的 `...MOESM<N>_ESM.xlsx`），而不是简单告诉你"没找到"——绝不暗示"查过=干净"。
 
 `fetch --download/--auto` 还会在下载目录写一个 `paperconan_source.json`（记录 DOI/标题/来源），随后 `paperconan <dir>` 会自动把它写进 scan.json 的 `paper` 字段做溯源；也可手动 `paperconan <dir> --doi <DOI> --title <T>` 标注。
@@ -186,8 +189,9 @@ echo '@/path/to/paperconan/skills/paperconan/SKILL.md' >> AGENTS.md
 - 同一篇论文里 **合理共享的对照组数据** 会被标记为 "跨 sheet 复用"
 - **量化产生的终位偏置**（细胞计数 / 4 视野平均 → 多 0.25 步长）会被标记为 "末位异常"
 - **共享的剂量轴 / 时间轴** 会被标记为 "跨列复制"
+- **密集 / 相关矩阵** 里成千上万对相同/线性列会被标记为 "列关系"
 
-不过这几类现在工具会主动帮你识别：同图重画的跨 sheet 复用会**自动降级**，剂量/时间轴、量化偏置等会附 `likely_benign` 旁注，末位 χ² 也做了多重检验校正（看 q 值而非裸 p）。即便如此，报告里 high severity 的 anomaly **依然需要人工读 figure legend 和 Methods** 才能下判断。不要把 high = misconduct。
+不过这几类现在工具会主动帮你识别：同图重画的跨 sheet 复用会**自动降级**，密集矩阵的列关系洪泛会按整张表降级并打 `dense_block`，剂量/时间轴、量化偏置等会附 `likely_benign` 旁注，末位 χ² 也做了多重检验校正（看 q 值而非裸 p）。即便如此，报告里 high severity 的 anomaly **依然需要人工读 figure legend 和 Methods** 才能下判断。不要把 high = misconduct。
 
 **Q: 我用它发现一篇看似有问题的论文，下一步该做什么？**
 
