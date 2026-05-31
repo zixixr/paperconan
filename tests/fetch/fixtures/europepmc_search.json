@@ -1,0 +1,18 @@
+{
+  "hitCount": 1,
+  "resultList": {
+    "result": [
+      {
+        "id": "33753749",
+        "source": "MED",
+        "pmid": "33753749",
+        "pmcid": "PMC7985210",
+        "doi": "10.1038/s41467-021-22125-z",
+        "title": "An open-access paper with supplementary data",
+        "authorString": "Doe J, Roe R.",
+        "firstPublicationDate": "2021-03-22",
+        "hasSuppl": "Y"
+      }
+    ]
+  }
+}

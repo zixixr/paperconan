@@ -72,8 +72,8 @@ def journal_guidance(paper):
     publisher = _DOI_PUBLISHER.get(prefix, "the publisher")
     url = f"https://doi.org/{doi}"
     lines = [
-        f"Not found in Zenodo / Figshare / Dryad. Source data for {doi} is most likely",
-        f"hosted by {publisher} on the article page:",
+        f"Not found in Zenodo / Figshare / Dryad / Europe PMC. Source data for {doi} is",
+        f"most likely hosted by {publisher} on the article page:",
         f"    {url}",
     ]
     if prefix == "10.1038":

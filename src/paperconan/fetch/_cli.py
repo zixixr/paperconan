@@ -13,7 +13,7 @@ from ._download import download_candidate
 
 def _print_table(cands):
     if not cands:
-        print("no candidate datasets found in Zenodo / Figshare / Dryad.")
+        print("no candidate datasets found in Zenodo / Figshare / Dryad / Europe PMC.")
         print("the data may be in journal supplementary (paywalled) or not deposited.")
         return
     for c in cands:

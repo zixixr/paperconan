@@ -79,6 +79,42 @@ def _dryad_candidate(doi):
                       ds.get("publicationDate"), all_files, related)
 
 
+_EPMC = "https://www.ebi.ac.uk/europepmc/webservices/rest"
+
+
+def _split_authors(author_string):
+    if not author_string:
+        return []
+    return [a.strip().rstrip(".").strip() for a in author_string.split(",") if a.strip()]
+
+
+def search_europepmc(query, size=5):
+    """Open-access supplementary data via the Europe PMC REST API.
+
+    Many NIH/Wellcome-funded papers (incl. in Nature journals) are in PMC's open
+    subset, where supplementary material is served — without a key and without
+    scraping the publisher — as a single zip at /{pmcid}/supplementaryFiles.
+    """
+    term = f'DOI:"{query}"' if str(query).startswith("10.") else query
+    data = _http.get_json(f"{_EPMC}/search",
+                          params={"query": term, "format": "json",
+                                  "resultType": "core", "pageSize": size})
+    out = []
+    for r in data.get("resultList", {}).get("result", [])[:size]:
+        pmcid = r.get("pmcid")
+        if not pmcid or (r.get("hasSuppl") or "").upper() != "Y":
+            continue
+        url = f"{_EPMC}/{pmcid}/supplementaryFiles"
+        arch_name = f"{pmcid}_supplementary.zip"
+        c = _candidate("europepmc", pmcid, r.get("doi"), r.get("title"),
+                       _split_authors(r.get("authorString")),
+                       r.get("firstPublicationDate"),
+                       [make_fileref(arch_name, None, url)], [])
+        c["supplementary_archive"] = {"url": url, "name": arch_name}
+        out.append(c)
+    return out
+
+
 def search_dryad(query, size=5):
     data = _http.get_json(f"{_DRYAD}/api/v2/search", params={"q": query, "per_page": size})
     out = []

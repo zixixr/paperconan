@@ -74,15 +74,17 @@ Workflow:
 3. Download the chosen candidate, then run `paperconan <dir>` on the output.
 
 ### Honesty rules (REQUIRED)
-- Searched repositories are Zenodo / Figshare / Dryad only.
+- Searched repositories are Zenodo / Figshare / Dryad / Europe PMC.
 - If a candidate has no `.xlsx/.csv/.tsv`, say so and name the other file types.
 - If nothing matches, `fetch` now prints a journal-guidance block derived from the
   DOI (publisher + `doi.org` article link + where that publisher puts source data,
   e.g. Nature's `...MOESM<N>_ESM.xlsx`). Relay it — never imply "checked = clean".
 - Do not bypass paywalls or scrape publisher sites.
-- Download works keyless for **Zenodo and Figshare**. **Dryad** is discovery/listing only —
-  its download API needs authentication, so report Dryad hits to the user and point them to
-  the Dryad dataset page to download the files manually.
+- Download works keyless for **Zenodo and Figshare**. **Europe PMC** is also keyless:
+  for open-access papers it serves supplementary material as one zip, and `fetch`
+  downloads it and extracts the tabular members automatically. **Dryad** is
+  discovery/listing only — its download API needs authentication, so report Dryad hits
+  to the user and point them to the Dryad dataset page to download the files manually.
 
 ## How to read the output
 

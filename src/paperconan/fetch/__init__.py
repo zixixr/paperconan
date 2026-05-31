@@ -15,6 +15,8 @@ def _rank(cand):
     score += (sig.get("author_overlap") or 0) * 5
     if cand.get("tabular_files"):
         score += 2
+    if cand.get("supplementary_archive"):
+        score += 2
     return score
 
 
@@ -29,7 +31,8 @@ def search_all(query, per_source=5):
     search_term = q["doi"] or q["title"] or query
 
     cands = []
-    for fn in (_sources.search_zenodo, _sources.search_figshare, _sources.search_dryad):
+    for fn in (_sources.search_zenodo, _sources.search_figshare,
+               _sources.search_dryad, _sources.search_europepmc):
         try:
             cands.extend(fn(search_term, size=per_source))
         except Exception:

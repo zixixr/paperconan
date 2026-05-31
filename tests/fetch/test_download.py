@@ -72,6 +72,36 @@ def test_download_candidate_writes_provenance_sidecar(monkeypatch, tmp_path):
     assert p["source"] == "zenodo"
 
 
+def test_download_candidate_extracts_tabular_from_supplementary_zip(monkeypatch, tmp_path):
+    """Europe PMC serves supplementary material as one zip — download_candidate must
+    extract only the tabular members (xlsx/csv/tsv) into out_dir, dropping the rest,
+    and flatten any internal paths (no path traversal)."""
+    import io, os, zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("nested/dir/table.xlsx", b"PK-fake-xlsx-bytes")
+        z.writestr("figure.csv", b"a,b\n1,2\n")
+        z.writestr("readme.txt", b"not data")
+    zbytes = buf.getvalue()
+
+    def fake_dl(url, dest, **kw):
+        open(dest, "wb").write(zbytes)
+        return {"ok": True, "path": dest}
+    monkeypatch.setattr(_download, "download_file", fake_dl)
+
+    cand = {"cand_id": "europepmc:PMC1", "source": "europepmc", "doi": "10.1038/x",
+            "title": "T", "tabular_files": [],
+            "supplementary_archive": {
+                "url": "https://www.ebi.ac.uk/europepmc/webservices/rest/PMC1/supplementaryFiles",
+                "name": "PMC1_supplementary.zip"}}
+    summary = _download.download_candidate(cand, str(tmp_path))
+
+    names = sorted(os.path.basename(p) for p in summary["downloaded"])
+    assert names == ["figure.csv", "table.xlsx"]
+    assert not (tmp_path / "readme.txt").exists()
+    assert not (tmp_path / "PMC1_supplementary.zip").exists(), "zip should be cleaned up"
+
+
 def test_download_file_rejects_non_http_scheme(tmp_path):
     res = _download.download_file("file:///etc/passwd", str(tmp_path / "x.csv"))
     assert res["ok"] is False
