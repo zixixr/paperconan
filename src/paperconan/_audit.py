@@ -475,6 +475,25 @@ def detect_repeated_decimals(values, label):
     return dict(label=label, n=n, n_unique=len(counts), top=flags)
 
 
+def benjamini_hochberg(pvals, alpha=0.05):
+    """Benjamini-Hochberg step-up FDR. Returns (adjusted_pvals, significant_flags),
+    both in the original order. Adjusted p (q-value) is the BH-corrected p; a sheet
+    is significant when its q-value <= alpha. Controls false positives when dozens of
+    per-sheet last-digit tests run at once."""
+    m = len(pvals)
+    if m == 0:
+        return [], []
+    order = sorted(range(m), key=lambda i: pvals[i])
+    adj = [1.0] * m
+    running_min = 1.0
+    for rank in range(m, 0, -1):          # largest p (rank m) down to smallest (rank 1)
+        i = order[rank - 1]
+        running_min = min(running_min, pvals[i] * m / rank)
+        adj[i] = min(running_min, 1.0)
+    sig = [adj[i] <= alpha for i in range(m)]
+    return adj, sig
+
+
 def detect_equal_pairs(rows, r0, r1, c0, c1, header):
     """Detect column pairs where many rows have identical values
     (e.g. tumor length == tumor width)."""
@@ -706,6 +725,14 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True):
         if dec:
             decimal_reports.append(dec)
 
+    # Multiple-testing control: dozens of per-sheet χ² tests run at once, so a raw
+    # p-threshold over-reports. Attach a BH-adjusted q-value + significance flag.
+    if digit_reports:
+        adj, sig = benjamini_hochberg([d["p"] for d in digit_reports], alpha=0.05)
+        for d, a, s in zip(digit_reports, adj, sig):
+            d["p_adj"] = a
+            d["fdr_significant"] = bool(s)
+
     out = dict(tool="paperconan",
                tool_version=_version(),
                scanned_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
@@ -780,12 +807,16 @@ def write_markdown_report(out, path):
         lines.append(f"- … and {len(medium) - 30} more (see scan.json)")
     lines.append("")
 
-    # last-digit chi-square
-    sig_digits = sorted([d for d in out["digit_distribution"] if d["p"] < 1e-6], key=lambda d: d["p"])
-    lines.append(f"## Last-digit χ² anomalies ({len(sig_digits)} sheets with p < 1e-6)\n")
+    # last-digit chi-square (BH-FDR-significant, falling back to raw p for old scans)
+    def _digit_sig(d):
+        return d["fdr_significant"] if "fdr_significant" in d else d["p"] < 1e-6
+    sig_digits = sorted([d for d in out["digit_distribution"] if _digit_sig(d)],
+                        key=lambda d: d.get("p_adj", d["p"]))
+    lines.append(f"## Last-digit χ² anomalies ({len(sig_digits)} sheets, BH-FDR q ≤ 0.05)\n")
     for d in sig_digits[:20]:
         top = ", ".join([f"{k}×{v}" for k, v in d["top"]])
-        lines.append(f"- `{d['label']}` n={d['n']} χ²={d['chi2']:.1f} p={d['p']:.1e} top: {top}")
+        qv = f" q={d['p_adj']:.1e}" if "p_adj" in d else ""
+        lines.append(f"- `{d['label']}` n={d['n']} χ²={d['chi2']:.1f} p={d['p']:.1e}{qv} top: {top}")
     lines.append("")
 
     # decimal endings

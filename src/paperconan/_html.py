@@ -218,9 +218,11 @@ def _render_filter_sidebar(findings: list[dict]) -> str:
 
 
 def _render_digit_section(scan: dict) -> str:
+    def _sig(d):  # prefer BH-FDR flag; fall back to raw p for pre-FDR scan.json
+        return d["fdr_significant"] if "fdr_significant" in d else d.get("p", 1) < 1e-6
     items = sorted(
-        [d for d in scan.get("digit_distribution") or [] if d.get("p", 1) < 1e-6],
-        key=lambda d: d.get("p", 1),
+        [d for d in scan.get("digit_distribution") or [] if _sig(d)],
+        key=lambda d: d.get("p_adj", d.get("p", 1)),
     )
     if not items:
         return ""
@@ -249,14 +251,16 @@ def _render_digit_section(scan: dict) -> str:
             f'<header><span class="badge sev-medium">χ²</span> '
             f'<span class="loc">{_esc(d.get("label"))}</span> · '
             f'n={_esc(d.get("n"))} · χ²={float(d.get("chi2", 0)):.1f} · '
-            f'p={float(d.get("p", 1)):.1e}</header>'
+            f'p={float(d.get("p", 1)):.1e}'
+            + (f' · q={float(d["p_adj"]):.1e}' if "p_adj" in d else "")
+            + '</header>'
             f'<div class="bars">{"".join(bars)}</div>'
             f'<p class="meta">top: {_esc(top)}</p>'
             '</div>'
         )
     return (
         f'<section id="sec-digit" class="section">'
-        f'<h2>Last-digit χ² anomalies ({len(items)} sheets with p &lt; 1e-6)</h2>'
+        f'<h2>Last-digit χ² anomalies ({len(items)} sheets, BH-FDR q ≤ 0.05)</h2>'
         f'<p class="hint">真实测量末位数字应近似均匀分布；偏离表示数字可能是人工构造。</p>'
         f'{"".join(cards)}</section>'
     )
