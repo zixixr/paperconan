@@ -542,6 +542,40 @@ def figure_key(sheet_name):
     return f"{namespace}:{m.group(2)}"
 
 
+def _value_delta(ga, gb):
+    """Characterize HOW two near-duplicate grids differ, so a clean re-plot can be
+    told apart from a copy-then-tweak.
+
+    - modified_cells: same (row,col) position, different value — only meaningful when
+      the two tables share a layout; the copy-then-tweak fingerprint.
+    - only_in_a / only_in_b: value-multiset members unique to each side (layout-robust).
+    - pattern:
+        value_tweaked : >=1 cell changed in place (most interesting — possible edit)
+        perfect_dup   : identical value multisets, no in-place edits (clean re-plot)
+        superset      : one side's values strictly contain the other's (e.g. an extra
+                        replicate column — main shows n=5, extended shows n=6)
+        value_divergent : both sides hold values the other lacks (partial overlap)
+    """
+    modified = sum(1 for k, v in ga.items() if k in gb and gb[k] != v)
+    ca, cb = Counter(ga.values()), Counter(gb.values())
+    shared = sum((ca & cb).values())
+    only_a = sum(ca.values()) - shared
+    only_b = sum(cb.values()) - shared
+    # The value multiset is layout-robust, so decide on it FIRST: identical content is
+    # a perfect_dup even if the two tables lay it out at different offsets (modified_cells
+    # is then just a layout-shift artifact, meaningful only when layouts align).
+    if only_a == 0 and only_b == 0:
+        pattern = "perfect_dup"
+    elif only_a == 0 or only_b == 0:
+        pattern = "superset"
+    elif modified > 0:
+        pattern = "value_tweaked"
+    else:
+        pattern = "value_divergent"
+    return dict(pattern=pattern, modified_cells=modified,
+                shared_values=shared, only_in_a=only_a, only_in_b=only_b)
+
+
 def detect_collisions(grids):
     """Find pairs of tables (sheets and/or flat files) with many bit-identical decimal
     values at the SAME (row, col). Catches "copy a table, then tweak a few values" fraud,
@@ -584,7 +618,8 @@ def detect_collisions(grids):
             vals_a, vals_b = set(ga.values()), set(gb.values())
             same_val = len(vals_a & vals_b)
 
-            ctx_fields = dict(figure_a=fig_a, figure_b=fig_b, same_figure=same_figure)
+            ctx_fields = dict(figure_a=fig_a, figure_b=fig_b, same_figure=same_figure,
+                              delta=_value_delta(ga, gb))
             if context:
                 ctx_fields["context"] = context
 

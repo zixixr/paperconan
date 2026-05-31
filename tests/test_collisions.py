@@ -68,3 +68,61 @@ def test_unparseable_sheet_names_are_not_same_figure():
     cf = detect_collisions(grids)[0]
     assert cf["same_figure"] is False
     assert cf["severity"] == "high"
+
+
+# ---------- Issue 2: near-duplicate delta characterization ----------
+
+def test_delta_perfect_dup():
+    """Two identical tables — a clean re-plot. Pattern must be perfect_dup."""
+    ga, gb = _identical_grids()
+    cf = detect_collisions({("a.xlsx", "Sheet1"): ga, ("a.xlsx", "Sheet2"): gb})[0]
+    delta = cf["delta"]
+    assert delta["pattern"] == "perfect_dup"
+    assert delta["only_in_a"] == 0 and delta["only_in_b"] == 0
+    assert delta["modified_cells"] == 0
+
+
+def test_delta_superset_extra_column():
+    """B = A plus one extra replicate column (new positions, new values), nothing
+    altered. This is the benign 'main shows n=5, extended shows n=6' shape —
+    pattern superset, modified_cells == 0, extras only on one side."""
+    ga, _ = _identical_grids(n_rows=10, n_cols=3)
+    gb = dict(ga)
+    extra_v = 900.1234
+    for r in range(10):  # an extra 4th column present only in B
+        gb[(r, 3)] = round(extra_v, 4)
+        extra_v += 0.55
+    cf = detect_collisions({("a.xlsx", "Sheet1"): ga, ("a.xlsx", "Sheet2"): gb})[0]
+    delta = cf["delta"]
+    assert delta["pattern"] == "superset"
+    assert delta["modified_cells"] == 0
+    assert delta["only_in_a"] == 0
+    assert delta["only_in_b"] >= 10
+
+
+def test_delta_value_tweaked():
+    """B is a copy of A with a few cells changed in place (same position, new value).
+    This is the copy-then-tweak fingerprint — pattern value_tweaked, the most
+    forensically interesting, distinct from a clean re-plot."""
+    ga, gb = _identical_grids(n_rows=10, n_cols=3)
+    gb[(0, 0)] = ga[(0, 0)] + 0.0009
+    gb[(5, 2)] = ga[(5, 2)] + 0.0011
+    cf = detect_collisions({("a.xlsx", "Sheet1"): ga, ("a.xlsx", "Sheet2"): gb})[0]
+    delta = cf["delta"]
+    assert delta["modified_cells"] == 2
+    assert delta["pattern"] == "value_tweaked"
+
+
+def test_delta_shifted_layout_is_perfect_dup_not_tweaked():
+    """Same numbers stored at a different column offset (a main figure and an
+    extended figure laying the cohort out differently). The value multiset is
+    identical, so this is a perfect_dup of the data — NOT value_tweaked, even
+    though raw (row,col) positions disagree."""
+    ga, _ = _identical_grids(n_rows=10, n_cols=3)
+    gb = {(r, c + 1): v for (r, c), v in ga.items()}  # shift every cell one column right
+    cf = detect_collisions({("M8.xlsx", "Figure 5o"): ga,
+                            ("M8.xlsx", "Figure 5o2"): gb})[0]
+    delta = cf["delta"]
+    assert delta["only_in_a"] == 0 and delta["only_in_b"] == 0
+    assert delta["pattern"] == "perfect_dup", \
+        f"identical value multiset must read as perfect_dup, got {delta['pattern']}"
