@@ -7,6 +7,7 @@ import json
 import sys
 
 from . import search_all
+from . import _resolve
 from ._download import download_candidate
 
 
@@ -64,6 +65,12 @@ def fetch_main(argv):
             print(json.dumps(cands, indent=2, default=str))
         else:
             _print_table(cands)
+            # No usable tabular dataset in the open repos: point the user at where the
+            # source data most likely lives (the journal article page).
+            if not any(c.get("tabular_files") for c in cands):
+                q = _resolve.normalize_query(args.query)
+                print()
+                print(_resolve.journal_guidance({"doi": q.get("doi"), "title": q.get("title")}))
         return 0
 
     out_dir = args.out or "paperconan_data"

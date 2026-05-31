@@ -59,3 +59,22 @@ def test_fetch_download_and_auto_mutually_exclusive():
     import pytest
     with pytest.raises(SystemExit):
         _cli.fetch_main(["10.x/paper", "--download", "zenodo:1", "--auto"])
+
+
+def test_fetch_empty_prints_journal_guidance(monkeypatch, capsys):
+    """No open-repo hit on a Nature DOI: point the user to the article's Source Data
+    section instead of leaving them with a dead end."""
+    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: [])
+    rc = _cli.fetch_main(["10.1038/s41590-026-02471-0"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "doi.org/10.1038/s41590-026-02471-0" in out
+    assert "Source data" in out
+
+
+def test_fetch_empty_json_mode_stays_clean(monkeypatch, capsys):
+    """--json must remain machine-parseable (empty list), no guidance prose mixed in."""
+    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: [])
+    rc = _cli.fetch_main(["10.1038/x", "--json"])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == []

@@ -34,6 +34,62 @@ def enrich_via_crossref(doi):
     return {"doi": doi, "title": title, "authors": authors, "year": year}
 
 
+# DOI registrant prefix -> publisher, for pointing users at the article page when the
+# source data isn't in an open repository. (Source data for high-impact papers usually
+# lives on the journal article page, not in Zenodo/Figshare/Dryad.)
+_DOI_PUBLISHER = {
+    "10.1038": "Springer Nature (Nature journals)",
+    "10.1126": "AAAS (Science)",
+    "10.1016": "Elsevier (ScienceDirect)",
+    "10.1073": "PNAS",
+    "10.1101": "Cold Spring Harbor",
+    "10.1002": "Wiley",
+    "10.1007": "Springer",
+    "10.1186": "BioMed Central",
+    "10.1371": "PLOS",
+    "10.15252": "EMBO Press",
+    "10.1172": "JCI",
+    "10.1084": "Rockefeller University Press",
+    "10.1093": "Oxford University Press",
+    "10.1158": "AACR",
+}
+
+
+def journal_guidance(paper):
+    """Human-readable next-step when no open-repo candidate was found.
+
+    Points the user at where the source data most likely lives (the publisher's
+    article page) using only DOI/metadata — paperconan never scrapes publisher
+    pages or bypasses paywalls, so the actual download stays a manual step.
+    """
+    doi = (paper or {}).get("doi")
+    if not doi:
+        return ("No DOI given, so I can't link to the article page. If the paper has a "
+                "DOI, re-run `paperconan fetch \"<DOI>\"`; otherwise open the journal "
+                "article page yourself and download any .xlsx/.csv/.tsv source-data or "
+                "supplementary files manually, then run `paperconan <dir>`.")
+    prefix = doi.split("/", 1)[0]
+    publisher = _DOI_PUBLISHER.get(prefix, "the publisher")
+    url = f"https://doi.org/{doi}"
+    lines = [
+        f"Not found in Zenodo / Figshare / Dryad. Source data for {doi} is most likely",
+        f"hosted by {publisher} on the article page:",
+        f"    {url}",
+    ]
+    if prefix == "10.1038":
+        lines.append("There, open the 'Source data' links under the figures and the "
+                     "'Supplementary information' section — files are usually named like "
+                     "41XXX_..._MOESM<N>_ESM.xlsx.")
+    else:
+        lines.append("There, look for a 'Supplementary information' / 'Supporting "
+                     "information' / 'Source data' section and download the "
+                     ".xlsx / .csv / .tsv files.")
+    lines.append("Save them into a folder, then run:  paperconan <folder>")
+    lines.append("(paperconan does not bypass paywalls or scrape publisher pages — "
+                 "this download is a manual step.)")
+    return "\n".join(lines)
+
+
 def _tokens(s):
     return set(re.findall(r"[a-z0-9]+", (s or "").lower()))
 
