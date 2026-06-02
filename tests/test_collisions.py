@@ -126,3 +126,79 @@ def test_delta_shifted_layout_is_perfect_dup_not_tweaked():
     assert delta["only_in_a"] == 0 and delta["only_in_b"] == 0
     assert delta["pattern"] == "perfect_dup", \
         f"identical value multiset must read as perfect_dup, got {delta['pattern']}"
+
+
+# ---------- Issue 3: shared-axis overlap downgrade ----------
+# A cross-figure overlap whose shared (row,col) cells concentrate on a column that
+# is an axis (serial-dilution dose ladder, swept time/field axis, or a column reused
+# across many sheets) is a shared-x-axis artifact, not cross-experiment reuse. It must
+# be downgraded — but only when the rest of the table diverges (pattern != perfect_dup);
+# a full-table duplicate stays high.
+
+def test_shared_dose_axis_overlap_is_downgraded():
+    """Fig 3e and Fig 5b are two dose-response curves: they share the identical
+    serial-dilution (1:3) concentration column at the same positions, but the
+    measured values differ. The overlap is the dose axis — must be downgraded."""
+    dose = [16.6667, 5.55556, 1.85185, 0.617284, 0.205761, 0.0685871, 0.0228624, 0.00762080]
+    ga, gb = {}, {}
+    for r, d in enumerate(dose):
+        ga[(r, 0)] = round(d, 6); gb[(r, 0)] = round(d, 6)          # shared dose axis
+        ga[(r, 1)] = round(10.0 + r * 0.3137, 4); ga[(r, 2)] = round(50.0 - r * 0.71, 4)
+        gb[(r, 1)] = round(90.0 - r * 0.41, 4);   gb[(r, 2)] = round(3.0 + r * 0.55, 4)
+    cf = detect_collisions({("M.xlsx", "Fig. 3e"): ga, ("M.xlsx", "Fig. 5b"): gb})[0]
+    assert cf["kind"] == "cross_sheet_position_identical"
+    assert cf["same_figure"] is False
+    assert cf["delta"]["pattern"] != "perfect_dup"
+    assert cf.get("axis_overlap") is True
+    assert cf["severity"] == "low", f"shared dose-axis overlap should be low, got {cf['severity']}"
+    assert cf.get("likely_benign")
+
+
+def test_recurring_axis_column_across_sheets_is_downgraded():
+    """A column whose value-set recurs across >=3 sheets is a shared axis even when
+    it is not a clean progression. A cross-figure pair sharing only that column
+    must be downgraded."""
+    axis = [0.1234, 0.8765, 0.4567, 0.9876, 0.3210, 0.6540, 0.2222]  # not a progression
+    def mk(base):
+        g = {}
+        for r, a in enumerate(axis):
+            g[(r, 0)] = round(a, 6)
+            g[(r, 1)] = round(base + r * 0.137, 4)   # distinct measurement per sheet
+        return g
+    grids = {("M.xlsx", "Figure 1O"): mk(10.0),
+             ("M.xlsx", "sFigure 2D"): mk(40.0),
+             ("M.xlsx", "Figure 5D"): mk(70.0)}
+    findings = detect_collisions(grids)
+    pair = next(f for f in findings
+                if {f["sheet_a"], f["sheet_b"]} == {"Figure 1O", "sFigure 2D"})
+    assert pair.get("axis_overlap") is True
+    assert pair["severity"] == "low"
+
+
+def test_full_table_dup_not_downgraded_by_axis_rule():
+    """A cross-figure overlap where EVERY column matches (perfect_dup) is a full
+    duplicate / re-plot — it must stay high regardless of the axis rule."""
+    ga, gb = _identical_grids()
+    cf = detect_collisions({("M8.xlsx", "Figure 5o"): ga,
+                            ("M16.xlsx", "exFig.6b-e"): gb})[0]
+    assert cf["delta"]["pattern"] == "perfect_dup"
+    assert cf["severity"] == "high"
+    assert cf.get("axis_overlap") is not True
+
+
+def test_copied_measurement_column_keeps_severity():
+    """Boundary guard: a pair that shares an axis AND a copied (realistic, non-progression)
+    MEASUREMENT column — with a third column divergent — must stay HIGH. The duplicated
+    measurement is the forensic signal; only the axis being shared must not buy a downgrade."""
+    axis = [16.6667, 5.55556, 1.85185, 0.617284, 0.205761, 0.0685871, 0.0228624, 0.00762080]
+    meas = [12.7431, 3.1188, 88.4502, 7.6613, 41.2099, 0.9931, 23.8847, 55.0024]  # not a progression
+    ga, gb = {}, {}
+    for r in range(len(axis)):
+        ga[(r, 0)] = round(axis[r], 6); gb[(r, 0)] = round(axis[r], 6)   # shared axis
+        ga[(r, 1)] = meas[r];           gb[(r, 1)] = meas[r]             # COPIED measurement
+        ga[(r, 2)] = round(10.0 + r * 0.3137, 4)
+        gb[(r, 2)] = round(90.0 - r * 0.41, 4)                          # divergent column
+    cf = detect_collisions({("M.xlsx", "Fig. 3e"): ga, ("M.xlsx", "Fig. 5b"): gb})[0]
+    assert cf["same_figure"] is False
+    assert cf.get("axis_overlap") is not True, "a copied measurement column must not be treated as axis"
+    assert cf["severity"] == "high"

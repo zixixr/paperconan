@@ -676,6 +676,80 @@ def _value_delta(ga, gb):
                 shared_values=shared, only_in_a=only_a, only_in_b=only_b)
 
 
+def _column_cells(grid, c):
+    """Row-ordered [(row, value)] for column ``c`` of a decimal grid."""
+    return sorted(((r, v) for (r, cc), v in grid.items() if cc == c), key=lambda t: t[0])
+
+
+def _is_axis_progression(grid, c, min_n=4, rel_tol=1e-4, geo_tol=1e-3):
+    """True when column ``c`` is a swept axis: its values lie on an arithmetic
+    (constant step) or geometric (constant ratio) progression in row order.
+
+    Catches dose ladders / serial dilutions (1:3 → geometric), time / frequency /
+    voltage sweeps (linear → arithmetic) and integer-step index axes. Gaps from
+    dropped integer rows are tolerated by fitting against the row index. ``geo_tol``
+    is looser than ``rel_tol`` so a serial dilution stored at 3 significant figures
+    (33.3 / 11.1 / 3.70 …) still reads as geometric.
+
+    Blind spot worth noting: a *measurement* column that happens to be an exact
+    arithmetic/geometric ramp is indistinguishable from an axis here. That is rare in
+    real data, and paperconan's within-column arithmetic/geometric detectors flag such
+    a column HIGH independently — so a copied exact-progression column is not silenced
+    overall, only this one cross-sheet finding would be downgraded.
+    """
+    cells = _column_cells(grid, c)
+    if len(cells) < min_n:
+        return False
+    rs = [r for r, _ in cells]
+    vs = [v for _, v in cells]
+    span = rs[-1] - rs[0]
+    if span <= 0:
+        return False
+    # arithmetic: v linear in row index, non-flat
+    step = (vs[-1] - vs[0]) / span
+    if abs(step) > 1e-12:
+        scale = max(abs(v) for v in vs) or 1.0
+        if all(abs(v - (vs[0] + step * (r - rs[0]))) <= rel_tol * scale for r, v in cells):
+            return True
+    # geometric: same-sign nonzero values that are linear in log space
+    if all(v != 0 for v in vs) and (all(v > 0 for v in vs) or all(v < 0 for v in vs)):
+        logs = [math.log(abs(v)) for v in vs]
+        lstep = (logs[-1] - logs[0]) / span
+        if abs(lstep) > 1e-9:
+            if all(abs(lg - (logs[0] + lstep * (r - rs[0]))) <= geo_tol for (r, _), lg in zip(cells, logs)):
+                return True
+    return False
+
+
+def _axis_columns(grids, recur_min=3):
+    """Classify, per (file, sheet), which columns are 'axis-like' so a cross-sheet
+    overlap that lands only on them can be recognized as a shared-x-axis artifact.
+
+    A column is axis-like if either:
+      (A) its values form an arithmetic/geometric progression (a swept axis), or
+      (B) its exact value-set recurs as a column across >= ``recur_min`` distinct
+          (file, sheet) grids — i.e. the same axis was reused across many panels.
+    """
+    # (B) fingerprint columns by their value-set; count how many sheets carry each.
+    fp_counts = Counter()
+    col_fps = {}
+    for key, grid in grids.items():
+        cols = {c for (_, c) in grid}
+        for c in cols:
+            vals = frozenset(v for (r, cc), v in grid.items() if cc == c)
+            if len(vals) >= 4:
+                col_fps[(key, c)] = vals
+                fp_counts[vals] += 1
+    recurring = {fp for fp, n in fp_counts.items() if n >= recur_min}
+
+    axis = {}
+    for key, grid in grids.items():
+        cols = {c for (_, c) in grid}
+        axis[key] = {c for c in cols
+                     if _is_axis_progression(grid, c) or col_fps.get((key, c)) in recurring}
+    return axis
+
+
 def detect_collisions(grids):
     """Find pairs of tables (sheets and/or flat files) with many bit-identical decimal
     values at the SAME (row, col). Catches "copy a table, then tweak a few values" fraud,
@@ -685,13 +759,21 @@ def detect_collisions(grids):
     suspicious pair, with file_a/file_b set so same-file and cross-file pairs are
     distinguishable.
 
-    Severity is context-aware: when both sheets resolve to the SAME figure id
-    (e.g. exFig.6i ↔ exFig.6k-n), the overlap is the expected combined-vs-individual
-    re-plot and is downgraded to "low" with an explanatory `context`. Cross-figure /
-    cross-file overlaps (e.g. main Fig 5o ↔ Extended Fig 6b-e) keep their base severity.
+    Severity is context-aware on two axes:
+
+    - SAME figure id (e.g. exFig.6i ↔ exFig.6k-n): the expected combined-vs-individual
+      re-plot, downgraded to "low" with an explanatory `context`.
+    - SHARED AXIS: when the bit-identical (row,col) cells concentrate (>=80%) on a
+      column that is a swept axis / serial-dilution ladder / index reused across panels,
+      AND the rest of the table diverges (pattern != perfect_dup), the overlap is just a
+      shared x-axis (dose / time / frequency) — downgraded to "low" with `axis_overlap`.
+      A full-table duplicate (perfect_dup) is NOT downgraded by this rule.
+
+    Cross-figure overlaps that survive both checks keep their base severity.
     """
     findings = []
     keys = list(grids.keys())
+    axis_cols = _axis_columns(grids)
     for i in range(len(keys)):
         for j in range(i + 1, len(keys)):
             (fa, sa), (fb, sb) = keys[i], keys[j]
@@ -724,7 +806,38 @@ def detect_collisions(grids):
                 ctx_fields["context"] = context
 
             if same_pos >= max(6, smaller * 0.15):
-                examples = [(k, v) for k, v in ga.items() if k in gb and gb[k] == v][:5]
+                shared = [(k, v) for k, v in ga.items() if k in gb and gb[k] == v]
+                examples = shared[:5]
+                # Shared-axis downgrade: if the bit-identical cells concentrate on a
+                # column that is a swept/recurring axis AND the rest diverges, this is a
+                # shared x-axis, not cross-experiment reuse. A perfect_dup spans every
+                # column (incl. measurements), so it is excluded and stays high.
+                pair_axis = axis_cols.get(keys[i], set()) | axis_cols.get(keys[j], set())
+                on_axis = sum(1 for (_, c), _ in shared if c in pair_axis)
+                non_axis_shared = len(shared) - on_axis
+                # Downgrade only when the overlap is essentially confined to axis
+                # columns: >=80% of shared cells on an axis AND no more than a couple of
+                # stray matches off-axis (absolute backstop, so a wide axis can't drag a
+                # real measurement overlap under the ratio). A perfect_dup spans every
+                # column and is excluded above.
+                axis_overlap = (
+                    not same_figure
+                    and ctx_fields["delta"]["pattern"] != "perfect_dup"
+                    and on_axis >= 0.8 * len(shared)
+                    and non_axis_shared <= 3
+                )
+                if axis_overlap:
+                    ctx_fields["axis_overlap"] = True
+                    axis_note = ("the bit-identical cells fall on a shared x-axis column "
+                                 "(serial-dilution dose, time/frequency sweep, or an index "
+                                 "reused across panels), while the measured values differ — "
+                                 "a shared axis, not cross-experiment data reuse")
+                    ctx_fields["context"] = axis_note
+                    ctx_fields["likely_benign"] = axis_note
+                if same_figure or axis_overlap:
+                    sev = "low"
+                else:
+                    sev = "high"
                 findings.append(dict(
                     kind="cross_sheet_position_identical",
                     file=fa if same_file else f"{fa} + {fb}",
@@ -734,7 +847,7 @@ def detect_collisions(grids):
                     same_position_count=same_pos,
                     fraction_of_smaller=same_pos / smaller,
                     examples=[dict(row=k[0] + 1, col=k[1] + 1, value=v) for k, v in examples],
-                    severity="low" if same_figure else "high",
+                    severity=sev,
                     **ctx_fields,
                     rule=f"{la} and {lb} share {same_pos}/{smaller} ({same_pos/smaller*100:.0f}%) decimal values at SAME (row,col) across 2 {scope}",
                 ))
