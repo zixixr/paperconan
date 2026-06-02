@@ -25,9 +25,9 @@ Use this skill when the user:
 ## Prerequisites
 
 ```bash
-pip install paperconan        # from PyPI (when published)
-# OR, from a local clone:
-pip install -e /path/to/paperconan
+pip install paperconan          # base install (xlsx / csv / tsv)
+pip install "paperconan[all]"   # + supplementary PDF / Word table extraction
+# Dev install from a clone:  pip install -e /path/to/paperconan
 ```
 
 Verify with `paperconan --help` (or `paperconan --version`).
