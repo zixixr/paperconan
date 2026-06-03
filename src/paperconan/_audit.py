@@ -27,6 +27,7 @@ import glob
 import json
 import math
 import os
+import re
 import sys
 from collections import Counter
 from fractions import Fraction
@@ -78,6 +79,69 @@ def trailing_decimal_digits(x, k=2):
         return None
     frac = s.split(".", 1)[1]
     return frac[-k:] if len(frac) >= k else None
+
+
+def _decimals_of(x, cap=6):
+    """Number of significant decimal places in x's shortest float repr, capped.
+
+    Cells are coerced to float on load, so displayed trailing zeros are lost.
+    Recovering decimals from the float repr therefore UNDER-counts precision for
+    values like 2.50 -> 2.5. That is conservatively safe for GRIM: fewer decimals
+    means a coarser grid and fewer flags, never a false flag."""
+    s = repr(float(x))
+    if "e" in s or "E" in s:
+        return cap  # scientific notation: assume high precision (conservative)
+    if "." not in s:
+        return 0
+    frac = s.split(".", 1)[1].rstrip("0")
+    return min(len(frac), cap)
+
+
+def grim_consistent(mean, n, decimals):
+    """True if `mean`, reported to `decimals` places, is achievable as an integer
+    total divided by `n`. Conservative: any bracketing integer total that rounds
+    back to the reported mean counts as consistent (tolerant of the rounding
+    convention used by the authors)."""
+    if n <= 0:
+        return True
+    scale = 10 ** decimals
+    target = round(mean * scale)
+    base = mean * n
+    for t in (math.floor(base), math.ceil(base), round(base)):
+        if round((t / n) * scale) == target:
+            return True
+    return False
+
+
+def grimmer_consistent(mean, sd, n, mean_decimals, sd_decimals):
+    """True if a sample of `n` integers can have both the reported `mean` and the
+    reported `sd` (to their stated decimals). Implements the GRIMMER test: for the
+    integer total T fixed by the mean, search the integer sum-of-squares values
+    whose implied sd rounds to the reported sd, and require one with the correct
+    parity (since sum(x^2) == sum(x) mod 2 for integers). Accepts either sample
+    (n-1) or population (n) SD convention so an unknown convention never
+    false-positives."""
+    if n <= 1 or sd < 0:
+        return True
+    T = round(mean * n)
+    half = 0.5 / (10 ** sd_decimals)
+    lo_sd = max(0.0, sd - half)
+    hi_sd = sd + half
+    for ddof in (1, 0):
+        denom = n - ddof
+        if denom <= 0:
+            continue
+        corr = (T * T) / n
+        ss_lo = lo_sd * lo_sd * denom + corr
+        ss_hi = hi_sd * hi_sd * denom + corr
+        for ss in range(math.ceil(ss_lo - 1e-9), math.floor(ss_hi + 1e-9) + 1):
+            if ss < 0:
+                continue
+            if (ss % 2) != (T % 2):       # integer parity test
+                continue
+            if ss + 1e-9 >= corr:          # variance >= 0
+                return True
+    return False
 
 
 # ---------- sheet I/O ----------
