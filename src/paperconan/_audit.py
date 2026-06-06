@@ -378,6 +378,9 @@ _GRIM_N_RE = re.compile(r"\bn\b|sample.?size|样本量|例数", re.I)
 _GRIM_INT_RE = re.compile(
     r"count|number|cells|foci|colon|nuclei|score|rating|likert"
     r"|个数|数目|计数|数量|评分|#", re.I)
+_GRIM_RATIO_RE = re.compile(
+    r"%|percent|percentage|\bratio\b|\brate\b|\bindex\b|proportion|fraction"
+    r"|百分|比例|比率|占比|指数", re.I)
 
 
 def detect_relations(rows, r0, r1, c0, c1, header):
@@ -635,6 +638,12 @@ def detect_grim_grimmer(rows, r0, r1, c0, c1, header):
     # itself, not anywhere in the row — otherwise a bookkeeping column such as
     # "number of replicates" would license GRIM on a continuous measurement.
     if not _GRIM_INT_RE.search(str(header[mean_i] or "")):
+        return findings
+    # Negative gate: a continuous ratio / percentage / index mean is not integer
+    # data even when its header also contains a count word (e.g. "% positive cells").
+    # NB: deliberately excludes "score"/"count" — GRIM's original domain is integer
+    # composite/Likert scores, which must still be checked.
+    if _GRIM_RATIO_RE.search(str(header[mean_i] or "")):
         return findings
 
     mean_c, n_c = c0 + mean_i, c0 + n_i

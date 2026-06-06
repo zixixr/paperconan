@@ -160,3 +160,32 @@ def test_detector_mean_header_with_n_token_uses_real_n_column():
     assert grim, "should flag 3.45 against the real n=10 column"
     assert grim[0]["n_col"] == "n"
     assert grim[0]["failed_rows"][0]["n"] == 10
+
+
+def test_detector_skips_percentage_mean_header():
+    # "% positive cells" is a continuous ratio, not integer count data -> skip,
+    # even though the header contains the count word "cells".
+    rows = [
+        ["group", "% positive cells mean", "sd", "n"],
+        ["A", 3.45, 1.0, 10],
+        ["B", 3.41, 1.0, 10],
+    ]
+    assert detect_grim_grimmer(*_block(rows)) == []
+
+
+def test_detector_skips_ratio_mean_header():
+    rows = [
+        ["group", "ratio number mean", "sd", "n"],
+        ["A", 3.45, 1.0, 10],
+    ]
+    assert detect_grim_grimmer(*_block(rows)) == []
+
+
+def test_detector_still_checks_composite_score_mean():
+    # Composite Likert/count score is GRIM's original domain — must NOT be skipped.
+    rows = [
+        ["group", "composite score mean", "sd", "n"],
+        ["A", 3.45, 1.0, 10],   # GRIM-impossible at n=10
+    ]
+    findings = detect_grim_grimmer(*_block(rows))
+    assert any(f["kind"] == "grim_inconsistent" for f in findings)
