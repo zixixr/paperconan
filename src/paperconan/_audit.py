@@ -27,6 +27,7 @@ import glob
 import json
 import math
 import os
+import re
 import sys
 from collections import Counter
 from fractions import Fraction
@@ -78,6 +79,69 @@ def trailing_decimal_digits(x, k=2):
         return None
     frac = s.split(".", 1)[1]
     return frac[-k:] if len(frac) >= k else None
+
+
+def _decimals_of(x, cap=6):
+    """Number of significant decimal places in x's shortest float repr, capped.
+
+    Cells are coerced to float on load, so displayed trailing zeros are lost.
+    Recovering decimals from the float repr therefore UNDER-counts precision for
+    values like 2.50 -> 2.5. That is conservatively safe for GRIM: fewer decimals
+    means a coarser grid and fewer flags, never a false flag."""
+    s = repr(float(x))
+    if "e" in s or "E" in s:
+        return cap  # scientific notation: assume high precision (conservative)
+    if "." not in s:
+        return 0
+    frac = s.split(".", 1)[1].rstrip("0")
+    return min(len(frac), cap)
+
+
+def grim_consistent(mean, n, decimals):
+    """True if `mean`, reported to `decimals` places, is achievable as an integer
+    total divided by `n`. Conservative: any bracketing integer total that rounds
+    back to the reported mean counts as consistent (tolerant of the rounding
+    convention used by the authors)."""
+    if n <= 0:
+        return True
+    scale = 10 ** decimals
+    target = round(mean * scale)
+    base = mean * n
+    for t in (math.floor(base), math.ceil(base), round(base)):
+        if round((t / n) * scale) == target:
+            return True
+    return False
+
+
+def grimmer_consistent(mean, sd, n, mean_decimals, sd_decimals):
+    """True if a sample of `n` integers can have both the reported `mean` and the
+    reported `sd` (to their stated decimals). Implements the GRIMMER test: for the
+    integer total T fixed by the mean, search the integer sum-of-squares values
+    whose implied sd rounds to the reported sd, and require one with the correct
+    parity (since sum(x^2) == sum(x) mod 2 for integers). Accepts either sample
+    (n-1) or population (n) SD convention so an unknown convention never
+    false-positives."""
+    if n <= 1 or sd < 0:
+        return True
+    T = round(mean * n)
+    half = 0.5 / (10 ** sd_decimals)
+    lo_sd = max(0.0, sd - half)
+    hi_sd = sd + half
+    for ddof in (1, 0):
+        denom = n - ddof
+        if denom <= 0:
+            continue
+        corr = (T * T) / n
+        ss_lo = lo_sd * lo_sd * denom + corr
+        ss_hi = hi_sd * hi_sd * denom + corr
+        for ss in range(math.ceil(ss_lo - 1e-9), math.floor(ss_hi + 1e-9) + 1):
+            if ss < 0:
+                continue
+            if (ss % 2) != (T % 2):       # integer parity test
+                continue
+            if ss + 1e-9 >= corr:          # variance >= 0
+                return True
+    return False
 
 
 # ---------- sheet I/O ----------
@@ -268,6 +332,10 @@ def benign_reason(f):
         if f.get("same_file") is False:
             return ("a control/baseline cohort is often reused across a main figure and "
                     "its extended-data figure — confirm the legend discloses the reuse")
+    if kind in ("grim_inconsistent", "grimmer_inconsistent"):
+        return ("GRIM/GRIMMER assume the statistic is a mean of integer-valued "
+                "items (counts/scores); verify the measure is integer-granular "
+                "before acting")
     return None
 
 
@@ -303,6 +371,17 @@ def _attach_evidence(findings, rows, r0, r1, c0, c1, header):
 
 
 # ---------- detectors ----------
+
+_GRIM_MEAN_RE = re.compile(r"\b(mean|average|avg)\b|均值|平均", re.I)
+_GRIM_SD_RE = re.compile(r"\b(s\.?d\.?|std)\b|标准差", re.I)
+_GRIM_N_RE = re.compile(r"\bn\b|sample.?size|样本量|例数", re.I)
+_GRIM_INT_RE = re.compile(
+    r"count|number|cells|foci|colon|nuclei|score|rating|likert"
+    r"|个数|数目|计数|数量|评分|#", re.I)
+_GRIM_RATIO_RE = re.compile(
+    r"%|percent|percentage|\bratio\b|\brate\b|\bindex\b|proportion|fraction"
+    r"|百分|比例|比率|占比|指数", re.I)
+
 
 def detect_relations(rows, r0, r1, c0, c1, header):
     findings = []
@@ -527,6 +606,104 @@ def detect_identical_after_rounding(rows, r0, r1, c0, c1, header):
                                  example_cells=[(r + 1, c + 1) for r, c, _ in lst[:6]],
                                  severity="medium",
                                  rule=f"{len(lst)} cells share rounded value {k} but have {len(uniq)} distinct precise values"))
+    return findings
+
+
+def detect_grim_grimmer(rows, r0, r1, c0, c1, header):
+    """GRIM/GRIMMER: flag reported means (and SDs) impossible for integer-valued
+    data at the stated n. Strictly gated — needs a header-located mean+n triple
+    AND a count/score keyword in the MEAN column header signalling integer items —
+    to stay false-positive-safe on continuous measurements where GRIM does not apply.
+    GRIMMER runs only on a true SD column (SEM/SE columns are deliberately ignored,
+    since GRIMMER is undefined for a standard error)."""
+    findings = []
+
+    def _find(rx, taken):
+        for idx, h in enumerate(header):
+            if idx not in taken and rx.search(str(h or "")):
+                return idx
+        return None
+
+    taken = set()
+    mean_i = _find(_GRIM_MEAN_RE, taken)
+    if mean_i is not None:
+        taken.add(mean_i)
+    n_i = _find(_GRIM_N_RE, taken)
+    if n_i is not None:
+        taken.add(n_i)
+    sd_i = _find(_GRIM_SD_RE, taken)
+    if mean_i is None or n_i is None:
+        return findings
+    # Integer-data gate: the count/score keyword must be in the MEAN column header
+    # itself, not anywhere in the row — otherwise a bookkeeping column such as
+    # "number of replicates" would license GRIM on a continuous measurement.
+    if not _GRIM_INT_RE.search(str(header[mean_i] or "")):
+        return findings
+    # Negative gate: a continuous ratio / percentage / index mean is not integer
+    # data even when its header also contains a count word (e.g. "% positive cells").
+    # NB: deliberately excludes "score"/"count" — GRIM's original domain is integer
+    # composite/Likert scores, which must still be checked.
+    if _GRIM_RATIO_RE.search(str(header[mean_i] or "")):
+        return findings
+
+    mean_c, n_c = c0 + mean_i, c0 + n_i
+    sd_c = c0 + sd_i if sd_i is not None else None
+    grim_fail, grimmer_fail = [], []
+    checked = grimmer_checked = 0
+    for r in range(r0, r1):
+        mv = rows[r][mean_c] if mean_c < len(rows[r]) else None
+        nv = rows[r][n_c] if n_c < len(rows[r]) else None
+        if not (is_num(mv) and is_num(nv)):
+            continue
+        n = int(round(float(nv)))
+        if n < 2:
+            continue
+        mean = float(mv)
+        d = _decimals_of(mean)
+        if n >= 10 ** d:                 # power gate: no discriminating power
+            continue
+        checked += 1
+        if not grim_consistent(mean, n, d):
+            grim_fail.append((r, mean, n, d))
+            continue                     # GRIM-failing rows are not re-reported
+        if sd_c is not None:
+            sv = rows[r][sd_c] if sd_c < len(rows[r]) else None
+            if is_num(sv):
+                sd = float(sv)
+                ds = _decimals_of(sd)
+                grimmer_checked += 1
+                if not grimmer_consistent(mean, sd, n, d, ds):
+                    grimmer_fail.append((r, mean, sd, n, ds))
+
+    mean_name = str(header[mean_i] or f"col{mean_c}")
+    n_name = str(header[n_i] or f"col{n_c}")
+    sd_name = str(header[sd_i] or f"col{sd_c}") if sd_i is not None else None
+
+    if grim_fail:
+        f = dict(kind="grim_inconsistent", severity="high",
+                 mean_col=mean_name, n_col=n_name, sd_col=sd_name,
+                 col_a_idx=mean_c,
+                 n=checked, n_rows_checked=checked, n_failed=len(grim_fail),
+                 failed_rows=[dict(row=r + 1, mean=m, n=nn, decimals=dd,
+                                   nearest_consistent=round(round(m * nn) / nn, dd))
+                              for (r, m, nn, dd) in grim_fail[:8]],
+                 example_cells=[[r + 1, mean_c + 1] for (r, *_rest) in grim_fail[:8]],
+                 rule=(f"{len(grim_fail)}/{checked} rows report a mean impossible for "
+                       f"integer data at the stated n (GRIM): col '{mean_name}'"))
+        if sd_c is not None:
+            f["col_b_idx"] = sd_c
+        findings.append(f)
+    if grimmer_fail:
+        findings.append(dict(
+            kind="grimmer_inconsistent", severity="high",
+            mean_col=mean_name, n_col=n_name, sd_col=sd_name,
+            col_a_idx=mean_c, col_b_idx=sd_c,
+            n=grimmer_checked, n_rows_checked=grimmer_checked, n_failed=len(grimmer_fail),
+            failed_rows=[dict(row=r + 1, mean=m, sd=s, n=nn, sd_decimals=ds)
+                         for (r, m, s, nn, ds) in grimmer_fail[:8]],
+            example_cells=[[r + 1, sd_c + 1] for (r, *_rest) in grimmer_fail[:8]],
+            rule=(f"{len(grimmer_fail)}/{grimmer_checked} rows report an SD impossible for "
+                  f"integer data at the stated mean & n (GRIMMER): col '{sd_name}'")))
     return findings
 
 
@@ -914,14 +1091,16 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None):
                 eq = detect_equal_pairs(rows, r0, r1, c0, c1, header)
                 wc = detect_within_column_patterns(rows, r0, r1, c0, c1, header)
                 iar = detect_identical_after_rounding(rows, r0, r1, c0, c1, header)
-                if rel or ap or eq or wc or iar:
-                    for group in (rel, ap, eq, wc, iar):
+                gg = detect_grim_grimmer(rows, r0, r1, c0, c1, header)
+                if rel or ap or eq or wc or iar or gg:
+                    for group in (rel, ap, eq, wc, iar, gg):
                         _attach_evidence(group, rows, r0, r1, c0, c1, header)
                         _attach_benign(group)
                     report_blocks.append(dict(file=os.path.basename(f), sheet=sn,
                                               block=dict(rows=f"{r0+1}-{r1}", cols=f"{c0+1}-{c1}", header=header),
                                               relations=rel, progressions=ap, equal_pairs=eq,
-                                              within_col=wc, identical_after_rounding=iar))
+                                              within_col=wc, identical_after_rounding=iar,
+                                              grim=gg))
 
     # Down-weight dense/correlated sheets: judged by per-sheet relation totals, so a
     # wide matrix's expected identical/linear columns don't flood high-severity output.
@@ -995,6 +1174,8 @@ def write_markdown_report(out, path):
         for r in b.get("within_col", []):
             push(b, r)
         for r in b.get("identical_after_rounding", []):
+            push(b, r)
+        for r in b.get("grim", []):
             push(b, r)
 
     csf = out.get("cross_sheet_findings", [])

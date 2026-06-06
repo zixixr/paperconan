@@ -10,6 +10,8 @@ Patterns embedded:
   - `arithmetic_progression`  : col ap_col is 2.5, 5.0, 7.5, … (non-integer step → high)
   - `cross_sheet_position_identical` : Sheet1 and Sheet2 share ≥ 15% bit-identical
                                        decimal values at the same (row, col)
+  - `grim_inconsistent`       : Fig3_counts sheet — reported mean 3.45 at n=10 is
+                                impossible for integer count data (GRIM)
 """
 from __future__ import annotations
 
@@ -55,6 +57,14 @@ def build(out_dir: str) -> str:
         if i == 7:
             vol = 9.0  # bit-tweak: differs at row 8, vol column
         ws2.append([mass, vol, copy_, 100.0 + i * 0.1])
+
+    # Summary-statistics sheet with an integer-item keyword in the MEAN header and
+    # one GRIM-impossible mean (3.45 is unreachable as an integer total / 10).
+    ws3 = wb.create_sheet("Fig3_counts")
+    ws3.append(["group", "cell count mean", "sd", "n"])
+    ws3.append(["control", 3.40, 1.0, 10])   # consistent
+    ws3.append(["treated", 3.45, 1.0, 10])   # GRIM-impossible
+    ws3.append(["rescue", 3.30, 1.0, 10])    # consistent
 
     path = os.path.join(out_dir, "ED_Fig1.xlsx")
     wb.save(path)
