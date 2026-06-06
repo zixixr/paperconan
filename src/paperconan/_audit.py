@@ -368,6 +368,14 @@ def _attach_evidence(findings, rows, r0, r1, c0, c1, header):
 
 # ---------- detectors ----------
 
+_GRIM_MEAN_RE = re.compile(r"\b(mean|average|avg)\b|均值|平均", re.I)
+_GRIM_SD_RE = re.compile(r"\b(s\.?d\.?|std|sem|s\.?e\.?m?\.?)\b|标准差|标准误", re.I)
+_GRIM_N_RE = re.compile(r"\bn\b|sample.?size|样本量|例数", re.I)
+_GRIM_INT_RE = re.compile(
+    r"count|number|cells|foci|colon|nuclei|score|rating|likert"
+    r"|个数|数目|计数|数量|评分|#", re.I)
+
+
 def detect_relations(rows, r0, r1, c0, c1, header):
     findings = []
     cols = [(c, col_array(rows, r0, r1, c)) for c in range(c0, c1)]
@@ -591,6 +599,86 @@ def detect_identical_after_rounding(rows, r0, r1, c0, c1, header):
                                  example_cells=[(r + 1, c + 1) for r, c, _ in lst[:6]],
                                  severity="medium",
                                  rule=f"{len(lst)} cells share rounded value {k} but have {len(uniq)} distinct precise values"))
+    return findings
+
+
+def detect_grim_grimmer(rows, r0, r1, c0, c1, header):
+    """GRIM/GRIMMER: flag reported means (and SDs) impossible for integer-valued
+    data at the stated n. Strictly gated — needs a header-located mean+n triple
+    AND a count/score keyword signalling integer items — to stay false-positive-safe
+    on continuous measurements where GRIM does not apply."""
+    findings = []
+    mean_i = sd_i = n_i = None
+    for idx, h in enumerate(header):
+        h = str(h or "")
+        if mean_i is None and _GRIM_MEAN_RE.search(h):
+            mean_i = idx
+        elif sd_i is None and _GRIM_SD_RE.search(h):
+            sd_i = idx
+        elif n_i is None and _GRIM_N_RE.search(h):
+            n_i = idx
+    if mean_i is None or n_i is None:
+        return findings
+    blob = " ".join(str(h or "") for h in header)
+    if not (_GRIM_INT_RE.search(str(header[mean_i] or "")) or _GRIM_INT_RE.search(blob)):
+        return findings
+
+    mean_c, n_c = c0 + mean_i, c0 + n_i
+    sd_c = c0 + sd_i if sd_i is not None else None
+    grim_fail, grimmer_fail, checked = [], [], 0
+    for r in range(r0, r1):
+        mv = rows[r][mean_c] if mean_c < len(rows[r]) else None
+        nv = rows[r][n_c] if n_c < len(rows[r]) else None
+        if not (is_num(mv) and is_num(nv)):
+            continue
+        n = int(round(float(nv)))
+        if n < 2:
+            continue
+        mean = float(mv)
+        d = _decimals_of(mean)
+        if n >= 10 ** d:                 # power gate: no discriminating power
+            continue
+        checked += 1
+        if not grim_consistent(mean, n, d):
+            grim_fail.append((r, mean, n, d))
+            continue                     # GRIM-failing rows are not re-reported
+        if sd_c is not None:
+            sv = rows[r][sd_c] if sd_c < len(rows[r]) else None
+            if is_num(sv):
+                sd = float(sv)
+                ds = _decimals_of(sd)
+                if not grimmer_consistent(mean, sd, n, d, ds):
+                    grimmer_fail.append((r, mean, sd, n, ds))
+
+    mean_name = str(header[mean_i] or f"col{mean_c}")
+    n_name = str(header[n_i] or f"col{n_c}")
+    sd_name = str(header[sd_i] or f"col{sd_c}") if sd_i is not None else None
+
+    if grim_fail:
+        f = dict(kind="grim_inconsistent", severity="high",
+                 mean_col=mean_name, n_col=n_name, sd_col=sd_name,
+                 col_a_idx=mean_c,
+                 n=checked, n_rows_checked=checked, n_failed=len(grim_fail),
+                 failed_rows=[dict(row=r + 1, mean=m, n=nn, decimals=dd,
+                                   nearest_consistent=round(round(m * nn) / nn, dd))
+                              for (r, m, nn, dd) in grim_fail[:8]],
+                 example_cells=[[r + 1, mean_c + 1] for (r, *_rest) in grim_fail],
+                 rule=(f"{len(grim_fail)}/{checked} rows report a mean impossible for "
+                       f"integer data at the stated n (GRIM): col '{mean_name}'"))
+        if sd_c is not None:
+            f["col_b_idx"] = sd_c
+        findings.append(f)
+    if grimmer_fail:
+        findings.append(dict(
+            kind="grimmer_inconsistent", severity="high",
+            mean_col=mean_name, n_col=n_name, sd_col=sd_name,
+            col_a_idx=mean_c, col_b_idx=sd_c,
+            n=checked, n_rows_checked=checked, n_failed=len(grimmer_fail),
+            failed_rows=[dict(row=r + 1, mean=m, sd=s, n=nn, sd_decimals=ds)
+                         for (r, m, s, nn, ds) in grimmer_fail[:8]],
+            example_cells=[[r + 1, sd_c + 1] for (r, *_rest) in grimmer_fail],
+            rule=(f"{len(grimmer_fail)}/{checked} rows report an SD impossible for "
+                  f"integer data at the stated mean & n (GRIMMER): col '{sd_name}'")))
     return findings
 
 

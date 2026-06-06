@@ -62,3 +62,53 @@ def test_grimmer_never_flags_achievable_integer_sds():
                 if not grim_consistent(mean, n, d):
                     continue
                 assert grimmer_consistent(mean, sd, n, d, d) is True, (combo, n, d, mean, sd)
+
+
+from paperconan._audit import detect_grim_grimmer
+
+
+def _block(rows):
+    # header row 0; data rows 1..len-1; full width.
+    return rows, 1, len(rows), 0, len(rows[0]), [str(x) for x in rows[0]]
+
+
+def test_detector_flags_impossible_mean_with_integer_keyword():
+    rows = [
+        ["group", "cell count mean", "sd", "n"],
+        ["A", 3.45, 1.0, 10],   # 3.45 impossible at n=10
+        ["B", 3.40, 1.0, 10],   # fine
+    ]
+    findings = detect_grim_grimmer(*_block(rows))
+    kinds = {f["kind"] for f in findings}
+    assert "grim_inconsistent" in kinds
+    grim = next(f for f in findings if f["kind"] == "grim_inconsistent")
+    assert grim["severity"] == "high"
+    assert grim["n_failed"] == 1
+    assert grim["failed_rows"][0]["row"] == 2  # 1-based sheet row of group A
+
+
+def test_detector_skips_without_integer_keyword():
+    # No count/score keyword -> assume continuous -> never run (no false positive).
+    rows = [
+        ["group", "concentration mean", "sd", "n"],
+        ["A", 3.45, 1.0, 10],
+        ["B", 3.40, 1.0, 10],
+    ]
+    assert detect_grim_grimmer(*_block(rows)) == []
+
+
+def test_detector_skips_without_n_column():
+    rows = [
+        ["group", "score mean", "sd"],
+        ["A", 3.45, 1.0],
+    ]
+    assert detect_grim_grimmer(*_block(rows)) == []
+
+
+def test_detector_power_gate_skips_large_n():
+    # n=1000 >= 10^2 -> GRIM has no power -> no finding even though keyword present.
+    rows = [
+        ["group", "score mean", "sd", "n"],
+        ["A", 3.45, 1.0, 1000],
+    ]
+    assert detect_grim_grimmer(*_block(rows)) == []
