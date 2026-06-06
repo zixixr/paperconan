@@ -121,3 +121,26 @@ def test_grim_findings_carry_benign_caveat():
     reason = benign_reason({"kind": "grim_inconsistent"})
     assert reason and "integer" in reason.lower()
     assert benign_reason({"kind": "grimmer_inconsistent"})
+
+
+def test_detector_does_not_run_grimmer_on_sem_column():
+    # SEM is a standard error, not an SD; GRIMMER must never run on it.
+    rows = [
+        ["group", "symptom score mean", "SEM", "n"],
+        ["A", 1.1, 0.2, 8],
+        ["B", 1.2, 0.3, 8],
+        ["C", 1.4, 0.4, 8],
+    ]
+    findings = detect_grim_grimmer(*_block(rows))
+    assert all(f["kind"] != "grimmer_inconsistent" for f in findings)
+
+
+def test_detector_integer_keyword_must_be_in_mean_header():
+    # An unrelated integer-keyword column ("number of replicates") must NOT license
+    # GRIM on a continuous-measurement mean column.
+    rows = [
+        ["number of replicates", "protein concentration mean", "sd", "n"],
+        [3, 3.45, 1.10, 10],
+        [3, 3.41, 1.20, 10],
+    ]
+    assert detect_grim_grimmer(*_block(rows)) == []
