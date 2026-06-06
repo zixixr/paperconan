@@ -1082,14 +1082,16 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None):
                 eq = detect_equal_pairs(rows, r0, r1, c0, c1, header)
                 wc = detect_within_column_patterns(rows, r0, r1, c0, c1, header)
                 iar = detect_identical_after_rounding(rows, r0, r1, c0, c1, header)
-                if rel or ap or eq or wc or iar:
-                    for group in (rel, ap, eq, wc, iar):
+                gg = detect_grim_grimmer(rows, r0, r1, c0, c1, header)
+                if rel or ap or eq or wc or iar or gg:
+                    for group in (rel, ap, eq, wc, iar, gg):
                         _attach_evidence(group, rows, r0, r1, c0, c1, header)
                         _attach_benign(group)
                     report_blocks.append(dict(file=os.path.basename(f), sheet=sn,
                                               block=dict(rows=f"{r0+1}-{r1}", cols=f"{c0+1}-{c1}", header=header),
                                               relations=rel, progressions=ap, equal_pairs=eq,
-                                              within_col=wc, identical_after_rounding=iar))
+                                              within_col=wc, identical_after_rounding=iar,
+                                              grim=gg))
 
     # Down-weight dense/correlated sheets: judged by per-sheet relation totals, so a
     # wide matrix's expected identical/linear columns don't flood high-severity output.
@@ -1163,6 +1165,8 @@ def write_markdown_report(out, path):
         for r in b.get("within_col", []):
             push(b, r)
         for r in b.get("identical_after_rounding", []):
+            push(b, r)
+        for r in b.get("grim", []):
             push(b, r)
 
     csf = out.get("cross_sheet_findings", [])
