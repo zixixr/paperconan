@@ -34,8 +34,8 @@ Verify with `paperconan --help` (or `paperconan --version`).
 
 A complete worked example — synthetic data + the report it produces + a guided
 walkthrough of every finding — lives in the repo's
-[`examples/`](../../examples/README.md) directory. Read it to see the output
-shape before running on real data.
+[`examples/`](https://github.com/zixixr/paperconan/tree/main/examples) directory
+of the repo. Read it to see the output shape before running on real data.
 
 ## How to invoke
 
