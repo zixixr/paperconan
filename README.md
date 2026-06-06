@@ -42,6 +42,8 @@
 | `within_col_decimal_repetition` | 同一组的 N 个数字小数尾 2 位高度重复 | "全部以 .25 / .75 结尾，分布不正常" |
 | `rounded_to_half_or_int` | 整列被舍入到固定刻度 (整数 / 0.5 / 0.25) | 自然测量不会全部精确落在某网格 |
 | `identical_after_rounding` | 两列舍掉末位后完全相同 | 一列 = 另一列 × 小扰动 |
+| `grim_inconsistent` | 报告的均值在该 n 下对整数数据不可能（GRIM，仅整数计数/评分类） | "n=10 的细胞计数均值出现 3.45——整数和除以 10 给不出这个值" |
+| `grimmer_inconsistent` | 报告的 SD 在该均值与 n 下对整数数据不可能（GRIMMER） | "均值/n 自洽，但这个 SD 没有任何整数样本能产生" |
 | `many_equal_pairs` | 两个本该独立的列里有 ≥40% 行 byte-identical | 9/10 一致 + 1 格手改的指纹 |
 | `cross_sheet_position_identical` | 两张 sheet 在同行同列位置数值完全一样 | 同一份样本被分析了两次 |
 | `last_digit_chi_square` | 整 sheet 末位数字偏离 χ² 均匀分布（BH-FDR 多重检验校正后 q ≤ 0.05） | 真实测量末位应近似均匀 |

@@ -10,6 +10,8 @@ Patterns embedded:
   - `arithmetic_progression`  : col ap_col is 2.5, 5.0, 7.5, … (non-integer step → high)
   - `cross_sheet_position_identical` : Sheet1 and Sheet2 share ≥ 15% bit-identical
                                        decimal values at the same (row, col)
+  - `grim_inconsistent`       : Fig3_counts sheet — reported mean 3.45 at n=10 is
+                                impossible for integer count data (GRIM)
 """
 from __future__ import annotations
 
