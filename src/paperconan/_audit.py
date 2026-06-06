@@ -332,6 +332,10 @@ def benign_reason(f):
         if f.get("same_file") is False:
             return ("a control/baseline cohort is often reused across a main figure and "
                     "its extended-data figure — confirm the legend discloses the reuse")
+    if kind in ("grim_inconsistent", "grimmer_inconsistent"):
+        return ("GRIM/GRIMMER assume the statistic is a mean of integer-valued "
+                "items (counts/scores); verify the measure is integer-granular "
+                "before acting")
     return None
 
 

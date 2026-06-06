@@ -112,3 +112,12 @@ def test_detector_power_gate_skips_large_n():
         ["A", 3.45, 1.0, 1000],
     ]
     assert detect_grim_grimmer(*_block(rows)) == []
+
+
+from paperconan._audit import benign_reason
+
+
+def test_grim_findings_carry_benign_caveat():
+    reason = benign_reason({"kind": "grim_inconsistent"})
+    assert reason and "integer" in reason.lower()
+    assert benign_reason({"kind": "grimmer_inconsistent"})
