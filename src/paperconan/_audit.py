@@ -615,15 +615,20 @@ def detect_grim_grimmer(rows, r0, r1, c0, c1, header):
     since GRIMMER is undefined for a standard error)."""
     findings = []
 
-    def _find(rx):
+    def _find(rx, taken):
         for idx, h in enumerate(header):
-            if rx.search(str(h or "")):
+            if idx not in taken and rx.search(str(h or "")):
                 return idx
         return None
 
-    mean_i = _find(_GRIM_MEAN_RE)
-    sd_i = _find(_GRIM_SD_RE)
-    n_i = _find(_GRIM_N_RE)
+    taken = set()
+    mean_i = _find(_GRIM_MEAN_RE, taken)
+    if mean_i is not None:
+        taken.add(mean_i)
+    n_i = _find(_GRIM_N_RE, taken)
+    if n_i is not None:
+        taken.add(n_i)
+    sd_i = _find(_GRIM_SD_RE, taken)
     if mean_i is None or n_i is None:
         return findings
     # Integer-data gate: the count/score keyword must be in the MEAN column header

@@ -144,3 +144,19 @@ def test_detector_integer_keyword_must_be_in_mean_header():
         [3, 3.41, 1.20, 10],
     ]
     assert detect_grim_grimmer(*_block(rows)) == []
+
+
+def test_detector_mean_header_with_n_token_uses_real_n_column():
+    # The mean header contains a standalone 'n' token ("n per group"). The real
+    # n column must still supply n — not the mean column (which would fabricate a
+    # tiny n and produce spurious GRIM findings).
+    rows = [
+        ["group", "score mean (n per group)", "sd", "n"],
+        ["A", 3.40, 1.0, 10],
+        ["B", 3.45, 1.0, 10],   # 3.45 is GRIM-impossible at the real n=10
+    ]
+    findings = detect_grim_grimmer(*_block(rows))
+    grim = [f for f in findings if f["kind"] == "grim_inconsistent"]
+    assert grim, "should flag 3.45 against the real n=10 column"
+    assert grim[0]["n_col"] == "n"
+    assert grim[0]["failed_rows"][0]["n"] == 10
