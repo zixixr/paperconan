@@ -105,7 +105,7 @@ Three artifacts may exist in the output dir:
 ```json
 {
   "tool": "paperconan",
-  "tool_version": "0.5.0",        // for provenance when the report is archived / shared
+  "tool_version": "0.6.0",        // for provenance when the report is archived / shared
   "scanned_at": "2026-05-29T02:08:53+00:00",
   "input_dir": "...",
   "paper": {"doi": "10.1038/...", "title": "..."},  // provenance, or null (see below)

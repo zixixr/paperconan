@@ -29,12 +29,16 @@ import math
 import os
 import re
 import sys
+import time
 from collections import Counter
 from fractions import Fraction
 
 import openpyxl
 import numpy as np
 from scipy import stats
+
+from ._profiles import apply_profile_to_findings, normalize_profile
+from .schema import PaperconanInputError
 
 
 def _version():
@@ -927,7 +931,7 @@ def _axis_columns(grids, recur_min=3):
     return axis
 
 
-def detect_collisions(grids):
+def detect_collisions(grids, profile="review"):
     """Find pairs of tables (sheets and/or flat files) with many bit-identical decimal
     values at the SAME (row, col). Catches "copy a table, then tweak a few values" fraud,
     whether the copy lives in another sheet of the same workbook or in a separate file.
@@ -1043,6 +1047,7 @@ def detect_collisions(grids):
                     **ctx_fields,
                     rule=f"{la} and {lb} share {same_val} bit-identical decimal values ({same_val/smaller*100:.0f}% of smaller) across 2 {scope}",
                 ))
+    apply_profile_to_findings(findings, profile)
     return findings
 
 
@@ -1061,29 +1066,56 @@ def _load_provenance(in_dir, paper):
     return None
 
 
-def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None):
+def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
+             profile="review"):
+    profile = normalize_profile(profile)
     files = sorted({p for pat in ("*.xlsx", "*.csv", "*.tsv", "*.pdf", "*.docx")
                     for p in glob.glob(os.path.join(in_dir, pat))})
     if not files:
-        sys.exit(f"no .xlsx / .csv / .tsv / .pdf / .docx files in {in_dir}\n"
-                 f"(paperconan reads .xlsx, .csv, .tsv, and tables inside .pdf / .docx; "
-                 f".xls/.xlsm are not supported)")
+        raise PaperconanInputError(
+            f"no .xlsx / .csv / .tsv / .pdf / .docx files in {in_dir}\n"
+            f"(paperconan reads .xlsx, .csv, .tsv, and tables inside .pdf / .docx; "
+            f".xls/.xlsm are not supported)"
+        )
 
     report_blocks = []
     per_sheet_numbers = {}
     grids = {}  # (file, sheet) -> decimal grid, for the unified collision pass
+    scan_errors = []
+    scan_stats = {"files": [], "sheets": []}
+    scan_start = time.perf_counter()
 
     for f in files:
+        file_start = time.perf_counter()
+        file_stat = {"file": os.path.basename(f), "path": f}
         try:
             sheets = load_table(f)
         except Exception as e:
             print(f"  failed to read {os.path.basename(f)}: {e}", file=sys.stderr)
+            scan_errors.append({"file": os.path.basename(f), "error": str(e)})
+            file_stat["error"] = str(e)
+            file_stat["elapsed_ms"] = round((time.perf_counter() - file_start) * 1000, 3)
+            scan_stats["files"].append(file_stat)
             continue
+        file_stat["n_sheets"] = len(sheets)
+        file_stat["elapsed_ms"] = round((time.perf_counter() - file_start) * 1000, 3)
+        scan_stats["files"].append(file_stat)
         for sn, rows in sheets.items():
+            sheet_start = time.perf_counter()
             grids[(os.path.basename(f), sn)] = _grid_from_rows(rows)
             sheet_nums = [float(v) for r in rows for v in r if is_num(v)]
             per_sheet_numbers[(os.path.basename(f), sn)] = sheet_nums
             blocks = find_numeric_blocks(rows)
+            max_cols = max((len(r) for r in rows), default=0)
+            scan_stats["sheets"].append({
+                "file": os.path.basename(f),
+                "sheet": sn,
+                "n_rows": len(rows),
+                "n_cols": max_cols,
+                "numeric_cells": len(sheet_nums),
+                "n_blocks": len(blocks),
+                "elapsed_ms": round((time.perf_counter() - sheet_start) * 1000, 3),
+            })
             for (r0, r1, c0, c1) in blocks:
                 header = header_for(rows, r0, c0, c1)
                 rel = detect_relations(rows, r0, r1, c0, c1, header)
@@ -1093,9 +1125,12 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None):
                 iar = detect_identical_after_rounding(rows, r0, r1, c0, c1, header)
                 gg = detect_grim_grimmer(rows, r0, r1, c0, c1, header)
                 if rel or ap or eq or wc or iar or gg:
+                    sheet_context = " ".join([os.path.basename(f), sn, *[str(h) for h in header]])
                     for group in (rel, ap, eq, wc, iar, gg):
                         _attach_evidence(group, rows, r0, r1, c0, c1, header)
                         _attach_benign(group)
+                        apply_profile_to_findings(group, profile,
+                                                  sheet_context=sheet_context)
                     report_blocks.append(dict(file=os.path.basename(f), sheet=sn,
                                               block=dict(rows=f"{r0+1}-{r1}", cols=f"{c0+1}-{c1}", header=header),
                                               relations=rel, progressions=ap, equal_pairs=eq,
@@ -1108,7 +1143,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None):
 
     # Unified collision pass: every (file, sheet) grid against every other —
     # covers both intra-workbook sheet pairs and cross-file duplicates.
-    cross_sheet_findings = detect_collisions(grids)
+    cross_sheet_findings = detect_collisions(grids, profile=profile)
     _attach_benign(cross_sheet_findings)
 
     digit_reports, decimal_reports = [], []
@@ -1131,10 +1166,14 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None):
     out = dict(tool="paperconan",
                tool_version=_version(),
                scanned_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+               profile=profile,
                input_dir=in_dir,
                paper=_load_provenance(in_dir, paper),
                n_files=len(files),
                n_blocks_with_findings=len(report_blocks),
+               scan_errors=scan_errors,
+               scan_stats={**scan_stats,
+                           "elapsed_ms": round((time.perf_counter() - scan_start) * 1000, 3)},
                relations_blocks=report_blocks,
                digit_distribution=digit_reports,
                decimal_endings=decimal_reports,
@@ -1244,6 +1283,9 @@ def main():
                     help="Record this paper DOI as scan.json provenance "
                          "(overrides any paperconan_source.json sidecar)")
     ap.add_argument("--title", default=None, help="Record this paper title as provenance")
+    ap.add_argument("--profile", choices=("review", "forensic", "triage"),
+                    default="review",
+                    help="False-positive handling profile: review (default), forensic, or triage")
     ap.add_argument("--version", action="version", version=f"paperconan {_version()}")
     args = ap.parse_args()
     out_dir = args.out or os.path.join(args.in_dir, "audit")
@@ -1251,7 +1293,11 @@ def main():
     paper = None
     if args.doi or args.title:
         paper = {"doi": args.doi, "title": args.title}
-    res = scan_dir(args.in_dir, out_dir, write_md=args.md, write_html=write_html, paper=paper)
+    try:
+        res = scan_dir(args.in_dir, out_dir, write_md=args.md, write_html=write_html,
+                       paper=paper, profile=args.profile)
+    except PaperconanInputError as e:
+        sys.exit(str(e))
     outputs = [f"{out_dir}/scan.json"]
     if write_html:
         outputs.append(f"{out_dir}/report.html")
