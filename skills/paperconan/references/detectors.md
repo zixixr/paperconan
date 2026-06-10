@@ -125,6 +125,22 @@
 
 ---
 
+## Profile 降级映射 (`false_positive_context` → 检测器)
+
+`--profile review`（默认）和 `triage` 会按列名/finding 形态把疑似误报降级。每条被降级的 finding 带一个 `profile_action`（`demoted`/`hidden`）和一组 `false_positive_context` 标签。下表把标签反查回它针对的检测器和良性理由 —— agent 看到标签时用它解释"为什么被降级"，并判断这个降级是否成立（名字正则会误判）。
+
+| `false_positive_context` | 命中的检测器 kind | 降级理由 | 怎么核 |
+|---|---|---|---|
+| `axis_or_scan_column` | `arithmetic_progression` | step 是整数，或列名像 day/time/dose/index/2θ 等扫描轴 | 确认这列确实是自变量轴而非测量值 |
+| `censoring_or_boundary_value` | `within_col_value_duplication` | 重复值是 0/1/-1/100 等边界（或 p 值列里的 1） | 边界值天然重复（截断/饱和/缺失计数/校正 p），但若重复的是普通测量值则降级不成立 |
+| `derived_or_unit_conversion` | `constant_ratio` / `exact_linear` / `sum_constant` | 列名含单位/比例/均值/归一等派生词 | 派生列本就和源列严格相关，合理；但要确认它确实是派生而非两次"独立"测量 |
+| `same_data_replot_or_duplicate_upload` | `cross_sheet_position_identical` / `cross_sheet_value_overlap`（仅 `delta.pattern == perfect_dup`） | 同图号，或表名像 source data / 补充表 | 同一份数据多图重绘属预期；**注意只对 `perfect_dup` 生效——`value_tweaked` 不会被降级，那才是改一格指纹** |
+| `omics_or_large_matrix_boundary_flood` | `within_col_value_duplication` / `within_col_decimal_repetition` | sheet/列名像 gene/protein/padj/logFC 等大矩阵 | omics 大表里 0/1/padj/logFC 边界值海量重复属常态 |
+
+`--profile forensic` 下本表全部不生效，所有 finding `profile_action: "kept"`、保留原始 severity。**当默认 profile 把一条你觉得该看的 high 降成了 low，重跑 `--profile forensic` 看原始严重度，再开原表核。**
+
+---
+
 ## 在 evidence 里高亮的列怎么对照
 
 每条 finding 的 `evidence.highlight_cols` 是 0-based 绝对列下标（不是 block 内偏移）。配合 `evidence.col_offset` 推断出 evidence 表里的相对位置：
