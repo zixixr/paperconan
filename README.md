@@ -91,10 +91,23 @@ python -m paperconan path/to/paper_dir/
 #   report.html    — 自包含的人类可读 HTML 报告（浏览器打开即可）
 #
 # 可选：
-paperconan path/to/paper_dir/ --md            # 额外生成 REPORT.md
-paperconan path/to/paper_dir/ --no-html       # 跳过 HTML（CI / 脚本场景）
+paperconan path/to/paper_dir/ --md                  # 额外生成 REPORT.md
+paperconan path/to/paper_dir/ --no-html             # 跳过 HTML（CI / 脚本场景）
 paperconan path/to/paper_dir/ --out /tmp/audit-of-this-paper
+paperconan path/to/paper_dir/ --profile forensic    # 关掉误报降级，看原始 severity（见下）
 ```
+
+#### 误报降级档位 `--profile {review,forensic,triage}`
+
+检测器只产出原始信号；要不要把"看着像误报"的命中降级，是另一层判断。`--profile` 控制这层，**默认 `review`** —— 也就是说你拿到的 scan.json 里，一部分命中已经被悄悄降级了：
+
+| 档位 | 行为 | 什么时候用 |
+|---|---|---|
+| `review`（默认） | 把按列名/形态匹配上的疑似误报降为 `low`，但**保留可见**并标注原因 | 日常审计的平衡默认 |
+| `forensic` | **不降级任何东西**，每条命中保留原始 severity | 想复核某条降级是否成立、或怀疑默认档把真信号藏了时 |
+| `triage` | 和 `review` 同样的降级，但直接**隐藏**（不展示） | 只想要一份最干净的清单做汇总时 |
+
+降级的命中会带 `profile_action`（`demoted`/`hidden`）和 `false_positive_context` 标签（如 `axis_or_scan_column`、`censoring_or_boundary_value`、`same_data_replot_or_duplicate_upload`），写明"为什么判它像误报"。**一条 `review` 档下被降成 `low` 的命中，那个 severity 是过滤器的意见，不是检测器的判定** —— 拿不准就重跑 `--profile forensic` 看原始严重度。
 
 ### 自动抓取论文数据（v0.4）
 
@@ -213,7 +226,7 @@ echo '@/path/to/paperconan/skills/paperconan/SKILL.md' >> AGENTS.md
 - **共享的剂量轴 / 时间轴** 会被标记为 "跨列复制"
 - **密集 / 相关矩阵** 里成千上万对相同/线性列会被标记为 "列关系"
 
-不过这几类现在工具会主动帮你识别：同图重画的跨 sheet 复用会**自动降级**，密集矩阵的列关系洪泛会按整张表降级并打 `dense_block`，剂量/时间轴、量化偏置等会附 `likely_benign` 旁注，末位 χ² 也做了多重检验校正（看 q 值而非裸 p）。即便如此，报告里 high severity 的 anomaly **依然需要人工读 figure legend 和 Methods** 才能下判断。不要把 high = misconduct。
+不过这几类现在工具会主动帮你识别：同图重画的跨 sheet 复用会**自动降级**，密集矩阵的列关系洪泛会按整张表降级并打 `dense_block`，剂量/时间轴、量化偏置等会附 `likely_benign` 旁注，末位 χ² 也做了多重检验校正（看 q 值而非裸 p）。误报降级的力度可以用 `--profile` 调（默认 `review`，`forensic` 关掉全部降级看原始信号，`triage` 把疑似误报直接藏掉）。即便如此，报告里 high severity 的 anomaly **依然需要人工读 figure legend 和 Methods** 才能下判断。不要把 high = misconduct。
 
 **Q: 我用它发现一篇看似有问题的论文，下一步该做什么？**
 

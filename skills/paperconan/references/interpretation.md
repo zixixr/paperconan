@@ -22,6 +22,8 @@ paperconan 输出的是 **统计异常**，不是 **学术不端结论**。Agent
 
 **源数据几乎总在本地**：跑过 `fetch --download` 或对本地目录做过审计后，原始 `.xlsx`/`.csv` 就在审计树里（典型是 `<audit>/source_downloads/<doi_slug>/`，doi 的 `/` 换成 `_`；或就是当初的输入目录）。**先 `ls` 找到它再下结论。** 如果确实拿不到原表（比如只接手了别人的 scan.json），就**明说"未核验—需打开原表"**，绝不能把 CSV 里的 severity 当成嫌疑判定转述给用户。
 
+**先确认你读的是不是被过滤过的 severity。** scan.json 默认是 `--profile review` 的输出 —— 一部分 finding 已被按列名/形态降级（带 `profile_action: "demoted"` 和 `false_positive_context` 标签）。如果一条本该 high 的命中被降成了 low，那是过滤器的正则意见，不是检测器的判定。核验时若怀疑降级有误，**重跑 `paperconan <dir> --profile forensic`** 拿回原始 severity，再开原表 —— 这是上面这套核验流程的工具级杠杆。`profile_action` / `false_positive_context` 字段说明见 [detectors.md 的「Profile 降级映射」](detectors.md)。
+
 核验每条 high（尤其 `cross_sheet_position_identical` / `perfect_dup` / `value_tweaked`）：打开两张 sheet，看表头、看每列是什么量、什么数据类型，然后归类：
 
 | 看到的情况 | 判定 | 怎么处理 |

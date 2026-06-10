@@ -19,7 +19,8 @@ Use this skill when the user:
 ## When NOT to use
 
 - The concern is image fraud (Western blot, microscopy, gel splicing) — paperconan only inspects numeric tables
-- The data is not tabular — paperconan reads `.xlsx` / `.csv` / `.tsv` only (not `.xls`, PDFs, or images)
+- The data lives in a **chart** (bar/line plot) rather than a table — paperconan does not digitize pixels, and does not OCR scanned images
+- The input is `.xls` (old binary Excel) — convert to `.xlsx` first. paperconan reads `.xlsx` / `.csv` / `.tsv` natively, plus **tables inside `.pdf` / `.docx` supplements** when the `[all]` extra is installed (see Prerequisites)
 - The user wants statistical methodology review or peer-review-style scrutiny — paperconan is forensic, not statistical
 
 ## Prerequisites
@@ -52,9 +53,38 @@ Common variants:
 paperconan <input-dir> --out /tmp/audit-X     # custom output dir
 paperconan <input-dir> --md                   # also write REPORT.md
 paperconan <input-dir> --no-html              # only scan.json (CI / scripted use)
+paperconan <input-dir> --profile forensic     # raw signals, nothing demoted (see Profiles)
 ```
 
 Exit code is 0 even when findings are present — findings are not errors.
+
+### Profiles — the false-positive filter you are reading through
+
+`--profile {review,forensic,triage}` controls a false-positive interpretation
+layer that sits **on top of** the raw detectors. **The default is `review`**, so
+by the time you read scan.json some findings have already been quietly demoted —
+you are never looking at raw detector output unless you ask for it.
+
+| Profile | What it does | When to run it |
+|---|---|---|
+| `review` (default) | Demotes name-matched likely-FP findings to `low` but keeps them visible, tagged with why | Normal audits — the balanced default |
+| `forensic` | Demotes **nothing** — every detector hit keeps its raw severity | When you want to second-guess a demotion, or verify a `high` the default may have hidden. This is the tool-level lever for the "先开原表再下结论" check |
+| `triage` | Same demotions as `review`, but hides them (`profile_action: "hidden"`) instead of showing them | When you want the shortest clean list for a summary |
+
+**How a finding gets demoted (review/triage):** `_profiles.py` matches column /
+sheet names and finding shape against a few innocent-explanation patterns —
+dose/time/index **axis** columns (`arithmetic_progression`), boundary values like
+0/1/-1/100 (`within_col_value_duplication`), unit-conversion / derived relations
+(`constant_ratio`, `exact_linear`, `sum_constant`), same-figure or
+source-data replots (`cross_sheet_position_identical` with `perfect_dup`), and
+omics/large-matrix boundary floods. Each demotion writes a
+`false_positive_context` tag + a `likely_benign` note onto the finding.
+
+**Practical rule:** if a `review`-profile finding sits at `low` with a
+`profile_action` of `demoted`, that severity is the *filter's* opinion, not the
+detector's. Before you tell the user "nothing high here," re-run
+`--profile forensic` and check what the raw severities were — a demotion is a
+name-regex heuristic and can be wrong.
 
 ## Fetching a paper's data automatically
 
@@ -62,12 +92,17 @@ If the user gives a paper (DOI or title) instead of a local directory:
 
 ```bash
 paperconan fetch "<DOI or title>"                 # list candidate datasets + match signals
+paperconan fetch "<DOI or title>" --json          # same listing as machine-readable JSON (parse this, don't scrape the table)
 paperconan fetch "<DOI>" --download <cand_id> --out data/   # download chosen candidate's tabular files
 paperconan data/                                  # then audit as usual
 ```
 
+Other flags: `--all` (also download non-tabular files), `--per-source N` (max
+results per repository, default 5), `--auto` (download only a confidently-matched
+top candidate), `--force` (download a no-match candidate anyway).
+
 Workflow:
-1. Run `paperconan fetch "<DOI>"`. Each candidate has `match_signals`
+1. Run `paperconan fetch "<DOI>" --json` and parse the candidates. Each has `match_signals`
    (`doi_in_related`, `title_overlap`, `author_overlap`).
 2. **You decide the match** — prefer `doi_in_related: true`; otherwise weigh title/author
    overlap. If unsure, show the user the candidates and ask. Repository full-text search
@@ -105,12 +140,19 @@ Three artifacts may exist in the output dir:
 ```json
 {
   "tool": "paperconan",
-  "tool_version": "0.6.0",        // for provenance when the report is archived / shared
+  "tool_version": "0.6.0",        // matches the pyproject version; provenance for archived reports
   "scanned_at": "2026-05-29T02:08:53+00:00",
+  "profile": "review",            // which FP profile ran (review|forensic|triage) — severities are post-filter unless "forensic"
   "input_dir": "...",
   "paper": {"doi": "10.1038/...", "title": "..."},  // provenance, or null (see below)
   "n_files": 3,
   "n_blocks_with_findings": 8,
+  "scan_errors": [                // files that failed to parse — surface these, don't imply a clean scan
+    {"file": "broken.xlsx", "error": "..."}
+  ],
+  "scan_stats": {                 // per-file / per-sheet sizing + timing (files[], sheets[], elapsed_ms)
+    "files": [...], "sheets": [...], "elapsed_ms": 412.5
+  },
   "relations_blocks": [
     {
       "file": "ED_Fig8b.xlsx",
@@ -147,6 +189,8 @@ Three artifacts may exist in the output dir:
 - `n`: sample size for the rule
 - `evidence`: block snippet `{headers, rows, highlight_cols, ...}` — used by report.html, but you can also surface a few highlighted values if useful
 - `likely_benign` (optional): a common innocent explanation for this kind — surface it to the user alongside the finding so a signal is never reported as a verdict
+- `profile_action`: `"kept"` | `"demoted"` | `"hidden"` — what the active profile did to this finding. `"demoted"`/`"hidden"` means the current `severity` is the **filter's** downgrade, not the detector's raw verdict (always `"kept"` under `--profile forensic`). See the Profiles section.
+- `false_positive_context` (list): machine tags for *why* it was demoted — e.g. `axis_or_scan_column`, `censoring_or_boundary_value`, `derived_or_unit_conversion`, `same_data_replot_or_duplicate_upload`, `omics_or_large_matrix_boundary_flood`. Map these back to the "常见误报" notes in [references/detectors.md](references/detectors.md).
 - `dense_block` (optional, column-relation / equal-pair findings): `true` means this finding comes from a sheet that floods with pairwise column relations (a dense / correlated matrix — correlation tables, normalized replicate panels). Such findings are auto-demoted to `low` severity because identical/linear columns there are expected by construction, not a duplication red flag — don't treat them as high-severity signal
 
 ### cross_sheet_findings fields
