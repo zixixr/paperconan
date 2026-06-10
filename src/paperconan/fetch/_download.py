@@ -13,7 +13,7 @@ from ._files import is_tabular
 # Provenance sidecar written next to downloads; read back by scan_dir to stamp scan.json.
 SOURCE_SIDECAR = "paperconan_source.json"
 
-_UA = "paperconan-fetch/0.4 (+https://github.com/zixixr/paperconan)"
+_UA = "paperconan-fetch/0.6 (+https://github.com/zixixr/paperconan)"
 _DEFAULT_MAX = 50 * 1024 * 1024     # 50 MB — per individual file / per extracted table
 # A supplementary archive bundles ALL supplementary material (often 100MB+ of video/
 # imaging) but we only keep its small tabular members, so it needs a much larger cap

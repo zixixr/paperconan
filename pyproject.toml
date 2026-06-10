@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paperconan"
-version = "0.5.0"
+version = "0.6.0"
 description = "Numeric forensics for paper supplementary source-data: surfaces fabrication-style patterns (signal, not verdict)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -35,6 +35,8 @@ dependencies = [
 pdf = ["pdfplumber>=0.11"]
 docx = ["python-docx>=1.1"]
 all = ["pdfplumber>=0.11", "python-docx>=1.1"]
+test = ["pytest>=8", "pdfplumber>=0.11", "python-docx>=1.1", "tomli>=2; python_version < '3.11'"]
+dev = ["pytest>=8", "pdfplumber>=0.11", "python-docx>=1.1", "tomli>=2; python_version < '3.11'"]
 
 [project.urls]
 Homepage = "https://github.com/zixixr/paperconan"

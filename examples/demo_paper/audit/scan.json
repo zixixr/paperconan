@@ -1,10 +1,59 @@
 {
   "tool": "paperconan",
-  "tool_version": "0.3.0",
-  "scanned_at": "2026-05-29T02:33:25+00:00",
+  "tool_version": "0.6.0",
+  "scanned_at": "2026-06-09T16:48:06+00:00",
+  "profile": "review",
   "input_dir": "examples/demo_paper",
+  "paper": null,
   "n_files": 2,
   "n_blocks_with_findings": 3,
+  "scan_errors": [],
+  "scan_stats": {
+    "files": [
+      {
+        "file": "ED_Fig2_tumor_volume.xlsx",
+        "path": "examples/demo_paper/ED_Fig2_tumor_volume.xlsx",
+        "n_sheets": 1,
+        "elapsed_ms": 2.61
+      },
+      {
+        "file": "ED_Fig4_qPCR.xlsx",
+        "path": "examples/demo_paper/ED_Fig4_qPCR.xlsx",
+        "n_sheets": 2,
+        "elapsed_ms": 1.609
+      }
+    ],
+    "sheets": [
+      {
+        "file": "ED_Fig2_tumor_volume.xlsx",
+        "sheet": "growth_curve",
+        "n_rows": 9,
+        "n_cols": 6,
+        "numeric_cells": 48,
+        "n_blocks": 1,
+        "elapsed_ms": 0.1
+      },
+      {
+        "file": "ED_Fig4_qPCR.xlsx",
+        "sheet": "donor_A",
+        "n_rows": 13,
+        "n_cols": 5,
+        "numeric_cells": 48,
+        "n_blocks": 1,
+        "elapsed_ms": 0.064
+      },
+      {
+        "file": "ED_Fig4_qPCR.xlsx",
+        "sheet": "donor_B",
+        "n_rows": 13,
+        "n_cols": 5,
+        "numeric_cells": 48,
+        "n_blocks": 1,
+        "elapsed_ms": 0.056
+      }
+    ],
+    "elapsed_ms": 10.214
+  },
   "relations_blocks": [
     {
       "file": "ED_Fig2_tumor_volume.xlsx",
@@ -157,7 +206,9 @@
                 ]
               }
             ]
-          }
+          },
+          "profile_action": "kept",
+          "false_positive_context": []
         },
         {
           "kind": "identical_column",
@@ -293,7 +344,9 @@
                 ]
               }
             ]
-          }
+          },
+          "profile_action": "kept",
+          "false_positive_context": []
         },
         {
           "kind": "constant_offset",
@@ -430,7 +483,9 @@
                 ]
               }
             ]
-          }
+          },
+          "profile_action": "kept",
+          "false_positive_context": []
         },
         {
           "kind": "small_diff_set",
@@ -570,7 +625,9 @@
                 ]
               }
             ]
-          }
+          },
+          "profile_action": "kept",
+          "false_positive_context": []
         }
       ],
       "progressions": [
@@ -581,7 +638,7 @@
           "n": 8,
           "step": 3.0,
           "first": 0.0,
-          "severity": "medium",
+          "severity": "low",
           "rule": "col[0] = arithmetic progression, step=3",
           "evidence": {
             "headers": [
@@ -707,7 +764,12 @@
                 ]
               }
             ]
-          }
+          },
+          "likely_benign": "an integer-step progression is usually an axis (day / dose / timepoint), not measured data",
+          "profile_action": "demoted",
+          "false_positive_context": [
+            "axis_or_scan_column"
+          ]
         }
       ],
       "equal_pairs": [
@@ -846,11 +908,14 @@
                 ]
               }
             ]
-          }
+          },
+          "profile_action": "kept",
+          "false_positive_context": []
         }
       ],
       "within_col": [],
-      "identical_after_rounding": []
+      "identical_after_rounding": [],
+      "grim": []
     },
     {
       "file": "ED_Fig4_qPCR.xlsx",
@@ -1022,7 +1087,9 @@
                 ]
               }
             ]
-          }
+          },
+          "profile_action": "kept",
+          "false_positive_context": []
         },
         {
           "kind": "within_col_decimal_repetition",
@@ -1177,7 +1244,9 @@
                 ]
               }
             ]
-          }
+          },
+          "profile_action": "kept",
+          "false_positive_context": []
         },
         {
           "kind": "rounded_to_half_or_int",
@@ -1331,7 +1400,10 @@
                 ]
               }
             ]
-          }
+          },
+          "likely_benign": "values ending in .0/.5 are common for derived or instrument-rounded quantities (cell counts, scores, calibrated readouts)",
+          "profile_action": "kept",
+          "false_positive_context": []
         }
       ],
       "identical_after_rounding": [
@@ -1525,9 +1597,13 @@
                 ]
               }
             ]
-          }
+          },
+          "likely_benign": "cells share a rounded value but differ at full precision \u2014 usually display rounding, not duplication",
+          "profile_action": "kept",
+          "false_positive_context": []
         }
-      ]
+      ],
+      "grim": []
     },
     {
       "file": "ED_Fig4_qPCR.xlsx",
@@ -1737,9 +1813,13 @@
                 ]
               }
             ]
-          }
+          },
+          "likely_benign": "cells share a rounded value but differ at full precision \u2014 usually display rounding, not duplication",
+          "profile_action": "kept",
+          "false_positive_context": []
         }
-      ]
+      ],
+      "grim": []
     }
   ],
   "digit_distribution": [
@@ -1773,7 +1853,9 @@
           "9",
           6
         ]
-      ]
+      ],
+      "p_adj": 0.8454257080158954,
+      "fdr_significant": false
     },
     {
       "label": "ED_Fig4_qPCR.xlsx::donor_A",
@@ -1805,7 +1887,9 @@
           "2",
           5
         ]
-      ]
+      ],
+      "p_adj": 0.012308505664906377,
+      "fdr_significant": true
     },
     {
       "label": "ED_Fig4_qPCR.xlsx::donor_B",
@@ -1837,7 +1921,9 @@
           "2",
           6
         ]
-      ]
+      ],
+      "p_adj": 0.1436477197272985,
+      "fdr_significant": false
     }
   ],
   "decimal_endings": [],
@@ -1882,7 +1968,19 @@
         }
       ],
       "severity": "high",
-      "rule": "donor_A and donor_B share 22/36 (61%) decimal values at SAME (row,col) across 2 sheets"
+      "figure_a": null,
+      "figure_b": null,
+      "same_figure": false,
+      "delta": {
+        "pattern": "value_tweaked",
+        "modified_cells": 14,
+        "shared_values": 22,
+        "only_in_a": 14,
+        "only_in_b": 14
+      },
+      "rule": "donor_A and donor_B share 22/36 (61%) decimal values at SAME (row,col) across 2 sheets",
+      "profile_action": "kept",
+      "false_positive_context": []
     }
   ]
 }

@@ -76,6 +76,8 @@ def _all_findings(scan: dict) -> list[dict]:
 def _severity_counts(findings: list[dict]) -> dict[str, int]:
     c = {"high": 0, "medium": 0, "low": 0}
     for item in findings:
+        if item["finding"].get("profile_action") == "hidden":
+            continue
         sev = (item["finding"].get("severity") or "low").lower()
         c[sev] = c.get(sev, 0) + 1
     return c
@@ -158,6 +160,7 @@ def _render_finding_card(item: dict) -> str:
     file_ = item["file"]
     sheet = item["sheet"]
     block_rows = item["block_rows"]
+    profile_action = (f.get("profile_action") or "kept").lower()
 
     if item["scope"] == "cross_sheet":
         evidence_html = _render_cross_sheet_examples(f)
@@ -180,17 +183,25 @@ def _render_finding_card(item: dict) -> str:
     benign = f.get("likely_benign")
     benign_html = (f'<p class="benign">↳ likely benign: {_esc(benign)}</p>'
                    if benign else "")
+    contexts = f.get("false_positive_context") or []
+    ctx_html = ""
+    if contexts:
+        chips = "".join(f'<span class="ctx-chip">{_esc(c)}</span>' for c in contexts)
+        ctx_html = f'<div class="profile-context">profile: {_esc(profile_action)} {chips}</div>'
 
     open_attr = " open" if sev == "high" else ""
+    hidden_style = ' style="display:none"' if profile_action == "hidden" else ""
     return (
         f'<details class="finding" data-severity="{sev}" data-kind="{_esc(kind)}" '
-        f'data-file="{_esc(file_)}" data-searchable="{_esc(searchable)}"{open_attr}>'
+        f'data-file="{_esc(file_)}" data-profile-action="{_esc(profile_action)}" '
+        f'data-searchable="{_esc(searchable)}"{open_attr}{hidden_style}>'
         '<summary>'
         f'<span class="badge sev-{sev}">{sev}</span>'
         f'<span class="badge kind">{_esc(kind)}</span>'
         f'<span class="loc">{loc}{extra_meta}</span>'
         '</summary>'
         f'<p class="rule"><code>{_esc(rule)}</code></p>'
+        f'{ctx_html}'
         f'{benign_html}'
         f'{evidence_html}'
         '</details>'
@@ -214,6 +225,7 @@ def _render_filter_sidebar(findings: list[dict]) -> str:
     return (
         '<aside class="filters">'
         '<input type="search" id="filter-search" placeholder="search file / sheet / rule…">'
+        '<label class="show-noisy"><input type="checkbox" id="show-noisy"> show noisy / hidden findings</label>'
         f'<fieldset><legend>severity</legend>{sev_box}</fieldset>'
         f'<fieldset><legend>detector</legend>{kind_box}</fieldset>'
         f'<fieldset><legend>file</legend>{file_box}</fieldset>'
@@ -363,6 +375,13 @@ p.rule { padding:8px 12px; background:var(--panel-2); border-radius:4px; margin:
 p.rule code { color:var(--text); }
 p.benign { margin:6px 14px; padding:6px 12px; font-size:13px; color:var(--low);
            border-left:3px solid var(--low); background:rgba(100,116,139,.08); }
+.profile-context { margin:6px 14px; color:var(--muted); font-size:12px; display:flex;
+  gap:6px; flex-wrap:wrap; align-items:center; }
+.ctx-chip { display:inline-block; padding:1px 7px; border-radius:10px;
+  background:rgba(100,116,139,.14); border:1px solid rgba(100,116,139,.35);
+  color:var(--muted); font-size:11px; }
+.show-noisy { margin:10px 0 2px; padding:6px 8px; border:1px solid var(--border);
+  border-radius:4px; background:var(--panel-2); }
 .ev-wrap { overflow-x:auto; border:1px solid var(--border); border-radius:4px; background:var(--panel-2); }
 table.ev { width:100%; border-collapse:collapse; }
 table.ev th, table.ev td { padding:5px 9px; border-bottom:1px solid var(--border);
@@ -405,6 +424,7 @@ _JS = """
   const findings = document.querySelectorAll('details.finding');
   const search = document.getElementById('filter-search');
   const reset = document.getElementById('reset-filters');
+  const showNoisy = document.getElementById('show-noisy');
 
   function getChecked(cls) {
     return new Set(Array.from(document.querySelectorAll('input.' + cls + ':checked'))
@@ -421,7 +441,8 @@ _JS = """
       const matchKind = kinds.has(el.dataset.kind);
       const matchFile = files.has(el.dataset.file);
       const matchQ = !q || (el.dataset.searchable || '').indexOf(q) !== -1;
-      el.style.display = (matchSev && matchKind && matchFile && matchQ) ? '' : 'none';
+      const matchProfile = showNoisy.checked || el.dataset.profileAction !== 'hidden';
+      el.style.display = (matchSev && matchKind && matchFile && matchQ && matchProfile) ? '' : 'none';
     });
     document.querySelectorAll('.section').forEach(sec => {
       const visible = Array.from(sec.querySelectorAll('details.finding'))
@@ -434,12 +455,15 @@ _JS = """
   document.querySelectorAll('input.f-sev, input.f-kind, input.f-file')
           .forEach(i => i.addEventListener('change', applyFilters));
   search.addEventListener('input', applyFilters);
+  showNoisy.addEventListener('change', applyFilters);
   reset.addEventListener('click', () => {
     document.querySelectorAll('input.f-sev, input.f-kind, input.f-file')
             .forEach(i => i.checked = true);
+    showNoisy.checked = false;
     search.value = '';
     applyFilters();
   });
+  applyFilters();
 })();
 """
 

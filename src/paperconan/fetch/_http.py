@@ -4,7 +4,7 @@ import json
 import urllib.parse
 import urllib.request
 
-_UA = "paperconan-fetch/0.4 (+https://github.com/zixixr/paperconan)"
+_UA = "paperconan-fetch/0.6 (+https://github.com/zixixr/paperconan)"
 
 
 def get_json(url, params=None, headers=None, timeout=15):
