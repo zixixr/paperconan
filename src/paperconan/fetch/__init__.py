@@ -17,6 +17,8 @@ def _rank(cand):
         score += 2
     if cand.get("supplementary_archive"):
         score += 2
+    if cand.get("oa_package"):
+        score += 3
     return score
 
 
@@ -31,7 +33,7 @@ def search_all(query, per_source=5):
     search_term = q["doi"] or q["title"] or query
 
     cands = []
-    for fn in (_sources.search_zenodo, _sources.search_figshare,
+    for fn in (_sources.search_nature_esm, _sources.search_zenodo, _sources.search_figshare,
                _sources.search_dryad, _sources.search_europepmc):
         try:
             cands.extend(fn(search_term, size=per_source))
