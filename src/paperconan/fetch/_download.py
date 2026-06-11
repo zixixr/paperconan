@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -21,38 +22,58 @@ _DEFAULT_MAX = 50 * 1024 * 1024     # 50 MB — per individual file / per extrac
 _ARCHIVE_MAX = 250 * 1024 * 1024    # 250 MB — whole supplementary zip
 
 
-def download_file(url, dest_path, timeout=60, max_bytes=_DEFAULT_MAX):
+def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
+                  retries=3, backoff=2.0):
+    """Download to disk with redirects, size cap, HTML sniffing, and retry/backoff.
+    Streams the body in chunks (no whole-file buffering). Retries on timeout and
+    HTTP 5xx; auth errors (401/403) and size/HTML rejections are terminal."""
     if not url.lower().startswith(("https://", "http://")):
         return {"ok": False, "path": dest_path,
                 "skipped_reason": f"unsupported URL scheme: {url!r}"}
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            ctype = (resp.info().get("Content-Type") or "").lower()
-            if "text/html" in ctype:
+    last_reason = "unknown error"
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                ctype = (resp.info().get("Content-Type") or "").lower()
+                if "text/html" in ctype:
+                    return {"ok": False, "path": dest_path,
+                            "skipped_reason": f"server returned HTML ({ctype}), not a data file"}
+                clen = resp.info().get("Content-Length")
+                if clen and clen.isdigit() and int(clen) > max_bytes:
+                    return {"ok": False, "path": dest_path,
+                            "skipped_reason": f"file exceeds max_bytes ({max_bytes})"}
+                os.makedirs(os.path.dirname(os.path.abspath(dest_path)) or ".", exist_ok=True)
+                total = 0
+                with open(dest_path, "wb") as fh:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > max_bytes:
+                            fh.close()
+                            try:
+                                os.remove(dest_path)
+                            except OSError:
+                                pass
+                            return {"ok": False, "path": dest_path,
+                                    "skipped_reason": f"file exceeds max_bytes ({max_bytes})"}
+                        fh.write(chunk)
+                return {"ok": True, "path": dest_path, "size": total}
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
                 return {"ok": False, "path": dest_path,
-                        "skipped_reason": f"server returned HTML ({ctype}), not a data file"}
-            clen = resp.info().get("Content-Length")
-            if clen and clen.isdigit() and int(clen) > max_bytes:
-                return {"ok": False, "path": dest_path,
-                        "skipped_reason": f"file exceeds max_bytes ({max_bytes})"}
-            data = resp.read(max_bytes + 1)
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            return {"ok": False, "path": dest_path,
-                    "skipped_reason": (f"requires authentication (HTTP {e.code}); "
-                                       "download this file manually from the dataset page")}
-        return {"ok": False, "path": dest_path,
-                "skipped_reason": f"HTTP {e.code}: {e.reason}"}
-    except Exception as e:
-        return {"ok": False, "path": dest_path, "skipped_reason": f"download error: {e}"}
-    if len(data) > max_bytes:
-        return {"ok": False, "path": dest_path,
-                "skipped_reason": f"file exceeds max_bytes ({max_bytes})"}
-    os.makedirs(os.path.dirname(os.path.abspath(dest_path)) or ".", exist_ok=True)
-    with open(dest_path, "wb") as fh:
-        fh.write(data)
-    return {"ok": True, "path": dest_path, "size": len(data)}
+                        "skipped_reason": (f"requires authentication (HTTP {e.code}); "
+                                           "download this file manually from the dataset page")}
+            last_reason = f"HTTP {e.code}: {e.reason}"
+            if not (500 <= e.code < 600):
+                return {"ok": False, "path": dest_path, "skipped_reason": last_reason}
+        except Exception as e:
+            last_reason = f"download error: {e}"
+        if attempt < retries - 1:
+            time.sleep(backoff * (2 ** attempt))
+    return {"ok": False, "path": dest_path, "skipped_reason": last_reason}
 
 
 def _extract_tabular_zip(zip_bytes, out_dir, max_member_bytes=_DEFAULT_MAX):
