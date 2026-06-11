@@ -3,6 +3,7 @@
 monkeypatch them."""
 from __future__ import annotations
 
+import re
 import urllib.parse as _urlparse
 
 from . import _http
@@ -79,6 +80,24 @@ def _dryad_candidate(doi):
                       ds.get("publicationDate"), all_files, related)
 
 
+_OA_FCGI = "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi"
+_OA_TGZ = re.compile(r'format="tgz"\s+href="([^"]+\.tar\.gz)"', re.I)
+
+
+def resolve_pmc_oa_package(pmcid):
+    """Resolve a PMCID to its static NCBI PMC OA package (.tar.gz on the FTP mirror).
+    Returns {"url","name"} (ftp:// rewritten to https://) or None if not in the OA subset."""
+    try:
+        xml = _http.get_text(_OA_FCGI, params={"id": pmcid}, timeout=30)
+    except Exception:
+        return None
+    m = _OA_TGZ.search(xml or "")
+    if not m:
+        return None
+    url = m.group(1).replace("ftp://ftp.ncbi.nlm.nih.gov/", "https://ftp.ncbi.nlm.nih.gov/")
+    return {"url": url, "name": url.rsplit("/", 1)[-1]}
+
+
 _EPMC = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 
 
@@ -111,6 +130,9 @@ def search_europepmc(query, size=5):
                        r.get("firstPublicationDate"),
                        [make_fileref(arch_name, None, url)], [])
         c["supplementary_archive"] = {"url": url, "name": arch_name}
+        pkg = resolve_pmc_oa_package(pmcid)
+        if pkg:
+            c["oa_package"] = pkg
         out.append(c)
     return out
 
