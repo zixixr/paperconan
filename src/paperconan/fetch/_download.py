@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import tarfile
 import time
 import urllib.error
 import urllib.request
@@ -90,6 +91,28 @@ def _extract_tabular_zip(zip_bytes, out_dir, max_member_bytes=_DEFAULT_MAX):
                 continue
             dest = os.path.join(out_dir, name)
             with zf.open(info) as src, open(dest, "wb") as fh:
+                fh.write(src.read(max_member_bytes + 1)[:max_member_bytes])
+            extracted.append(dest)
+    return extracted
+
+
+def _extract_tabular_tar(tar_path, out_dir, max_member_bytes=_DEFAULT_MAX):
+    """Extract only tabular members (.xlsx/.csv/.tsv) from a .tar.gz into out_dir,
+    flattening internal paths to the basename and capping per-member size.
+    Returns the list of extracted file paths."""
+    extracted = []
+    with tarfile.open(tar_path, "r:gz") as tf:
+        for member in tf.getmembers():
+            if not member.isfile():
+                continue
+            name = os.path.basename(member.name)
+            if not name or not is_tabular(name) or member.size > max_member_bytes:
+                continue
+            src = tf.extractfile(member)
+            if src is None:
+                continue
+            dest = os.path.join(out_dir, name)
+            with open(dest, "wb") as fh:
                 fh.write(src.read(max_member_bytes + 1)[:max_member_bytes])
             extracted.append(dest)
     return extracted

@@ -55,3 +55,23 @@ def test_download_does_not_retry_on_403(tmp_path, monkeypatch):
     monkeypatch.setattr(dl.time, "sleep", lambda *_: None)
     res = dl.download_file("https://x/t.csv", str(tmp_path / "t.csv"), retries=3, backoff=0.0)
     assert res["ok"] is False and calls["n"] == 1   # auth errors are terminal, no retry
+
+
+def test_extract_tabular_tar(tmp_path):
+    import io, tarfile, os
+    import paperconan.fetch._download as dl
+    # Build a small tar.gz with one xlsx-named member, one csv, one pdf (ignored)
+    tar_path = tmp_path / "pkg.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tf:
+        for name, body in [("PMC1/data1.xlsx", b"x"), ("PMC1/t.csv", b"a,b\n1,2\n"),
+                           ("PMC1/fig.pdf", b"%PDF")]:
+            data = body
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    out = tmp_path / "out"
+    out.mkdir()
+    extracted = dl._extract_tabular_tar(str(tar_path), str(out))
+    names = sorted(os.path.basename(p) for p in extracted)
+    assert names == ["data1.xlsx", "t.csv"]      # pdf dropped, paths flattened
+    assert (out / "t.csv").read_bytes() == b"a,b\n1,2\n"
