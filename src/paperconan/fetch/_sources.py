@@ -149,3 +149,6 @@ def search_dryad(query, size=5):
         except Exception:
             continue
     return out
+
+
+from ._nature import search_nature_esm  # noqa: F401  re-exported for search_all + tests

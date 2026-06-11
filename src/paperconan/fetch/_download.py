@@ -118,6 +118,24 @@ def _extract_tabular_tar(tar_path, out_dir, max_member_bytes=_DEFAULT_MAX):
     return extracted
 
 
+def _download_oa_package(pkg, out_dir, downloaded, skipped, max_bytes):
+    """Download the static PMC OA tar.gz, extract its tabular members, drop the tarball."""
+    tmp = os.path.join(out_dir, pkg.get("name") or "oa_package.tar.gz")
+    res = download_file(pkg["url"], tmp, max_bytes=_ARCHIVE_MAX)
+    if not res.get("ok"):
+        skipped.append({"name": pkg.get("name"), "reason": res.get("skipped_reason")})
+        return
+    try:
+        downloaded.extend(_extract_tabular_tar(tmp, out_dir, max_bytes))
+    except (tarfile.TarError, OSError) as e:
+        skipped.append({"name": pkg.get("name"), "reason": f"bad tar.gz: {e}"})
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
 def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_bytes,
                                     archive_max=_ARCHIVE_MAX):
     """Fetch a supplementary zip (Europe PMC), extract its tabular members, drop the zip.
@@ -169,8 +187,11 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
             downloaded.append(res["path"])
         else:
             skipped.append({"name": f["name"], "reason": res.get("skipped_reason")})
+    pkg = cand.get("oa_package")
+    if pkg and pkg.get("url"):
+        _download_oa_package(pkg, out_dir, downloaded, skipped, max_bytes)
     arch = cand.get("supplementary_archive")
-    if arch and arch.get("url"):
+    if not downloaded and arch and arch.get("url"):
         _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_bytes,
                                         archive_max=archive_max)
     return {"cand_id": cand.get("cand_id"), "out_dir": out_dir,
