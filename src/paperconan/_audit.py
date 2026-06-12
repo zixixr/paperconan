@@ -1066,6 +1066,13 @@ def _load_provenance(in_dir, paper):
     return None
 
 
+# Per-file memory guard: workbooks above this size expand to many GB of Python objects
+# when fully materialized, so they are skipped (recorded as oversized) before loading.
+# Default 25 MB keeps normal source-data tables; raise PAPERCONAN_MAX_FILE_MB on big-RAM hosts.
+_MAX_FILE_MB = float(os.environ.get("PAPERCONAN_MAX_FILE_MB", "25"))
+_MAX_FILE_BYTES = int(_MAX_FILE_MB * 1024 * 1024)
+
+
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
              profile="review"):
     profile = normalize_profile(profile)
@@ -1088,6 +1095,23 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     for f in files:
         file_start = time.perf_counter()
         file_stat = {"file": os.path.basename(f), "path": f}
+        # Memory guard: a large workbook expands to many GB of Python objects when fully
+        # loaded, so cap file size BEFORE loading. Oversized files are recorded (never
+        # silently treated as clean) and skipped. Raise PAPERCONAN_MAX_FILE_MB on big-RAM hosts.
+        try:
+            fsize = os.path.getsize(f)
+        except OSError:
+            fsize = 0
+        if fsize > _MAX_FILE_BYTES:
+            msg = (f"oversized: {fsize / 1048576:.1f}MB exceeds {_MAX_FILE_MB:.0f}MB cap "
+                   f"(set PAPERCONAN_MAX_FILE_MB to raise) — skipped to bound memory")
+            print(f"  skipping {os.path.basename(f)}: {msg}", file=sys.stderr)
+            scan_errors.append({"file": os.path.basename(f), "error": msg})
+            file_stat["error"] = msg
+            file_stat["oversized"] = True
+            file_stat["elapsed_ms"] = round((time.perf_counter() - file_start) * 1000, 3)
+            scan_stats["files"].append(file_stat)
+            continue
         try:
             sheets = load_table(f)
         except Exception as e:
