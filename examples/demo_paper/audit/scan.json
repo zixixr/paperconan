@@ -1,7 +1,7 @@
 {
   "tool": "paperconan",
-  "tool_version": "0.6.0",
-  "scanned_at": "2026-06-09T16:48:06+00:00",
+  "tool_version": "0.7.0",
+  "scanned_at": "2026-06-13T03:12:28+00:00",
   "profile": "review",
   "input_dir": "examples/demo_paper",
   "paper": null,
@@ -14,13 +14,13 @@
         "file": "ED_Fig2_tumor_volume.xlsx",
         "path": "examples/demo_paper/ED_Fig2_tumor_volume.xlsx",
         "n_sheets": 1,
-        "elapsed_ms": 2.61
+        "elapsed_ms": 2.055
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
         "path": "examples/demo_paper/ED_Fig4_qPCR.xlsx",
         "n_sheets": 2,
-        "elapsed_ms": 1.609
+        "elapsed_ms": 1.537
       }
     ],
     "sheets": [
@@ -31,7 +31,7 @@
         "n_cols": 6,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.1
+        "elapsed_ms": 0.102
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
@@ -40,7 +40,7 @@
         "n_cols": 5,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.064
+        "elapsed_ms": 0.067
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
@@ -49,10 +49,10 @@
         "n_cols": 5,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.056
+        "elapsed_ms": 0.051
       }
     ],
-    "elapsed_ms": 10.214
+    "elapsed_ms": 9.14
   },
   "relations_blocks": [
     {

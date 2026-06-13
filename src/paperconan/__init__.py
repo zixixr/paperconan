@@ -12,4 +12,4 @@ from ._audit import scan_dir as audit_dir  # noqa: F401  public library entry po
 from ._html import write_html_report  # noqa: F401
 from .schema import PaperconanInputError  # noqa: F401
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
