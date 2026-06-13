@@ -151,12 +151,29 @@ def grimmer_consistent(mean, sd, n, mean_decimals, sd_decimals):
 # ---------- sheet I/O ----------
 
 def load_workbook_rows(path):
-    """Return dict of sheet_name -> list[list]."""
+    """Return dict of sheet_name -> list[list]. A sheet whose cell count exceeds _MAX_CELLS is
+    returned as None (oversized: skipped before materializing, to bound memory)."""
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     out = {}
     for s in wb.sheetnames:
         ws = wb[s]
-        rows = [list(r) for r in ws.iter_rows(values_only=True)]
+        mr, mc = ws.max_row, ws.max_column
+        if mr and mc and mr * mc > _MAX_CELLS:      # cheap dimension precheck — never materialize
+            out[s] = None
+            continue
+        rows = []
+        cells = 0
+        oversized = False
+        for r in ws.iter_rows(values_only=True):
+            row = list(r)
+            rows.append(row)
+            cells += len(row)
+            if cells > _MAX_CELLS:                   # dimension absent/understated — bail mid-stream
+                oversized = True
+                break
+        if oversized:
+            out[s] = None
+            continue
         maxc = max((len(r) for r in rows), default=0)
         for r in rows:
             if len(r) < maxc:
@@ -189,14 +206,23 @@ def load_csv_rows(path, delimiter):
     A flat file has no sheets, so it becomes a single sheet named after the file stem."""
     stem = os.path.splitext(os.path.basename(path))[0]
     rows = []
+    oversized = False
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
         try:
+            rows = []
+            cells = 0
             with open(path, newline="", encoding=enc) as fh:
-                rows = [[_coerce_cell(c) for c in r]
-                        for r in _csv.reader(fh, delimiter=delimiter)]
+                for r in _csv.reader(fh, delimiter=delimiter):
+                    rows.append([_coerce_cell(c) for c in r])
+                    cells += len(r)
+                    if cells > _MAX_CELLS:           # oversized: stop before exhausting memory
+                        oversized = True
+                        break
             break
         except UnicodeDecodeError:
             continue
+    if oversized:
+        return {stem: None}
     maxc = max((len(r) for r in rows), default=0)
     for r in rows:
         if len(r) < maxc:
@@ -1068,9 +1094,17 @@ def _load_provenance(in_dir, paper):
 
 # Per-file memory guard: workbooks above this size expand to many GB of Python objects
 # when fully materialized, so they are skipped (recorded as oversized) before loading.
-# Default 25 MB keeps normal source-data tables; raise PAPERCONAN_MAX_FILE_MB on big-RAM hosts.
-_MAX_FILE_MB = float(os.environ.get("PAPERCONAN_MAX_FILE_MB", "25"))
+# Coarse byte backstop (generous — the precise guard is the cell-count cap below).
+_MAX_FILE_MB = float(os.environ.get("PAPERCONAN_MAX_FILE_MB", "200"))
 _MAX_FILE_BYTES = int(_MAX_FILE_MB * 1024 * 1024)
+# Precise memory guard: each cell expands to ~100-200 bytes as a Python object, so a dense
+# matrix OOMs regardless of file *size*. Skip a sheet whose cell count exceeds this, checked
+# from the sheet dimensions BEFORE materializing. Default 2M cells ≈ a 2000×1000 table.
+_MAX_CELLS = int(os.environ.get("PAPERCONAN_MAX_CELLS", "2000000"))
+# Wide blocks (dense correlation matrices) blow up the O(col²) relation/equal-pair detectors in
+# both compute time and output size (scan.json / report.html). Skip just those two detectors when
+# a block is wider than this; the cheap column-wise detectors still run. 0 disables the skip.
+_MAX_BLOCK_COLS = int(os.environ.get("PAPERCONAN_MAX_BLOCK_COLS", "120"))
 
 
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
@@ -1126,6 +1160,14 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         scan_stats["files"].append(file_stat)
         for sn, rows in sheets.items():
             sheet_start = time.perf_counter()
+            if rows is None:        # oversized sheet (>_MAX_CELLS): recorded, never audited
+                msg = (f"oversized sheet exceeds {_MAX_CELLS} cells "
+                       f"(set PAPERCONAN_MAX_CELLS to raise) — skipped to bound memory")
+                scan_errors.append({"file": os.path.basename(f), "sheet": sn, "error": msg})
+                scan_stats["sheets"].append({
+                    "file": os.path.basename(f), "sheet": sn, "oversized": True,
+                    "elapsed_ms": round((time.perf_counter() - sheet_start) * 1000, 3)})
+                continue
             grids[(os.path.basename(f), sn)] = _grid_from_rows(rows)
             sheet_nums = [float(v) for r in rows for v in r if is_num(v)]
             per_sheet_numbers[(os.path.basename(f), sn)] = sheet_nums
@@ -1142,9 +1184,13 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             })
             for (r0, r1, c0, c1) in blocks:
                 header = header_for(rows, r0, c0, c1)
-                rel = detect_relations(rows, r0, r1, c0, c1, header)
+                # On very wide blocks (dense correlation matrices) the O(col²) relation and
+                # equal-pair detectors explode in compute + output, so skip just those two; the
+                # column-wise detectors below still run. (_MAX_BLOCK_COLS=0 disables the skip.)
+                wide = _MAX_BLOCK_COLS and (c1 - c0) > _MAX_BLOCK_COLS
+                rel = [] if wide else detect_relations(rows, r0, r1, c0, c1, header)
                 ap = detect_arithmetic_progression(rows, r0, r1, c0, c1, header)
-                eq = detect_equal_pairs(rows, r0, r1, c0, c1, header)
+                eq = [] if wide else detect_equal_pairs(rows, r0, r1, c0, c1, header)
                 wc = detect_within_column_patterns(rows, r0, r1, c0, c1, header)
                 iar = detect_identical_after_rounding(rows, r0, r1, c0, c1, header)
                 gg = detect_grim_grimmer(rows, r0, r1, c0, c1, header)
