@@ -97,7 +97,9 @@ run there.
 
 - Whether the XHS agent runtime can execute Python / reach the network is
   unknown — the A+C hybrid is the mitigation.
-- PyPI lags the repo (0.5.0 vs 0.6.0); consider cutting a 0.6.0 release so the
-  installed tool matches the skill's documented version. Not a blocker.
+- PyPI lagged the repo (was 0.5.0 while the repo carried unreleased post-tag
+  changes). Resolved 2026-06-13: bumped to **0.7.0** (public `audit_dir()` +
+  fetch-hardening + oversized-guard), tagged `v0.7.0`, and published to PyPI so
+  `pip install paperconan` matches the skill's documented version.
 - XHS moderation may reject the academic-integrity framing; guardrails-forward
   wording is the mitigation.

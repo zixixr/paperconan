@@ -1,11 +1,17 @@
 ---
 name: paperconan
+version: 0.7.0
 description: Paper data sanity check — scan supplementary source data (.xlsx / .csv / .tsv files in a directory) for numerical fabrication red flags. Use when user mentions 论文数据检查, 论文数据造假, 数据 sanity check, 学术不端检测, 数据取证, 检查论文数据, paper data audit, source data audit, PubPeer prep, suspicious paper data, fabrication check, research integrity, or hands you a directory of supplementary data tables and asks "does this look real?". Produces structured findings (scan.json) the agent reads, plus a self-contained HTML report (report.html) the user opens in a browser, 从数据库下载论文数据, 找源数据, fetch paper data, download source data and analyze.
 ---
 
 # paperconan — paper data sanity check
 
 Tool repository: https://github.com/zixixr/paperconan
+
+> **Signal, not verdict.** paperconan surfaces statistical anomalies for a human
+> to follow up — it never proves misconduct, and you must never call a paper
+> "fake"/"fraudulent" or name authors. Read the red-lines in
+> "CRITICAL: signal, not verdict" at the end of this file before reporting anything.
 
 ## When to use
 
@@ -37,6 +43,27 @@ A complete worked example — synthetic data + the report it produces + a guided
 walkthrough of every finding — lives in the repo's
 [`examples/`](https://github.com/zixixr/paperconan/tree/main/examples) directory
 of the repo. Read it to see the output shape before running on real data.
+
+## Runtime & graceful fallback
+
+paperconan runs **real Python detectors** — its findings cannot be faked by
+eyeballing a table. Pick the path that matches your environment, in order:
+
+1. **Python + network (authoritative):** `pip install paperconan` →
+   `paperconan <dir>`. Always prefer this. If `pip` isn't available, try
+   `pipx run paperconan <dir>` or `uvx paperconan <dir>`.
+2. **Python, no PyPI access:** install from a local clone if one exists
+   (`pip install -e /path/to/paperconan`); otherwise tell the user.
+3. **No Python runtime at all:** do **not** invent findings. Say plainly that you
+   cannot run the authoritative scan in this environment, and tell the user to run
+   `paperconan <dir>` on their own machine. You *may* offer a clearly-labelled,
+   **non-authoritative** manual look using
+   [references/detectors.md](references/detectors.md) — but mark it as a hint, not
+   tool output, and never attach `high`/`medium`/`low` severities as if the
+   detectors produced them.
+
+The rule that never bends: **never present eyeballed guesses as paperconan
+output.**
 
 ## How to invoke
 
@@ -87,6 +114,12 @@ detector's. Before you tell the user "nothing high here," re-run
 name-regex heuristic and can be wrong.
 
 ## Fetching a paper's data automatically
+
+> **Secondary, network-dependent.** This needs outbound access to Zenodo /
+> Figshare / Europe PMC / NCBI. In a sandboxed runtime without network it will
+> not work — fall back to asking the user for a local data directory and audit
+> that instead. The local audit above is the core capability; fetch is a
+> convenience on top of it.
 
 If the user gives a paper (DOI or title) instead of a local directory:
 
@@ -140,7 +173,7 @@ Three artifacts may exist in the output dir:
 ```json
 {
   "tool": "paperconan",
-  "tool_version": "0.6.0",        // matches the pyproject version; provenance for archived reports
+  "tool_version": "0.7.0",        // matches the pyproject version; provenance for archived reports
   "scanned_at": "2026-05-29T02:08:53+00:00",
   "profile": "review",            // which FP profile ran (review|forensic|triage) — severities are post-filter unless "forensic"
   "input_dir": "...",
