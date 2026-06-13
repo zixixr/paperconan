@@ -26,6 +26,13 @@ The public `uploader.md` is thin; the real rules live in the
 - **Metadata** parsed from `SKILL.md` frontmatter. `name` → permanent,
   immutable Skill ID via `deriveIdentifier` (`paperconan`). `version` is
   optional (defaults to `1.0.0`).
+- **`skill_md_content` (the SKILL.md *body*, shown as "Skill介绍") is capped at
+  ~10,000 chars and truncated past that** — discovered post-submit on
+  2026-06-13 (our body was 15,026 chars; the cut dropped the scan.json schema
+  and the entire "CRITICAL: signal, not verdict" section). Keep the SKILL.md
+  body well under 10k and push verbose reference material into bundled
+  `references/` files (which ride along in the zip and aren't subject to this
+  cap). The CLI does **not** warn about this — only the platform truncates.
 - **Publish flow:** device-code login via the XHS mobile app → `--dry-run`
   payload preview → pick `原创/转载` + ≥1 live **content tag** → explicit submit
   → uploads to Tencent COS → **XHS moderation review**.

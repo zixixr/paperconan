@@ -37,12 +37,9 @@ pip install "paperconan[all]"   # + supplementary PDF / Word table extraction
 # Dev install from a clone:  pip install -e /path/to/paperconan
 ```
 
-Verify with `paperconan --help` (or `paperconan --version`).
-
-A complete worked example — synthetic data + the report it produces + a guided
-walkthrough of every finding — lives in the repo's
-[`examples/`](https://github.com/zixixr/paperconan/tree/main/examples) directory
-of the repo. Read it to see the output shape before running on real data.
+Verify with `paperconan --help` (or `paperconan --version`). A complete worked
+example (synthetic data + the report it produces + a per-finding walkthrough) lives
+in the repo's [`examples/`](https://github.com/zixixr/paperconan/tree/main/examples).
 
 ## Runtime & graceful fallback
 
@@ -62,8 +59,7 @@ eyeballing a table. Pick the path that matches your environment, in order:
    tool output, and never attach `high`/`medium`/`low` severities as if the
    detectors produced them.
 
-The rule that never bends: **never present eyeballed guesses as paperconan
-output.**
+The rule that never bends: **never present eyeballed guesses as paperconan output.**
 
 ## How to invoke
 
@@ -85,164 +81,79 @@ paperconan <input-dir> --profile forensic     # raw signals, nothing demoted (se
 
 Exit code is 0 even when findings are present — findings are not errors.
 
-### Profiles — the false-positive filter you are reading through
+### Profiles — the false-positive filter you're reading through
 
-`--profile {review,forensic,triage}` controls a false-positive interpretation
-layer that sits **on top of** the raw detectors. **The default is `review`**, so
-by the time you read scan.json some findings have already been quietly demoted —
-you are never looking at raw detector output unless you ask for it.
+`--profile {review,forensic,triage}` sits **on top of** the raw detectors, so by the
+time you read scan.json some findings are already demoted — you're not seeing raw
+detector output unless you ask.
 
-| Profile | What it does | When to run it |
-|---|---|---|
-| `review` (default) | Demotes name-matched likely-FP findings to `low` but keeps them visible, tagged with why | Normal audits — the balanced default |
-| `forensic` | Demotes **nothing** — every detector hit keeps its raw severity | When you want to second-guess a demotion, or verify a `high` the default may have hidden. This is the tool-level lever for the "先开原表再下结论" check |
-| `triage` | Same demotions as `review`, but hides them (`profile_action: "hidden"`) instead of showing them | When you want the shortest clean list for a summary |
+- `review` (default) — demotes name-matched likely-FP findings to `low` but keeps
+  them visible, tagged with why.
+- `forensic` — demotes **nothing**; every hit keeps its raw severity. Re-run with
+  this before telling the user "nothing high here" — a demotion is a name-regex
+  heuristic and can be wrong.
+- `triage` — same demotions as `review`, but hidden (`profile_action: "hidden"`).
 
-**How a finding gets demoted (review/triage):** `_profiles.py` matches column /
-sheet names and finding shape against a few innocent-explanation patterns —
-dose/time/index **axis** columns (`arithmetic_progression`), boundary values like
-0/1/-1/100 (`within_col_value_duplication`), unit-conversion / derived relations
-(`constant_ratio`, `exact_linear`, `sum_constant`), same-figure or
-source-data replots (`cross_sheet_position_identical` with `perfect_dup`), and
-omics/large-matrix boundary floods. Each demotion writes a
-`false_positive_context` tag + a `likely_benign` note onto the finding.
-
-**Practical rule:** if a `review`-profile finding sits at `low` with a
-`profile_action` of `demoted`, that severity is the *filter's* opinion, not the
-detector's. Before you tell the user "nothing high here," re-run
-`--profile forensic` and check what the raw severities were — a demotion is a
-name-regex heuristic and can be wrong.
+A `low` finding with `profile_action: "demoted"` is the *filter's* opinion, not the
+detector's. Demotion reasons + the full mapping are in
+[references/detectors.md](references/detectors.md).
 
 ## Fetching a paper's data automatically
 
-> **Secondary, network-dependent.** This needs outbound access to Zenodo /
-> Figshare / Europe PMC / NCBI. In a sandboxed runtime without network it will
-> not work — fall back to asking the user for a local data directory and audit
-> that instead. The local audit above is the core capability; fetch is a
-> convenience on top of it.
+> **Secondary, network-dependent.** Needs outbound access to Zenodo / Figshare /
+> Europe PMC / NCBI. In a sandboxed runtime without network it won't work — fall
+> back to asking the user for a local data directory. The local audit above is the
+> core capability; fetch is a convenience on top of it.
 
 If the user gives a paper (DOI or title) instead of a local directory:
 
 ```bash
-paperconan fetch "<DOI or title>"                 # list candidate datasets + match signals
-paperconan fetch "<DOI or title>" --json          # same listing as machine-readable JSON (parse this, don't scrape the table)
-paperconan fetch "<DOI>" --download <cand_id> --out data/   # download chosen candidate's tabular files
-paperconan data/                                  # then audit as usual
+paperconan fetch "<DOI or title>"            # list candidate datasets + match signals
+paperconan fetch "<DOI or title>" --json     # machine-readable listing (parse this)
+paperconan fetch "<DOI>" --download <id> --out data/   # download a candidate's tabular files
+paperconan data/                             # then audit as usual
 ```
 
-Other flags: `--all` (also download non-tabular files), `--per-source N` (max
-results per repository, default 5), `--auto` (download only a confidently-matched
-top candidate), `--force` (download a no-match candidate anyway).
+Flags: `--all` (also non-tabular), `--per-source N` (default 5), `--auto` (download
+only a confidently-matched top candidate), `--force` (download a no-match anyway).
 
-Workflow:
-1. Run `paperconan fetch "<DOI>" --json` and parse the candidates. Each has `match_signals`
-   (`doi_in_related`, `title_overlap`, `author_overlap`).
-2. **You decide the match** — prefer `doi_in_related: true`; otherwise weigh title/author
-   overlap. If unsure, show the user the candidates and ask. Repository full-text search
-   (especially figshare/zenodo) often returns **unrelated deposits**, so `fetch --auto`
-   refuses to download a candidate with no DOI match / weak title overlap (it falls back
-   to journal guidance), and `fetch --download <id>` of such a candidate requires `--force`.
-   A candidate flagged `⚠ no DOI/title match` in the listing is probably not this paper's data.
-3. Download the chosen candidate, then run `paperconan <dir>` on the output.
+**You decide the match** from each candidate's `match_signals` (`doi_in_related`,
+`title_overlap`, `author_overlap`) — prefer `doi_in_related: true`. Repository
+full-text search (esp. figshare/zenodo) often returns **unrelated deposits**, so
+`--auto` refuses a no-DOI/weak-title candidate and `--download` of one needs `--force`.
+A candidate flagged `⚠ no DOI/title match` is probably not this paper's data.
 
-### Honesty rules (REQUIRED)
-- Searched repositories are Zenodo / Figshare / Dryad / Europe PMC.
-- If a candidate has no `.xlsx/.csv/.tsv`, say so and name the other file types.
-- If nothing matches, `fetch` now prints a journal-guidance block derived from the
-  DOI (publisher + `doi.org` article link + where that publisher puts source data,
-  e.g. Nature's `...MOESM<N>_ESM.xlsx`). Relay it — never imply "checked = clean".
-- Do not bypass paywalls or scrape publisher sites.
-- Download works keyless for **Zenodo and Figshare**. **Europe PMC** is also keyless:
-  for open-access papers it serves supplementary material as one zip, and `fetch`
-  downloads it and extracts the tabular members automatically. **Dryad** is
-  discovery/listing only — its download API needs authentication, so report Dryad hits
-  to the user and point them to the Dryad dataset page to download the files manually.
+**Honesty rules (REQUIRED):** searched repos are Zenodo / Figshare / Dryad / Europe
+PMC. If a candidate has no `.xlsx/.csv/.tsv`, say so and name the other types. If
+nothing matches, `fetch` prints DOI-derived journal guidance — relay it, never imply
+"checked = clean". Don't bypass paywalls or scrape publisher sites. Download is
+keyless for Zenodo/Figshare and Europe PMC (OA supplements auto-extracted); **Dryad**
+is listing-only (its download API needs auth) — point the user to the Dryad page.
 
 ## How to read the output
 
-Three artifacts may exist in the output dir:
-
 | File | Audience | Purpose |
 |---|---|---|
-| `scan.json` | **you (the agent)** | full structured findings — parse this when analyzing |
-| `report.html` | **the user** | self-contained interactive HTML report — tell the user to open it in a browser |
-| `REPORT.md` | optional | markdown report; only present with `--md` |
+| `scan.json` | **you (the agent)** | full structured findings — parse this |
+| `report.html` | **the user** | self-contained interactive report — tell them to open it in a browser |
+| `REPORT.md` | optional | markdown report; only with `--md` |
 
-### scan.json top-level schema
+**Full structured schema** — top-level `scan.json` fields, the per-finding fields
+(`kind` / `severity` / `rule` / `evidence` / `profile_action` /
+`false_positive_context` / `dense_block` …), and `cross_sheet_findings` fields — is
+in [references/output-schema.md](references/output-schema.md). Read it before parsing.
 
-```json
-{
-  "tool": "paperconan",
-  "tool_version": "0.7.0",        // matches the pyproject version; provenance for archived reports
-  "scanned_at": "2026-05-29T02:08:53+00:00",
-  "profile": "review",            // which FP profile ran (review|forensic|triage) — severities are post-filter unless "forensic"
-  "input_dir": "...",
-  "paper": {"doi": "10.1038/...", "title": "..."},  // provenance, or null (see below)
-  "n_files": 3,
-  "n_blocks_with_findings": 8,
-  "scan_errors": [                // files that failed to parse — surface these, don't imply a clean scan
-    {"file": "broken.xlsx", "error": "..."}
-  ],
-  "scan_stats": {                 // per-file / per-sheet sizing + timing (files[], sheets[], elapsed_ms)
-    "files": [...], "sheets": [...], "elapsed_ms": 412.5
-  },
-  "relations_blocks": [
-    {
-      "file": "ED_Fig8b.xlsx",
-      "sheet": "Sheet1",
-      "block": {"rows": "6-15", "cols": "1-30", "header": [...]},
-      "relations": [...],              // cross-column relations
-      "progressions": [...],           // arithmetic progressions
-      "equal_pairs": [...],            // pairs of columns with many equal rows
-      "within_col": [...],             // within-column anomalies
-      "identical_after_rounding": [...], // cells matching after rounding
-      "grim": [...]                    // GRIM/GRIMMER: reported mean/SD impossible for integer data
-    }
-  ],
-  // per-sheet last-digit χ². Each: {label, n, chi2, p, p_adj, fdr_significant, counts, top}
-  // Filter on fdr_significant (BH-FDR q ≤ 0.05), NOT raw p — dozens of sheets are tested.
-  "digit_distribution": [...],
-  // per-sheet two-decimal ending counts. Each: {label, n, n_unique, top}
-  "decimal_endings": [...],
-  // bit-identical / value-overlap across sheets (same file OR cross-file). See fields below.
-  "cross_sheet_findings": [...]
-}
-```
+What to surface to the user:
 
-`paper` provenance is populated from a `paperconan_source.json` sidecar that
-`paperconan fetch --download/--auto` writes alongside the data, or from
-`paperconan <dir> --doi <DOI> --title <T>`. It is `null` when neither is present
-(a bare directory audit) — never read `null` as "no paper".
-
-### Every finding has
-
-- `kind`: detector name (see [references/detectors.md](references/detectors.md))
-- `severity`: `"high"` | `"medium"` | `"low"`
-- `rule`: human-readable rule string e.g. `col[27] ≡ col[28] in 9/10 rows`
-- `n`: sample size for the rule
-- `evidence`: block snippet `{headers, rows, highlight_cols, ...}` — used by report.html, but you can also surface a few highlighted values if useful
-- `likely_benign` (optional): a common innocent explanation for this kind — surface it to the user alongside the finding so a signal is never reported as a verdict
-- `profile_action`: `"kept"` | `"demoted"` | `"hidden"` — what the active profile did to this finding. `"demoted"`/`"hidden"` means the current `severity` is the **filter's** downgrade, not the detector's raw verdict (always `"kept"` under `--profile forensic`). See the Profiles section.
-- `false_positive_context` (list): machine tags for *why* it was demoted — e.g. `axis_or_scan_column`, `censoring_or_boundary_value`, `derived_or_unit_conversion`, `same_data_replot_or_duplicate_upload`, `omics_or_large_matrix_boundary_flood`. Map these back to the "常见误报" notes in [references/detectors.md](references/detectors.md).
-- `dense_block` (optional, column-relation / equal-pair findings): `true` means this finding comes from a sheet that floods with pairwise column relations (a dense / correlated matrix — correlation tables, normalized replicate panels). Such findings are auto-demoted to `low` severity because identical/linear columns there are expected by construction, not a duplication red flag — don't treat them as high-severity signal
-
-### cross_sheet_findings fields
-
-- `same_file`: whether the two sheets live in one workbook or span two files
-- `figure_a` / `figure_b` / `same_figure`: parsed figure identity (e.g. `main:5`, `ext:6`). When `same_figure` is true the overlap is a combined-vs-individual re-plot of one display item — it is **downgraded to `low`** and carries a `context` note. Cross-figure / cross-file overlaps keep `high`/`medium` and are the ones worth checking against the legend.
-- `delta`: how the two near-duplicate tables differ — `{pattern, modified_cells, shared_values, only_in_a, only_in_b}`. `pattern` is one of:
-  - `perfect_dup` — identical value multiset (clean re-plot)
-  - `superset` — one side strictly contains the other (e.g. an extra replicate column, n=5 vs n=6)
-  - `value_tweaked` — cells changed in place (copy-then-tweak fingerprint; most worth investigating)
-  - `value_divergent` — both sides hold values the other lacks
-
-### What to surface to the user
-
-1. **Cross-sheet findings first.** `cross_sheet_position_identical` is the single most-investigated paperconan signal — same position, same value, across "independent" sheets.
-2. **Group by file, then by severity.** Most users want "which figure should I look at first."
-3. **Always include severity badges in your summary.** Don't flatten `high` and `medium` together.
-4. **Point them to `report.html`.** That file has the actual table snippets with the suspicious cells highlighted — much easier for the user than re-reading xlsx.
-5. **Read [references/interpretation.md](references/interpretation.md)** for the response template and the red lines.
+1. **Cross-sheet findings first.** `cross_sheet_position_identical` is the single
+   most-investigated paperconan signal — same position, same value, across
+   "independent" sheets.
+2. **Group by file, then severity** — most users want "which figure first."
+3. **Always show severity badges** — don't flatten `high` and `medium`.
+4. **Point them to `report.html`** — it has the table snippets with suspicious cells
+   highlighted, much easier than re-reading xlsx.
+5. Read [references/interpretation.md](references/interpretation.md) for the response
+   template and the red lines.
 
 ## CRITICAL: signal, not verdict
 
