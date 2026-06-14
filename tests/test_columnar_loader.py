@@ -54,3 +54,21 @@ def test_streaming_matches_from_rows(tmp_path):
                           np.nan_to_num(ref.numeric, nan=-123456.5))
     assert streamed._text == ref._text
     assert streamed._ints == ref._ints
+
+
+def test_load_csv_returns_sheet(tmp_path):
+    from paperconan._audit import load_csv_rows
+    p = tmp_path / "d.csv"; p.write_text("a,b\n1,2.5\n3,x\n")
+    s = load_csv_rows(str(p), delimiter=",")["d"]
+    assert isinstance(s, Sheet)
+    assert s.cell(0, 0) == "a"
+    assert s.cell(1, 0) == 1 and isinstance(s.cell(1, 0), int)
+    assert s.cell(1, 1) == 2.5
+    assert s.cell(2, 1) == "x"
+
+
+def test_load_table_yields_sheets(tmp_path):
+    from paperconan._audit import load_table
+    p = tmp_path / "d.csv"; p.write_text("x\n1\n2\n3\n")
+    out = load_table(str(p))
+    assert all(v is None or isinstance(v, Sheet) for v in out.values())

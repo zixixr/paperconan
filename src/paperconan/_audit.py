@@ -244,8 +244,9 @@ def _coerce_cell(s):
 
 
 def load_csv_rows(path, delimiter):
-    """Load a delimited text file as {sheet_name: rows}, mirroring load_workbook_rows.
-    A flat file has no sheets, so it becomes a single sheet named after the file stem."""
+    """Load a delimited text file as {sheet_name: Sheet|None}, mirroring load_workbook_rows.
+    A flat file has no sheets, so it becomes a single sheet named after the file stem.
+    Oversized (> _MAX_CELLS) -> {stem: None}; otherwise the rows are wrapped in a Sheet."""
     stem = os.path.splitext(os.path.basename(path))[0]
     rows = []
     oversized = False
@@ -269,11 +270,11 @@ def load_csv_rows(path, delimiter):
     for r in rows:
         if len(r) < maxc:
             r.extend([None] * (maxc - len(r)))
-    return {stem: rows}
+    return {stem: Sheet.from_rows(rows)}
 
 
 def load_table(path):
-    """Dispatch by extension to a {sheet_name: rows} loader."""
+    """Dispatch by extension to a {sheet_name: Sheet|None} loader."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".tsv":
         return load_csv_rows(path, delimiter="\t")
@@ -281,10 +282,10 @@ def load_table(path):
         return load_csv_rows(path, delimiter=",")
     if ext == ".pdf":
         from ._extract import load_pdf_tables
-        return load_pdf_tables(path)
+        return {k: (None if v is None else Sheet.from_rows(v)) for k, v in load_pdf_tables(path).items()}
     if ext == ".docx":
         from ._extract import load_docx_tables
-        return load_docx_tables(path)
+        return {k: (None if v is None else Sheet.from_rows(v)) for k, v in load_docx_tables(path).items()}
     return load_workbook_rows(path)
 
 
