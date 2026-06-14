@@ -1,0 +1,234 @@
+{
+  "block_findings": [
+    {
+      "block_cols": "1-4",
+      "block_rows": "2-11",
+      "file": "ED_Fig1.xlsx",
+      "finding": {
+        "col": "ap_col",
+        "col_idx": 3,
+        "count_05": 10,
+        "false_positive_context": [],
+        "kind": "rounded_to_half_or_int",
+        "likely_benign": "values ending in .0/.5 are common for derived or instrument-rounded quantities (cell counts, scores, calibrated readouts)",
+        "n": 10,
+        "profile_action": "kept",
+        "rule": "col[3]: 10/10 values end in 0 or 5",
+        "severity": "medium"
+      },
+      "group": "within_col",
+      "header": [
+        "mass(kg)",
+        "vol(mL)",
+        "copy_of_mass",
+        "ap_col"
+      ],
+      "sheet": "Sheet1"
+    },
+    {
+      "block_cols": "1-4",
+      "block_rows": "2-11",
+      "file": "ED_Fig1.xlsx",
+      "finding": {
+        "col": "ap_col",
+        "col_idx": 3,
+        "false_positive_context": [],
+        "first": 100.0,
+        "kind": "arithmetic_progression",
+        "n": 10,
+        "profile_action": "kept",
+        "rule": "col[3] = arithmetic progression, step=0.1",
+        "severity": "high",
+        "step": 0.09999999999999432
+      },
+      "group": "progressions",
+      "header": [
+        "mass(kg)",
+        "vol(mL)",
+        "copy_of_mass",
+        "ap_col"
+      ],
+      "sheet": "Sheet2"
+    },
+    {
+      "block_cols": "1-4",
+      "block_rows": "2-11",
+      "file": "ED_Fig1.xlsx",
+      "finding": {
+        "col": "ap_col",
+        "col_idx": 3,
+        "false_positive_context": [],
+        "first": 2.5,
+        "kind": "arithmetic_progression",
+        "n": 10,
+        "profile_action": "kept",
+        "rule": "col[3] = arithmetic progression, step=2.5",
+        "severity": "high",
+        "step": 2.5
+      },
+      "group": "progressions",
+      "header": [
+        "mass(kg)",
+        "vol(mL)",
+        "copy_of_mass",
+        "ap_col"
+      ],
+      "sheet": "Sheet1"
+    },
+    {
+      "block_cols": "1-4",
+      "block_rows": "2-11",
+      "file": "ED_Fig1.xlsx",
+      "finding": {
+        "col_a": "mass(kg)",
+        "col_a_idx": 0,
+        "col_b": "copy_of_mass",
+        "col_b_idx": 2,
+        "false_positive_context": [],
+        "kind": "identical_column",
+        "n": 10,
+        "profile_action": "kept",
+        "rule": "col[2] == col[0]",
+        "severity": "high"
+      },
+      "group": "relations",
+      "header": [
+        "mass(kg)",
+        "vol(mL)",
+        "copy_of_mass",
+        "ap_col"
+      ],
+      "sheet": "Sheet1"
+    },
+    {
+      "block_cols": "1-4",
+      "block_rows": "2-11",
+      "file": "ED_Fig1.xlsx",
+      "finding": {
+        "col_a": "mass(kg)",
+        "col_a_idx": 0,
+        "col_b": "copy_of_mass",
+        "col_b_idx": 2,
+        "false_positive_context": [],
+        "kind": "identical_column",
+        "n": 10,
+        "profile_action": "kept",
+        "rule": "col[2] == col[0]",
+        "severity": "high"
+      },
+      "group": "relations",
+      "header": [
+        "mass(kg)",
+        "vol(mL)",
+        "copy_of_mass",
+        "ap_col"
+      ],
+      "sheet": "Sheet2"
+    },
+    {
+      "block_cols": "2-4",
+      "block_rows": "2-4",
+      "file": "ED_Fig1.xlsx",
+      "finding": {
+        "col_a_idx": 1,
+        "col_b_idx": 2,
+        "example_cells": [
+          [
+            3,
+            2
+          ]
+        ],
+        "failed_rows": [
+          {
+            "decimals": 2,
+            "mean": 3.45,
+            "n": 10,
+            "nearest_consistent": 3.4,
+            "row": 3
+          }
+        ],
+        "false_positive_context": [],
+        "kind": "grim_inconsistent",
+        "likely_benign": "GRIM/GRIMMER assume the statistic is a mean of integer-valued items (counts/scores); verify the measure is integer-granular before acting",
+        "mean_col": "cell count mean",
+        "n": 1,
+        "n_col": "n",
+        "n_failed": 1,
+        "n_rows_checked": 1,
+        "profile_action": "kept",
+        "rule": "1/1 rows report a mean impossible for integer data at the stated n (GRIM): col 'cell count mean'",
+        "sd_col": "sd",
+        "severity": "high"
+      },
+      "group": "grim",
+      "header": [
+        "cell count mean",
+        "sd",
+        "n"
+      ],
+      "sheet": "Fig3_counts"
+    }
+  ],
+  "cross_sheet_findings": [
+    {
+      "delta": {
+        "modified_cells": 0,
+        "only_in_a": 1,
+        "only_in_b": 0,
+        "pattern": "superset",
+        "shared_values": 29
+      },
+      "examples": [
+        {
+          "col": 1,
+          "row": 2,
+          "value": 1.2345
+        },
+        {
+          "col": 2,
+          "row": 2,
+          "value": 2.5101
+        },
+        {
+          "col": 3,
+          "row": 2,
+          "value": 1.2345
+        },
+        {
+          "col": 1,
+          "row": 3,
+          "value": 1.8923
+        },
+        {
+          "col": 2,
+          "row": 3,
+          "value": 3.7842
+        }
+      ],
+      "false_positive_context": [],
+      "figure_a": null,
+      "figure_b": null,
+      "file": "ED_Fig1.xlsx",
+      "file_a": "ED_Fig1.xlsx",
+      "file_b": "ED_Fig1.xlsx",
+      "fraction_of_smaller": 1.0,
+      "kind": "cross_sheet_position_identical",
+      "profile_action": "kept",
+      "rule": "Sheet1 and Sheet2 share 29/29 (100%) decimal values at SAME (row,col) across 2 sheets",
+      "same_figure": false,
+      "same_file": true,
+      "same_position_count": 29,
+      "severity": "high",
+      "sheet_a": "Sheet1",
+      "sheet_b": "Sheet2",
+      "size_a": 30,
+      "size_b": 29
+    }
+  ],
+  "decimal_endings": [],
+  "digit_distribution": [],
+  "n_blocks_with_findings": 3,
+  "n_files": 1,
+  "profile": "review",
+  "scan_errors": []
+}
