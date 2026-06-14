@@ -65,11 +65,13 @@ def test_grimmer_never_flags_achievable_integer_sds():
 
 
 from paperconan._audit import detect_grim_grimmer
+from paperconan._sheet import Sheet
 
 
 def _block(rows):
     # header row 0; data rows 1..len-1; full width.
-    return rows, 1, len(rows), 0, len(rows[0]), [str(x) for x in rows[0]]
+    # Detectors now take a columnar Sheet; bridge the list-of-lists like scan_dir does.
+    return Sheet.from_rows(rows), 1, len(rows), 0, len(rows[0]), [str(x) for x in rows[0]]
 
 
 def test_detector_flags_impossible_mean_with_integer_keyword():

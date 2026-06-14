@@ -38,6 +38,7 @@ import numpy as np
 from scipy import stats
 
 from ._profiles import apply_profile_to_findings, normalize_profile
+from ._sheet import Sheet
 from .schema import PaperconanInputError
 
 
@@ -250,16 +251,11 @@ def load_table(path):
     return load_workbook_rows(path)
 
 
-def find_numeric_blocks(rows, min_rows=3, min_cols=1):
-    if not rows:
+def find_numeric_blocks(sheet, min_rows=3, min_cols=1):
+    R, C = sheet.nrows, sheet.ncols
+    if R == 0 or C == 0:
         return []
-    R = len(rows)
-    C = max(len(r) for r in rows)
-    num = np.zeros((R, C), dtype=bool)
-    for i in range(R):
-        for j in range(min(C, len(rows[i]))):
-            if is_num(rows[i][j]):
-                num[i, j] = True
+    num = ~np.isnan(sheet.numeric)
     blocks = []
     visited = np.zeros_like(num)
     for j in range(C):
@@ -285,23 +281,20 @@ def find_numeric_blocks(rows, min_rows=3, min_cols=1):
     return blocks
 
 
-def header_for(rows, r0, c0, c1):
+def header_for(sheet, r0, c0, c1):
     for r in range(r0 - 1, max(-1, r0 - 5), -1):
         if r < 0:
             continue
-        line = rows[r][c0:c1]
+        line = [sheet.cell(r, c) for c in range(c0, c1)]
         texty = [x for x in line if x is not None and not is_num(x)]
         if texty:
-            return [str(rows[r][c]).strip() if rows[r][c] is not None else "" for c in range(c0, c1)]
+            return [str(sheet.cell(r, c)).strip() if sheet.cell(r, c) is not None else ""
+                    for c in range(c0, c1)]
     return [""] * (c1 - c0)
 
 
-def col_array(rows, r0, r1, c):
-    out = []
-    for r in range(r0, r1):
-        v = rows[r][c] if c < len(rows[r]) else None
-        out.append(to_float(v) if is_num(v) else np.nan)
-    return np.array(out, dtype=float)
+def col_array(sheet, r0, r1, c):
+    return sheet.numeric[r0:r1, c].copy()
 
 
 # ---------- evidence helpers ----------
@@ -319,14 +312,14 @@ def _cell_value(v):
     return str(v)
 
 
-def _block_evidence(rows, r0, r1, c0, c1, header, highlight_cols, highlight_rows=None):
+def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_rows=None):
     """Slice a numeric block (with 1 row of context above/below if available) into a
     JSON-friendly evidence dict that the HTML renderer can show as a table."""
     r_start = max(0, r0 - 1)
-    r_end = min(len(rows), r1 + 1)
+    r_end = min(sheet.nrows, r1 + 1)
     data_rows = []
     for r in range(r_start, r_end):
-        vals = [_cell_value(rows[r][c]) if c < len(rows[r]) else None for c in range(c0, c1)]
+        vals = [_cell_value(sheet.cell(r, c)) for c in range(c0, c1)]
         data_rows.append({
             "row_idx": r + 1,
             "is_context": r < r0 or r >= r1,
@@ -382,7 +375,7 @@ def _attach_benign(findings):
     return findings
 
 
-def _attach_evidence(findings, rows, r0, r1, c0, c1, header):
+def _attach_evidence(findings, sheet, r0, r1, c0, c1, header):
     """Mutate each finding in-place to add an `evidence` field, derived from the same
     block coordinates the detector was scanning. Highlight columns come from the
     finding's own col_*_idx / col_idx fields."""
@@ -398,7 +391,7 @@ def _attach_evidence(findings, rows, r0, r1, c0, c1, header):
                 hi_rows.append(int(ex[0]))
             except (TypeError, ValueError, IndexError):
                 pass
-        f["evidence"] = _block_evidence(rows, r0, r1, c0, c1, header,
+        f["evidence"] = _block_evidence(sheet, r0, r1, c0, c1, header,
                                         highlight_cols=hi_cols,
                                         highlight_rows=hi_rows)
     return findings
@@ -417,9 +410,9 @@ _GRIM_RATIO_RE = re.compile(
     r"|百分|比例|比率|占比|指数", re.I)
 
 
-def detect_relations(rows, r0, r1, c0, c1, header):
+def detect_relations(sheet, r0, r1, c0, c1, header):
     findings = []
-    cols = [(c, col_array(rows, r0, r1, c)) for c in range(c0, c1)]
+    cols = [(c, col_array(sheet, r0, r1, c)) for c in range(c0, c1)]
     for i in range(len(cols)):
         for j in range(i + 1, len(cols)):
             ci, ai = cols[i]
@@ -522,10 +515,10 @@ def _demote_dense_sheets(report_blocks, cap=RELATION_FLOOD_CAP):
     return report_blocks
 
 
-def detect_arithmetic_progression(rows, r0, r1, c0, c1, header):
+def detect_arithmetic_progression(sheet, r0, r1, c0, c1, header):
     findings = []
     for c in range(c0, c1):
-        a = col_array(rows, r0, r1, c)
+        a = col_array(sheet, r0, r1, c)
         a = a[~np.isnan(a)]
         if len(a) < 5:
             continue
@@ -539,7 +532,7 @@ def detect_arithmetic_progression(rows, r0, r1, c0, c1, header):
     return findings
 
 
-def detect_within_column_patterns(rows, r0, r1, c0, c1, header, min_n=6):
+def detect_within_column_patterns(sheet, r0, r1, c0, c1, header, min_n=6):
     """Detect within-column anomalies:
        - many identical values in one column (Su Jiacao: '13 中 8 个相同')
        - many values sharing same last-2 decimals (Su Jiacao: '13 中 11 个末两位相同')
@@ -548,7 +541,7 @@ def detect_within_column_patterns(rows, r0, r1, c0, c1, header, min_n=6):
     """
     findings = []
     for c in range(c0, c1):
-        a = col_array(rows, r0, r1, c)
+        a = col_array(sheet, r0, r1, c)
         a_clean = a[~np.isnan(a)]
         n = len(a_clean)
         if n < min_n:
@@ -604,14 +597,14 @@ def detect_within_column_patterns(rows, r0, r1, c0, c1, header, min_n=6):
     return findings
 
 
-def detect_identical_after_rounding(rows, r0, r1, c0, c1, header):
+def detect_identical_after_rounding(sheet, r0, r1, c0, c1, header):
     """Detect pairs/groups of cells that differ at higher precision but match at lower (e.g.
        4.2735 vs 4.2812 — both round to 4.3). Kang Tiebang ED6h/6j signal."""
     findings = []
     cells = []
     for r in range(r0, r1):
         for c in range(c0, c1):
-            v = rows[r][c] if c < len(rows[r]) else None
+            v = sheet.cell(r, c)
             if is_num(v) and abs(v) > 1e-9:
                 cells.append((r, c, float(v)))
     if len(cells) < 20:
@@ -643,7 +636,7 @@ def detect_identical_after_rounding(rows, r0, r1, c0, c1, header):
     return findings
 
 
-def detect_grim_grimmer(rows, r0, r1, c0, c1, header):
+def detect_grim_grimmer(sheet, r0, r1, c0, c1, header):
     """GRIM/GRIMMER: flag reported means (and SDs) impossible for integer-valued
     data at the stated n. Strictly gated — needs a header-located mean+n triple
     AND a count/score keyword in the MEAN column header signalling integer items —
@@ -685,8 +678,8 @@ def detect_grim_grimmer(rows, r0, r1, c0, c1, header):
     grim_fail, grimmer_fail = [], []
     checked = grimmer_checked = 0
     for r in range(r0, r1):
-        mv = rows[r][mean_c] if mean_c < len(rows[r]) else None
-        nv = rows[r][n_c] if n_c < len(rows[r]) else None
+        mv = sheet.cell(r, mean_c)
+        nv = sheet.cell(r, n_c)
         if not (is_num(mv) and is_num(nv)):
             continue
         n = int(round(float(nv)))
@@ -701,7 +694,7 @@ def detect_grim_grimmer(rows, r0, r1, c0, c1, header):
             grim_fail.append((r, mean, n, d))
             continue                     # GRIM-failing rows are not re-reported
         if sd_c is not None:
-            sv = rows[r][sd_c] if sd_c < len(rows[r]) else None
+            sv = sheet.cell(r, sd_c)
             if is_num(sv):
                 sd = float(sv)
                 ds = _decimals_of(sd)
@@ -786,12 +779,11 @@ def benjamini_hochberg(pvals, alpha=0.05):
     return adj, sig
 
 
-def detect_equal_pairs(rows, r0, r1, c0, c1, header):
+def detect_equal_pairs(sheet, r0, r1, c0, c1, header):
     """Detect column pairs where many rows have identical values
     (e.g. tumor length == tumor width)."""
     findings = []
-    A = np.array([[to_float(rows[r][c]) if c < len(rows[r]) and is_num(rows[r][c]) else np.nan
-                   for c in range(c0, c1)] for r in range(r0, r1)], dtype=float)
+    A = sheet.block(r0, r1, c0, c1)
     for i in range(c1 - c0):
         for j in range(i + 1, c1 - c0):
             a, b = A[:, i], A[:, j]
@@ -810,21 +802,24 @@ def detect_equal_pairs(rows, r0, r1, c0, c1, header):
 
 # ---------- driver ----------
 
-def _grid_from_rows(rows, min_decimal_places=3, max_rows=200):
-    """Build {(r, c): rounded_value} of decimal-bearing numeric cells from a rows matrix.
+def _grid_from_rows(sheet, min_decimal_places=3, max_rows=200):
+    """Build {(r, c): rounded_value} of decimal-bearing numeric cells from a Sheet.
     Only keeps non-integer values with >= min_decimal_places decimals in a sane range —
     these are the values whose bit-identical reuse across tables is suspicious."""
     grid = {}
-    for ri, r in enumerate(rows[:max_rows]):
-        for ci, v in enumerate(r):
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
-                fv = float(v)
-                if fv != int(fv) and 0.001 <= abs(fv) < 100000:
-                    s = repr(fv)
-                    if "." in s and "e" not in s.lower():
-                        frac = s.split(".", 1)[1]
-                        if len(frac) >= min_decimal_places:
-                            grid[(ri, ci)] = round(fv, 9)
+    nm = sheet.numeric
+    rmax = min(sheet.nrows, max_rows)
+    for ri in range(rmax):
+        for ci in range(sheet.ncols):
+            fv = nm[ri, ci]
+            if math.isnan(fv):
+                continue
+            if fv != int(fv) and 0.001 <= abs(fv) < 100000:
+                s = repr(float(fv))
+                if "." in s and "e" not in s.lower():
+                    frac = s.split(".", 1)[1]
+                    if len(frac) >= min_decimal_places:
+                        grid[(ri, ci)] = round(fv, 9)
     return grid
 
 
@@ -1175,15 +1170,16 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                     "file": os.path.basename(f), "sheet": sn, "oversized": True,
                     "elapsed_ms": round((time.perf_counter() - sheet_start) * 1000, 3)})
                 continue
-            grids[(os.path.basename(f), sn)] = _grid_from_rows(rows)
-            sheet_nums = [float(v) for r in rows for v in r if is_num(v)]
+            sheet = rows if isinstance(rows, Sheet) else Sheet.from_rows(rows)
+            grids[(os.path.basename(f), sn)] = _grid_from_rows(sheet)
+            sheet_nums = sheet.numeric_values()
             per_sheet_numbers[(os.path.basename(f), sn)] = sheet_nums
-            blocks = find_numeric_blocks(rows)
-            max_cols = max((len(r) for r in rows), default=0)
+            blocks = find_numeric_blocks(sheet)
+            max_cols = sheet.ncols
             scan_stats["sheets"].append({
                 "file": os.path.basename(f),
                 "sheet": sn,
-                "n_rows": len(rows),
+                "n_rows": sheet.nrows,
                 "n_cols": max_cols,
                 "numeric_cells": len(sheet_nums),
                 "n_blocks": len(blocks),
@@ -1192,21 +1188,21 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             for (r0, r1, c0, c1) in blocks:
                 if len(report_blocks) >= _MAX_REPORT_BLOCKS:   # output budget reached; stop collecting
                     break
-                header = header_for(rows, r0, c0, c1)
+                header = header_for(sheet, r0, c0, c1)
                 # On very wide blocks (dense correlation matrices) the O(col²) relation and
                 # equal-pair detectors explode in compute + output, so skip just those two; the
                 # column-wise detectors below still run. (_MAX_BLOCK_COLS=0 disables the skip.)
                 wide = _MAX_BLOCK_COLS and (c1 - c0) > _MAX_BLOCK_COLS
-                rel = [] if wide else detect_relations(rows, r0, r1, c0, c1, header)
-                ap = detect_arithmetic_progression(rows, r0, r1, c0, c1, header)
-                eq = [] if wide else detect_equal_pairs(rows, r0, r1, c0, c1, header)
-                wc = detect_within_column_patterns(rows, r0, r1, c0, c1, header)
-                iar = detect_identical_after_rounding(rows, r0, r1, c0, c1, header)
-                gg = detect_grim_grimmer(rows, r0, r1, c0, c1, header)
+                rel = [] if wide else detect_relations(sheet, r0, r1, c0, c1, header)
+                ap = detect_arithmetic_progression(sheet, r0, r1, c0, c1, header)
+                eq = [] if wide else detect_equal_pairs(sheet, r0, r1, c0, c1, header)
+                wc = detect_within_column_patterns(sheet, r0, r1, c0, c1, header)
+                iar = detect_identical_after_rounding(sheet, r0, r1, c0, c1, header)
+                gg = detect_grim_grimmer(sheet, r0, r1, c0, c1, header)
                 if rel or ap or eq or wc or iar or gg:
                     sheet_context = " ".join([os.path.basename(f), sn, *[str(h) for h in header]])
                     for group in (rel, ap, eq, wc, iar, gg):
-                        _attach_evidence(group, rows, r0, r1, c0, c1, header)
+                        _attach_evidence(group, sheet, r0, r1, c0, c1, header)
                         _attach_benign(group)
                         apply_profile_to_findings(group, profile,
                                                   sheet_context=sheet_context)
