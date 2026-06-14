@@ -155,10 +155,13 @@ def load_workbook_rows(path):
     returned as None (oversized: skipped before materializing, to bound memory)."""
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     out = {}
+    loaded = 0                                       # cumulative cells across this file's sheets
     for s in wb.sheetnames:
         ws = wb[s]
         mr, mc = ws.max_row, ws.max_column
-        if mr and mc and mr * mc > _MAX_CELLS:      # cheap dimension precheck — never materialize
+        # Skip a sheet that is too big on its own, OR once this file's cumulative cell budget is
+        # spent (a many-sheet workbook materialized at once OOMs even if each sheet is under cap).
+        if loaded >= _MAX_CELLS or (mr and mc and mr * mc > _MAX_CELLS):
             out[s] = None
             continue
         rows = []
@@ -168,12 +171,13 @@ def load_workbook_rows(path):
             row = list(r)
             rows.append(row)
             cells += len(row)
-            if cells > _MAX_CELLS:                   # dimension absent/understated — bail mid-stream
+            if loaded + cells > _MAX_CELLS:          # per-file cumulative budget — bail mid-stream
                 oversized = True
                 break
         if oversized:
             out[s] = None
             continue
+        loaded += cells
         maxc = max((len(r) for r in rows), default=0)
         for r in rows:
             if len(r) < maxc:
