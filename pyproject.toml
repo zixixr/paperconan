@@ -34,6 +34,9 @@ dependencies = [
 # install (xlsx/csv/tsv) stays dependency-light; the parsers are imported lazily.
 pdf = ["pdfplumber>=0.11"]
 docx = ["python-docx>=1.1"]
+# Optional Rust xlsx reader: much faster than openpyxl, byte-identical Sheet. The
+# openpyxl reference path is used automatically when this is not installed.
+fast = ["python-calamine>=0.2"]
 all = ["pdfplumber>=0.11", "python-docx>=1.1"]
 test = ["pytest>=8", "pdfplumber>=0.11", "python-docx>=1.1", "tomli>=2; python_version < '3.11'"]
 dev = ["pytest>=8", "pdfplumber>=0.11", "python-docx>=1.1", "tomli>=2; python_version < '3.11'"]

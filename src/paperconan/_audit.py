@@ -151,16 +151,70 @@ def grimmer_consistent(mean, sd, n, mean_decimals, sd_decimals):
 
 # ---------- sheet I/O ----------
 
-def load_workbook_rows(path):
-    """Return dict of sheet_name -> Sheet. A sheet over _MAX_CELLS (on its own, or
-    once this file's cumulative cell budget is spent) is returned as None
-    (oversized), preserving the legacy memory guard. Rows stream directly into the
-    Sheet's columnar arrays — the full list-of-lists is never materialized.
+def _fill_sheet_from_rows(rows_iter, mr, mc, loaded):
+    """Stream rows of openpyxl-shaped cell values (int/float/str/datetime/bool/None)
+    into a Sheet, honouring the cumulative `_MAX_CELLS` budget that `loaded` cells
+    have already consumed across this file.
 
-    The produced Sheet is byte-identical to Sheet.from_rows of the same workbook:
-    nrows == number of rows iter_rows yields, ncols == max row width seen (the
-    same `max(len(row))` from_rows uses — trailing all-empty columns/rows are NOT
-    trimmed, exactly as from_rows keeps them as NaN padding)."""
+    Returns (sheet_or_None, cells): None means the per-file cumulative budget was
+    exceeded mid-stream (oversized). Both readers (openpyxl, calamine) funnel through
+    this so they produce a byte-identical Sheet; the calamine path normalizes its
+    typed values to openpyxl's shape BEFORE calling here.
+
+    The produced Sheet matches Sheet.from_rows of the same rows: nrows == rows
+    consumed, ncols == max row width seen (trailing all-empty rows/cols are kept as
+    NaN padding, not trimmed). `mr`/`mc` are only the pre-allocation hint; the array
+    grows on demand if a reader under-declares dimensions."""
+    numeric = np.full((mr, mc), np.nan, dtype=float) if (mr and mc) else np.empty((0, 0))
+    text = {}
+    ints = set()
+    r = 0                                        # rows consumed (== final nrows)
+    cells = 0
+    max_w = 0                                    # max row width seen (== final ncols)
+    oversized = False
+    for row in rows_iter:
+        if r >= numeric.shape[0]:                # reader under-reported rows: grow by one
+            grow = np.full((1, numeric.shape[1]), np.nan)
+            numeric = np.vstack([numeric, grow]) if numeric.size or numeric.shape[1] else grow
+        width = len(row)
+        if width > numeric.shape[1]:             # row wider than declared: grow columns
+            pad = np.full((numeric.shape[0], width - numeric.shape[1]), np.nan)
+            numeric = np.hstack([numeric, pad]) if numeric.shape[1] else pad
+        for c, v in enumerate(row):
+            if is_num(v):
+                numeric[r, c] = float(v)
+                if isinstance(v, int) and not isinstance(v, bool):
+                    ints.add((r, c))
+            elif v is not None:
+                text[(r, c)] = v
+        if width > max_w:
+            max_w = width
+        cells += width
+        if loaded + cells > _MAX_CELLS:          # per-file cumulative budget — bail mid-stream
+            oversized = True
+            break
+        r += 1
+    if oversized:
+        return None, cells
+    # Trim to the geometry Sheet.from_rows would produce: nrows == rows consumed,
+    # ncols == max(len(row)). (numeric may be larger if the reader over-declared.)
+    n_rows, n_cols = r, max_w
+    if n_rows and n_cols:
+        numeric = numeric[:n_rows, :n_cols]
+    else:
+        numeric = np.full((n_rows, n_cols), np.nan, dtype=float)
+    text = {(rr, cc): val for (rr, cc), val in text.items()
+            if rr < n_rows and cc < n_cols}
+    ints = {(rr, cc) for (rr, cc) in ints if rr < n_rows and cc < n_cols}
+    return Sheet(numeric.shape[0], numeric.shape[1], numeric, text, ints), cells
+
+
+def _load_workbook_openpyxl(path):
+    """Return dict of sheet_name -> Sheet via openpyxl (the reference reader). A sheet
+    over _MAX_CELLS (on its own, or once this file's cumulative cell budget is spent)
+    is returned as None (oversized), preserving the legacy memory guard. Rows stream
+    directly into the Sheet's columnar arrays — the full list-of-lists is never
+    materialized."""
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     out = {}
     loaded = 0                                       # cumulative cells across this file's sheets
@@ -172,57 +226,72 @@ def load_workbook_rows(path):
         if loaded >= _MAX_CELLS or (mr and mc and mr * mc > _MAX_CELLS):
             out[s] = None
             continue
-        # Pre-allocate to openpyxl's declared dimensions; grow on demand if a row is
-        # wider / there are more rows than declared (defensive, matches from_rows).
-        numeric = np.full((mr, mc), np.nan, dtype=float) if (mr and mc) else np.empty((0, 0))
-        text = {}
-        ints = set()
-        r = 0                                        # rows consumed (== final nrows)
-        cells = 0
-        max_w = 0                                    # max row width seen (== final ncols)
-        oversized = False
-        for row in ws.iter_rows(values_only=True):
-            if r >= numeric.shape[0]:                # openpyxl under-reported rows: grow by one
-                grow = np.full((1, numeric.shape[1]), np.nan)
-                numeric = np.vstack([numeric, grow]) if numeric.size or numeric.shape[1] else grow
-            width = len(row)
-            if width > numeric.shape[1]:             # row wider than declared: grow columns
-                pad = np.full((numeric.shape[0], width - numeric.shape[1]), np.nan)
-                numeric = np.hstack([numeric, pad]) if numeric.shape[1] else pad
-            for c, v in enumerate(row):
-                if is_num(v):
-                    numeric[r, c] = float(v)
-                    if isinstance(v, int) and not isinstance(v, bool):
-                        ints.add((r, c))
-                elif v is not None:
-                    text[(r, c)] = v
-            if width > max_w:
-                max_w = width
-            cells += width
-            if loaded + cells > _MAX_CELLS:          # per-file cumulative budget — bail mid-stream
-                oversized = True
-                break
-            r += 1
-        if oversized:
-            out[s] = None
-            continue
-        loaded += cells
-        # Trim to the geometry Sheet.from_rows would produce: nrows == rows consumed,
-        # ncols == max(len(row)). (numeric may be larger if openpyxl over-declared.)
-        n_rows, n_cols = r, max_w
-        if n_rows and n_cols:
-            numeric = numeric[:n_rows, :n_cols]
-            text = {(rr, cc): val for (rr, cc), val in text.items()
-                    if rr < n_rows and cc < n_cols}
-            ints = {(rr, cc) for (rr, cc) in ints if rr < n_rows and cc < n_cols}
-        else:
-            numeric = np.full((n_rows, n_cols), np.nan, dtype=float)
-            text = {(rr, cc): val for (rr, cc), val in text.items()
-                    if rr < n_rows and cc < n_cols}
-            ints = {(rr, cc) for (rr, cc) in ints if rr < n_rows and cc < n_cols}
-        out[s] = Sheet(numeric.shape[0], numeric.shape[1], numeric, text, ints)
+        sheet, cells = _fill_sheet_from_rows(ws.iter_rows(values_only=True), mr, mc, loaded)
+        out[s] = sheet
+        if sheet is not None:
+            loaded += cells
     wb.close()
     return out
+
+
+def _calamine_cell(v):
+    """Normalize one python_calamine typed value to the shape openpyxl's read_only
+    reader produces, so a Sheet built from calamine rows is byte-identical:
+      - "" (calamine's empty cell) -> None (openpyxl yields None for empty cells)
+      - whole-number float -> int (openpyxl coerces every integral value to int)
+      - datetime.date -> datetime.datetime at midnight (openpyxl never yields bare date)
+    bool / str / datetime / non-integral float pass through unchanged."""
+    if isinstance(v, bool):
+        return v
+    if v == "":
+        return None
+    if isinstance(v, float):
+        if math.isfinite(v) and v == int(v):
+            return int(v)
+        return v
+    if isinstance(v, datetime.datetime):
+        return v
+    if isinstance(v, datetime.date):
+        return datetime.datetime(v.year, v.month, v.day)
+    return v
+
+
+def _load_workbook_calamine(path):
+    """Return dict of sheet_name -> Sheet via python-calamine (a fast Rust reader),
+    producing a Sheet byte-identical to _load_workbook_openpyxl. Same _MAX_CELLS
+    per-sheet + cumulative guard, same oversized->None, same trim-to-max-width."""
+    import python_calamine
+    wb = python_calamine.CalamineWorkbook.from_path(path)
+    out = {}
+    loaded = 0                                       # cumulative cells across this file's sheets
+    for name in wb.sheet_names:
+        sh = wb.get_sheet_by_name(name)
+        rows = sh.to_python(skip_empty_area=False)
+        mr = len(rows)
+        mc = max((len(row) for row in rows), default=0)
+        if loaded >= _MAX_CELLS or (mr and mc and mr * mc > _MAX_CELLS):
+            out[name] = None
+            continue
+        norm = ([_calamine_cell(v) for v in row] for row in rows)
+        sheet, cells = _fill_sheet_from_rows(norm, mr, mc, loaded)
+        out[name] = sheet
+        if sheet is not None:
+            loaded += cells
+    return out
+
+
+def load_workbook_rows(path):
+    """Return dict of sheet_name -> Sheet. Uses python-calamine (a fast Rust xlsx
+    reader) when installed, falling back to the openpyxl reference path otherwise or
+    on any reader quirk. Both paths produce a byte-identical Sheet."""
+    try:
+        import python_calamine  # noqa: F401
+    except Exception:
+        return _load_workbook_openpyxl(path)
+    try:
+        return _load_workbook_calamine(path)
+    except Exception:
+        return _load_workbook_openpyxl(path)  # any reader quirk → reference path
 
 
 def _coerce_cell(s):

@@ -72,3 +72,20 @@ def test_load_table_yields_sheets(tmp_path):
     p = tmp_path / "d.csv"; p.write_text("x\n1\n2\n3\n")
     out = load_table(str(p))
     assert all(v is None or isinstance(v, Sheet) for v in out.values())
+
+
+def test_calamine_matches_openpyxl(tmp_path):
+    import importlib.util, paperconan._audit as A
+    if importlib.util.find_spec("python_calamine") is None:
+        import pytest; pytest.skip("python-calamine not installed")
+    p = tmp_path / "a.xlsx"
+    _write_xlsx(p, [["H", "K"], [1, 2.5], [3, 4.0], [5, 6.25], [None, 7]])
+    via_cal = A._load_workbook_calamine(str(p))
+    via_op = A._load_workbook_openpyxl(str(p))
+    for name in via_op:
+        a, b = via_cal[name], via_op[name]
+        assert (a is None) == (b is None)
+        if a is not None:
+            assert a.nrows == b.nrows and a.ncols == b.ncols
+            assert np.array_equal(np.nan_to_num(a.numeric, nan=-1.5e9), np.nan_to_num(b.numeric, nan=-1.5e9))
+            assert a._text == b._text and a._ints == b._ints
