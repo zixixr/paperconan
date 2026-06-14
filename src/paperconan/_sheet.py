@@ -55,7 +55,11 @@ class Sheet:
         if 0 <= r < self.nrows and 0 <= c < self.ncols:
             v = self.numeric[r, c]
             if not math.isnan(v):
-                return int(v) if (r, c) in self._ints else v
+                # Return built-in int/float, never numpy scalars: evidence cells
+                # are JSON-serialized, and np.float64 would either fail json.dump
+                # or (with default=str) drift to a quoted string vs the legacy
+                # Python-float output. int_mask preserves int-vs-float fidelity.
+                return int(v) if (r, c) in self._ints else float(v)
         return self._text.get((r, c))
 
     def block(self, r0, r1, c0, c1):

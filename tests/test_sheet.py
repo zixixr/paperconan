@@ -15,6 +15,15 @@ def test_from_rows_roundtrip_types():
     assert s.cell(1, 3) == "txt"
     assert s.cell(2, 1) is True
 
+def test_cell_returns_builtin_not_numpy():
+    # Evidence cells are JSON-serialized; cell() must hand back built-in
+    # int/float, never numpy scalars (np.float64 fails json.dump / drifts under
+    # default=str). type() is exact-checked on purpose, not isinstance.
+    s = Sheet.from_rows([[2.5, 7]])
+    assert type(s.cell(0, 0)) is float
+    assert type(s.cell(0, 1)) is int
+
+
 def test_numeric_array_nan_for_nonnumeric():
     s = Sheet.from_rows([["a", 1], [2, None], [3.5, "b"]])
     nm = s.numeric
