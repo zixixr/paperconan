@@ -152,38 +152,75 @@ def grimmer_consistent(mean, sd, n, mean_decimals, sd_decimals):
 # ---------- sheet I/O ----------
 
 def load_workbook_rows(path):
-    """Return dict of sheet_name -> list[list]. A sheet whose cell count exceeds _MAX_CELLS is
-    returned as None (oversized: skipped before materializing, to bound memory)."""
+    """Return dict of sheet_name -> Sheet. A sheet over _MAX_CELLS (on its own, or
+    once this file's cumulative cell budget is spent) is returned as None
+    (oversized), preserving the legacy memory guard. Rows stream directly into the
+    Sheet's columnar arrays — the full list-of-lists is never materialized.
+
+    The produced Sheet is byte-identical to Sheet.from_rows of the same workbook:
+    nrows == number of rows iter_rows yields, ncols == max row width seen (the
+    same `max(len(row))` from_rows uses — trailing all-empty columns/rows are NOT
+    trimmed, exactly as from_rows keeps them as NaN padding)."""
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     out = {}
     loaded = 0                                       # cumulative cells across this file's sheets
     for s in wb.sheetnames:
         ws = wb[s]
-        mr, mc = ws.max_row, ws.max_column
+        mr, mc = ws.max_row or 0, ws.max_column or 0
         # Skip a sheet that is too big on its own, OR once this file's cumulative cell budget is
         # spent (a many-sheet workbook materialized at once OOMs even if each sheet is under cap).
         if loaded >= _MAX_CELLS or (mr and mc and mr * mc > _MAX_CELLS):
             out[s] = None
             continue
-        rows = []
+        # Pre-allocate to openpyxl's declared dimensions; grow on demand if a row is
+        # wider / there are more rows than declared (defensive, matches from_rows).
+        numeric = np.full((mr, mc), np.nan, dtype=float) if (mr and mc) else np.empty((0, 0))
+        text = {}
+        ints = set()
+        r = 0                                        # rows consumed (== final nrows)
         cells = 0
+        max_w = 0                                    # max row width seen (== final ncols)
         oversized = False
-        for r in ws.iter_rows(values_only=True):
-            row = list(r)
-            rows.append(row)
-            cells += len(row)
+        for row in ws.iter_rows(values_only=True):
+            if r >= numeric.shape[0]:                # openpyxl under-reported rows: grow by one
+                grow = np.full((1, numeric.shape[1]), np.nan)
+                numeric = np.vstack([numeric, grow]) if numeric.size or numeric.shape[1] else grow
+            width = len(row)
+            if width > numeric.shape[1]:             # row wider than declared: grow columns
+                pad = np.full((numeric.shape[0], width - numeric.shape[1]), np.nan)
+                numeric = np.hstack([numeric, pad]) if numeric.shape[1] else pad
+            for c, v in enumerate(row):
+                if is_num(v):
+                    numeric[r, c] = float(v)
+                    if isinstance(v, int) and not isinstance(v, bool):
+                        ints.add((r, c))
+                elif v is not None:
+                    text[(r, c)] = v
+            if width > max_w:
+                max_w = width
+            cells += width
             if loaded + cells > _MAX_CELLS:          # per-file cumulative budget — bail mid-stream
                 oversized = True
                 break
+            r += 1
         if oversized:
             out[s] = None
             continue
         loaded += cells
-        maxc = max((len(r) for r in rows), default=0)
-        for r in rows:
-            if len(r) < maxc:
-                r.extend([None] * (maxc - len(r)))
-        out[s] = rows
+        # Trim to the geometry Sheet.from_rows would produce: nrows == rows consumed,
+        # ncols == max(len(row)). (numeric may be larger if openpyxl over-declared.)
+        n_rows, n_cols = r, max_w
+        if n_rows and n_cols:
+            numeric = numeric[:n_rows, :n_cols]
+            text = {(rr, cc): val for (rr, cc), val in text.items()
+                    if rr < n_rows and cc < n_cols}
+            ints = {(rr, cc) for (rr, cc) in ints if rr < n_rows and cc < n_cols}
+        else:
+            numeric = np.full((n_rows, n_cols), np.nan, dtype=float)
+            text = {(rr, cc): val for (rr, cc), val in text.items()
+                    if rr < n_rows and cc < n_cols}
+            ints = {(rr, cc) for (rr, cc) in ints if rr < n_rows and cc < n_cols}
+        out[s] = Sheet(numeric.shape[0], numeric.shape[1], numeric, text, ints)
     wb.close()
     return out
 
