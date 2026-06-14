@@ -94,3 +94,20 @@ def test_download_candidate_extracts_oa_package(tmp_path, monkeypatch):
             "oa_package": {"url": "https://ftp.ncbi.nlm.nih.gov/x/PMC1.tar.gz", "name": "PMC1.tar.gz"}}
     res = dl.download_candidate(cand, str(tmp_path / "out"))
     assert any(p.endswith("sd.csv") for p in res["downloaded"])
+
+
+def test_per_paper_cap_stops_extraction(tmp_path, monkeypatch):
+    import io, tarfile
+    import paperconan.fetch._download as dl
+    monkeypatch.setattr(dl, "_MAX_PAPER_BYTES", 3000)   # tiny per-paper budget
+    tar_path = tmp_path / "many.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tf:
+        for i in range(20):                              # 20 x 1KB tabular files = 20KB
+            data = b"a,b\n" + b"1,2\n" * 250             # ~1KB each
+            info = tarfile.TarInfo(f"P/d{i}.csv"); info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    out = tmp_path / "out"; out.mkdir()
+    extracted = dl._extract_tabular_tar(str(tar_path), str(out))
+    # budget ~3KB -> only a few files extracted, not all 20
+    assert 0 < len(extracted) < 20
+    assert dl._dir_size(str(out)) <= 3000 + 1100        # stopped near the cap

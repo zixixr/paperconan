@@ -21,6 +21,22 @@ _DEFAULT_MAX = 50 * 1024 * 1024     # 50 MB — per individual file / per extrac
 # imaging) but we only keep its small tabular members, so it needs a much larger cap
 # than a single file — otherwise big-but-tabular Europe PMC zips truncate and are lost.
 _ARCHIVE_MAX = 250 * 1024 * 1024    # 250 MB — whole supplementary zip
+# Per-PAPER total cap: a genomics supplement can hold hundreds of tabular files that extract
+# to many GB and fill the worker disk before audit cleans up. Stop extracting/downloading once
+# a paper's out_dir reaches this. Default 1.5 GB; raise PAPERCONAN_MAX_PAPER_MB on big disks.
+_MAX_PAPER_MB = float(os.environ.get("PAPERCONAN_MAX_PAPER_MB", "1500"))
+_MAX_PAPER_BYTES = int(_MAX_PAPER_MB * 1024 * 1024)
+
+
+def _dir_size(path):
+    total = 0
+    for dp, _, fs in os.walk(path):
+        for f in fs:
+            try:
+                total += os.path.getsize(os.path.join(dp, f))
+            except OSError:
+                pass
+    return total
 
 
 def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
@@ -82,16 +98,22 @@ def _extract_tabular_zip(zip_bytes, out_dir, max_member_bytes=_DEFAULT_MAX):
     out_dir, flattening internal paths to the basename (no path traversal) and
     capping per-member size. Returns the list of extracted file paths."""
     extracted = []
+    written = _dir_size(out_dir)
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         for info in zf.infolist():
+            if written > _MAX_PAPER_BYTES:        # per-paper budget reached; stop extracting
+                break
             if info.is_dir():
                 continue
             name = os.path.basename(info.filename)
             if not name or not is_tabular(name) or info.file_size > max_member_bytes:
                 continue
             dest = os.path.join(out_dir, name)
+            data = None
             with zf.open(info) as src, open(dest, "wb") as fh:
-                fh.write(src.read(max_member_bytes + 1)[:max_member_bytes])
+                data = src.read(max_member_bytes + 1)[:max_member_bytes]
+                fh.write(data)
+            written += len(data)
             extracted.append(dest)
     return extracted
 
@@ -101,8 +123,11 @@ def _extract_tabular_tar(tar_path, out_dir, max_member_bytes=_DEFAULT_MAX):
     flattening internal paths to the basename and capping per-member size.
     Returns the list of extracted file paths."""
     extracted = []
+    written = _dir_size(out_dir)
     with tarfile.open(tar_path, "r:gz") as tf:
         for member in tf.getmembers():
+            if written > _MAX_PAPER_BYTES:        # per-paper budget reached; stop extracting
+                break
             if not member.isfile():
                 continue
             name = os.path.basename(member.name)
@@ -112,8 +137,10 @@ def _extract_tabular_tar(tar_path, out_dir, max_member_bytes=_DEFAULT_MAX):
             if src is None:
                 continue
             dest = os.path.join(out_dir, name)
+            data = src.read(max_member_bytes + 1)[:max_member_bytes]
             with open(dest, "wb") as fh:
-                fh.write(src.read(max_member_bytes + 1)[:max_member_bytes])
+                fh.write(data)
+            written += len(data)
             extracted.append(dest)
     return extracted
 
@@ -181,6 +208,9 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
     _write_source_sidecar(cand, out_dir)
     downloaded, skipped = [], []
     for f in files:
+        if _dir_size(out_dir) > _MAX_PAPER_BYTES:   # per-paper budget reached; stop downloading
+            skipped.append({"name": f["name"], "reason": "paper data exceeds per-paper cap"})
+            continue
         dest = os.path.join(out_dir, os.path.basename(f["name"]))
         res = download_file(f["download_url"], dest, max_bytes=max_bytes)
         if res.get("ok"):
