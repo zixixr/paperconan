@@ -1203,10 +1203,11 @@ def _load_provenance(in_dir, paper):
 # Coarse byte backstop (generous — the precise guard is the cell-count cap below).
 _MAX_FILE_MB = float(os.environ.get("PAPERCONAN_MAX_FILE_MB", "200"))
 _MAX_FILE_BYTES = int(_MAX_FILE_MB * 1024 * 1024)
-# Precise memory guard: each cell expands to ~100-200 bytes as a Python object, so a dense
-# matrix OOMs regardless of file *size*. Skip a sheet whose cell count exceeds this, checked
-# from the sheet dimensions BEFORE materializing. Default 2M cells ≈ a 2000×1000 table.
-_MAX_CELLS = int(os.environ.get("PAPERCONAN_MAX_CELLS", "2000000"))
+# Precise memory guard: the columnar substrate stores numeric cells in a dense float64
+# array (~8 bytes/cell) instead of ~100-200 bytes/cell as Python objects, so a given cell
+# budget now bounds far less RAM. Skip a sheet whose cell count exceeds this, checked from
+# the sheet dimensions BEFORE materializing. Default 10M cells ≈ an 80MB numeric array.
+_MAX_CELLS = int(os.environ.get("PAPERCONAN_MAX_CELLS", "10000000"))
 # Wide blocks (dense correlation matrices) blow up the O(col²) relation/equal-pair detectors in
 # both compute time and output size (scan.json / report.html). Skip just those two detectors when
 # a block is wider than this; the cheap column-wise detectors still run. 0 disables the skip.
