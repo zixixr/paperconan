@@ -1105,6 +1105,9 @@ _MAX_CELLS = int(os.environ.get("PAPERCONAN_MAX_CELLS", "2000000"))
 # both compute time and output size (scan.json / report.html). Skip just those two detectors when
 # a block is wider than this; the cheap column-wise detectors still run. 0 disables the skip.
 _MAX_BLOCK_COLS = int(os.environ.get("PAPERCONAN_MAX_BLOCK_COLS", "120"))
+# Output cap: each finding embeds a table-snippet as evidence, so a paper with thousands of
+# findings balloons scan.json to many GB. Stop collecting blocks once this many have findings.
+_MAX_REPORT_BLOCKS = int(os.environ.get("PAPERCONAN_MAX_REPORT_BLOCKS", "2000"))
 
 
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
@@ -1183,6 +1186,8 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 "elapsed_ms": round((time.perf_counter() - sheet_start) * 1000, 3),
             })
             for (r0, r1, c0, c1) in blocks:
+                if len(report_blocks) >= _MAX_REPORT_BLOCKS:   # output budget reached; stop collecting
+                    break
                 header = header_for(rows, r0, c0, c1)
                 # On very wide blocks (dense correlation matrices) the O(col²) relation and
                 # equal-pair detectors explode in compute + output, so skip just those two; the
