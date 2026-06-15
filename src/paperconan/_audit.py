@@ -421,24 +421,82 @@ def _cell_value(v):
 
 def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_rows=None):
     """Slice a numeric block (with 1 row of context above/below if available) into a
-    JSON-friendly evidence dict that the HTML renderer can show as a table."""
+    JSON-friendly evidence dict that the HTML renderer can show as a table.
+
+    The emitted snippet is bounded to a contiguous _MAX_EV_ROWS × _MAX_EV_COLS
+    sub-rectangle inside the block, always covering the highlighted columns (and rows
+    when given). This stops a dense block from being copied whole into every finding
+    (which balloons the scan dict / scan.json to GBs). Small blocks are emitted whole
+    and stay byte-identical (no `truncated` key)."""
+    truncated = False
+
+    # --- column window -------------------------------------------------------
+    ec0, ec1 = c0, c1
+    if (c1 - c0) > _MAX_EV_COLS:
+        truncated = True
+        if highlight_cols:
+            lo = min(highlight_cols)
+            hi = max(highlight_cols)
+        else:
+            lo = hi = c0
+        if hi - lo + 1 > _MAX_EV_COLS:
+            ec0 = lo
+            ec1 = lo + _MAX_EV_COLS
+        else:
+            # Center a _MAX_EV_COLS-wide window on [lo, hi], then clamp into [c0, c1).
+            pad = (_MAX_EV_COLS - (hi - lo + 1)) // 2
+            ec0 = lo - pad
+            ec1 = ec0 + _MAX_EV_COLS
+            if ec0 < c0:
+                ec0, ec1 = c0, c0 + _MAX_EV_COLS
+            if ec1 > c1:
+                ec1 = c1
+                ec0 = ec1 - _MAX_EV_COLS
+            if ec0 < c0:
+                ec0 = c0
+
+    # --- row window ----------------------------------------------------------
     r_start = max(0, r0 - 1)
     r_end = min(sheet.nrows, r1 + 1)
+    if (r_end - r_start) > _MAX_EV_ROWS:
+        truncated = True
+        if highlight_rows:
+            # highlight_rows are 1-based row numbers; center the window on them.
+            rlo = min(highlight_rows) - 1
+            rhi = max(highlight_rows) - 1
+            if rhi - rlo + 1 >= _MAX_EV_ROWS:
+                wr0 = rlo
+            else:
+                pad = (_MAX_EV_ROWS - (rhi - rlo + 1)) // 2
+                wr0 = rlo - pad
+        else:
+            wr0 = r_start
+        if wr0 < r_start:
+            wr0 = r_start
+        wr1 = wr0 + _MAX_EV_ROWS
+        if wr1 > r_end:
+            wr1 = r_end
+            wr0 = max(r_start, wr1 - _MAX_EV_ROWS)
+        r_start, r_end = wr0, wr1
+
     data_rows = []
     for r in range(r_start, r_end):
-        vals = [_cell_value(sheet.cell(r, c)) for c in range(c0, c1)]
+        vals = [_cell_value(sheet.cell(r, c)) for c in range(ec0, ec1)]
         data_rows.append({
             "row_idx": r + 1,
             "is_context": r < r0 or r >= r1,
             "values": vals,
         })
-    return {
-        "headers": list(header),
-        "col_offset": c0,
+    out = {
+        "headers": list(header[ec0 - c0:ec1 - c0]),
+        "col_offset": ec0,
         "highlight_cols": list(highlight_cols),
         "highlight_rows": list(highlight_rows) if highlight_rows else [],
         "rows": data_rows,
     }
+    if truncated:
+        out["truncated"] = True
+    return out
 
 
 def benign_reason(f):
@@ -1215,6 +1273,13 @@ _MAX_BLOCK_COLS = int(os.environ.get("PAPERCONAN_MAX_BLOCK_COLS", "120"))
 # Output cap: each finding embeds a table-snippet as evidence, so a paper with thousands of
 # findings balloons scan.json to many GB. Stop collecting blocks once this many have findings.
 _MAX_REPORT_BLOCKS = int(os.environ.get("PAPERCONAN_MAX_REPORT_BLOCKS", "2000"))
+# Per-finding evidence cap: each finding embeds a sub-rectangle of its block as evidence.
+# On a dense matrix a single block can be hundreds of rows × cols, and that copy is duplicated
+# across thousands of findings — ballooning the scan dict / scan.json to many GB and OOMing the
+# worker. Bound each evidence snippet to a contiguous window of this many rows × cols (always
+# including the highlighted cells). Small blocks are emitted whole and stay byte-identical.
+_MAX_EV_ROWS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_ROWS", "50"))
+_MAX_EV_COLS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_COLS", "30"))
 
 
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
