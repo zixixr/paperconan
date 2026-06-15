@@ -1291,8 +1291,11 @@ _MAX_EV_COLS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_COLS", "30"))
 
 
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
-             profile="review", write_json=True):
+             profile="review", write_json=True, evidence=True):
     profile = normalize_profile(profile)
+    # The HTML report renders the evidence snippets, so it requires them.
+    if write_html:
+        evidence = True
     files = sorted({p for pat in ("*.xlsx", "*.csv", "*.tsv", "*.pdf", "*.docx")
                     for p in glob.glob(os.path.join(in_dir, pat))})
     if not files:
@@ -1383,7 +1386,8 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 if rel or ap or eq or wc or iar or gg:
                     sheet_context = " ".join([os.path.basename(f), sn, *[str(h) for h in header]])
                     for group in (rel, ap, eq, wc, iar, gg):
-                        _attach_evidence(group, sheet, r0, r1, c0, c1, header)
+                        if evidence:
+                            _attach_evidence(group, sheet, r0, r1, c0, c1, header)
                         _attach_benign(group)
                         apply_profile_to_findings(group, profile,
                                                   sheet_context=sheet_context)
