@@ -595,15 +595,21 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
             if n < 4:
                 continue
             x, y = ai[mask], aj[mask]
+            # Scale-relative tolerance. A fixed absolute atol (1e-9) misfires on tiny-magnitude
+            # data: e.g. MEG fields ~1e-14 T are all within 1e-9 of each other, so every column
+            # pair falsely reads as identical/linear. Tie the tolerance to the data magnitude so
+            # these are tests of RELATIVE precision at any scale (and large-magnitude columns
+            # aren't held to an unreasonably tight absolute bound either).
+            tol = 1e-9 * max(float(np.max(np.abs(x))), float(np.max(np.abs(y))), 1e-300)
             # identical
-            if np.allclose(x, y, atol=1e-9):
+            if np.allclose(x, y, atol=tol, rtol=1e-9):
                 findings.append(dict(kind="identical_column", col_a=header[ci - c0], col_b=header[cj - c0],
                                      col_a_idx=ci, col_b_idx=cj, n=n, severity="high",
                                      rule=f"col[{cj}] == col[{ci}]"))
                 continue
             # constant offset
             diff = y - x
-            if np.std(diff) < 1e-9 and abs(np.mean(diff)) > 1e-9:
+            if np.std(diff) < tol and abs(np.mean(diff)) > tol:
                 findings.append(dict(kind="constant_offset", col_a=header[ci - c0], col_b=header[cj - c0],
                                      col_a_idx=ci, col_b_idx=cj, n=n, offset=float(np.mean(diff)),
                                      severity="high",
@@ -619,9 +625,9 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                                          rule=f"col[{cj}] = col[{ci}] * {np.mean(ratio):.6g}"))
             # mirror: x + y == constant
             csum = x + y
-            if n >= 5 and np.std(csum) < 1e-9:
+            if n >= 5 and np.std(csum) < tol:
                 K = float(np.mean(csum))
-                if abs(K) > 1e-9:
+                if abs(K) > tol:
                     findings.append(dict(kind="sum_constant", col_a=header[ci - c0], col_b=header[cj - c0],
                                          col_a_idx=ci, col_b_idx=cj, n=n, sum=K,
                                          severity="high",
@@ -633,8 +639,8 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                 except ValueError:
                     continue
                 resid = y - (slope * x + intercept)
-                if np.std(y) > 0 and np.std(resid) < 1e-9 and abs(r) > 0.99:
-                    if not (abs(slope - 1) < 1e-9 and abs(intercept) < 1e-9):
+                if np.std(y) > 0 and np.std(resid) < tol and abs(r) > 0.99:
+                    if not (abs(slope - 1) < 1e-9 and abs(intercept) < tol):
                         findings.append(dict(kind="exact_linear", col_a=header[ci - c0], col_b=header[cj - c0],
                                              col_a_idx=ci, col_b_idx=cj, n=n,
                                              slope=float(slope), intercept=float(intercept),
@@ -696,7 +702,8 @@ def detect_arithmetic_progression(sheet, r0, r1, c0, c1, header):
         if len(a) < 5:
             continue
         diffs = np.diff(a)
-        if np.allclose(diffs, diffs[0], atol=1e-9) and abs(diffs[0]) > 1e-9:
+        tol = 1e-9 * max(float(np.max(np.abs(a))), 1e-300)   # scale-relative (see detect_relations)
+        if np.allclose(diffs, diffs[0], atol=tol, rtol=1e-9) and abs(diffs[0]) > tol:
             sev = "medium" if abs(diffs[0] - round(diffs[0])) < 1e-9 else "high"
             findings.append(dict(kind="arithmetic_progression", col=header[c - c0], col_idx=c,
                                  n=int(len(a)), step=float(diffs[0]), first=float(a[0]),
@@ -964,8 +971,11 @@ def detect_equal_pairs(sheet, r0, r1, c0, c1, header):
             n = int(mask.sum())
             if n < 6:
                 continue
-            eq = int((np.isclose(a[mask], b[mask], atol=1e-6)).sum())
-            if eq >= max(6, n // 2) and eq / n >= 0.5 and not np.allclose(a[mask], b[mask], atol=1e-9):
+            am, bm = a[mask], b[mask]
+            # scale-relative tolerances (a fixed atol misfires on tiny-magnitude data — see detect_relations)
+            scale = max(float(np.max(np.abs(am))), float(np.max(np.abs(bm))), 1e-300)
+            eq = int((np.isclose(am, bm, atol=1e-6 * scale, rtol=1e-6)).sum())
+            if eq >= max(6, n // 2) and eq / n >= 0.5 and not np.allclose(am, bm, atol=1e-9 * scale, rtol=1e-9):
                 findings.append(dict(kind="many_equal_pairs", col_a=header[i], col_b=header[j],
                                      col_a_idx=c0 + i, col_b_idx=c0 + j, n=n, equal=eq,
                                      severity="medium" if eq < n else "high",
