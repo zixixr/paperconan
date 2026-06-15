@@ -412,6 +412,19 @@ def col_array(sheet, r0, r1, c):
     return sheet.numeric[r0:r1, c].copy()
 
 
+def _sample(arr, k=8):
+    """A tiny value peek for downstream LLM triage: the first <=k finite numeric
+    values of `arr` as built-in floats rounded to 6 significant figures. Bounded to
+    <=k elements so it CANNOT reintroduce the evidence-bloat OOM (~64 bytes here)."""
+    out = []
+    for v in arr[:k]:
+        fv = float(v)
+        if math.isnan(fv) or math.isinf(fv):
+            continue
+        out.append(round(fv, 6))
+    return out
+
+
 # ---------- evidence helpers ----------
 
 def _cell_value(v):
@@ -595,6 +608,8 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
             if n < 4:
                 continue
             x, y = ai[mask], aj[mask]
+            # Compact value peek for downstream LLM triage (bounded <=8 each, ~tiny).
+            sa, sb = _sample(x), _sample(y)
             # Scale-relative tolerance. A fixed absolute atol (1e-9) misfires on tiny-magnitude
             # data: e.g. MEG fields ~1e-14 T are all within 1e-9 of each other, so every column
             # pair falsely reads as identical/linear. Tie the tolerance to the data magnitude so
@@ -605,6 +620,7 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
             if np.allclose(x, y, atol=tol, rtol=1e-9):
                 findings.append(dict(kind="identical_column", col_a=header[ci - c0], col_b=header[cj - c0],
                                      col_a_idx=ci, col_b_idx=cj, n=n, severity="high",
+                                     col_a_sample=sa, col_b_sample=sb,
                                      rule=f"col[{cj}] == col[{ci}]"))
                 continue
             # constant offset
@@ -613,6 +629,7 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                 findings.append(dict(kind="constant_offset", col_a=header[ci - c0], col_b=header[cj - c0],
                                      col_a_idx=ci, col_b_idx=cj, n=n, offset=float(np.mean(diff)),
                                      severity="high",
+                                     col_a_sample=sa, col_b_sample=sb,
                                      rule=f"col[{cj}] = col[{ci}] + {np.mean(diff):.6g}"))
                 continue
             # constant ratio
@@ -622,6 +639,7 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                     findings.append(dict(kind="constant_ratio", col_a=header[ci - c0], col_b=header[cj - c0],
                                          col_a_idx=ci, col_b_idx=cj, n=n, ratio=float(np.mean(ratio)),
                                          severity="high",
+                                         col_a_sample=sa, col_b_sample=sb,
                                          rule=f"col[{cj}] = col[{ci}] * {np.mean(ratio):.6g}"))
             # mirror: x + y == constant
             csum = x + y
@@ -631,6 +649,7 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                     findings.append(dict(kind="sum_constant", col_a=header[ci - c0], col_b=header[cj - c0],
                                          col_a_idx=ci, col_b_idx=cj, n=n, sum=K,
                                          severity="high",
+                                         col_a_sample=sa, col_b_sample=sb,
                                          rule=f"col[{ci}] + col[{cj}] = {K:.6g}"))
             # exact linear (non-identical)
             if n >= 5 and np.ptp(x) > 1e-12:
@@ -645,6 +664,7 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                                              col_a_idx=ci, col_b_idx=cj, n=n,
                                              slope=float(slope), intercept=float(intercept),
                                              severity="high",
+                                             col_a_sample=sa, col_b_sample=sb,
                                              rule=f"col[{cj}] = {slope:.4g} * col[{ci}] + {intercept:.4g}"))
             # small discrete diff set
             if n >= 8:
@@ -655,6 +675,7 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                                          col_a_idx=ci, col_b_idx=cj, n=n,
                                          unique_diffs=[float(x) for x in uniq],
                                          severity="medium",
+                                         col_a_sample=sa, col_b_sample=sb,
                                          rule=f"col[{cj}] - col[{ci}] only takes {len(uniq)} discrete values"))
     return findings
 
@@ -979,6 +1000,7 @@ def detect_equal_pairs(sheet, r0, r1, c0, c1, header):
                 findings.append(dict(kind="many_equal_pairs", col_a=header[i], col_b=header[j],
                                      col_a_idx=c0 + i, col_b_idx=c0 + j, n=n, equal=eq,
                                      severity="medium" if eq < n else "high",
+                                     col_a_sample=_sample(am), col_b_sample=_sample(bm),
                                      rule=f"col[{c0+i}] == col[{c0+j}] in {eq}/{n} rows"))
     return findings
 
