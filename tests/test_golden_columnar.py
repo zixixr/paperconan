@@ -57,9 +57,15 @@ def _sortkey(obj) -> str:
     return json.dumps(obj, sort_keys=True, default=str)
 
 
+# Display-only fields dropped from the golden substance: the evidence blob plus the
+# per-finding value-peek samples (col_a_sample/col_b_sample) fed to downstream LLM
+# triage. Like `evidence`, these are presentation data, not finding substance.
+_DISPLAY_ONLY = frozenset({"evidence", "col_a_sample", "col_b_sample"})
+
+
 def _drop_evidence(finding: dict) -> dict:
-    """A finding without its (large, rendering-only) evidence blob."""
-    return {k: v for k, v in finding.items() if k != "evidence"}
+    """A finding without its (large, rendering-only) evidence/sample display blobs."""
+    return {k: v for k, v in finding.items() if k not in _DISPLAY_ONLY}
 
 
 def _stable(scan: dict) -> dict:
