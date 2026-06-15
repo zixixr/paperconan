@@ -1,5 +1,5 @@
 from paperconan._sheet import Sheet
-from paperconan._audit import _block_evidence
+from paperconan._audit import _block_evidence, scan_dir
 
 
 def _grid(nr, nc):
@@ -23,3 +23,18 @@ def test_big_block_truncated_keeps_highlight():
     # the highlighted columns are within the emitted window
     assert ev["col_offset"] <= 150 and ev["col_offset"] + len(ev["headers"]) > 151
     assert len(ev["headers"]) == len(ev["rows"][0]["values"])
+
+
+def test_write_json_false_skips_file(tmp_path):
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).parent))
+    from build_fixture import build as build_tiny
+    ind = tmp_path / "in"; out = tmp_path / "out"; ind.mkdir()
+    build_tiny(str(ind))
+    res = scan_dir(str(ind), str(out), write_md=False, write_html=False, write_json=False)
+    assert res is not None and "relations_blocks" in res
+    assert not (out / "scan.json").exists()
+    # default writes it
+    out2 = tmp_path / "out2"
+    scan_dir(str(ind), str(out2), write_md=False, write_html=False)
+    assert (out2 / "scan.json").exists()

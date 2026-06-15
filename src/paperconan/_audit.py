@@ -1283,7 +1283,7 @@ _MAX_EV_COLS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_COLS", "30"))
 
 
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
-             profile="review"):
+             profile="review", write_json=True):
     profile = normalize_profile(profile)
     files = sorted({p for pat in ("*.xlsx", "*.csv", "*.tsv", "*.pdf", "*.docx")
                     for p in glob.glob(os.path.join(in_dir, pat))})
@@ -1427,8 +1427,9 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                decimal_endings=decimal_reports,
                cross_sheet_findings=cross_sheet_findings)
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "scan.json"), "w") as fh:
-        json.dump(out, fh, indent=2, default=str)
+    if write_json:
+        with open(os.path.join(out_dir, "scan.json"), "w") as fh:
+            json.dump(out, fh, indent=2, default=str)
     if write_md:
         write_markdown_report(out, os.path.join(out_dir, "REPORT.md"))
     if write_html:
