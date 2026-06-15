@@ -266,6 +266,14 @@ def _load_workbook_calamine(path):
     loaded = 0                                       # cumulative cells across this file's sheets
     for name in wb.sheet_names:
         sh = wb.get_sheet_by_name(name)
+        # Reject from the cheap DECLARED dimensions BEFORE to_python materializes the
+        # full bounding box: a sheet that declares e.g. C1000000 would otherwise
+        # allocate millions of cells just to be discarded — that materialization is
+        # what OOMs in prod. `height` × `width` matches to_python(skip_empty_area=False).
+        h, w = sh.height, sh.width
+        if loaded >= _MAX_CELLS or (h and w and h * w > _MAX_CELLS):
+            out[name] = None
+            continue
         rows = sh.to_python(skip_empty_area=False)
         mr = len(rows)
         mc = max((len(row) for row in rows), default=0)

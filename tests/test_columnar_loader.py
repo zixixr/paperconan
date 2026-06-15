@@ -89,3 +89,31 @@ def test_calamine_matches_openpyxl(tmp_path):
             assert a.nrows == b.nrows and a.ncols == b.ncols
             assert np.array_equal(np.nan_to_num(a.numeric, nan=-1.5e9), np.nan_to_num(b.numeric, nan=-1.5e9))
             assert a._text == b._text and a._ints == b._ints
+
+
+def test_calamine_huge_bounding_box_is_none_not_oom(tmp_path, monkeypatch):
+    import importlib.util
+    if importlib.util.find_spec("python_calamine") is None:
+        pytest.skip("no calamine")
+    import paperconan._audit as A
+    monkeypatch.setattr(A, "_MAX_CELLS", 1_000_000)
+    p = tmp_path / "huge.xlsx"; wb = openpyxl.Workbook(); ws = wb.active
+    ws["A1"] = 1
+    ws["C1000000"] = 2          # ~3M declared cells > 1M cap (within Excel's row limit)
+    wb.save(str(p))
+
+    # The oversized sheet must be rejected from its DECLARED dimensions, BEFORE
+    # to_python materializes the full bounding box (that materialization is what
+    # OOMs in prod). Spy on to_python to prove it is never called on this sheet.
+    import python_calamine as pc
+    orig = pc.CalamineSheet.to_python
+    calls = {"n": 0}
+
+    def spy(self, *a, **k):
+        calls["n"] += 1
+        return orig(self, *a, **k)
+
+    monkeypatch.setattr(pc.CalamineSheet, "to_python", spy)
+    out = A._load_workbook_calamine(str(p))   # must NOT OOM; oversized -> None
+    assert out["Sheet"] is None
+    assert calls["n"] == 0                     # never materialized the huge box
