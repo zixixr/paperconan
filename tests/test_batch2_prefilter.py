@@ -225,6 +225,88 @@ def test_prefilter_drops_common_unit_scale_even_with_blank_labels():
     assert f["prefilter_reason"] == "unit_conversion_or_normalization"
 
 
+def test_prefilter_drops_genome_size_pg_to_mbp_conversion():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "1C_pg",
+        "1C_Mbp",
+        42,
+        1.0,
+        "col[5] = col[4] * 980",
+        [4.43, 4.70, 6.00, 7.35, 8.28],
+        [4341.4, 4606.0, 5880.0, 7203.0, 8114.4],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "unit_conversion_or_normalization"
+
+
+def test_prefilter_does_not_treat_pg_to_gbp_factor_as_mbp_conversion():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "1C_pg",
+        "1C_Mbp",
+        42,
+        1.0,
+        "col[7] = col[4] * 0.98",
+        [4.43, 4.70, 6.00, 7.35, 8.28],
+        [4.3414, 4.606, 5.88, 7.203, 8.1144],
+    )
+
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_drops_genome_size_pg_to_gbp_conversion():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "1C_pg",
+        "1C_Gbp",
+        42,
+        1.0,
+        "col[7] = col[4] * 0.98",
+        [4.43, 4.70, 6.00, 7.35, 8.28],
+        [4.3414, 4.606, 5.88, 7.203, 8.1144],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "unit_conversion_or_normalization"
+
+
+def test_prefilter_keeps_unlabeled_980_factor_without_genome_size_context():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "",
+        "",
+        23,
+        1.0,
+        "col[5] = col[4] * 980",
+        [0.63, 0.93, 1.05, 1.27, 1.50],
+        [617.4, 911.4, 1029.0, 1244.6, 1470.0],
+    )
+
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_keeps_non_genome_size_text_labels_with_980_ratio():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "Drug A response",
+        "Drug B response",
+        12,
+        1.0,
+        "col[2] = col[1] * 980",
+        [0.63, 0.93, 1.05, 1.27, 1.50],
+        [617.4, 911.4, 1029.0, 1244.6, 1470.0],
+    )
+
+    assert f["prefilter"] == "keep"
+
+
 def test_prefilter_keeps_non_unit_tiny_ratio():
     cp = _collector()
     f = cp.prefilter_relation_finding(
