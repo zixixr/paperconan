@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from typing import Iterable
 
+from ._prefilter import make_finding as _make_relation_prefilter_finding
 from .schema import Profile, VALID_PROFILES
 
 
@@ -114,6 +115,46 @@ def _is_derived_relation(f: dict) -> bool:
     return bool(_DERIVED_RE.search(_names_for(f)))
 
 
+def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
+    if f.get("kind") not in {
+        "identical_column",
+        "constant_offset",
+        "constant_ratio",
+        "exact_linear",
+        "sum_constant",
+        "many_equal_pairs",
+    }:
+        return None
+    try:
+        n = int(f.get("n") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    frac = None
+    if f.get("kind") == "many_equal_pairs" and n:
+        try:
+            frac = float(f.get("equal")) / n
+        except (TypeError, ValueError):
+            frac = None
+    pf = _make_relation_prefilter_finding(
+        f.get("kind"),
+        f.get("col_a"),
+        f.get("col_b"),
+        n,
+        frac,
+        f.get("rule"),
+        f.get("col_a_sample"),
+        f.get("col_b_sample"),
+    )
+    action = pf.get("prefilter")
+    reason = pf.get("prefilter_reason")
+    if action in {"drop", "downweight"} and reason:
+        f["prefilter"] = action
+        f["prefilter_reason"] = reason
+        f["prefilter_flags"] = pf.get("flags", {})
+        return str(action), str(reason)
+    return None
+
+
 def _is_omics_boundary_flood(f: dict, sheet_context: str = "") -> bool:
     if f.get("kind") not in {"within_col_value_duplication", "within_col_decimal_repetition"}:
         return False
@@ -128,7 +169,7 @@ def _is_same_data_replot(f: dict) -> bool:
         return False
     if f.get("same_figure"):
         return True
-    return bool(_REplot_RE.search(_names_for(f)))
+    return False
 
 
 def apply_profile_to_findings(findings: Iterable[dict], profile: str | None,
@@ -160,6 +201,20 @@ def apply_profile_to_findings(findings: Iterable[dict], profile: str | None,
                 "or derived summary statistic",
             )
             _demote_or_hide(f, profile_name)
+        elif relation_decision := _relation_prefilter(f):
+            action, reason = relation_decision
+            ctx = (
+                "deterministic_relation_prefilter"
+                if action == "drop"
+                else "deterministic_relation_downweight"
+            )
+            _add_context(
+                f,
+                ctx,
+                f"deterministic relation prefilter matched {reason}; "
+                "this pattern is usually a derived, structural, or low-information relation",
+            )
+            _demote_or_hide(f, profile_name)
         elif _is_same_data_replot(f):
             _add_context(
                 f, "same_data_replot_or_duplicate_upload",
@@ -172,4 +227,3 @@ def apply_profile_to_findings(findings: Iterable[dict], profile: str | None,
                 "large omics/statistical matrices commonly contain many zero, one, adjusted-p, or logFC boundary values",
             )
             _demote_or_hide(f, profile_name)
-

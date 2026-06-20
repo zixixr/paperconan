@@ -6,6 +6,6 @@ def test_engineering_modules_expose_scanner_boundaries():
 
     assert callable(io.load_table)
     assert callable(detectors.detect_relations)
+    assert callable(detectors.prefilter_relation_finding)
     assert callable(collisions.detect_collisions)
     assert schema.VALID_PROFILES == ("review", "forensic", "triage")
-
