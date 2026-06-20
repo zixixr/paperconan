@@ -358,6 +358,23 @@ def test_prefilter_keeps_compact_coordinate_x0_x2_labels():
     assert f["prefilter"] == "keep"
 
 
+def test_prefilter_does_not_treat_sample_size_slash_labels_as_formula():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "exact_linear",
+        "34,990 cases / 150,760 controls",
+        "17,790 cases / 243,645 controls",
+        20,
+        1.0,
+        "col[5] = 1.26 * col[4] + -1065",
+        [112.0, 245.0, 301.0, 499.0, 812.0],
+        [-923.88, -756.3, -685.74, -436.26, -41.88],
+    )
+
+    assert f["flags"]["explicit_formula_label"] is False
+    assert f["prefilter"] == "keep"
+
+
 def test_prefilter_reports_formula_reason_before_axis_when_formula_samples_are_arithmetic():
     cp = _collector()
     f = cp.prefilter_relation_finding(
