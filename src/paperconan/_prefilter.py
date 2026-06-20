@@ -94,7 +94,9 @@ _COORDINATE_CONTEXT_RE = re.compile(
     re.I,
 )
 _EXPLICIT_FORMULA_RE = re.compile(
-    r"(?<![a-z0-9])(?:x|×|\*)\s*\d+(?:\.\d+)?\b|"
+    r"(?<![a-z0-9])(?:x|×|\*)\s+(?:\d+(?:\.\d+)?|\d{1,3}(?:,\d{3})+)\b|"
+    r"(?<![a-z0-9])(?:x|×|\*)\s*10(?:\^|-)?\d*\b|"
+    r"(?<![a-z0-9])(?:×|\*)\s*\d+(?:\.\d+)?\b|"
     r"(?:^|\s)/\s*\d+(?:\.\d+)?\b|"
     r"\bper\s+\d+(?:\.\d+)?\b|"
     r"\b(?:startplusone|2\^-|1/koff|ln\(2\)|log2|log10)\b",

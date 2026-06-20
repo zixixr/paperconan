@@ -324,6 +324,40 @@ def test_prefilter_drops_explicit_multiplier_formula_labels():
     assert f["prefilter_reason"] == "explicit_formula_or_unit_conversion"
 
 
+def test_prefilter_does_not_treat_coordinate_x1_y1_as_formula():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_offset",
+        "x1",
+        "y1",
+        4101,
+        1.0,
+        "col[2] = col[1] + 10000",
+        [1.31, 2.47, 2.93, 4.81, 7.29],
+        [10001.31, 10002.47, 10002.93, 10004.81, 10007.29],
+    )
+
+    assert f["flags"]["explicit_formula_label"] is False
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_keeps_compact_coordinate_x0_x2_labels():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "identical_column",
+        "x0",
+        "x2",
+        5,
+        1.0,
+        "col[20] == col[18]",
+        [0.11, 0.29, 0.37, 0.68, 0.91],
+        [0.11, 0.29, 0.37, 0.68, 0.91],
+    )
+
+    assert f["flags"]["explicit_formula_label"] is False
+    assert f["prefilter"] == "keep"
+
+
 def test_prefilter_reports_formula_reason_before_axis_when_formula_samples_are_arithmetic():
     cp = _collector()
     f = cp.prefilter_relation_finding(
