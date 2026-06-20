@@ -211,6 +211,24 @@ def test_cross_figure_perfect_duplicate_is_not_demoted_as_source_replot():
     assert "same_data_replot_or_duplicate_upload" not in cf["false_positive_context"]
 
 
+def test_cross_file_perfect_duplicate_is_not_demoted_as_same_figure_replot():
+    ga = {(r, c): round(1.2345 + r + c * 0.1, 4)
+          for r in range(6) for c in range(2)}
+    gb = dict(ga)
+    findings = detect_collisions({
+        ("main_source_data.xlsx", "Figure 2a source data"): ga,
+        ("supplementary_table.xlsx", "Figure 2b source data"): gb,
+    })
+
+    cf = findings[0]
+    assert cf["delta"]["pattern"] == "perfect_dup"
+    assert cf["same_file"] is False
+    assert cf["same_figure"] is False
+    assert cf["severity"] == "high"
+    assert cf["profile_action"] == "kept"
+    assert "same_data_replot_or_duplicate_upload" not in cf["false_positive_context"]
+
+
 def test_cli_accepts_profile_flag(tmp_path):
     data = tmp_path / "d"
     data.mkdir()
