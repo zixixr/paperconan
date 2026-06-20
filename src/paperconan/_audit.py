@@ -1200,7 +1200,7 @@ def detect_collisions(grids, profile="review"):
             scope = "sheets" if same_file else "files"
 
             fig_a, fig_b = figure_key(sa), figure_key(sb)
-            same_figure = bool(fig_a and fig_b and fig_a == fig_b)
+            same_figure = bool(same_file and fig_a and fig_b and fig_a == fig_b)
             context = None
             if same_figure:
                 context = (f"both sheets belong to the same display item ({fig_a}); "

@@ -21,6 +21,7 @@ from ._audit import (
     grim_consistent,
     grimmer_consistent,
 )
+from ._prefilter import make_finding as prefilter_relation_finding
 
 __all__ = [
     "RELATION_FLOOD_CAP",
@@ -36,5 +37,5 @@ __all__ = [
     "detect_within_column_patterns",
     "grim_consistent",
     "grimmer_consistent",
+    "prefilter_relation_finding",
 ]
-

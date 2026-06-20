@@ -88,6 +88,45 @@ def test_review_profile_demotes_unit_conversion_relation(tmp_path):
                for f in relations)
 
 
+def test_review_profile_demotes_explicit_formula_relation(tmp_path):
+    data = tmp_path / "d"
+    data.mkdir()
+    rows = ["sample,signal,signal x 100"]
+    for i in range(8):
+        signal = 1.25 + i * 0.37
+        rows.append(f"s{i},{signal},{signal * 100}")
+    (data / "formula.csv").write_text(_csv(rows), encoding="utf-8")
+
+    scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+    relations = [f for f in _all_block_findings(scan)
+                 if f["kind"] in {"constant_ratio", "exact_linear"}]
+
+    assert relations
+    assert any("deterministic_relation_prefilter" in f.get("false_positive_context", [])
+               and f.get("prefilter_reason") == "explicit_formula_or_unit_conversion"
+               and f["severity"] == "low"
+               and f["profile_action"] == "demoted"
+               for f in relations)
+
+
+def test_review_profile_keeps_independent_condition_transform(tmp_path):
+    data = tmp_path / "d"
+    data.mkdir()
+    rows = ["sample,Control,Treatment"]
+    for i, control in enumerate([1.25, 1.91, 2.44, 3.78, 5.12, 8.03, 13.7, 21.4]):
+        rows.append(f"s{i},{control},{control * 1.337}")
+    (data / "conditions.csv").write_text(_csv(rows), encoding="utf-8")
+
+    scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+    relations = [f for f in _all_block_findings(scan)
+                 if f["kind"] in {"constant_ratio", "exact_linear"}]
+
+    assert relations
+    assert all(f["profile_action"] == "kept" for f in relations)
+    assert all("deterministic_relation_prefilter" not in f.get("false_positive_context", [])
+               for f in relations)
+
+
 def test_triage_profile_hides_noisy_boundary_findings_from_html(tmp_path):
     scan = {
         "input_dir": "/tmp/x", "n_files": 1, "n_blocks_with_findings": 1,
@@ -125,7 +164,7 @@ def test_review_profile_marks_source_data_duplicate_replot():
     gb = dict(ga)
     findings = detect_collisions({
         ("source_data.xlsx", "Figure 2a source data"): ga,
-        ("supplementary_table.xlsx", "Supplementary Table 1"): gb,
+        ("source_data.xlsx", "Figure 2b source data"): gb,
     })
 
     cf = findings[0]
@@ -153,6 +192,41 @@ def test_true_copy_then_tweak_survives_review_profile():
     assert cf["delta"]["pattern"] == "value_tweaked"
     assert cf["severity"] == "high"
     assert cf["profile_action"] == "kept"
+
+
+def test_cross_figure_perfect_duplicate_is_not_demoted_as_source_replot():
+    ga = {(r, c): round(1.2345 + r + c * 0.1, 4)
+          for r in range(6) for c in range(2)}
+    gb = dict(ga)
+    findings = detect_collisions({
+        ("source_data.xlsx", "ExtFig 8c source data"): ga,
+        ("source_data.xlsx", "ExtFig 10a source data"): gb,
+    })
+
+    cf = findings[0]
+    assert cf["delta"]["pattern"] == "perfect_dup"
+    assert cf["same_figure"] is False
+    assert cf["severity"] == "high"
+    assert cf["profile_action"] == "kept"
+    assert "same_data_replot_or_duplicate_upload" not in cf["false_positive_context"]
+
+
+def test_cross_file_perfect_duplicate_is_not_demoted_as_same_figure_replot():
+    ga = {(r, c): round(1.2345 + r + c * 0.1, 4)
+          for r in range(6) for c in range(2)}
+    gb = dict(ga)
+    findings = detect_collisions({
+        ("main_source_data.xlsx", "Figure 2a source data"): ga,
+        ("supplementary_table.xlsx", "Figure 2b source data"): gb,
+    })
+
+    cf = findings[0]
+    assert cf["delta"]["pattern"] == "perfect_dup"
+    assert cf["same_file"] is False
+    assert cf["same_figure"] is False
+    assert cf["severity"] == "high"
+    assert cf["profile_action"] == "kept"
+    assert "same_data_replot_or_duplicate_upload" not in cf["false_positive_context"]
 
 
 def test_cli_accepts_profile_flag(tmp_path):
