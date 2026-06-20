@@ -79,12 +79,12 @@ _IMAGE_DERIVED_RE = re.compile(
     re.I,
 )
 _GENOMIC_START_RE = re.compile(
-    r"(^|[^a-z])(chrom)?(motif|midpoint|block|thick)?[_ -]*(start|s1|bp)([^a-z]|$)"
+    r"(^|[^a-z])(chrom)?(motif|midpoint|block|thick)?[_ -]*(start[lr]?|s1|bp)([^a-z]|$)"
     r"|start[_ -]*position",
     re.I,
 )
 _GENOMIC_END_RE = re.compile(
-    r"(^|[^a-z])(chrom)?(motif|midpoint|block|thick)?[_ -]*(end|stop|e1|genpos)([^a-z]|$)"
+    r"(^|[^a-z])(chrom)?(motif|midpoint|block|thick)?[_ -]*(end[lr]?|stop|e1|genpos)([^a-z]|$)"
     r"|end[_ -]*position",
     re.I,
 )
@@ -169,18 +169,39 @@ def _samples_sum_constant(sa: list[Any] | None, sb: list[Any] | None, tol: float
     return all(abs(x - target) <= tol * scale for x in sums[1:])
 
 
-def _complement_percentage(kind: str | None, a: str | None, b: str | None,
-                           sa: list[Any] | None, sb: list[Any] | None) -> bool:
-    if kind != "sum_constant":
+def _exact_linear_negative_unit_intercept(slope: Any, intercept: Any, target: float,
+                                          tol: float = 1e-9) -> bool:
+    try:
+        s = float(slope)
+        b = float(intercept)
+    except (TypeError, ValueError):
         return False
-    if _percent_label(a) or _percent_label(b):
+    return abs(s + 1.0) <= tol and abs(b - target) <= tol * max(abs(target), 1.0)
+
+
+def _complement_percentage(kind: str | None, a: str | None, b: str | None,
+                           sa: list[Any] | None, sb: list[Any] | None,
+                           slope: Any = None, intercept: Any = None) -> bool:
+    if kind not in {"sum_constant", "exact_linear"}:
+        return False
+    if kind == "sum_constant" and (_percent_label(a) or _percent_label(b)):
         return True
+    if kind == "exact_linear" and not _exact_linear_negative_unit_intercept(slope, intercept, 100.0):
+        return False
     return _sample_sums_to(sa, sb, 100.0)
 
 
 def _complement_fraction(kind: str | None, _a: str | None, _b: str | None,
-                         sa: list[Any] | None, sb: list[Any] | None) -> bool:
-    if kind != "sum_constant":
+                         sa: list[Any] | None, sb: list[Any] | None,
+                         slope: Any = None, intercept: Any = None) -> bool:
+    if kind not in {"sum_constant", "exact_linear"}:
+        return False
+    if not (_derived_label(_a) or _derived_label(_b) or _percent_label(_a) or _percent_label(_b)):
+        return False
+    if kind == "exact_linear" and not (
+        _exact_linear_negative_unit_intercept(slope, intercept, 1.0)
+        or _exact_linear_negative_unit_intercept(slope, intercept, 2.0)
+    ):
         return False
     return _sample_sums_to(sa, sb, 1.0) or _sample_sums_to(sa, sb, 2.0)
 
@@ -190,8 +211,13 @@ def _tokenized_label(label: str | None) -> set[str]:
 
 
 def _complement_category(kind: str | None, a: str | None, b: str | None,
-                         sa: list[Any] | None, sb: list[Any] | None) -> bool:
-    if kind != "sum_constant" or not _samples_sum_constant(sa, sb):
+                         sa: list[Any] | None, sb: list[Any] | None,
+                         slope: Any = None, intercept: Any = None) -> bool:
+    if kind not in {"sum_constant", "exact_linear"} or not _samples_sum_constant(sa, sb):
+        return False
+    if kind == "exact_linear" and not _exact_linear_negative_unit_intercept(
+        slope, intercept, _nums(sa)[0] + _nums(sb)[0] if _nums(sa) and _nums(sb) else 0.0
+    ):
         return False
     ta, tb = _tokenized_label(a), _tokenized_label(b)
     for left, right in _COMPLEMENT_LABEL_PAIRS:
@@ -285,6 +311,16 @@ def _explicit_formula_label(label: str | None) -> bool:
     return bool(_EXPLICIT_FORMULA_RE.search(label or ""))
 
 
+def _signed_formula_counterpart(a: str | None, b: str | None) -> bool:
+    left = re.sub(r"\s+", "", a or "")
+    right = re.sub(r"\s+", "", b or "")
+    if not left or not right:
+        return False
+    if not any(ch in left + right for ch in "/^*"):
+        return False
+    return right == "-" + left or left == "-" + right
+
+
 def _count_to_probability_or_rate(kind: str | None, a: str | None, b: str | None) -> bool:
     if kind not in {"constant_ratio", "exact_linear"}:
         return False
@@ -361,6 +397,8 @@ def prefilter(kind: str | None, a: str | None, b: str | None,
     if flags.get("common_unit_scale"):
         return "drop", "unit_conversion_or_normalization"
     if flags["derived_label"]:
+        if kind in {"constant_ratio", "constant_offset", "exact_linear", "sum_constant"}:
+            return "downweight", "derived_normalized"
         return "drop", "derived_normalized"
     if flags.get("low_information_sparse"):
         return "downweight", "low_information_sparse_transform"
@@ -382,10 +420,13 @@ def make_finding(kind: str | None, a: str | None, b: str | None, n: int,
         "qpcr_derived_label": _qpcr_derived_label(a) or _qpcr_derived_label(b),
         "summary_scale_label": _summary_scale_label(a) or _summary_scale_label(b),
         "image_derived_label": _image_derived_label(a) or _image_derived_label(b),
-        "complement_percentage": _complement_percentage(kind, a, b, sa, sb),
-        "complement_fraction": _complement_fraction(kind, a, b, sa, sb),
-        "complement_category": _complement_category(kind, a, b, sa, sb),
-        "explicit_formula_label": _explicit_formula_label(a) or _explicit_formula_label(b),
+        "complement_percentage": _complement_percentage(kind, a, b, sa, sb, extra.get("slope"), extra.get("intercept")),
+        "complement_fraction": _complement_fraction(kind, a, b, sa, sb, extra.get("slope"), extra.get("intercept")),
+        "complement_category": _complement_category(kind, a, b, sa, sb, extra.get("slope"), extra.get("intercept")),
+        "explicit_formula_label": (
+            _explicit_formula_label(a) or _explicit_formula_label(b)
+            or _signed_formula_counterpart(a, b)
+        ),
         "count_to_probability_or_rate": _count_to_probability_or_rate(kind, a, b),
         "common_unit_scale": _common_unit_scale(kind, sa, sb),
         "genome_size_unit_conversion": _genome_size_unit_conversion(kind, a, b, sa, sb),
