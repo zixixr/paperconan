@@ -585,6 +585,29 @@ def _attach_evidence(findings, sheet, r0, r1, c0, c1, header):
 
 # ---------- detectors ----------
 
+def _isclose_rowwise(actual, expected, rtol=1e-9):
+    """Return row-wise closeness at each row's own numeric scale.
+
+    A single coordinate/metadata row can be orders of magnitude larger than
+    the measurement rows. A block-wide absolute tolerance lets those small
+    measurement rows drift substantially while still passing a relation check.
+    """
+    actual = np.asarray(actual, dtype=float)
+    expected = np.asarray(expected, dtype=float)
+    row_scale = np.maximum.reduce([
+        np.abs(actual),
+        np.abs(expected),
+        np.full_like(actual, 1e-300, dtype=float),
+    ])
+    typical_scale = max(float(np.median(row_scale)), 1e-300)
+    tol = rtol * row_scale + (np.finfo(float).eps * typical_scale * 64)
+    return np.abs(actual - expected) <= tol
+
+
+def _allclose_rowwise(actual, expected, rtol=1e-9):
+    return bool(np.all(_isclose_rowwise(actual, expected, rtol=rtol)))
+
+
 _GRIM_MEAN_RE = re.compile(r"\b(mean|average|avg)\b|均值|平均", re.I)
 _GRIM_SD_RE = re.compile(r"\b(s\.?d\.?|std)\b|标准差", re.I)
 _GRIM_N_RE = re.compile(r"\bn\b|sample.?size|样本量|例数", re.I)
@@ -617,7 +640,7 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
             # aren't held to an unreasonably tight absolute bound either).
             tol = 1e-9 * max(float(np.max(np.abs(x))), float(np.max(np.abs(y))), 1e-300)
             # identical
-            if np.allclose(x, y, atol=tol, rtol=1e-9):
+            if _allclose_rowwise(x, y):
                 findings.append(dict(kind="identical_column", col_a=header[ci - c0], col_b=header[cj - c0],
                                      col_a_idx=ci, col_b_idx=cj, n=n, severity="high",
                                      col_a_sample=sa, col_b_sample=sb,
@@ -625,22 +648,30 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                 continue
             # constant offset
             diff = y - x
-            if np.std(diff) < tol and abs(np.mean(diff)) > tol:
+            mean_diff = float(np.mean(diff))
+            if abs(mean_diff) > tol and _allclose_rowwise(y, x + mean_diff):
                 findings.append(dict(kind="constant_offset", col_a=header[ci - c0], col_b=header[cj - c0],
-                                     col_a_idx=ci, col_b_idx=cj, n=n, offset=float(np.mean(diff)),
+                                     col_a_idx=ci, col_b_idx=cj, n=n, offset=mean_diff,
                                      severity="high",
                                      col_a_sample=sa, col_b_sample=sb,
-                                     rule=f"col[{cj}] = col[{ci}] + {np.mean(diff):.6g}"))
+                                     rule=f"col[{cj}] = col[{ci}] + {mean_diff:.6g}"))
                 continue
             # constant ratio
             if np.all(np.abs(x) > 1e-12):
                 ratio = y / x
-                if np.std(ratio) < 1e-9 and abs(np.mean(ratio) - 1) > 1e-9 and abs(np.mean(ratio)) > 1e-9:
+                mean_ratio = float(np.mean(ratio))
+                ratio_tol = 1e-9 * max(abs(mean_ratio), 1e-300)
+                if (
+                    np.std(ratio) < ratio_tol
+                    and abs(mean_ratio - 1) > 1e-9
+                    and abs(mean_ratio) > 1e-9
+                    and _allclose_rowwise(y, mean_ratio * x)
+                ):
                     findings.append(dict(kind="constant_ratio", col_a=header[ci - c0], col_b=header[cj - c0],
-                                         col_a_idx=ci, col_b_idx=cj, n=n, ratio=float(np.mean(ratio)),
+                                         col_a_idx=ci, col_b_idx=cj, n=n, ratio=mean_ratio,
                                          severity="high",
                                          col_a_sample=sa, col_b_sample=sb,
-                                         rule=f"col[{cj}] = col[{ci}] * {np.mean(ratio):.6g}"))
+                                         rule=f"col[{cj}] = col[{ci}] * {mean_ratio:.6g}"))
             # mirror: x + y == constant
             csum = x + y
             if n >= 5 and np.std(csum) < tol:
@@ -657,8 +688,8 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                     slope, intercept, r, _p, _se = stats.linregress(x, y)
                 except ValueError:
                     continue
-                resid = y - (slope * x + intercept)
-                if np.std(y) > 0 and np.std(resid) < tol and abs(r) > 0.99:
+                fitted = slope * x + intercept
+                if np.std(y) > 0 and _allclose_rowwise(y, fitted, rtol=1e-7) and abs(r) > 0.99:
                     if not (abs(slope - 1) < 1e-9 and abs(intercept) < tol):
                         findings.append(dict(kind="exact_linear", col_a=header[ci - c0], col_b=header[cj - c0],
                                              col_a_idx=ci, col_b_idx=cj, n=n,
@@ -993,10 +1024,10 @@ def detect_equal_pairs(sheet, r0, r1, c0, c1, header):
             if n < 6:
                 continue
             am, bm = a[mask], b[mask]
-            # scale-relative tolerances (a fixed atol misfires on tiny-magnitude data — see detect_relations)
-            scale = max(float(np.max(np.abs(am))), float(np.max(np.abs(bm))), 1e-300)
-            eq = int((np.isclose(am, bm, atol=1e-6 * scale, rtol=1e-6)).sum())
-            if eq >= max(6, n // 2) and eq / n >= 0.5 and not np.allclose(am, bm, atol=1e-9 * scale, rtol=1e-9):
+            # scale-relative tolerances, applied per row so one large metadata
+            # coordinate does not make small measurement rows look equal.
+            eq = int(_isclose_rowwise(am, bm, rtol=1e-6).sum())
+            if eq >= max(6, n // 2) and eq / n >= 0.5 and not _allclose_rowwise(am, bm, rtol=1e-9):
                 findings.append(dict(kind="many_equal_pairs", col_a=header[i], col_b=header[j],
                                      col_a_idx=c0 + i, col_b_idx=c0 + j, n=n, equal=eq,
                                      severity="medium" if eq < n else "high",
