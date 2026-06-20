@@ -123,6 +123,8 @@ _COMMON_UNIT_FACTORS = {
     1e-12, 1e-9, 1e-6, 1e-3, 1e-2,
     1e2, 1e3, 1e6, 1e9, 1e12,
 }
+_GENOME_SIZE_MBP_FACTORS = {980.0, 1.0 / 980.0}
+_GENOME_SIZE_GBP_FACTORS = {0.98, 1.0 / 0.98}
 
 
 def _derived_label(label: str | None) -> bool:
@@ -210,6 +212,33 @@ def _common_unit_scale(kind: str | None, sa: list[Any] | None, sb: list[Any] | N
         return False
     scale = max(max(abs(x) for pair in pairs for x in pair), 1.0)
     return all(abs(y - ratio * x) <= 1e-9 * scale for x, y in pairs)
+
+
+def _genome_size_unit_conversion(kind: str | None, a: str | None, b: str | None,
+                                 sa: list[Any] | None, sb: list[Any] | None) -> bool:
+    if kind not in {"constant_ratio", "exact_linear"}:
+        return False
+    labels = f" {a or ''} {b or ''} ".lower()
+    has_genome_size_context = any(token in labels for token in ("1c", "c-value", "c value", "genome"))
+    has_pg = re.search(r"(^|[^a-z])pg([^a-z]|$)", labels) is not None
+    has_mbp = re.search(r"(^|[^a-z])mbp([^a-z]|$)", labels) is not None
+    has_gbp = re.search(r"(^|[^a-z])gbp([^a-z]|$)", labels) is not None
+    pairs = [(x, y) for x, y in zip(_nums(sa), _nums(sb)) if abs(x) > 1e-12 and abs(y) > 1e-12]
+    if len(pairs) < 3:
+        return False
+    ratios = [y / x for x, y in pairs]
+    ratio = sum(ratios) / len(ratios)
+    factors = set()
+    if has_mbp:
+        factors.update(_GENOME_SIZE_MBP_FACTORS)
+    if has_gbp:
+        factors.update(_GENOME_SIZE_GBP_FACTORS)
+    if not factors or not any(abs(ratio - k) <= 1e-9 * max(abs(k), 1.0) for k in factors):
+        return False
+    scale = max(max(abs(x) for pair in pairs for x in pair), 1.0)
+    if not all(abs(y - ratio * x) <= 1e-9 * scale for x, y in pairs):
+        return False
+    return has_genome_size_context and has_pg and (has_mbp or has_gbp)
 
 
 def _large_integer_coordinates(sa: list[Any] | None, sb: list[Any] | None) -> bool:
@@ -327,6 +356,8 @@ def prefilter(kind: str | None, a: str | None, b: str | None,
         return "drop", "n_column"
     if flags.get("image_derived_label"):
         return "drop", "image_processing_derived_column"
+    if flags.get("genome_size_unit_conversion"):
+        return "drop", "unit_conversion_or_normalization"
     if flags.get("common_unit_scale"):
         return "drop", "unit_conversion_or_normalization"
     if flags["derived_label"]:
@@ -357,6 +388,7 @@ def make_finding(kind: str | None, a: str | None, b: str | None, n: int,
         "explicit_formula_label": _explicit_formula_label(a) or _explicit_formula_label(b),
         "count_to_probability_or_rate": _count_to_probability_or_rate(kind, a, b),
         "common_unit_scale": _common_unit_scale(kind, sa, sb),
+        "genome_size_unit_conversion": _genome_size_unit_conversion(kind, a, b, sa, sb),
         "genomic_coordinate": _coordinate_pair(a, b, sa, sb),
         "low_information_sparse": _low_information_sparse(kind, int(n or 0), sa, sb, hp),
         "replicate": _replicate_label(a) and _replicate_label(b),
