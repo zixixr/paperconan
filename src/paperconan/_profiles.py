@@ -144,6 +144,8 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
         f.get("rule"),
         f.get("col_a_sample"),
         f.get("col_b_sample"),
+        slope=f.get("slope"),
+        intercept=f.get("intercept"),
     )
     action = pf.get("prefilter")
     reason = pf.get("prefilter_reason")

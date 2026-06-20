@@ -606,3 +606,141 @@ def test_prefilter_keeps_small_high_precision_independent_transform():
     )
 
     assert f["prefilter"] == "keep"
+
+
+def test_prefilter_keeps_independent_conditions_that_sum_to_one():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "sum_constant",
+        "shControl",
+        "shPACSIN2-D11",
+        20,
+        1.0,
+        "col[4] + col[5] = 1",
+        [1.0, 1.0, 0.8889, 0.8889, 0.5556],
+        [0.0, 0.0, 0.1111, 0.1111, 0.4444],
+    )
+
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_keeps_independent_repeats_that_sum_to_two():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "sum_constant",
+        "Repeat1",
+        "Repeat2",
+        10,
+        1.0,
+        "col[6] + col[7] = 2",
+        [1.109006, 0.830224, 1.32632, 1.139431, 1.223372],
+        [0.890994, 1.169776, 0.67368, 0.860569, 0.776628],
+    )
+
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_drops_exact_linear_percent_complements():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "exact_linear",
+        "GPR15-",
+        "GPR15+",
+        10,
+        1.0,
+        "col[2] = -1 * col[1] + 100",
+        [80.0, 72.0, 61.5, 54.0, 43.2],
+        [20.0, 28.0, 38.5, 46.0, 56.8],
+        slope=-1.0,
+        intercept=100.0,
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "complement_percentage_sum_to_100"
+
+
+def test_prefilter_downweights_exact_linear_percent_columns_that_do_not_complement():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "exact_linear",
+        "percent viability day 1",
+        "percent viability day 2",
+        20,
+        1.0,
+        "col[2] = 0.8 * col[1] + 5",
+        [80.0, 72.0, 61.5, 54.0, 43.2],
+        [69.0, 62.6, 54.2, 48.2, 39.56],
+        slope=0.8,
+        intercept=5.0,
+    )
+
+    assert f["prefilter"] == "downweight"
+    assert f["prefilter_reason"] == "derived_normalized"
+
+
+def test_prefilter_does_not_drop_exact_linear_complement_from_sample_only():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "exact_linear",
+        "GPR15-",
+        "GPR15+",
+        100,
+        1.0,
+        "col[2] = -0.8 * col[1] + 84",
+        [80.0, 72.0, 61.5, 54.0, 43.2],
+        [20.0, 28.0, 38.5, 46.0, 56.8],
+        slope=-0.8,
+        intercept=84.0,
+    )
+
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_drops_signed_formula_counterpart_labels():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "A/r^2",
+        "-A/r^2",
+        304,
+        1.0,
+        "col[8] = col[7] * -1",
+        [5.31488, 4.74074, 4.25485, 3.84, 3.48299],
+        [-5.31488, -4.74074, -4.25485, -3.84, -3.48299],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "explicit_formula_or_unit_conversion"
+
+
+def test_prefilter_keeps_signed_parenthetical_condition_labels():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "Signal (baseline)",
+        "-Signal (baseline)",
+        30,
+        1.0,
+        "col[2] = col[1] * -1",
+        [1.2, 2.5, 3.1, 5.8, 6.4],
+        [-1.2, -2.5, -3.1, -5.8, -6.4],
+    )
+
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_drops_left_right_genomic_bin_coordinates():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_offset",
+        "startL",
+        "endL",
+        1165,
+        1.0,
+        "col[2] = col[1] + 10000",
+        [74520000.0, 18780000.0, 13710000.0, 18780000.0, 18730000.0],
+        [74530000.0, 18790000.0, 13720000.0, 18790000.0, 18740000.0],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "genomic_coordinate_table"
