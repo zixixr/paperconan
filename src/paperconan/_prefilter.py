@@ -49,7 +49,8 @@ _AGG = (
     "average", "mean", "median", "std", " sd", "sd ", "stdev", "stddev",
     "s.d", "sem", "s.e.m", "variance", " var", "error", "95%", " ci",
     "sum", "total", "%", "percent", "ratio", "norm", "fold", "relative",
-    "cumulative", "fraction",
+    "cumulative", "fraction", "centered", "centred", "standardized",
+    "standardised", "scaled",
 )
 _AXIS_LABEL_RE = re.compile(
     r"(^|[^a-z0-9])("
@@ -63,6 +64,7 @@ _STAT_DERIVED_RE = re.compile(
     r"\b(adj(?:usted)?[._ -]?p(?:[._ -]?val(?:ue)?)?|p[._ -]?val(?:ue)?|"
     r"q[._ -]?val(?:ue)?|fdr|fwer|padj|p\.?value|adj\.?p\.?val|"
     r"bonferroni|benjamini|critical|rank|log2err|z[._ -]?score|"
+    r"aic|bic|aicc|effect[._ -]?size|lcl|ucl|"
     r"confidence[ _-]*interval)\b",
     re.I,
 )
@@ -103,7 +105,22 @@ _EXPLICIT_FORMULA_RE = re.compile(
 )
 _PROBABILITY_RATE_RE = re.compile(
     r"\b(?:probability|prob|frequency|freq|rate|coverage|depth|mapping[ _-]*rate|"
-    r"frac(?:tion)?(?:of)?samples?)\b",
+    r"precision|recall|sensitivity|specificity|frac(?:tion)?(?:of)?samples?)\b",
+    re.I,
+)
+_INTERVAL_BOUND_CONTEXT_RE = re.compile(
+    r"\b(?:limit|bound|ci|interval|parallel|outlier)\b|"
+    r"\bconfidence[ _-]*interval\b|"
+    r"(?:^|[_ -])(?:lcl|ucl)(?:$|[_ -])",
+    re.I,
+)
+_LOWER_BOUND_RE = re.compile(r"\b(?:lower|low|lcl)\b|(?:^|[_ -])lwr(?:$|[_ -])", re.I)
+_UPPER_BOUND_RE = re.compile(r"\b(?:upper|high|ucl)\b|(?:^|[_ -])upr(?:$|[_ -])", re.I)
+_LATITUDE_RE = re.compile(r"\b(?:latitude|lat)\b", re.I)
+_LONGITUDE_RE = re.compile(r"\b(?:longitude|lon|long)\b", re.I)
+_INFO_CRITERION_RE = re.compile(r"^(?:aic|bic|aicc)$", re.I)
+_CENTERED_STANDARDIZED_RE = re.compile(
+    r"(?:^|[_\s-])(?:centered|centred|standardi[sz]ed)(?:$|[_\s-])",
     re.I,
 )
 _COMPLEMENT_LABEL_PAIRS = (
@@ -304,7 +321,10 @@ def _replicate_label(label: str | None) -> bool:
 
 def _count_label(label: str | None) -> bool:
     text = " " + (label or "").lower() + " "
-    return any(token in text for token in ("count", "number of", "sample size", " n=", "n =", "(n)", " n ", "ndots", " dots", "reads"))
+    return any(token in text for token in (
+        "count", "number of", "sample size", " n=", "n =", "(n)", " n ",
+        "ndots", " dots", "reads", "intersection_size", "intersection size",
+    ))
 
 
 def _explicit_formula_label(label: str | None) -> bool:
@@ -328,6 +348,33 @@ def _count_to_probability_or_rate(kind: str | None, a: str | None, b: str | None
     rate_a = bool(_PROBABILITY_RATE_RE.search(a or ""))
     rate_b = bool(_PROBABILITY_RATE_RE.search(b or ""))
     return (count_a and rate_b) or (count_b and rate_a)
+
+
+def _interval_bound_pair(a: str | None, b: str | None) -> bool:
+    la, lb = a or "", b or ""
+    text = f"{la} {lb}"
+    if not _INTERVAL_BOUND_CONTEXT_RE.search(text):
+        return False
+    return (
+        (_LOWER_BOUND_RE.search(la) and _UPPER_BOUND_RE.search(lb))
+        or (_UPPER_BOUND_RE.search(la) and _LOWER_BOUND_RE.search(lb))
+    )
+
+
+def _coordinate_label_pair(a: str | None, b: str | None) -> bool:
+    la, lb = a or "", b or ""
+    return (
+        (_LATITUDE_RE.search(la) and _LONGITUDE_RE.search(lb))
+        or (_LONGITUDE_RE.search(la) and _LATITUDE_RE.search(lb))
+    )
+
+
+def _information_criterion_pair(a: str | None, b: str | None) -> bool:
+    return bool(_INFO_CRITERION_RE.search(a or "") and _INFO_CRITERION_RE.search(b or ""))
+
+
+def _centered_or_standardized_label(a: str | None, b: str | None) -> bool:
+    return bool(_CENTERED_STANDARDIZED_RE.search(a or "") or _CENTERED_STANDARDIZED_RE.search(b or ""))
 
 
 def _low_information_sparse(kind: str | None, n: int, sa: list[Any] | None,
@@ -368,6 +415,14 @@ def prefilter(kind: str | None, a: str | None, b: str | None,
               flags: dict[str, bool]) -> tuple[str, str | None]:
     if flags["trivial"]:
         return "drop", "trivial_constant"
+    if flags.get("interval_bound_pair"):
+        return "drop", "interval_bounds"
+    if flags.get("coordinate_label_pair"):
+        return "drop", "coordinate_table"
+    if flags.get("information_criterion_pair"):
+        return "drop", "information_criterion_columns"
+    if flags.get("centered_or_standardized_label"):
+        return "drop", "centered_or_standardized_column"
     if flags.get("genomic_coordinate"):
         return "drop", "genomic_coordinate_table"
     if flags.get("complement_percentage"):
@@ -423,6 +478,10 @@ def make_finding(kind: str | None, a: str | None, b: str | None, n: int,
         "complement_percentage": _complement_percentage(kind, a, b, sa, sb, extra.get("slope"), extra.get("intercept")),
         "complement_fraction": _complement_fraction(kind, a, b, sa, sb, extra.get("slope"), extra.get("intercept")),
         "complement_category": _complement_category(kind, a, b, sa, sb, extra.get("slope"), extra.get("intercept")),
+        "interval_bound_pair": _interval_bound_pair(a, b),
+        "coordinate_label_pair": _coordinate_label_pair(a, b),
+        "information_criterion_pair": _information_criterion_pair(a, b),
+        "centered_or_standardized_label": _centered_or_standardized_label(a, b),
         "explicit_formula_label": (
             _explicit_formula_label(a) or _explicit_formula_label(b)
             or _signed_formula_counterpart(a, b)
