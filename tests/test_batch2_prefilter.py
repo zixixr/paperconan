@@ -878,3 +878,332 @@ def test_prefilter_drops_latitude_longitude_coordinate_pairs():
 
     assert f["prefilter"] == "drop"
     assert f["prefilter_reason"] == "coordinate_table"
+
+
+# --- R2 rules: ImageJ IntDen / qPCR from-equation / Metascape / baseline-correction / PD export twin ---
+
+def test_prefilter_drops_imagej_intden_equals_rawintden():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "identical_column",
+        "IntDen",
+        "RawIntDen",
+        27,
+        1.0,
+        "col[2] == col[1]",
+        [120.5, 340.2, 560.8, 78.1, 910.3],
+        [120.5, 340.2, 560.8, 78.1, 910.3],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "image_processing_derived_column"
+
+
+def test_prefilter_drops_qpcr_quantity_from_equation():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "Cq",
+        "Copies from equation",
+        30,
+        1.0,
+        "col[2] = col[1] * 0.5",
+        [22.1, 20.4, 24.7, 19.5, 26.3],
+        [11.05, 10.2, 12.35, 9.75, 13.15],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "qpcr_formula_derived_column"
+
+
+def test_prefilter_downweights_metascape_enrichment_columns():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "exact_linear",
+        "LogP",
+        "FirstInGroupByEnrichment",
+        40,
+        1.0,
+        "col[2] = 1 * col[1] + 0",
+        [-5.2, -3.1, -8.4, -2.0, -10.1],
+        [-5.2, -3.1, -8.4, -2.0, -10.1],
+    )
+
+    assert f["prefilter"] == "downweight"
+    assert f["prefilter_reason"] == "derived_statistical_column"
+
+
+def test_prefilter_drops_single_sided_baseline_corrected_transform():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_offset",
+        "Absorbance",
+        "Absorbance corrected",
+        16,
+        1.0,
+        "col[2] = col[1] + -0.08",
+        [0.81, 0.72, 0.69, 0.63, 0.51],
+        [0.73, 0.64, 0.61, 0.55, 0.43],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "baseline_correction_derived"
+
+
+def test_prefilter_drops_baseline_correction_noun_form():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_offset",
+        "Signal",
+        "Signal baseline correction",
+        16,
+        1.0,
+        "col[2] = col[1] + -0.08",
+        [0.81, 0.72, 0.69, 0.63, 0.51],
+        [0.73, 0.64, 0.61, 0.55, 0.43],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "baseline_correction_derived"
+
+
+def test_prefilter_drops_blank_subtraction_noun_form():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_offset",
+        "OD",
+        "OD blank subtraction",
+        16,
+        1.0,
+        "col[2] = col[1] + -0.08",
+        [0.81, 0.72, 0.69, 0.63, 0.51],
+        [0.73, 0.64, 0.61, 0.55, 0.43],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "baseline_correction_derived"
+
+
+def test_prefilter_drops_nominal_to_corrected_same_measurement():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "Nominal response",
+        "Corrected response",
+        16,
+        1.0,
+        "col[2] = col[1] * 0.727",
+        [1.0, 2.4, 3.1, 4.8, 5.2],
+        [0.727, 1.7448, 2.2537, 3.4896, 3.7804],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "baseline_correction_derived"
+
+
+def test_prefilter_keeps_two_independent_corrected_columns():
+    # Both sides carry the token -> NOT a raw->corrected derivation; two corrected things being
+    # identical is itself the concern. Must NOT be auto-dropped.
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "identical_column",
+        "WT corrected",
+        "KO corrected",
+        30,
+        1.0,
+        "col[2] == col[1]",
+        [1.21, 2.34, 3.56, 4.78, 5.91],
+        [1.21, 2.34, 3.56, 4.78, 5.91],
+    )
+
+    assert f["flags"]["derived_transform_pair"] is False
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_keeps_one_sided_corrected_independent_groups():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_offset",
+        "WT",
+        "KO corrected",
+        30,
+        1.0,
+        "col[2] = col[1] + -0.08",
+        [1.21, 2.34, 3.56, 4.78, 5.91],
+        [1.13, 2.26, 3.48, 4.70, 5.83],
+    )
+
+    assert f["flags"]["derived_transform_pair"] is False
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_keeps_shared_measurement_token_but_different_groups():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_offset",
+        "WT OD",
+        "KO OD corrected",
+        30,
+        1.0,
+        "col[2] = col[1] + -0.08",
+        [1.21, 2.34, 3.56, 4.78, 5.91],
+        [1.13, 2.26, 3.48, 4.70, 5.83],
+    )
+
+    assert f["flags"]["derived_transform_pair"] is False
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_keeps_baseline_condition_with_corrected_other_group():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_offset",
+        "Baseline OD",
+        "OD corrected",
+        30,
+        1.0,
+        "col[2] = col[1] + -0.08",
+        [1.21, 2.34, 3.56, 4.78, 5.91],
+        [1.13, 2.26, 3.48, 4.70, 5.83],
+    )
+
+    assert f["flags"]["derived_transform_pair"] is False
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_keeps_blank_condition_token_when_not_correction_phrase():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_offset",
+        "Blank media OD",
+        "Media OD corrected",
+        30,
+        1.0,
+        "col[2] = col[1] + -0.08",
+        [1.21, 2.34, 3.56, 4.78, 5.91],
+        [1.13, 2.26, 3.48, 4.70, 5.83],
+    )
+
+    assert f["flags"]["derived_transform_pair"] is False
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_keeps_background_condition_token_when_not_correction_phrase():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_offset",
+        "Background OD",
+        "OD corrected",
+        30,
+        1.0,
+        "col[2] = col[1] + -0.08",
+        [1.21, 2.34, 3.56, 4.78, 5.91],
+        [1.13, 2.26, 3.48, 4.70, 5.83],
+    )
+
+    assert f["flags"]["derived_transform_pair"] is False
+    assert f["flags"]["image_derived_label"] is False
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_keeps_original_independent_condition_label():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "Control original",
+        "Treatment",
+        30,
+        1.0,
+        "col[2] = col[1] * 0.7",
+        [10.0, 22.0, 31.0, 48.0, 56.0],
+        [7.0, 15.4, 21.7, 33.6, 39.2],
+    )
+
+    assert f["flags"]["derived_transform_pair"] is False
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_keeps_independent_groups_with_fixed_ratio_no_derivation_token():
+    # Real Tier-1 pattern (e.g. PBS vs Phosphatidylcholine x0.7): a fixed ratio between two
+    # independent groups with no derivation token must survive.
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "PBS",
+        "Phosphatidylcholine",
+        6,
+        1.0,
+        "col[2] = col[1] * 0.7",
+        [10.0, 22.0, 31.0, 48.0, 56.0],
+        [7.0, 15.4, 21.7, 33.6, 39.2],
+    )
+
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_drops_search_engine_export_twin():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "identical_column",
+        "# Peptides",
+        "# Peptides (by Search Engine): Sequest HT",
+        50,
+        1.0,
+        "col[2] == col[1]",
+        [3.0, 12.0, 7.0, 21.0, 9.0],
+        [3.0, 12.0, 7.0, 21.0, 9.0],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "search_engine_export_duplicate"
+
+
+def test_prefilter_drops_statistical_search_engine_export_twin_before_stat_downweight():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "identical_column",
+        "P.Value",
+        "P.Value (by Search Engine): Sequest HT",
+        50,
+        1.0,
+        "col[2] == col[1]",
+        [0.01, 0.23, 0.04, 0.5, 0.91],
+        [0.01, 0.23, 0.04, 0.5, 0.91],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "search_engine_export_duplicate"
+
+
+def test_prefilter_does_not_drop_search_engine_suffix_transform():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "# Peptides",
+        "# Peptides (by Search Engine): Sequest HT",
+        50,
+        1.0,
+        "col[2] = col[1] * 2",
+        [3.0, 12.0, 7.0, 21.0, 9.0],
+        [6.0, 24.0, 14.0, 42.0, 18.0],
+    )
+
+    assert f["flags"]["search_engine_export_twin"] is False
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_keeps_different_bases_with_search_engine_suffix():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "identical_column",
+        "Metric A",
+        "Metric B (by Search Engine): Mascot",
+        12,
+        1.0,
+        "col[2] == col[1]",
+        [0.11, 0.29, 0.37, 0.68, 0.91],
+        [0.11, 0.29, 0.37, 0.68, 0.91],
+    )
+
+    assert f["flags"]["search_engine_export_twin"] is False
+    assert f["prefilter"] == "keep"
