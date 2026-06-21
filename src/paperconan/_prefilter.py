@@ -76,7 +76,14 @@ _QPCR_DERIVED_RE = re.compile(
     r"from[ _-]*equation)\b",
     re.I,
 )
-_SUMMARY_SCALE_RE = re.compile(r"\b(?:sem|s\.e\.m|se|sd|s\.d|std|stdev|stddev)\b", re.I)
+_SEM_LABEL_RE = re.compile(
+    r"\b(?:sem|s\.e\.m|se|standard[ _-]*error|std[._ -]*error|st[._ -]*error)\b",
+    re.I,
+)
+_SD_LABEL_RE = re.compile(
+    r"\b(?:sd|s\.d|stdev|stddev|standard[ _-]*deviation)\b|\bstd\b(?![._ -]*error)",
+    re.I,
+)
 _IMAGE_DERIVED_RE = re.compile(
     r"\b(gray|grey|intensity|pixel|invert|normalized|normalised|"
     r"set\s*0|threshold|roi|intden|rawintden|raw\s*int\s*den|integrated\s*density|"
@@ -144,6 +151,11 @@ _LONGITUDE_RE = re.compile(r"\b(?:longitude|lon|long)\b", re.I)
 _INFO_CRITERION_RE = re.compile(r"^(?:aic|bic|aicc)$", re.I)
 _CENTERED_STANDARDIZED_RE = re.compile(
     r"(?:^|[_\s-])(?:centered|centred|standardi[sz]ed)(?:$|[_\s-])",
+    re.I,
+)
+_ID_TIMESTAMP_RE = re.compile(
+    r"\b(?:id|identifier|accession|barcode|timestamp|time[ _-]*stamp|epoch|unix[ _-]*time|"
+    r"date[ _-]*(?:time|stamp)?|sample[ _-]*(?:id|identifier)|specimen[ _-]*id)\b",
     re.I,
 )
 _COMPLEMENT_LABEL_PAIRS = (
@@ -343,6 +355,121 @@ def _genome_size_unit_conversion(kind: str | None, a: str | None, b: str | None,
     return has_genome_size_context and has_pg and (has_mbp or has_gbp)
 
 
+def _median(vals: list[float]) -> float:
+    ordered = sorted(vals)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _sample_ratio(sa: list[Any] | None, sb: list[Any] | None) -> float | None:
+    pairs = [(x, y) for x, y in zip(_nums(sa), _nums(sb)) if abs(x) > 1e-12 and abs(y) > 1e-12]
+    if len(pairs) < 3:
+        return None
+    ratios = [y / x for x, y in pairs]
+    ratio = _median(ratios)
+    scale = max(abs(ratio), 1.0)
+    if not all(abs(r - ratio) <= 1e-4 * scale for r in ratios):
+        return None
+    return abs(ratio)
+
+
+def _adjacent_column_rule(rule: str | None) -> bool:
+    if not rule:
+        return False
+    cols = [int(x) for x in re.findall(r"col\[(\d+)\]", rule)]
+    return len(cols) >= 2 and abs(cols[0] - cols[1]) == 1
+
+
+def _low_context_label(label: str | None) -> bool:
+    text = (label or "").strip()
+    return not text or re.fullmatch(r"(?:col(?:umn)?|var|x|y)?\s*\d*", text, re.I) is not None
+
+
+def _near_zero_intercept(intercept: Any) -> bool:
+    if intercept is None:
+        return True
+    try:
+        return abs(float(intercept)) <= 1e-8
+    except (TypeError, ValueError):
+        return False
+
+
+def _sem_sd_integer_n_scaling(kind: str | None, a: str | None, b: str | None,
+                              sa: list[Any] | None, sb: list[Any] | None,
+                              slope: Any = None, intercept: Any = None,
+                              n: int = 0, rule: str | None = None) -> bool:
+    if kind not in {"constant_ratio", "exact_linear"}:
+        return False
+    has_sd_sem_pair = (
+        (_SD_LABEL_RE.search(a or "") and _SEM_LABEL_RE.search(b or ""))
+        or (_SEM_LABEL_RE.search(a or "") and _SD_LABEL_RE.search(b or ""))
+    )
+    unlabeled_adjacent_pair = (
+        not has_sd_sem_pair
+        and int(n or 0) >= 100
+        and _low_context_label(a)
+        and _low_context_label(b)
+        and _adjacent_column_rule(rule)
+    )
+    if not (has_sd_sem_pair or unlabeled_adjacent_pair):
+        return False
+    ratio = None
+    if kind == "exact_linear":
+        if not _near_zero_intercept(intercept):
+            return False
+        try:
+            ratio = abs(float(slope))
+        except (TypeError, ValueError):
+            ratio = None
+    if ratio is None:
+        ratio = _sample_ratio(sa, sb)
+    if ratio is None or ratio <= 1e-12:
+        return False
+    ratio = min(ratio, 1.0 / ratio)
+    implied_n = 1.0 / (ratio * ratio)
+    nearest = round(implied_n)
+    if abs(implied_n - nearest) > 0.03:
+        return False
+    if has_sd_sem_pair:
+        return 2 <= nearest <= 200
+    return 5 <= nearest <= 30
+
+
+def _mostly_integerish(vals: list[float]) -> bool:
+    if len(vals) < 3:
+        return False
+    return sum(1 for v in vals if abs(v - round(v)) <= 1e-6) >= max(3, len(vals) - 1)
+
+
+def _dominant_id_timestamp_values(vals: list[float], other: list[float], label: str | None) -> bool:
+    if len(vals) < 3 or len(other) < 3 or not _mostly_integerish(vals):
+        return False
+    abs_vals = [abs(v) for v in vals if abs(v) > 0]
+    abs_other = [abs(v) for v in other]
+    if not abs_vals or not abs_other:
+        return False
+    median_large = _median(abs_vals)
+    max_other = max(abs_other)
+    label_match = _ID_TIMESTAMP_RE.search(label or "") is not None
+    spread = max(abs_vals) - min(abs_vals)
+    # Unlabeled timestamp-like columns are restricted to epoch-millisecond scale
+    # and tight local ranges; other ID/timestamp ranges require label support.
+    timestamp_like = 1e12 <= median_large <= 3e12 and spread <= 1e8
+    if not (label_match or timestamp_like):
+        return False
+    return median_large >= 1e9 and max_other / median_large <= 1e-4
+
+
+def _id_timestamp_dominant_sum(kind: str | None, a: str | None, b: str | None,
+                               sa: list[Any] | None, sb: list[Any] | None) -> bool:
+    if kind != "sum_constant" or not _samples_sum_constant(sa, sb):
+        return False
+    va, vb = _nums(sa), _nums(sb)
+    return _dominant_id_timestamp_values(va, vb, a) or _dominant_id_timestamp_values(vb, va, b)
+
+
 def _large_integer_coordinates(sa: list[Any] | None, sb: list[Any] | None) -> bool:
     vals = _nums(sa) + _nums(sb)
     if len(vals) < 4:
@@ -367,10 +494,6 @@ def _coordinate_pair(a: str | None, b: str | None, sa: list[Any] | None, sb: lis
 
 def _qpcr_derived_label(label: str | None) -> bool:
     return bool(_QPCR_DERIVED_RE.search(label or ""))
-
-
-def _summary_scale_label(label: str | None) -> bool:
-    return bool(_SUMMARY_SCALE_RE.search(label or ""))
 
 
 def _replicate_label(label: str | None) -> bool:
@@ -490,6 +613,8 @@ def prefilter(kind: str | None, a: str | None, b: str | None,
         return "drop", "complement_fraction_sum_to_constant"
     if flags.get("complement_category"):
         return "drop", "complement_category_sum_to_constant"
+    if flags.get("id_timestamp_dominant_sum"):
+        return "drop", "id_timestamp_dominant_sum"
     if flags.get("qpcr_derived_label"):
         return "drop", "qpcr_formula_derived_column"
     if flags.get("summary_scale_label"):
@@ -536,13 +661,16 @@ def make_finding(kind: str | None, a: str | None, b: str | None, n: int,
         "derived_label": _derived_label(a) or _derived_label(b),
         "derived_stat_label": _derived_stat_label(a) or _derived_stat_label(b),
         "qpcr_derived_label": _qpcr_derived_label(a) or _qpcr_derived_label(b),
-        "summary_scale_label": _summary_scale_label(a) or _summary_scale_label(b),
+        "summary_scale_label": _sem_sd_integer_n_scaling(
+            kind, a, b, sa, sb, extra.get("slope"), extra.get("intercept"), int(n or 0), rule
+        ),
         "image_derived_label": _image_derived_label(a) or _image_derived_label(b),
         "derived_transform_pair": _derived_transform_pair(a, b),
         "search_engine_export_twin": _search_engine_export_twin(kind, a, b),
         "complement_percentage": _complement_percentage(kind, a, b, sa, sb, extra.get("slope"), extra.get("intercept")),
         "complement_fraction": _complement_fraction(kind, a, b, sa, sb, extra.get("slope"), extra.get("intercept")),
         "complement_category": _complement_category(kind, a, b, sa, sb, extra.get("slope"), extra.get("intercept")),
+        "id_timestamp_dominant_sum": _id_timestamp_dominant_sum(kind, a, b, sa, sb),
         "interval_bound_pair": _interval_bound_pair(a, b),
         "coordinate_label_pair": _coordinate_label_pair(a, b),
         "information_criterion_pair": _information_criterion_pair(a, b),
