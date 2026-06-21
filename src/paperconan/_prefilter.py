@@ -65,21 +65,44 @@ _STAT_DERIVED_RE = re.compile(
     r"q[._ -]?val(?:ue)?|fdr|fwer|padj|p\.?value|adj\.?p\.?val|"
     r"bonferroni|benjamini|critical|rank|log2err|z[._ -]?score|"
     r"aic|bic|aicc|effect[._ -]?size|lcl|ucl|"
+    r"firstingroupbyenrichment|by[ _-]?logp|"
     r"confidence[ _-]*interval)\b",
     re.I,
 )
 _QPCR_DERIVED_RE = re.compile(
     r"\b(?:dct|ddct|delta[ _-]*ct|delta[ _-]*delta[ _-]*ct|"
     r"deltacq|delta[ _-]*cq|delta[ _-]*delta[ _-]*cq|"
-    r"2\^-?ddct|relative[ _-]*(?:expression|quantity|value)|rq)\b",
+    r"2\^-?ddct|relative[ _-]*(?:expression|quantity|value)|rq|"
+    r"from[ _-]*equation)\b",
     re.I,
 )
 _SUMMARY_SCALE_RE = re.compile(r"\b(?:sem|s\.e\.m|se|sd|s\.d|std|stdev|stddev)\b", re.I)
 _IMAGE_DERIVED_RE = re.compile(
-    r"\b(gray|grey|intensity|pixel|invert|background|bg|normalized|normalised|"
-    r"set\s*0|threshold|roi)\b",
+    r"\b(gray|grey|intensity|pixel|invert|normalized|normalised|"
+    r"set\s*0|threshold|roi|intden|rawintden|raw\s*int\s*den|integrated\s*density|"
+    r"mean\s*gr[ae]y)\b",
     re.I,
 )
+# A single-sided correction token is only safe to auto-drop when the rest of the
+# label still names the same measurement, e.g. "Absorbance" vs "Absorbance corrected".
+_DERIVED_TRANSFORM_RE = re.compile(
+    r"\b(?:corrected|baseline[ _-]*(?:correction|subtract(?:ion|ed)?)|"
+    r"background[ _-]*(?:correction|subtract(?:ion|ed)?)|"
+    r"blank[ _-]*(?:correction|subtract(?:ion|ed)?)|"
+    r"bkg[ _-]*sub(?:tract(?:ion|ed)?)?|drift[ _-]*correct(?:ion|ed)?|"
+    r"debleach(?:ed)?)\b",
+    re.I,
+)
+_DERIVED_TRANSFORM_STRIP_RE = re.compile(
+    r"\b(?:corrected|baseline[ _-]*(?:correction|subtract(?:ion|ed)?)|"
+    r"background[ _-]*(?:correction|subtract(?:ion|ed)?)|"
+    r"blank[ _-]*(?:correction|subtract(?:ion|ed)?)|"
+    r"bkg[ _-]*sub(?:tract(?:ion|ed)?)?|drift[ _-]*correct(?:ion|ed)?|"
+    r"debleach(?:ed)?)\b",
+    re.I,
+)
+# Proteome Discoverer / MaxQuant export twin:  "X" vs "X (by Search Engine): Sequest HT"
+_SEARCH_ENGINE_SUFFIX_RE = re.compile(r"\s*\(by\s+search\s+engine\)?:?.*$", re.I)
 _GENOMIC_START_RE = re.compile(
     r"(^|[^a-z])(chrom)?(motif|midpoint|block|thick)?[_ -]*(start[lr]?|s1|bp)([^a-z]|$)"
     r"|start[_ -]*position",
@@ -159,6 +182,42 @@ def _derived_stat_label(label: str | None) -> bool:
 
 def _image_derived_label(label: str | None) -> bool:
     return bool(_IMAGE_DERIVED_RE.search(label or ""))
+
+
+def _derived_transform_token(label: str | None) -> bool:
+    return bool(_DERIVED_TRANSFORM_RE.search(label or ""))
+
+
+def _substantive_label_tokens(label: str | None) -> set[str]:
+    text = _DERIVED_TRANSFORM_STRIP_RE.sub(" ", label or "")
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if len(token) > 1 and token not in {"raw", "nominal", "value", "values", "data"}
+    }
+
+
+def _derived_transform_pair(a: str | None, b: str | None) -> bool:
+    """One side carries a correction token and both sides name the same base measurement."""
+    if _derived_transform_token(a) == _derived_transform_token(b):
+        return False
+    ta = _substantive_label_tokens(a)
+    tb = _substantive_label_tokens(b)
+    if not ta or not tb:
+        return False
+    return ta == tb
+
+
+def _search_engine_export_twin(kind: str | None, a: str | None, b: str | None) -> bool:
+    if kind not in {"identical_column", "many_equal_pairs"}:
+        return False
+    if not a or not b:
+        return False
+    if not (_SEARCH_ENGINE_SUFFIX_RE.search(a) or _SEARCH_ENGINE_SUFFIX_RE.search(b)):
+        return False
+    base_a = _SEARCH_ENGINE_SUFFIX_RE.sub("", a).strip().lower()
+    base_b = _SEARCH_ENGINE_SUFFIX_RE.sub("", b).strip().lower()
+    return bool(base_a) and base_a == base_b
 
 
 def _percent_label(label: str | None) -> bool:
@@ -435,6 +494,8 @@ def prefilter(kind: str | None, a: str | None, b: str | None,
         return "drop", "qpcr_formula_derived_column"
     if flags.get("summary_scale_label"):
         return "drop", "summary_statistic_scaling"
+    if flags.get("search_engine_export_twin"):
+        return "drop", "search_engine_export_duplicate"
     if flags.get("derived_stat_label"):
         return "downweight", "derived_statistical_column"
     if flags.get("explicit_formula_label"):
@@ -447,6 +508,8 @@ def prefilter(kind: str | None, a: str | None, b: str | None,
         return "drop", "n_column"
     if flags.get("image_derived_label"):
         return "drop", "image_processing_derived_column"
+    if flags.get("derived_transform_pair") and kind in {"constant_offset", "constant_ratio", "exact_linear"}:
+        return "drop", "baseline_correction_derived"
     if flags.get("genome_size_unit_conversion"):
         return "drop", "unit_conversion_or_normalization"
     if flags.get("common_unit_scale"):
@@ -475,6 +538,8 @@ def make_finding(kind: str | None, a: str | None, b: str | None, n: int,
         "qpcr_derived_label": _qpcr_derived_label(a) or _qpcr_derived_label(b),
         "summary_scale_label": _summary_scale_label(a) or _summary_scale_label(b),
         "image_derived_label": _image_derived_label(a) or _image_derived_label(b),
+        "derived_transform_pair": _derived_transform_pair(a, b),
+        "search_engine_export_twin": _search_engine_export_twin(kind, a, b),
         "complement_percentage": _complement_percentage(kind, a, b, sa, sb, extra.get("slope"), extra.get("intercept")),
         "complement_fraction": _complement_fraction(kind, a, b, sa, sb, extra.get("slope"), extra.get("intercept")),
         "complement_category": _complement_category(kind, a, b, sa, sb, extra.get("slope"), extra.get("intercept")),
