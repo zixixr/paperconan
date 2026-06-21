@@ -124,6 +124,125 @@ def test_prefilter_drops_explicit_sem_sd_scaling():
     assert f["prefilter_reason"] == "summary_statistic_scaling"
 
 
+def test_prefilter_drops_sem_sd_scaling_for_integer_sample_size():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "standard deviation",
+        "standard error",
+        24,
+        1.0,
+        "col[2] = col[1] * 0.447214",
+        [2.0, 3.2, 4.7, 5.1, 6.8],
+        [0.894428, 1.4310848, 2.1019058, 2.2807914, 3.0410552],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "summary_statistic_scaling"
+
+
+def test_prefilter_does_not_drop_sem_sd_scaling_for_non_integer_sample_size():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "material A SD",
+        "material B SEM",
+        24,
+        1.0,
+        "col[2] = col[1] * 0.5468",
+        [2.0, 3.2, 4.7, 5.1, 6.8],
+        [1.0936, 1.74976, 2.56996, 2.78868, 3.71824],
+    )
+
+    assert f["flags"]["summary_scale_label"] is False
+    assert f["prefilter"] != "drop"
+
+
+def test_prefilter_drops_explicit_sem_sd_scaling_for_large_sample_size():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "SD",
+        "SEM",
+        300,
+        1.0,
+        "col[2] = col[1] * 0.141421",
+        [2.0, 3.2, 4.7, 5.1, 6.8],
+        [0.282842, 0.4525472, 0.6646787, 0.7212471, 0.9616628],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "summary_statistic_scaling"
+
+
+def test_prefilter_drops_unlabeled_adjacent_sem_scale_ratio():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "",
+        "",
+        360,
+        1.0,
+        "col[4] = col[3] * 0.377964",
+        [23.530812, 33.67896, 33.460176, 29.0, 31.5],
+        [8.893811, 12.72945, 12.646758, 10.9609697, 11.9058809],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "summary_statistic_scaling"
+
+
+def test_prefilter_keeps_unlabeled_adjacent_low_sample_sqrt_ratio():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "",
+        "",
+        360,
+        1.0,
+        "col[4] = col[3] * 0.5",
+        [2.0, 3.2, 4.7, 5.1, 6.8],
+        [1.0, 1.6, 2.35, 2.55, 3.4],
+    )
+
+    assert f["flags"]["summary_scale_label"] is False
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_keeps_small_unlabeled_adjacent_sqrt_ratio():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "",
+        "",
+        24,
+        1.0,
+        "col[4] = col[3] * 0.377964",
+        [23.530812, 33.67896, 33.460176, 29.0, 31.5],
+        [8.893811, 12.72945, 12.646758, 10.9609697, 11.9058809],
+    )
+
+    assert f["flags"]["summary_scale_label"] is False
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_keeps_labeled_independent_integer_sqrt_ratio():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "PBS",
+        "Phosphatidylcholine",
+        360,
+        1.0,
+        "col[4] = col[3] * 0.5",
+        [2.0, 3.2, 4.7, 5.1, 6.8],
+        [1.0, 1.6, 2.35, 2.55, 3.4],
+    )
+
+    assert f["flags"]["summary_scale_label"] is False
+    assert f["prefilter"] == "keep"
+
+
 def test_prefilter_drops_image_processing_derived_columns():
     cp = _collector()
     f = cp.prefilter_relation_finding(
@@ -621,6 +740,57 @@ def test_prefilter_keeps_independent_conditions_that_sum_to_one():
         [0.0, 0.0, 0.1111, 0.1111, 0.4444],
     )
 
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_drops_id_timestamp_dominant_sum_constant():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "sum_constant",
+        "timestamp_ms",
+        "elapsed_seconds",
+        50,
+        1.0,
+        "col[1] + col[2] = 1700000010000",
+        [1700000000000, 1700000000001, 1700000000002, 1700000000003, 1700000000004],
+        [10000, 9999, 9998, 9997, 9996],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "id_timestamp_dominant_sum"
+
+
+def test_prefilter_keeps_large_measurements_that_sum_without_id_context():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "sum_constant",
+        "treatment signal",
+        "control signal",
+        50,
+        1.0,
+        "col[1] + col[2] = 2000000000",
+        [1200000000, 1300000000, 1100000000, 1250000000, 1400000000],
+        [800000000, 700000000, 900000000, 750000000, 600000000],
+    )
+
+    assert f["flags"]["id_timestamp_dominant_sum"] is False
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_keeps_unlabeled_dominant_large_sum_outside_timestamp_range():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "sum_constant",
+        "",
+        "residual",
+        50,
+        1.0,
+        "col[1] + col[2] = 5000000010000",
+        [5000000000000, 5000000000001, 5000000000004, 5000000000009, 5000000000016],
+        [10000, 9999, 9996, 9991, 9984],
+    )
+
+    assert f["flags"]["id_timestamp_dominant_sum"] is False
     assert f["prefilter"] == "keep"
 
 
