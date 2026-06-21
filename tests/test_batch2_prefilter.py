@@ -744,3 +744,137 @@ def test_prefilter_drops_left_right_genomic_bin_coordinates():
 
     assert f["prefilter"] == "drop"
     assert f["prefilter_reason"] == "genomic_coordinate_table"
+
+
+def test_prefilter_drops_information_criterion_statistics():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_offset",
+        "AIC",
+        "BIC",
+        8054,
+        1.0,
+        "col[8] = col[7] + 4.55333",
+        [101.2, 98.4, 103.7, 110.5, 95.3],
+        [105.75333, 102.95333, 108.25333, 115.05333, 99.85333],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "information_criterion_columns"
+
+
+def test_prefilter_drops_interval_bound_pairs():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_offset",
+        "Lower limit",
+        "Upper limit",
+        72,
+        1.0,
+        "col[7] = col[6] + 0.0264234",
+        [0.101, 0.205, 0.308, 0.401, 0.552],
+        [0.1274234, 0.2314234, 0.3344234, 0.4274234, 0.5784234],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "interval_bounds"
+
+
+def test_prefilter_does_not_drop_independent_lower_upper_condition_names():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_offset",
+        "Lower airway",
+        "Upper airway",
+        12,
+        1.0,
+        "col[2] = col[1] + 0.3",
+        [1.2, 2.5, 3.1, 5.8, 6.4],
+        [1.5, 2.8, 3.4, 6.1, 6.7],
+    )
+
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_does_not_drop_low_high_confidence_condition_names():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_offset",
+        "Low confidence",
+        "High confidence",
+        24,
+        1.0,
+        "col[2] = col[1] + 0.1",
+        [0.2, 0.4, 0.5, 0.7, 0.8],
+        [0.3, 0.5, 0.6, 0.8, 0.9],
+    )
+
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_drops_intersection_size_to_precision():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio",
+        "intersection_size",
+        "precision",
+        537,
+        1.0,
+        "col[6] = col[5] * 0.00127065",
+        [1.0, 3.0, 5.0, 8.0, 13.0],
+        [0.00127065, 0.00381195, 0.00635325, 0.0101652, 0.01651845],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "count_to_probability_or_rate"
+
+
+def test_prefilter_drops_centered_log_columns():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_offset",
+        "DMSO_R1_log2",
+        "DMSO_R1_log2_centered",
+        3288,
+        1.0,
+        "col[17] = col[9] + -21.62",
+        [22.1, 23.4, 24.7, 25.5, 26.3],
+        [0.48, 1.78, 3.08, 3.88, 4.68],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "centered_or_standardized_column"
+
+
+def test_prefilter_drops_centered_labels_with_spaces():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_offset",
+        "sample value",
+        "sample value centered",
+        120,
+        1.0,
+        "col[2] = col[1] + -4.2",
+        [5.1, 6.4, 7.2, 8.9, 10.3],
+        [0.9, 2.2, 3.0, 4.7, 6.1],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "centered_or_standardized_column"
+
+
+def test_prefilter_drops_latitude_longitude_coordinate_pairs():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_offset",
+        "Latitude",
+        "Longitude",
+        261,
+        1.0,
+        "col[2] = col[1] + 90",
+        [-87.2, -86.9, -86.5, -86.0, -85.7],
+        [2.8, 3.1, 3.5, 4.0, 4.3],
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "coordinate_table"
