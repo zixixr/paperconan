@@ -118,9 +118,10 @@ def test_rule_low_dominance_downweights():
     assert d == ("downweight", "weak_repeat_dominance")
 
 
-def test_rule_low_information_downweights():
-    d = prefilter_within_col(_vd(col="measure", dup_value=3.71, frac_repeat=0.7, all_integer=False, n_distinct=2))
-    assert d == ("downweight", "low_information_column")
+def test_rule_low_cardinality_downweights():
+    # few-value (n_distinct<=4) non-integer column -> too low-cardinality to be a keep
+    d = prefilter_within_col(_vd(col="measure", dup_value=3.71, frac_repeat=0.7, all_integer=False, n_distinct=3))
+    assert d == ("downweight", "low_cardinality_column")
 
 
 # --- KEEP reflexes: genuine high-dominance precise repeats must survive ---
@@ -195,3 +196,22 @@ def test_regression_genuine_signals_are_never_hard_dropped(rec):
     rec = dict(rec, rule=f"col {rec['col']} shares last-2 decimals")
     decision, _reason = prefilter_within_col(rec, sheet_high_count=None)
     assert decision != "drop", f"genuine signal {rec['col']} would be hard-dropped (false negative)"
+
+
+# ----------------------- per-sheet within_col flood gate (_audit) -----------------------
+from paperconan._audit import _demote_within_col_flood, WITHIN_COL_SHEET_CAP
+
+
+def test_per_sheet_within_col_flood_demotes_all():
+    # a sheet with > cap within_col findings is a repetitive data table -> demote wholesale
+    flood = [dict(kind="within_col_value_duplication", severity="high", prefilter="keep")
+             for _ in range(WITHIN_COL_SHEET_CAP + 5)]
+    _demote_within_col_flood(flood)
+    assert all(f["severity"] == "low" and f["prefilter"] == "drop"
+               and f["prefilter_reason"] == "within_col_sheet_flood" for f in flood)
+
+
+def test_per_sheet_within_col_below_cap_untouched():
+    few = [dict(kind="within_col_value_duplication", severity="high", prefilter="keep") for _ in range(3)]
+    _demote_within_col_flood(few)
+    assert all(f["severity"] == "high" and f["prefilter"] == "keep" for f in few)

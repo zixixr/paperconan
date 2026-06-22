@@ -721,6 +721,7 @@ def make_finding(kind: str | None, a: str | None, b: str | None, n: int,
 # Tunable thresholds (see plan + offline iteration on the cached corpus):
 WC_FLOOD_K = 12        # within_col HIGH findings in one sheet/block -> matrix flood
 WC_CARD_K = 8          # distinct values <= this + all-integer -> categorical/coded
+WC_CARD_MIN = 4        # distinct values <= this -> low-cardinality, downweight (not a keep)
 WC_DOM_MIN = 0.60      # repeat dominance below this -> weak signal
 WC_NEAR_UNIT = (0.9, 1.1)   # |dup_value| in this band (and != 1.0) -> normalized/corr flood
 _WC_DECIMAL_THIRDS = {"33", "67", "66", "34"}   # last-2 decimals of k/3 fractions
@@ -808,7 +809,9 @@ def prefilter_within_col(f: dict[str, Any],
     # 8) weak repeat dominance -> downweight (only ~half the column repeats)
     if frac_repeat is not None and frac_repeat < WC_DOM_MIN:
         return "downweight", "weak_repeat_dominance"
-    # 9) low-information column (<=2 distinct values)
-    if n_distinct is not None and n_distinct <= 2:
-        return "downweight", "low_information_column"
+    # 9) low-cardinality column -> downweight. A genuine measurement-repeat signal needs a
+    #    high-cardinality column where one value still recurs; <=4 distinct values is a
+    #    few-value/categorical-ish column (kept for the judge, just not high-priority).
+    if n_distinct is not None and n_distinct <= WC_CARD_MIN:
+        return "downweight", "low_cardinality_column"
     return "keep", None

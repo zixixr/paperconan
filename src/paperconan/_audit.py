@@ -717,6 +717,27 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
 # proteomics sheet produced ~20,000 such 'high' relations, drowning the genuine signal.
 RELATION_FLOOD_CAP = 40
 
+# Above this many within-column findings on ONE (file, sheet), the sheet is a large
+# data table whose columns are repetitive by construction (categorical codes, dose
+# grids, few-value panels). Genuine within-col signals live in low-count sheets
+# (offline corpus: genuine-signal sheets held <=2 within_col each), so a sheet-wide
+# flood is noise — demote it wholesale instead of flooding the judge.
+WITHIN_COL_SHEET_CAP = 25
+
+
+def _demote_within_col_flood(within_col, cap=WITHIN_COL_SHEET_CAP):
+    """Demote a per-sheet flood of within-column findings to low severity, dropping them
+    from the packet (prefilter='drop'). Kept in scan.json (reversible via forensic).
+    Mutates + returns the same list."""
+    if len(within_col) <= cap:
+        return within_col
+    for f in within_col:
+        f["severity"] = "low"
+        f["prefilter"] = "drop"
+        f["prefilter_reason"] = "within_col_sheet_flood"
+        f["within_col_flood_sheet"] = True
+    return within_col
+
 
 def _demote_dense_relations(relations, cap=RELATION_FLOOD_CAP):
     """Demote a flood of pairwise column relations to low severity (tagging them
@@ -737,12 +758,14 @@ def _demote_dense_sheets(report_blocks, cap=RELATION_FLOOD_CAP):
     by_sheet = {}
     for b in report_blocks:
         key = (b["file"], b["sheet"])
-        agg = by_sheet.setdefault(key, {"relations": [], "equal_pairs": []})
+        agg = by_sheet.setdefault(key, {"relations": [], "equal_pairs": [], "within_col": []})
         agg["relations"].extend(b.get("relations", []))
         agg["equal_pairs"].extend(b.get("equal_pairs", []))
+        agg["within_col"].extend(b.get("within_col", []))
     for agg in by_sheet.values():
         _demote_dense_relations(agg["relations"], cap)   # same dict objects as in blocks
         _demote_dense_relations(agg["equal_pairs"], cap)
+        _demote_within_col_flood(agg["within_col"])      # per-sheet within-col flood gate
     return report_blocks
 
 
