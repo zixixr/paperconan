@@ -1,0 +1,197 @@
+"""within_col FP-reduction: detector enrichment + prefilter_within_col rules.
+
+The within_col detectors (value-duplication / decimal-repetition) flood high-severity
+output on large omics/matrix tables. The current profile already demotes ~83% via
+boundary/omics rules; these tests pin (a) the cheap detector enrichment that lets a
+prefilter decide precisely, and (b) the deterministic within_col prefilter that demotes
+the remaining structural FPs (categorical/integer columns, normalized ~1.0 floods, /3
+decimal artifacts, per-sheet floods) while KEEPING genuine high-dominance repeats.
+"""
+import numpy as np
+from paperconan._sheet import Sheet
+from paperconan._audit import detect_within_column_patterns
+
+
+def _sheet(cols, headers=None):
+    headers = headers or [f"c{j}" for j in range(len(cols))]
+    rows = [list(headers)]
+    for k in range(len(cols[0])):
+        rows.append([cols[j][k] for j in range(len(cols))])
+    return Sheet.from_rows(rows)
+
+
+def _detect(col, header="c0"):
+    s = _sheet([col], [header])
+    return detect_within_column_patterns(s, 1, len(col) + 1, 0, 1, [header])
+
+
+# ----------------------- detector enrichment -----------------------
+
+def test_value_duplication_finding_is_enriched():
+    col = [5, 5, 5, 5, 5, 5, 1, 2, 3]  # 5 repeated 6/9; all integer; 4 distinct
+    vd = [f for f in _detect(col) if f["kind"] == "within_col_value_duplication"]
+    assert vd, "expected a value-duplication finding"
+    g = vd[0]
+    assert g["n_distinct"] == 4
+    assert g["all_integer"] is True
+    assert abs(g["frac_repeat"] - 6 / 9) < 1e-9
+    assert isinstance(g["value_sample"], list) and 5.0 in g["value_sample"]
+
+
+def test_decimal_repetition_finding_is_enriched():
+    col = [1.33, 2.33, 3.33, 4.33, 5.33, 6.33, 7.33, 8.33, 9.01]  # 8/9 share '.33'
+    dr = [f for f in _detect(col) if f["kind"] == "within_col_decimal_repetition"]
+    assert dr, "expected a decimal-repetition finding"
+    g = dr[0]
+    assert g["all_integer"] is False
+    assert abs(g["frac_repeat"] - 8 / 9) < 1e-9
+    assert isinstance(g["value_sample"], list) and len(g["value_sample"]) >= 1
+
+
+# ----------------------- prefilter_within_col rules -----------------------
+from paperconan._prefilter import prefilter_within_col
+
+
+def _vd(col="", dup_value=3.7, frac_repeat=0.8, all_integer=False, n_distinct=10, **kw):
+    f = dict(kind="within_col_value_duplication", col=col, dup_value=dup_value,
+             frac_repeat=frac_repeat, all_integer=all_integer, n_distinct=n_distinct,
+             rule=f"col has value {dup_value} repeated")
+    f.update(kw)
+    return f
+
+
+def _dr(col="", ending="19", frac_repeat=0.9, n_distinct=20, **kw):
+    f = dict(kind="within_col_decimal_repetition", col=col, ending=ending,
+             frac_repeat=frac_repeat, all_integer=False, n_distinct=n_distinct,
+             rule=f"values share last-2 decimals '.{ending}'")
+    f.update(kw)
+    return f
+
+
+def test_rule_sheet_flood_drops():
+    assert prefilter_within_col(_vd(), sheet_high_count=15) == ("drop", "within_col_sheet_flood")
+
+
+def test_rule_axis_or_index_drops():
+    assert prefilter_within_col(_vd(col="Day"))[0] == "drop"
+    assert prefilter_within_col(_vd(col="Day"))[1] == "axis_or_index_column"
+
+
+def test_rule_count_or_categorical_drops():
+    assert prefilter_within_col(_vd(col="Community"))[1] == "count_or_categorical_column"
+    assert prefilter_within_col(_vd(col="cluster id"))[1] == "count_or_categorical_column"
+
+
+def test_rule_categorical_integer_drops():
+    # blank-named integer column with low cardinality = coded/categorical
+    assert prefilter_within_col(_vd(col="", all_integer=True, n_distinct=4))[1] == "categorical_integer_column"
+
+
+def test_rule_integer_no_context_downweights():
+    # integer but high-cardinality, no flood, no telltale name -> weak, keep visible
+    d = prefilter_within_col(_vd(col="signal", all_integer=True, n_distinct=60))
+    assert d == ("downweight", "integer_valued_repeat")
+
+
+def test_rule_normalized_near_unit_drops():
+    d = prefilter_within_col(_vd(col="", dup_value=0.9977, all_integer=False, n_distinct=25))
+    assert d == ("drop", "normalized_near_unit")
+
+
+def test_rule_derived_fraction_decimal_drops():
+    # explicit proportion/percent column -> hard drop regardless of cardinality/ending
+    assert prefilter_within_col(_dr(col="percent positive", ending="11"))[1] == "derived_fraction_decimal"
+    # constant / two-value /3-family fraction column -> hard drop (trivially repeated fractions)
+    assert prefilter_within_col(_dr(ending="33", n_distinct=1))[1] == "derived_fraction_decimal"
+    assert prefilter_within_col(_dr(ending="67", n_distinct=2))[1] == "derived_fraction_decimal"
+
+
+def test_rule_multivalue_shared_decimal_ending_downweights_not_drops():
+    # >=3 distinct precise values sharing a /3 ending is the genuine manufactured-digit
+    # signal -> must NOT be hard-dropped; downweighted so it still reaches the judge
+    assert prefilter_within_col(_dr(ending="33", n_distinct=4, frac_repeat=0.7)) == ("downweight", "shared_decimal_ending")
+    assert prefilter_within_col(_dr(ending="67", n_distinct=12, frac_repeat=0.8)) == ("downweight", "shared_decimal_ending")
+
+
+def test_rule_low_dominance_downweights():
+    d = prefilter_within_col(_vd(col="abundance", dup_value=3.71, frac_repeat=0.5, all_integer=False, n_distinct=20))
+    assert d == ("downweight", "weak_repeat_dominance")
+
+
+def test_rule_low_information_downweights():
+    d = prefilter_within_col(_vd(col="measure", dup_value=3.71, frac_repeat=0.7, all_integer=False, n_distinct=2))
+    assert d == ("downweight", "low_information_column")
+
+
+# --- KEEP reflexes: genuine high-dominance precise repeats must survive ---
+
+def test_keep_genuine_value_duplication():
+    # precise non-integer value repeated in most rows of a measurement column, no flood
+    d = prefilter_within_col(_vd(col="OD600", dup_value=0.4523, frac_repeat=0.9,
+                                 all_integer=False, n_distinct=10), sheet_high_count=2)
+    assert d == ("keep", None)
+
+
+def test_keep_genuine_decimal_repetition():
+    # shared last-2 decimals not explained by /3 or a derived label, high dominance
+    d = prefilter_within_col(_dr(col="value", ending="19", frac_repeat=0.95, n_distinct=30),
+                             sheet_high_count=3)
+    assert d == ("keep", None)
+
+
+def test_non_within_col_kind_is_passthrough():
+    assert prefilter_within_col(dict(kind="identical_column")) == ("keep", None)
+
+
+# ----------------------- profile integration (flood gate end-to-end) -----------------------
+from paperconan._profiles import apply_profile_to_findings
+from paperconan._prefilter import WC_FLOOD_K
+
+
+def _wc_high(col, dup_value=3.7, frac_repeat=0.9, all_integer=False, n_distinct=20):
+    return dict(kind="within_col_value_duplication", col=col, dup_value=dup_value,
+                frac_repeat=frac_repeat, all_integer=all_integer, n_distinct=n_distinct,
+                severity="high", rule=f"col[{col}] has value {dup_value} repeated")
+
+
+def test_profile_review_demotes_within_col_flood():
+    # each finding alone would be KEPT; WC_FLOOD_K of them in one block -> matrix flood -> all demoted
+    block = [_wc_high(f"c{i}") for i in range(WC_FLOOD_K)]
+    apply_profile_to_findings(block, "review")
+    assert all(f["severity"] == "low" and f["profile_action"] == "demoted" for f in block)
+    assert all(any("within_col" in c for c in f.get("false_positive_context", [])) for f in block)
+
+
+def test_profile_forensic_keeps_within_col_flood_high():
+    block = [_wc_high(f"c{i}") for i in range(WC_FLOOD_K)]
+    apply_profile_to_findings(block, "forensic")
+    assert all(f["severity"] == "high" and f["profile_action"] == "kept" for f in block)
+
+
+def test_profile_review_keeps_genuine_survivor():
+    block = [_wc_high("OD600", dup_value=0.4523, frac_repeat=0.9, n_distinct=10)]
+    apply_profile_to_findings(block, "review")
+    assert block[0]["severity"] == "high" and block[0]["profile_action"] == "kept"
+
+
+# ----------------------- regression guard -----------------------
+# These genuine-signal decimal-repetition findings (oracle-confirmed on the 69-paper
+# offline corpus) MUST keep reaching the judge — a rule change that hard-drops any of
+# them is a false negative. Frozen from within_col_regression.json.
+import pytest
+
+_REGRESSION = [
+    dict(kind="within_col_decimal_repetition", col="0.05", ending="33", n_distinct=9, frac_repeat=0.64, all_integer=False),
+    dict(kind="within_col_decimal_repetition", col="DN_sen", ending="67", n_distinct=10, frac_repeat=0.75, all_integer=False),
+    dict(kind="within_col_decimal_repetition", col="fracCorNeg", ending="52", n_distinct=6, frac_repeat=0.86, all_integer=False),
+    dict(kind="within_col_decimal_repetition", col="Cre+", ending="25", n_distinct=8, frac_repeat=0.62, all_integer=False),
+    dict(kind="within_col_decimal_repetition", col="Ctrl", ending="33", n_distinct=12, frac_repeat=0.64, all_integer=False),
+    dict(kind="within_col_decimal_repetition", col="dp", ending="78", n_distinct=4, frac_repeat=0.75, all_integer=False),
+]
+
+
+@pytest.mark.parametrize("rec", _REGRESSION, ids=[r["col"] for r in _REGRESSION])
+def test_regression_genuine_signals_are_never_hard_dropped(rec):
+    rec = dict(rec, rule=f"col {rec['col']} shares last-2 decimals")
+    decision, _reason = prefilter_within_col(rec, sheet_high_count=None)
+    assert decision != "drop", f"genuine signal {rec['col']} would be hard-dropped (false negative)"

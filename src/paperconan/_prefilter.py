@@ -705,3 +705,110 @@ def make_finding(kind: str | None, a: str | None, b: str | None, n: int,
     }
     finding.update(extra)
     return finding
+
+
+# --------------------------------------------------------------------------
+# within_col prefilter
+#
+# The within_col_value_duplication / within_col_decimal_repetition detectors
+# flood high-severity output on large omics/matrix tables. The relation prefilter
+# above does not apply (single-column findings, different fields). This is the
+# parallel deterministic layer: it demotes structural FPs (axis/index, categorical
+# or integer-coded columns, normalized ~1.0 floods, /3 decimal artifacts, per-sheet
+# floods) and downweights weak signals (integer repeats, low dominance), while
+# keeping genuine high-dominance repeats of precise measured values for review.
+#
+# Tunable thresholds (see plan + offline iteration on the cached corpus):
+WC_FLOOD_K = 12        # within_col HIGH findings in one sheet/block -> matrix flood
+WC_CARD_K = 8          # distinct values <= this + all-integer -> categorical/coded
+WC_DOM_MIN = 0.60      # repeat dominance below this -> weak signal
+WC_NEAR_UNIT = (0.9, 1.1)   # |dup_value| in this band (and != 1.0) -> normalized/corr flood
+_WC_DECIMAL_THIRDS = {"33", "67", "66", "34"}   # last-2 decimals of k/3 fractions
+
+_WC_CATEGORICAL_RE = re.compile(
+    r"\b(community|communit\w*|mode|cluster|type|group|grade|stage|class|categor\w*|"
+    r"label|id|index|rank|bin|level|state|status|condition|genotype|cohort|batch|"
+    r"replicate|well|plate|channel|count|number|reads?|order|flag|module|partition)\b"
+    r"|分类|簇|类型|分组|等级|分期|索引|批次|计数|编号",
+    re.I,
+)
+_WC_AXIS_RE = re.compile(
+    r"\b(day|days|time|hour|hours|hr|hrs|min|mins|week|weeks|month|months|year|years|age|"
+    r"dose|concentration|conc|dilution|distance|depth|position|coordinate|coord|"
+    r"step|cycle|frame|wavelength|frequency|freq|voltage|temperature|temp)\b"
+    r"|时间|剂量|浓度|位置|坐标|波长|频率|温度|天数|周|月|年",
+    re.I,
+)
+
+
+def _wc_name(f: dict[str, Any]) -> str:
+    return " ".join(str(f.get(k) or "") for k in ("col", "rule"))
+
+
+def prefilter_within_col(f: dict[str, Any],
+                         sheet_high_count: int | None = None) -> tuple[str, str | None]:
+    """Deterministic FP filter for within_col_* findings.
+
+    Returns (decision, reason) with decision in {"drop", "downweight", "keep"}.
+    `sheet_high_count` is the number of within_col HIGH findings in the same
+    sheet/block (enables the matrix-flood gate); pass None to disable it.
+    Relies on the detector enrichment fields all_integer / n_distinct / frac_repeat.
+    """
+    kind = f.get("kind")
+    if kind not in {"within_col_value_duplication", "within_col_decimal_repetition"}:
+        return "keep", None
+
+    name = _wc_name(f)
+    all_integer = bool(f.get("all_integer"))
+    n_distinct = f.get("n_distinct")
+    n_distinct = n_distinct if isinstance(n_distinct, int) else None
+    try:
+        frac_repeat = float(f["frac_repeat"]) if f.get("frac_repeat") is not None else None
+    except (TypeError, ValueError):
+        frac_repeat = None
+
+    # 1) per-sheet within_col flood -> correlation/omics matrix dump, demote the noise
+    if sheet_high_count is not None and sheet_high_count >= WC_FLOOD_K:
+        return "drop", "within_col_sheet_flood"
+    # 2) axis / index / scan column by name
+    if _axis_label(name) or _WC_AXIS_RE.search(name):
+        return "drop", "axis_or_index_column"
+    # 3) count / categorical column by name
+    if _count_label(name) or _WC_CATEGORICAL_RE.search(name):
+        return "drop", "count_or_categorical_column"
+    # 4) integer-valued + low cardinality -> categorical / coded column
+    if all_integer and n_distinct is not None and n_distinct <= WC_CARD_K:
+        return "drop", "categorical_integer_column"
+    # 5) integer-valued otherwise -> counts repeat naturally; weak, keep visible but demote
+    if all_integer:
+        return "downweight", "integer_valued_repeat"
+    # 6) normalized / correlation flood: precise value clustered near 1.0 (e.g. 0.99x)
+    if kind == "within_col_value_duplication":
+        try:
+            dv = abs(float(f.get("dup_value")))
+        except (TypeError, ValueError):
+            dv = None
+        if dv is not None and WC_NEAR_UNIT[0] <= dv <= WC_NEAR_UNIT[1] and abs(dv - 1.0) > 1e-9:
+            return "drop", "normalized_near_unit"
+    # 7) decimal repetition. This is the strongest fabrication signal (manufactured digits),
+    #    so only HARD-drop when the benign explanation is unambiguous: an explicitly
+    #    proportion/percent column, or a low-cardinality /3-family fraction column. A
+    #    high-cardinality precise column that merely shares a /3 ending is kept for the
+    #    judge (downweighted, not dropped) so genuine signals are never lost.
+    if kind == "within_col_decimal_repetition":
+        if _derived_label(name) or _derived_stat_label(name) or _percent_label(name):
+            return "drop", "derived_fraction_decimal"
+        if str(f.get("ending")) in _WC_DECIMAL_THIRDS:
+            # only HARD-drop a constant / two-value fraction column; any column with >=3
+            # distinct precise values sharing a /3 ending is kept for the judge (the
+            # manufactured-digit signal lives here), downweighted not dropped.
+            if n_distinct is not None and n_distinct <= 2:
+                return "drop", "derived_fraction_decimal"
+            return "downweight", "shared_decimal_ending"
+    # 8) weak repeat dominance -> downweight (only ~half the column repeats)
+    if frac_repeat is not None and frac_repeat < WC_DOM_MIN:
+        return "downweight", "weak_repeat_dominance"
+    # 9) low-information column (<=2 distinct values)
+    if n_distinct is not None and n_distinct <= 2:
+        return "downweight", "low_information_column"
+    return "keep", None
