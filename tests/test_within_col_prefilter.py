@@ -73,37 +73,43 @@ def test_rule_sheet_flood_drops():
 
 
 def test_rule_axis_or_index_drops():
-    assert prefilter_within_col(_vd(col="Day"))[0] == "drop"
-    assert prefilter_within_col(_vd(col="Day"))[1] == "axis_or_index_column"
+    assert prefilter_within_col(_vd(col="Day")) == ("drop", "axis_or_index")
 
 
 def test_rule_count_or_categorical_drops():
-    assert prefilter_within_col(_vd(col="Community"))[1] == "count_or_categorical_column"
-    assert prefilter_within_col(_vd(col="cluster id"))[1] == "count_or_categorical_column"
+    assert prefilter_within_col(_vd(col="Community"))[1] == "categorical_or_integer_code"
+    assert prefilter_within_col(_vd(col="cluster id"))[1] == "categorical_or_integer_code"
 
 
-def test_rule_categorical_integer_drops():
-    # blank-named integer column with low cardinality = coded/categorical
-    assert prefilter_within_col(_vd(col="", all_integer=True, n_distinct=4))[1] == "categorical_integer_column"
+def test_rule_derived_or_model_output_drops():
+    # computed / model-output / derived / percentage columns are format artifacts (Phase-2 taxonomy)
+    assert prefilter_within_col(_vd(col="predicted score"))[1] == "derived_or_model_output"
+    assert prefilter_within_col(_vd(col="mean intensity"))[1] == "derived_or_model_output"
+    assert prefilter_within_col(_dr(col="percent positive", ending="11"))[1] == "derived_or_model_output"
 
 
-def test_rule_integer_no_context_downweights():
-    # integer but high-cardinality, no flood, no telltale name -> weak, keep visible
-    d = prefilter_within_col(_vd(col="signal", all_integer=True, n_distinct=60))
-    assert d == ("downweight", "integer_valued_repeat")
+def test_rule_any_integer_column_drops():
+    # integer-valued column = counts/codes/categories; genuine signals are non-integer
+    assert prefilter_within_col(_vd(col="", all_integer=True, n_distinct=4)) == ("drop", "categorical_or_integer_code")
+    assert prefilter_within_col(_vd(col="signal", all_integer=True, n_distinct=60)) == ("drop", "categorical_or_integer_code")
 
 
 def test_rule_normalized_near_unit_drops():
     d = prefilter_within_col(_vd(col="", dup_value=0.9977, all_integer=False, n_distinct=25))
-    assert d == ("drop", "normalized_near_unit")
+    assert d == ("drop", "normalized_or_fold_change")
 
 
-def test_rule_derived_fraction_decimal_drops():
-    # explicit proportion/percent column -> hard drop regardless of cardinality/ending
-    assert prefilter_within_col(_dr(col="percent positive", ending="11"))[1] == "derived_fraction_decimal"
-    # constant / two-value /3-family fraction column -> hard drop (trivially repeated fractions)
-    assert prefilter_within_col(_dr(ending="33", n_distinct=1))[1] == "derived_fraction_decimal"
-    assert prefilter_within_col(_dr(ending="67", n_distinct=2))[1] == "derived_fraction_decimal"
+def test_rule_fixed_denominator_drops():
+    # values consistent with k/N (here k/6) -> sample-size / ratio arithmetic, not manufactured
+    d = prefilter_within_col(_dr(col="x", ending="67", n_distinct=8,
+                                 value_sample=[0.667, 0.333, 0.5, 0.833, 0.167]))
+    assert d == ("drop", "fixed_denominator")
+
+
+def test_rule_low_n_downweights():
+    # too few rows to judge -> insufficient context (kept visible, not dropped)
+    d = prefilter_within_col(_vd(col="abundance", dup_value=3.71, n=7, frac_repeat=0.9, n_distinct=6))
+    assert d == ("downweight", "low_n_or_insufficient_context")
 
 
 def test_rule_multivalue_shared_decimal_ending_downweights_not_drops():
@@ -181,13 +187,15 @@ def test_profile_review_keeps_genuine_survivor():
 # them is a false negative. Frozen from within_col_regression.json.
 import pytest
 
+# Genuine-signal survivors whose patterns resist EVERY computational explanation. The k/N rule
+# (Phase 2) correctly reclassified DN_sen (k/30), Cre+ (k/40), 0.05 (k/300) and Ctrl (8 values all
+# exactly k/75) as benign sample-size/ratio arithmetic, so they left the guard. What remains must
+# stay reachable by the judge (kept or downweighted, never hard-dropped).
 _REGRESSION = [
-    dict(kind="within_col_decimal_repetition", col="0.05", ending="33", n_distinct=9, frac_repeat=0.64, all_integer=False),
-    dict(kind="within_col_decimal_repetition", col="DN_sen", ending="67", n_distinct=10, frac_repeat=0.75, all_integer=False),
-    dict(kind="within_col_decimal_repetition", col="fracCorNeg", ending="52", n_distinct=6, frac_repeat=0.86, all_integer=False),
-    dict(kind="within_col_decimal_repetition", col="Cre+", ending="25", n_distinct=8, frac_repeat=0.62, all_integer=False),
-    dict(kind="within_col_decimal_repetition", col="Ctrl", ending="33", n_distinct=12, frac_repeat=0.64, all_integer=False),
-    dict(kind="within_col_decimal_repetition", col="dp", ending="78", n_distinct=4, frac_repeat=0.75, all_integer=False),
+    dict(kind="within_col_decimal_repetition", col="dp", ending="78", n_distinct=4, frac_repeat=0.75, all_integer=False,
+         value_sample=[0.127, 0.278, 0.778, 0.878]),
+    dict(kind="within_col_decimal_repetition", col="fracCorNeg", ending="52", n_distinct=6, frac_repeat=0.86, all_integer=False,
+         value_sample=[0.9995, 1.0, 0.8, 0.7, 0.73, 0.9667]),
 ]
 
 

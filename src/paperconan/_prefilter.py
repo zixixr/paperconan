@@ -723,6 +723,7 @@ WC_FLOOD_K = 12        # within_col HIGH findings in one sheet/block -> matrix f
 WC_CARD_K = 8          # distinct values <= this + all-integer -> categorical/coded
 WC_CARD_MIN = 4        # distinct values <= this -> low-cardinality, downweight (not a keep)
 WC_DOM_MIN = 0.60      # repeat dominance below this -> weak signal
+WC_N_MIN = 10          # fewer than this many rows -> too little context to judge (downweight)
 WC_NEAR_UNIT = (0.9, 1.1)   # |dup_value| in this band (and != 1.0) -> normalized/corr flood
 _WC_DECIMAL_THIRDS = {"33", "67", "66", "34"}   # last-2 decimals of k/3 fractions
 
@@ -733,6 +734,58 @@ _WC_CATEGORICAL_RE = re.compile(
     r"|分类|簇|类型|分组|等级|分期|索引|批次|计数|编号",
     re.I,
 )
+# computed/model-output columns (Phase-2 FP taxonomy: model_output_or_stat_table / derived /
+# normalized / percentage). A repeat/shared-ending in a computed column is a format artifact.
+_WC_DERIVED_RE = re.compile(
+    r"\b(model|predicted|prediction|fitted|fit|estimate|estimated|output|"
+    r"coef(?:ficient)?|loading|residual|expected|probability|prob|likelihood|density|"
+    r"score|weight|mean|median|average|avg|std|sd|sem|\bse\b|variance|\bvar\b|"
+    r"ratio|rate|fraction|proportion|percent|percentage|normal\w*|fold|log2?fc|logfc|"
+    r"z[-_ ]?score|auc|pval|p[-_ ]?value|qval|q[-_ ]?value|fdr|padj|adjusted)\b"
+    r"|占比|比例|比率|均值|平均|标准差|标准误|归一|预测|拟合|模型|得分|概率",
+    re.I,
+)
+
+
+def _wc_nums(value_sample: Any) -> list[float]:
+    out = []
+    for v in (value_sample or []):
+        try:
+            out.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _wc_decimals(x: float) -> int:
+    s = repr(abs(x))
+    if "e" in s or "E" in s:
+        return 9
+    return len(s.split(".", 1)[1].rstrip("0")) if "." in s else 0
+
+
+def _wc_fixed_denominator(value_sample: Any) -> bool:
+    """True if the sampled non-integer values are consistent with k/N for ONE small N — i.e. the
+    shared trailing digits are sample-size / ratio arithmetic (x/30, x/300...), not manufactured.
+    Principled test: for some N, the nearest k/N reproduces EVERY value at its own display precision
+    (no loose growing tolerance, so genuine continuous measurements are not false-matched)."""
+    vals = [v for v in _wc_nums(value_sample) if abs(v - round(v)) > 1e-9]
+    if len(vals) < 3:
+        return False
+    if max(_wc_decimals(v) for v in vals) >= 6:   # very high precision -> not a small-N fraction
+        return False
+    for N in range(2, 401):
+        if N > 50 and len(vals) < 5:              # large denominator + few values -> coincidental
+            continue
+        ok = True
+        for v in vals:
+            scale = 10 ** _wc_decimals(v)
+            if round((round(v * N) / N) * scale) != round(v * scale):
+                ok = False
+                break
+        if ok:
+            return True
+    return False
 _WC_AXIS_RE = re.compile(
     r"\b(day|days|time|hour|hours|hr|hrs|min|mins|week|weeks|month|months|year|years|age|"
     r"dose|concentration|conc|dilution|distance|depth|position|coordinate|coord|"
@@ -768,21 +821,28 @@ def prefilter_within_col(f: dict[str, Any],
     except (TypeError, ValueError):
         frac_repeat = None
 
+    value_sample = f.get("value_sample")
+    try:
+        n_rows = int(f.get("n")) if f.get("n") is not None else None
+    except (TypeError, ValueError):
+        n_rows = None
+
     # 1) per-sheet within_col flood -> correlation/omics matrix dump, demote the noise
     if sheet_high_count is not None and sheet_high_count >= WC_FLOOD_K:
         return "drop", "within_col_sheet_flood"
     # 2) axis / index / scan column by name
     if _axis_label(name) or _WC_AXIS_RE.search(name):
-        return "drop", "axis_or_index_column"
+        return "drop", "axis_or_index"
     # 3) count / categorical column by name
     if _count_label(name) or _WC_CATEGORICAL_RE.search(name):
-        return "drop", "count_or_categorical_column"
-    # 4) integer-valued + low cardinality -> categorical / coded column
-    if all_integer and n_distinct is not None and n_distinct <= WC_CARD_K:
-        return "drop", "categorical_integer_column"
-    # 5) integer-valued otherwise -> counts repeat naturally; weak, keep visible but demote
+        return "drop", "categorical_or_integer_code"
+    # 4) computed / model-output / derived / percentage column by name -> format artifact
+    if _WC_DERIVED_RE.search(name) or _derived_label(name) or _derived_stat_label(name) or _percent_label(name):
+        return "drop", "derived_or_model_output"
+    # 5) integer-valued -> counts / codes / categories repeat naturally (genuine measurement
+    #    signals are non-integer); the FP taxonomy shows the judge drops these wholesale.
     if all_integer:
-        return "downweight", "integer_valued_repeat"
+        return "drop", "categorical_or_integer_code"
     # 6) normalized / correlation flood: precise value clustered near 1.0 (e.g. 0.99x)
     if kind == "within_col_value_duplication":
         try:
@@ -790,28 +850,25 @@ def prefilter_within_col(f: dict[str, Any],
         except (TypeError, ValueError):
             dv = None
         if dv is not None and WC_NEAR_UNIT[0] <= dv <= WC_NEAR_UNIT[1] and abs(dv - 1.0) > 1e-9:
-            return "drop", "normalized_near_unit"
-    # 7) decimal repetition. This is the strongest fabrication signal (manufactured digits),
-    #    so only HARD-drop when the benign explanation is unambiguous: an explicitly
-    #    proportion/percent column, or a low-cardinality /3-family fraction column. A
-    #    high-cardinality precise column that merely shares a /3 ending is kept for the
-    #    judge (downweighted, not dropped) so genuine signals are never lost.
-    if kind == "within_col_decimal_repetition":
-        if _derived_label(name) or _derived_stat_label(name) or _percent_label(name):
-            return "drop", "derived_fraction_decimal"
-        if str(f.get("ending")) in _WC_DECIMAL_THIRDS:
-            # only HARD-drop a constant / two-value fraction column; any column with >=3
-            # distinct precise values sharing a /3 ending is kept for the judge (the
-            # manufactured-digit signal lives here), downweighted not dropped.
-            if n_distinct is not None and n_distinct <= 2:
-                return "drop", "derived_fraction_decimal"
-            return "downweight", "shared_decimal_ending"
-    # 8) weak repeat dominance -> downweight (only ~half the column repeats)
+            return "drop", "normalized_or_fold_change"
+    # 7) values explained by a small fixed denominator k/N -> sample-size / ratio arithmetic
+    #    (also subsumes coarse rounding grids, which are just k/N with N = 1/step)
+    if _wc_fixed_denominator(value_sample):
+        return "drop", "fixed_denominator"
+    # 8) decimal repetition: a constant / two-value /3-family fraction column hard-drops; a
+    #    high-cardinality precise column merely sharing a /3 ending is kept for the judge.
+    if kind == "within_col_decimal_repetition" and str(f.get("ending")) in _WC_DECIMAL_THIRDS:
+        if n_distinct is not None and n_distinct <= 2:
+            return "drop", "fixed_denominator"
+        return "downweight", "shared_decimal_ending"
+    # 10) too few rows to judge -> insufficient context (kept visible, low priority)
+    if n_rows is not None and n_rows < WC_N_MIN:
+        return "downweight", "low_n_or_insufficient_context"
+    # 11) weak repeat dominance -> downweight (only ~half the column repeats)
     if frac_repeat is not None and frac_repeat < WC_DOM_MIN:
         return "downweight", "weak_repeat_dominance"
-    # 9) low-cardinality column -> downweight. A genuine measurement-repeat signal needs a
-    #    high-cardinality column where one value still recurs; <=4 distinct values is a
-    #    few-value/categorical-ish column (kept for the judge, just not high-priority).
+    # 12) low-cardinality column -> downweight (a genuine measurement-repeat signal needs a
+    #     high-cardinality column where one value still recurs).
     if n_distinct is not None and n_distinct <= WC_CARD_MIN:
         return "downweight", "low_cardinality_column"
     return "keep", None
