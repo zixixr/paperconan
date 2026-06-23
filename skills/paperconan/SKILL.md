@@ -75,7 +75,7 @@ When a finding has `profile_action: "demoted"` or `profile_action: "hidden"`, th
 
 Load references only when needed:
 
-- [references/output-schema.md](references/output-schema.md): read before parsing `scan.json` or explaining fields such as `profile_action`, `prefilter_reason`, `col_a_sample`, or `cross_sheet_findings`.
+- [references/output-schema.md](references/output-schema.md): read before parsing `scan.json` or explaining fields such as `profile_action`, `prefilter_reason`, `value_sample`, `col_a_sample`, or `cross_sheet_findings`.
 - [references/detectors.md](references/detectors.md): read when interpreting a detector kind and its common false positives.
 - [references/judgment-rubric.md](references/judgment-rubric.md): read before ranking findings, judging within-column signals, or drafting PubPeer/research-integrity language.
 - [references/interpretation.md](references/interpretation.md): read when composing the final user-facing answer or handling requests to accuse, expose, or escalate.

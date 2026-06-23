@@ -6,7 +6,7 @@ Use this reference when deciding how strongly to surface a paperconan finding or
 - `likely benign`: the pattern is explained by table structure, formulas, shared data, rounding, bounded values, or another ordinary workflow.
 - `needs human context`: the finding could matter, but the agent cannot confirm a key premise from the available data.
 
-Do not use internal batch-review labels in user-facing output.
+Do not use non-public review labels in user-facing output.
 
 ## First-Pass Ordering
 
