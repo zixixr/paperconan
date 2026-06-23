@@ -1377,3 +1377,145 @@ def test_prefilter_keeps_different_bases_with_search_engine_suffix():
 
     assert f["flags"]["search_engine_export_twin"] is False
     assert f["prefilter"] == "keep"
+
+
+def test_prefilter_drops_cross_sheet_partial_shared_control_overlap():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "cross_sheet:value_tweaked",
+        "Fig. 3B control",
+        "Fig. S6B vehicle control",
+        8,
+        0.5,
+        "8/16 same-position values",
+        None,
+        None,
+    )
+
+    assert f["fraction_of_smaller"] == 0.5
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "shared_control_or_baseline"
+
+
+def test_prefilter_downweights_small_cross_sheet_partial_overlap():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "cross_sheet:value_tweaked",
+        "Fig. 3B treatment",
+        "Fig. S6B treatment",
+        8,
+        0.5,
+        "8/16 same-position values",
+        None,
+        None,
+    )
+
+    assert f["prefilter"] == "downweight"
+    assert f["prefilter_reason"] == "cross_sheet_partial_overlap"
+
+
+def test_prefilter_downweights_cross_sheet_shared_axis_overlap():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "cross_sheet:value_tweaked",
+        "Fig. 1 time axis",
+        "Fig. 2 time axis",
+        40,
+        0.45,
+        "40/89 same-position values",
+        None,
+        None,
+    )
+
+    assert f["prefilter"] == "downweight"
+    assert f["prefilter_reason"] == "shared_axis_overlap"
+
+
+def test_prefilter_keeps_mass_cross_sheet_perfect_duplicate_for_judging():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "cross_sheet:perfect_dup",
+        "Control MSU Time 1",
+        "Control MSU Time 2",
+        220,
+        1.0,
+        "220/220 same-position values",
+        None,
+        None,
+    )
+
+    assert f["mass"] is True
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_downweights_identical_calibration_export_columns():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "identical_column",
+        "Obs Conc",
+        "Exp Conc",
+        96,
+        1.0,
+        "col[4] == col[3]",
+        [1.2, 4.5, 8.1, 16.0, 32.0],
+        [1.2, 4.5, 8.1, 16.0, 32.0],
+    )
+
+    assert f["prefilter"] == "downweight"
+    assert f["prefilter_reason"] == "derived_or_export_column"
+
+
+def test_prefilter_keeps_independent_identical_biomarker_columns():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "identical_column",
+        "ESR1",
+        "EGFR",
+        14,
+        1.0,
+        "col[1] == col[0]",
+        [5.1551, 4.3899, 3.4051, 6.1391, 5.09],
+        [5.1551, 4.3899, 3.4051, 6.1391, 5.09],
+    )
+
+    assert f["prefilter"] == "keep"
+
+
+def test_prefilter_drops_cross_sheet_enriched_shared_control_context():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "cross_sheet:value_tweaked",
+        "Fig. 3B",
+        "Fig. S6B",
+        24,
+        0.5,
+        "24/48 same-position values",
+        None,
+        None,
+        shared_context={"shared_control_or_baseline": True, "shared_axis_or_coordinate": False},
+        label_context_a={"text": "control baseline"},
+        label_context_b={"text": "vehicle control"},
+    )
+
+    assert f["prefilter"] == "drop"
+    assert f["prefilter_reason"] == "shared_control_or_baseline"
+
+
+def test_prefilter_downweights_cross_sheet_enriched_axis_context():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "cross_sheet:value_tweaked",
+        "Fig. 1",
+        "Fig. 2",
+        40,
+        0.45,
+        "40/89 same-position values",
+        None,
+        None,
+        shared_context={"shared_control_or_baseline": False, "shared_axis_or_coordinate": True},
+        label_context_a={"text": "time"},
+        label_context_b={"text": "time"},
+    )
+
+    assert f["prefilter"] == "downweight"
+    assert f["prefilter_reason"] == "shared_axis_overlap"

@@ -69,6 +69,12 @@ _STAT_DERIVED_RE = re.compile(
     r"confidence[ _-]*interval)\b",
     re.I,
 )
+_DERIVED_EXPORT_RE = re.compile(
+    r"\b(?:obs(?:erved)?[ _-]?conc(?:entration)?|exp(?:ected)?[ _-]?conc(?:entration)?|"
+    r"calibrat(?:e|ed|ion|or)?|predicted|fitted|export|score|loading|residual|"
+    r"theoretical|nominal)\b",
+    re.I,
+)
 _QPCR_DERIVED_RE = re.compile(
     r"\b(?:dct|ddct|delta[ _-]*ct|delta[ _-]*delta[ _-]*ct|"
     r"deltacq|delta[ _-]*cq|delta[ _-]*delta[ _-]*cq|"
@@ -158,6 +164,16 @@ _ID_TIMESTAMP_RE = re.compile(
     r"date[ _-]*(?:time|stamp)?|sample[ _-]*(?:id|identifier)|specimen[ _-]*id)\b",
     re.I,
 )
+_CONTROL_BASELINE_RE = re.compile(
+    r"\b(?:control|ctrl|baseline|vehicle|untreated|wt|wild[- ]?type|reference|mock|"
+    r"naive|sham|pbs|dmso)\b|参照|对照|基线",
+    re.I,
+)
+_CROSS_SHEET_AXIS_RE = re.compile(
+    r"\b(?:time|day|dose|conc(?:entration)?|wavelength|m/z|mz|position|chr|"
+    r"coordinate|coord|index|bin)\b|波长|时间|剂量",
+    re.I,
+)
 _COMPLEMENT_LABEL_PAIRS = (
     ("with", "without"),
     ("pos", "neg"),
@@ -190,6 +206,10 @@ def _axis_label(label: str | None) -> bool:
 
 def _derived_stat_label(label: str | None) -> bool:
     return bool(_STAT_DERIVED_RE.search(label or ""))
+
+
+def _derived_export_label(label: str | None) -> bool:
+    return bool(_DERIVED_EXPORT_RE.search(label or ""))
 
 
 def _image_derived_label(label: str | None) -> bool:
@@ -573,6 +593,37 @@ def _low_information_sparse(kind: str | None, n: int, sa: list[Any] | None,
     return unique <= 4 or zeros >= len(vals) // 2
 
 
+def _is_cross_sheet(kind: str | None) -> bool:
+    return bool(kind and str(kind).startswith("cross_sheet:"))
+
+
+def _cross_sheet_non_perfect(kind: str | None, frac: float | None, mass: bool) -> bool:
+    if not _is_cross_sheet(kind):
+        return False
+    if kind == "cross_sheet:perfect_dup" or mass:
+        return False
+    return frac is None or frac < 0.9
+
+
+def _cross_sheet_side_text(label: str | None, figure: Any = None) -> str:
+    parts = [str(x) for x in (label, figure) if x]
+    return " ".join(parts)
+
+
+def _shared_control_or_baseline(side_a: str, side_b: str) -> bool:
+    return bool(_CONTROL_BASELINE_RE.search(side_a) and _CONTROL_BASELINE_RE.search(side_b))
+
+
+def _cross_sheet_axis_overlap(side_a: str, side_b: str) -> bool:
+    return bool(_CROSS_SHEET_AXIS_RE.search(side_a) or _CROSS_SHEET_AXIS_RE.search(side_b))
+
+
+def _small_cross_sheet_partial_overlap(kind: str | None, n: int, frac: float | None, mass: bool) -> bool:
+    if not _cross_sheet_non_perfect(kind, frac, mass):
+        return False
+    return frac is not None and frac < 0.7 and int(n or 0) < 12
+
+
 def evidence_confidence(n: int, frac: float | None, high_precision: bool) -> float:
     """Legacy mechanical certainty score kept for packet compatibility.
 
@@ -621,8 +672,18 @@ def prefilter(kind: str | None, a: str | None, b: str | None,
         return "drop", "summary_statistic_scaling"
     if flags.get("search_engine_export_twin"):
         return "drop", "search_engine_export_duplicate"
+    if flags.get("cross_sheet_protected_repeat"):
+        return "keep", None
+    if flags.get("cross_sheet_shared_control"):
+        return "drop", "shared_control_or_baseline"
+    if flags.get("cross_sheet_axis_overlap"):
+        return "downweight", "shared_axis_overlap"
+    if flags.get("cross_sheet_partial_overlap"):
+        return "downweight", "cross_sheet_partial_overlap"
     if flags.get("derived_stat_label"):
         return "downweight", "derived_statistical_column"
+    if flags.get("derived_export_label"):
+        return "downweight", "derived_or_export_column"
     if flags.get("explicit_formula_label"):
         return "drop", "explicit_formula_or_unit_conversion"
     if flags["is_axis"]:
@@ -654,12 +715,25 @@ def make_finding(kind: str | None, a: str | None, b: str | None, n: int,
                  frac: float | None, rule: str | None, sa: list[Any] | None,
                  sb: list[Any] | None, **extra: Any) -> dict[str, Any]:
     hp = _high_precision(sa) or _high_precision(sb)
+    mass = bool((n or 0) >= 200 or ((n or 0) >= 5 and hp))
+    side_a = _cross_sheet_side_text(a, extra.get("figure_a"))
+    side_b = _cross_sheet_side_text(b, extra.get("figure_b"))
+    shared_context = extra.get("shared_context") or {}
+    label_context_a = extra.get("label_context_a") or {}
+    label_context_b = extra.get("label_context_b") or {}
+    ctx_side_a = " ".join([side_a, str(label_context_a.get("text") or "")])
+    ctx_side_b = " ".join([side_b, str(label_context_b.get("text") or "")])
+    cross_sheet_non_perfect = _cross_sheet_non_perfect(kind, frac, mass)
     flags = {
         "trivial": _is_constant(sa) or _is_constant(sb),
         "is_axis": _is_arith_axis(sa) or _is_arith_axis(sb) or _axis_label(a) or _axis_label(b),
         "same_label": bool(a) and a == b,
         "derived_label": _derived_label(a) or _derived_label(b),
         "derived_stat_label": _derived_stat_label(a) or _derived_stat_label(b),
+        "derived_export_label": (
+            kind in {"identical_column", "many_equal_pairs"}
+            and (_derived_export_label(a) or _derived_export_label(b))
+        ),
         "qpcr_derived_label": _qpcr_derived_label(a) or _qpcr_derived_label(b),
         "summary_scale_label": _sem_sd_integer_n_scaling(
             kind, a, b, sa, sb, extra.get("slope"), extra.get("intercept"), int(n or 0), rule
@@ -686,6 +760,23 @@ def make_finding(kind: str | None, a: str | None, b: str | None, n: int,
         "low_information_sparse": _low_information_sparse(kind, int(n or 0), sa, sb, hp),
         "replicate": _replicate_label(a) and _replicate_label(b),
         "count_label": _count_label(a) or _count_label(b),
+        "cross_sheet": _is_cross_sheet(kind),
+        "cross_sheet_protected_repeat": _is_cross_sheet(kind) and not cross_sheet_non_perfect,
+        "cross_sheet_shared_control": (
+            cross_sheet_non_perfect
+            and (
+                bool(shared_context.get("shared_control_or_baseline"))
+                or _shared_control_or_baseline(ctx_side_a, ctx_side_b)
+            )
+        ),
+        "cross_sheet_axis_overlap": (
+            cross_sheet_non_perfect
+            and (
+                bool(shared_context.get("shared_axis_or_coordinate"))
+                or _cross_sheet_axis_overlap(ctx_side_a, ctx_side_b)
+            )
+        ),
+        "cross_sheet_partial_overlap": _small_cross_sheet_partial_overlap(kind, int(n or 0), frac, mass),
     }
     decision, reason = prefilter(kind, a, b, sa, sb, flags)
     finding = {
@@ -694,10 +785,11 @@ def make_finding(kind: str | None, a: str | None, b: str | None, n: int,
         "col_b": b,
         "n": n,
         "rule": rule,
+        "fraction_of_smaller": frac,
         "top5_a": (sa or [])[:5],
         "top5_b": (sb or [])[:5],
         "high_precision": hp,
-        "mass": bool((n or 0) >= 200 or ((n or 0) >= 5 and hp)),
+        "mass": mass,
         "evidence_confidence": evidence_confidence(int(n or 0), frac, hp),
         "flags": flags,
         "prefilter": decision,

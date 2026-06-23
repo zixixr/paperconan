@@ -5,7 +5,17 @@ so we can exercise severity/context logic without round-tripping through xlsx.
 """
 from __future__ import annotations
 
-from paperconan._audit import detect_collisions
+from paperconan._audit import Sheet, detect_collisions
+
+
+def _grid_from_sheet(sheet):
+    grid = {}
+    for r in range(sheet.nrows):
+        for c in range(sheet.ncols):
+            v = sheet.cell(r, c)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                grid[(r, c)] = round(float(v), 9)
+    return grid
 
 
 def _identical_grids(n_rows=10, n_cols=3, base=1.1001):
@@ -21,6 +31,74 @@ def _identical_grids(n_rows=10, n_cols=3, base=1.1001):
 
 def _find(findings, kind):
     return next((f for f in findings if f["kind"] == kind), None)
+
+
+def test_cross_sheet_finding_carries_matched_control_labels():
+    rows_a = [
+        ["condition", "day", "control", "treated"],
+        ["rep1", 0.0, 1.23, 9.11],
+        ["rep2", 1.0, 1.45, 9.31],
+        ["rep3", 2.0, 1.67, 9.51],
+        ["rep4", 3.0, 1.89, 9.71],
+        ["rep5", 4.0, 2.01, 9.91],
+        ["rep6", 5.0, 2.23, 10.11],
+    ]
+    rows_b = [
+        ["condition", "day", "vehicle control", "drug B"],
+        ["rep1", 0.0, 1.23, 4.11],
+        ["rep2", 1.0, 1.45, 4.31],
+        ["rep3", 2.0, 1.67, 4.51],
+        ["rep4", 3.0, 1.89, 4.71],
+        ["rep5", 4.0, 2.01, 4.91],
+        ["rep6", 5.0, 2.23, 5.11],
+    ]
+    sheet_a = Sheet.from_rows(rows_a)
+    sheet_b = Sheet.from_rows(rows_b)
+
+    findings = detect_collisions(
+        {("a.xlsx", "Fig. 1 control"): _grid_from_sheet(sheet_a),
+         ("b.xlsx", "Fig. 2 control"): _grid_from_sheet(sheet_b)},
+        sheets={("a.xlsx", "Fig. 1 control"): sheet_a,
+                ("b.xlsx", "Fig. 2 control"): sheet_b},
+    )
+
+    cf = findings[0]
+    assert "control" in cf["label_context_a"]["text"].lower()
+    assert "vehicle control" in cf["label_context_b"]["text"].lower()
+    assert cf["shared_context"]["shared_control_or_baseline"] is True
+
+
+def test_cross_sheet_context_marks_time_axis_from_local_labels():
+    rows_a = [
+        ["sample", "time", "signal"],
+        ["r1", 0, 1.1],
+        ["r2", 1, 1.3],
+        ["r3", 2, 1.5],
+        ["r4", 3, 1.7],
+        ["r5", 4, 1.9],
+        ["r6", 5, 2.1],
+    ]
+    rows_b = [
+        ["sample", "time", "signal"],
+        ["r1", 0, 8.1],
+        ["r2", 1, 8.3],
+        ["r3", 2, 8.5],
+        ["r4", 3, 8.7],
+        ["r5", 4, 8.9],
+        ["r6", 5, 9.1],
+    ]
+    sheet_a = Sheet.from_rows(rows_a)
+    sheet_b = Sheet.from_rows(rows_b)
+
+    cf = detect_collisions(
+        {("a.xlsx", "Fig. 1"): _grid_from_sheet(sheet_a),
+         ("b.xlsx", "Fig. 2"): _grid_from_sheet(sheet_b)},
+        sheets={("a.xlsx", "Fig. 1"): sheet_a,
+                ("b.xlsx", "Fig. 2"): sheet_b},
+    )[0]
+
+    assert cf["shared_context"]["shared_axis_or_coordinate"] is True
+    assert cf["delta"]["pattern"] != "perfect_dup"
 
 
 # ---------- Issue 1: context-aware severity ----------

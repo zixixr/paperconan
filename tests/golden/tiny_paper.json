@@ -213,12 +213,47 @@
       "file_b": "ED_Fig1.xlsx",
       "fraction_of_smaller": 1.0,
       "kind": "cross_sheet_position_identical",
+      "label_context_a": {
+        "column_labels": [
+          "mass(kg)",
+          "vol(mL)",
+          "copy_of_mass"
+        ],
+        "nearby_labels": [
+          "mass(kg)",
+          "vol(mL)",
+          "copy_of_mass",
+          "ap_col"
+        ],
+        "row_labels": [],
+        "text": "mass(kg) vol(mL) copy_of_mass mass(kg) vol(mL) copy_of_mass ap_col"
+      },
+      "label_context_b": {
+        "column_labels": [
+          "mass(kg)",
+          "vol(mL)",
+          "copy_of_mass"
+        ],
+        "nearby_labels": [
+          "mass(kg)",
+          "vol(mL)",
+          "copy_of_mass",
+          "ap_col"
+        ],
+        "row_labels": [],
+        "text": "mass(kg) vol(mL) copy_of_mass mass(kg) vol(mL) copy_of_mass ap_col"
+      },
       "profile_action": "kept",
       "rule": "Sheet1 and Sheet2 share 29/29 (100%) decimal values at SAME (row,col) across 2 sheets",
       "same_figure": false,
       "same_file": true,
       "same_position_count": 29,
       "severity": "high",
+      "shared_context": {
+        "context_reason": null,
+        "shared_axis_or_coordinate": false,
+        "shared_control_or_baseline": false
+      },
       "sheet_a": "Sheet1",
       "sheet_b": "Sheet2",
       "size_a": 30,

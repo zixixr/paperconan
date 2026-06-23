@@ -1097,6 +1097,16 @@ import re as _re
 # Matches a figure id inside a sheet name: an optional "extended/ED/ex" marker
 # followed by a figure number, e.g. "Figure 5o", "exFig.6b-e", "ED_Fig8b", " exFig.6i".
 _FIG_RE = _re.compile(r"(ext(?:ended)?|ed|ex)?\s*\.?\s*fig(?:ure)?\s*\.?\s*0*(\d+)", _re.I)
+_CONTROL_BASELINE_LABEL_RE = _re.compile(
+    r"\b(?:control|ctrl|baseline|vehicle|untreated|wt|wild[- ]?type|reference|mock|"
+    r"naive|sham|pbs|dmso)\b|参照|对照|基线",
+    _re.I,
+)
+_AXIS_CONTEXT_LABEL_RE = _re.compile(
+    r"\b(?:time|day|dose|conc(?:entration)?|wavelength|m/z|mz|position|chr|"
+    r"coordinate|coord|index|bin)\b|波长|时间|剂量",
+    _re.I,
+)
 
 
 def figure_key(sheet_name):
@@ -1225,7 +1235,74 @@ def _axis_columns(grids, recur_min=3):
     return axis
 
 
-def detect_collisions(grids, profile="review"):
+def _text_cell(sheet, r, c):
+    if sheet is None or r < 0 or c < 0 or r >= sheet.nrows or c >= sheet.ncols:
+        return ""
+    v = sheet.cell(r, c)
+    if isinstance(v, str):
+        return v.strip()
+    return ""
+
+
+def _label_context_for_matches(sheet, shared, max_labels=40):
+    if sheet is None:
+        return {"column_labels": [], "row_labels": [], "nearby_labels": [], "text": ""}
+    col_labels, row_labels, nearby = [], [], []
+    for (r, c), _v in shared[:max_labels]:
+        for rr in range(max(0, r - 3), r):
+            label = _text_cell(sheet, rr, c)
+            if label:
+                col_labels.append(label)
+        for cc in range(max(0, c - 3), c):
+            label = _text_cell(sheet, r, cc)
+            if label:
+                row_labels.append(label)
+        for rr in range(max(0, r - 2), min(sheet.nrows, r + 3)):
+            for cc in range(max(0, c - 2), min(sheet.ncols, c + 3)):
+                label = _text_cell(sheet, rr, cc)
+                if label:
+                    nearby.append(label)
+
+    def uniq(vals):
+        out, seen = [], set()
+        for val in vals:
+            key = val.lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(val)
+        return out[:max_labels]
+
+    ctx = {
+        "column_labels": uniq(col_labels),
+        "row_labels": uniq(row_labels),
+        "nearby_labels": uniq(nearby),
+    }
+    ctx["text"] = " ".join(ctx["column_labels"] + ctx["row_labels"] + ctx["nearby_labels"])
+    return ctx
+
+
+def _shared_cross_sheet_context(ctx_a, ctx_b, pattern, fraction):
+    text_a = (ctx_a or {}).get("text", "")
+    text_b = (ctx_b or {}).get("text", "")
+    both_control = bool(
+        _CONTROL_BASELINE_LABEL_RE.search(text_a)
+        and _CONTROL_BASELINE_LABEL_RE.search(text_b)
+    )
+    either_axis = bool(_AXIS_CONTEXT_LABEL_RE.search(text_a) or _AXIS_CONTEXT_LABEL_RE.search(text_b))
+    non_perfect = pattern != "perfect_dup" and (fraction is None or fraction < 0.9)
+    reason = None
+    if non_perfect and both_control:
+        reason = "matched cells are labelled as shared control/baseline/reference context"
+    elif non_perfect and either_axis:
+        reason = "matched cells are labelled as shared axis/coordinate context"
+    return {
+        "shared_control_or_baseline": bool(non_perfect and both_control),
+        "shared_axis_or_coordinate": bool(non_perfect and either_axis),
+        "context_reason": reason,
+    }
+
+
+def detect_collisions(grids, profile="review", sheets=None):
     """Find pairs of tables (sheets and/or flat files) with many bit-identical decimal
     values at the SAME (row, col). Catches "copy a table, then tweak a few values" fraud,
     whether the copy lives in another sheet of the same workbook or in a separate file.
@@ -1283,6 +1360,15 @@ def detect_collisions(grids, profile="review"):
             if same_pos >= max(6, smaller * 0.15):
                 shared = [(k, v) for k, v in ga.items() if k in gb and gb[k] == v]
                 examples = shared[:5]
+                label_context_a = _label_context_for_matches((sheets or {}).get(keys[i]), shared)
+                label_context_b = _label_context_for_matches((sheets or {}).get(keys[j]), shared)
+                fraction_of_smaller = same_pos / smaller
+                shared_context = _shared_cross_sheet_context(
+                    label_context_a,
+                    label_context_b,
+                    ctx_fields["delta"]["pattern"],
+                    fraction_of_smaller,
+                )
                 # Shared-axis downgrade: if the bit-identical cells concentrate on a
                 # column that is a swept/recurring axis AND the rest diverges, this is a
                 # shared x-axis, not cross-experiment reuse. A perfect_dup spans every
@@ -1320,7 +1406,10 @@ def detect_collisions(grids, profile="review"):
                     sheet_a=la, sheet_b=lb,
                     size_a=size_a, size_b=size_b,
                     same_position_count=same_pos,
-                    fraction_of_smaller=same_pos / smaller,
+                    fraction_of_smaller=fraction_of_smaller,
+                    label_context_a=label_context_a,
+                    label_context_b=label_context_b,
+                    shared_context=shared_context,
                     examples=[dict(row=k[0] + 1, col=k[1] + 1, value=v) for k, v in examples],
                     severity=sev,
                     **ctx_fields,
@@ -1404,6 +1493,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     report_blocks = []
     per_sheet_numbers = {}
     grids = {}  # (file, sheet) -> decimal grid, for the unified collision pass
+    grid_sheets = {}  # (file, sheet) -> Sheet, for local cross-sheet label context
     scan_errors = []
     scan_stats = {"files": [], "sheets": []}
     scan_start = time.perf_counter()
@@ -1452,6 +1542,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 continue
             sheet = rows if isinstance(rows, Sheet) else Sheet.from_rows(rows)
             grids[(os.path.basename(f), sn)] = _grid_from_rows(sheet)
+            grid_sheets[(os.path.basename(f), sn)] = sheet
             sheet_nums = sheet.numeric_values()
             per_sheet_numbers[(os.path.basename(f), sn)] = sheet_nums
             blocks = find_numeric_blocks(sheet)
@@ -1499,7 +1590,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
 
     # Unified collision pass: every (file, sheet) grid against every other —
     # covers both intra-workbook sheet pairs and cross-file duplicates.
-    cross_sheet_findings = detect_collisions(grids, profile=profile)
+    cross_sheet_findings = detect_collisions(grids, profile=profile, sheets=grid_sheets)
     _attach_benign(cross_sheet_findings)
 
     digit_reports, decimal_reports = [], []
