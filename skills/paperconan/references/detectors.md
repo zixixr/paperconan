@@ -52,13 +52,15 @@
 
 ### `within_col_value_duplication`
 - **原理**：同列内某个具体数值重复出现 ≥ 一半的行数（且不是全相同）。
-- **典型命中**："0.208975 在 8 个独立实验里出现 8 次" 的造假。
-- **常见误报**：检出限以下截断（LOD）；零计数。
+- **典型命中**：非圆整连续测量值（如 `0.208975`）在多行独立样本里反复出现，且这些行不是技术重复、共享对照或同一条件重复读数。
+- **常见误报**：检出限以下截断（LOD）、饱和上限、背景扣除后的固定值、零/一/100 等边界值、缺失/默认填充值、人工评分等级、四舍五入网格、技术重复、共享 batch control。
+- **解读时**：高门槛。只有在重复值是非圆整、非阈值、非填充值的连续测量，且行与行确认为独立样本时，才值得重点报告。否则按 `likely benign` 或 `needs human context` 处理。
 
 ### `within_col_decimal_repetition`
 - **原理**：同列中 ≥ 2/3 数值末两位完全一致（如 `.25` / `.75`）。
-- **典型命中**：编造数字时不自觉地写同样的小数尾。
-- **常见误报**：细胞计数 / 4 视野平均，会天然落在 0.25 步长。
+- **典型命中**：一列原始独立测量的不同取值大量共享末两位，且不能由固定分母、公式派生、归一化或显示精度解释。
+- **常见误报**：细胞计数 / 4 视野平均天然落在 0.25 步长；百分比、ratio、proportion、normalized/log/fold-change、p/q-value、AUC、coverage、model output、Excel 公式、标准化后四舍五入都可能生成固定小数尾。
+- **解读时**：必须做 fixed-denominator 思路：对样本值测试 `N=2..500`（至少 2..200），看 `value * N` 或百分比列的 `value / 100 * N` 是否接近整数。若大多能被同一个小分母解释，按良性固定分母/rounding grid 处理。
 
 ### `rounded_to_half_or_int`
 - **原理**：整列 ≥ 70% 末位是 0 或 5。
@@ -136,6 +138,8 @@
 | `derived_or_unit_conversion` | `constant_ratio` / `exact_linear` / `sum_constant` | 列名含单位/比例/均值/归一等派生词 | 派生列本就和源列严格相关，合理；但要确认它确实是派生而非两次"独立"测量 |
 | `same_data_replot_or_duplicate_upload` | `cross_sheet_position_identical` / `cross_sheet_value_overlap`（仅 `delta.pattern == perfect_dup`） | 同图号，或表名像 source data / 补充表 | 同一份数据多图重绘属预期；**注意只对 `perfect_dup` 生效——`value_tweaked` 不会被降级，那才是改一格指纹** |
 | `omics_or_large_matrix_boundary_flood` | `within_col_value_duplication` / `within_col_decimal_repetition` | sheet/列名像 gene/protein/padj/logFC 等大矩阵 | omics 大表里 0/1/padj/logFC 边界值海量重复属常态 |
+
+`prefilter_reason` / `prefilter_flags` 是更早的确定性 triage 信息，尤其常见于 `within_col_*`。它们不是最终结论，但能提示为什么某条看似高 severity 的单列模式可能只是结构性误报：低基数、边界值、整数/类别编码、比例或归一化列、固定分母、模型/统计表、floor/ceiling、默认填充值、或每 sheet 大量同类命中。详细判读流程见 [judgment-rubric.md](judgment-rubric.md)。
 
 `--profile forensic` 下本表全部不生效，所有 finding `profile_action: "kept"`、保留原始 severity。**当默认 profile 把一条你觉得该看的 high 降成了 low，重跑 `--profile forensic` 看原始严重度，再开原表核。**
 

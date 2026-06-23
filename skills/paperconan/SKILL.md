@@ -1,173 +1,102 @@
 ---
 name: paperconan
 version: 0.8.0
-description: Paper data sanity check — scan supplementary source data (.xlsx / .csv / .tsv files in a directory) for numerical fabrication red flags. Use when user mentions 论文数据检查, 论文数据造假, 数据 sanity check, 学术不端检测, 数据取证, 检查论文数据, paper data audit, source data audit, PubPeer prep, suspicious paper data, fabrication check, research integrity, or hands you a directory of supplementary data tables and asks "does this look real?". Produces structured findings (scan.json) the agent reads, plus a self-contained HTML report (report.html) the user opens in a browser, 从数据库下载论文数据, 找源数据, fetch paper data, download source data and analyze.
+description: Use when auditing paper source-data tables for numerical integrity signals, interpreting paperconan scan.json/report.html, preparing cautious PubPeer or research-integrity notes, or finding open supplementary data from a DOI/title. Trigger on 论文数据检查, source data audit, paper data audit, suspicious numeric tables, fabrication red flags, PubPeer prep, research integrity, DOI/title data fetch. Covers .xlsx/.csv/.tsv and tables in .pdf/.docx; not image forensics or chart digitization.
 ---
 
-# paperconan — paper data sanity check
+# paperconan
+
+paperconan scans paper source-data tables for numerical anomaly signals. Treat every hit as **signal, not verdict**: report locations and patterns, never intent or misconduct.
 
 Tool repository: https://github.com/zixixr/paperconan
 
-> **Signal, not verdict.** paperconan surfaces statistical anomalies for a human
-> to follow up — it never proves misconduct, and you must never call a paper
-> "fake"/"fraudulent" or name authors. Read the red-lines in
-> "CRITICAL: signal, not verdict" at the end of this file before reporting anything.
+## Core Workflow
 
-## When to use
+1. Confirm what the user supplied:
+   - Local source-data directory: run `paperconan <input-dir>`.
+   - DOI or title: run `paperconan fetch "<DOI or title>"`, choose a matched tabular dataset, download it, then scan the downloaded directory.
+   - Only an existing audit: read `audit/scan.json` and point the user to `audit/report.html`.
+2. Prefer the real CLI. Do not invent findings from eyeballing tables.
+3. Parse `scan.json`, then load the reference file needed for the task.
+4. Open the original table when describing a serious finding as worth follow-up. If the original data is unavailable, say the finding is unverified.
+5. Answer cautiously: explain the anomaly, plausible benign explanations, and what human context is needed.
 
-Use this skill when the user:
-
-- Hands over a directory of supplementary source data (`.xlsx` / `.csv` / `.tsv`) and asks for a data integrity / sanity check
-- Wants to prep a PubPeer post and asks you to surface suspicious numeric patterns first
-- Asks about a paper they suspect has fabricated data and wants statistical signal before deciding next step
-- Says things like "帮我看看这篇论文数据有没有问题", "扫一下这个 source data", "查查这些表格的可疑模式", "audit this paper's data"
-
-## When NOT to use
-
-- The concern is image fraud (Western blot, microscopy, gel splicing) — paperconan only inspects numeric tables
-- The data lives in a **chart** (bar/line plot) rather than a table — paperconan does not digitize pixels, and does not OCR scanned images
-- The input is `.xls` (old binary Excel) — convert to `.xlsx` first. paperconan reads `.xlsx` / `.csv` / `.tsv` natively, plus **tables inside `.pdf` / `.docx` supplements** when the `[all]` extra is installed (see Prerequisites)
-- The user wants statistical methodology review or peer-review-style scrutiny — paperconan is forensic, not statistical
-
-## Prerequisites
+## Install And Run
 
 ```bash
-pip install paperconan          # base install (xlsx / csv / tsv)
-pip install "paperconan[all]"   # + supplementary PDF / Word table extraction
-# Dev install from a clone:  pip install -e /path/to/paperconan
-```
-
-Verify with `paperconan --help` (or `paperconan --version`). A complete worked
-example (synthetic data + the report it produces + a per-finding walkthrough) lives
-in the repo's [`examples/`](https://github.com/zixixr/paperconan/tree/main/examples).
-
-## Runtime & graceful fallback
-
-paperconan runs **real Python detectors** — its findings cannot be faked by
-eyeballing a table. Pick the path that matches your environment, in order:
-
-1. **Python + network (authoritative):** `pip install paperconan` →
-   `paperconan <dir>`. Always prefer this. If `pip` isn't available, try
-   `pipx run paperconan <dir>` or `uvx paperconan <dir>`.
-2. **Python, no PyPI access:** install from a local clone if one exists
-   (`pip install -e /path/to/paperconan`); otherwise tell the user.
-3. **No Python runtime at all:** do **not** invent findings. Say plainly that you
-   cannot run the authoritative scan in this environment, and tell the user to run
-   `paperconan <dir>` on their own machine. You *may* offer a clearly-labelled,
-   **non-authoritative** manual look using
-   [references/detectors.md](references/detectors.md) — but mark it as a hint, not
-   tool output, and never attach `high`/`medium`/`low` severities as if the
-   detectors produced them.
-
-The rule that never bends: **never present eyeballed guesses as paperconan output.**
-
-## How to invoke
-
-Single command, takes a directory of data tables (`.xlsx` / `.csv` / `.tsv`):
-
-```bash
+pip install paperconan
+pip install "paperconan[all]"   # includes PDF / Word table extraction
+paperconan --version
 paperconan <input-dir>
-# Default output: <input-dir>/audit/scan.json + <input-dir>/audit/report.html
 ```
 
-Common variants:
+Default output:
+
+```text
+<input-dir>/audit/scan.json
+<input-dir>/audit/report.html
+```
+
+Useful variants:
 
 ```bash
-paperconan <input-dir> --out /tmp/audit-X     # custom output dir
-paperconan <input-dir> --md                   # also write REPORT.md
-paperconan <input-dir> --no-html              # only scan.json (CI / scripted use)
-paperconan <input-dir> --profile forensic     # raw signals, nothing demoted (see Profiles)
+paperconan <input-dir> --out /tmp/audit-X
+paperconan <input-dir> --md
+paperconan <input-dir> --no-html
+paperconan <input-dir> --profile forensic
 ```
 
-Exit code is 0 even when findings are present — findings are not errors.
+If Python or package access is unavailable, tell the user to run the command locally. A manual review may be offered only as a non-authoritative hint and must not be presented as paperconan output.
 
-### Profiles — the false-positive filter you're reading through
+## Fetching Data
 
-`--profile {review,forensic,triage}` sits **on top of** the raw detectors, so by the
-time you read scan.json some findings are already demoted — you're not seeing raw
-detector output unless you ask.
-
-- `review` (default) — demotes name-matched likely-FP findings to `low` but keeps
-  them visible, tagged with why.
-- `forensic` — demotes **nothing**; every hit keeps its raw severity. Re-run with
-  this before telling the user "nothing high here" — a demotion is a name-regex
-  heuristic and can be wrong.
-- `triage` — same demotions as `review`, but hidden (`profile_action: "hidden"`).
-
-A `low` finding with `profile_action: "demoted"` is the *filter's* opinion, not the
-detector's. Demotion reasons + the full mapping are in
-[references/detectors.md](references/detectors.md).
-
-## Fetching a paper's data automatically
-
-> **Secondary, network-dependent.** Needs outbound access to Zenodo / Figshare /
-> Europe PMC / NCBI. In a sandboxed runtime without network it won't work — fall
-> back to asking the user for a local data directory. The local audit above is the
-> core capability; fetch is a convenience on top of it.
-
-If the user gives a paper (DOI or title) instead of a local directory:
+Use fetch only when the user gives a DOI/title instead of local files:
 
 ```bash
-paperconan fetch "<DOI or title>"            # list candidate datasets + match signals
-paperconan fetch "<DOI or title>" --json     # machine-readable listing (parse this)
-paperconan fetch "<DOI>" --download <id> --out data/   # download a candidate's tabular files
-paperconan data/                             # then audit as usual
+paperconan fetch "<DOI or title>"
+paperconan fetch "<DOI or title>" --json
+paperconan fetch "<DOI>" --download <id> --out data/
+paperconan data/
 ```
 
-Flags: `--all` (also non-tabular), `--per-source N` (default 5), `--auto` (download
-only a confidently-matched top candidate), `--force` (download a no-match anyway).
+Prefer candidates with `doi_in_related: true`. Repository search can return unrelated deposits, so report weak matches honestly and do not imply "no data found" means "paper is clean". Do not bypass paywalls or scrape publisher sites.
 
-**You decide the match** from each candidate's `match_signals` (`doi_in_related`,
-`title_overlap`, `author_overlap`) — prefer `doi_in_related: true`. Repository
-full-text search (esp. figshare/zenodo) often returns **unrelated deposits**, so
-`--auto` refuses a no-DOI/weak-title candidate and `--download` of one needs `--force`.
-A candidate flagged `⚠ no DOI/title match` is probably not this paper's data.
+## Profiles
 
-**Honesty rules (REQUIRED):** searched repos are Zenodo / Figshare / Dryad / Europe
-PMC. If a candidate has no `.xlsx/.csv/.tsv`, say so and name the other types. If
-nothing matches, `fetch` prints DOI-derived journal guidance — relay it, never imply
-"checked = clean". Don't bypass paywalls or scrape publisher sites. Download is
-keyless for Zenodo/Figshare and Europe PMC (OA supplements auto-extracted); **Dryad**
-is listing-only (its download API needs auth) — point the user to the Dryad page.
+`--profile {review,forensic,triage}` changes what you see in `scan.json`:
 
-## How to read the output
+- `review` is the default. It keeps likely false positives visible but may demote them to `low`.
+- `forensic` preserves raw detector severity. Use it before saying a concerning hit was only low severity under the raw detector.
+- `triage` hides likely false positives.
 
-| File | Audience | Purpose |
-|---|---|---|
-| `scan.json` | **you (the agent)** | full structured findings — parse this |
-| `report.html` | **the user** | self-contained interactive report — tell them to open it in a browser |
-| `REPORT.md` | optional | markdown report; only with `--md` |
+When a finding has `profile_action: "demoted"` or `profile_action: "hidden"`, the active profile changed the visible severity. Use `prefilter_reason`, `prefilter_flags`, and `false_positive_context` to explain why, then decide whether the filter reason actually fits the table context.
 
-**Full structured schema** — top-level `scan.json` fields, the per-finding fields
-(`kind` / `severity` / `rule` / `evidence` / `profile_action` /
-`false_positive_context` / `dense_block` …), and `cross_sheet_findings` fields — is
-in [references/output-schema.md](references/output-schema.md). Read it before parsing.
+## Reference Routing
 
-What to surface to the user:
+Load references only when needed:
 
-1. **Cross-sheet findings first.** `cross_sheet_position_identical` is the single
-   most-investigated paperconan signal — same position, same value, across
-   "independent" sheets.
-2. **Group by file, then severity** — most users want "which figure first."
-3. **Always show severity badges** — don't flatten `high` and `medium`.
-4. **Point them to `report.html`** — it has the table snippets with suspicious cells
-   highlighted, much easier than re-reading xlsx.
-5. Read [references/interpretation.md](references/interpretation.md) for the response
-   template and the red lines.
+- [references/output-schema.md](references/output-schema.md): read before parsing `scan.json` or explaining fields such as `profile_action`, `prefilter_reason`, `col_a_sample`, or `cross_sheet_findings`.
+- [references/detectors.md](references/detectors.md): read when interpreting a detector kind and its common false positives.
+- [references/judgment-rubric.md](references/judgment-rubric.md): read before ranking findings, judging within-column signals, or drafting PubPeer/research-integrity language.
+- [references/interpretation.md](references/interpretation.md): read when composing the final user-facing answer or handling requests to accuse, expose, or escalate.
 
-## CRITICAL: signal, not verdict
+## Judgment Discipline
 
-paperconan output is a **statistical anomaly**, NOT a determination of misconduct. Do not:
+- Never convert `severity` into a misconduct conclusion. Severity means anomaly strength after the active profile, not author intent.
+- Inspect cross-sheet reuse and cross-column transforms before weaker single-column patterns.
+- Prefer benign structural explanations first: shared controls, re-plots, unit conversions, formulas, indices, ratios, normalized values, model outputs, detection floors, and bounded scoring scales.
+- Treat `within_col_*` findings as false-positive-heavy by default. Do not strongly report `n < 10`, categorical/index labels, derived columns, fixed-denominator ratios, rounded grids, floors/ceilings, or repeated fill values.
+- Use "needs human context" when you cannot confirm row independence, raw measurement status, formula generation, Methods/legend meaning, or original-table provenance.
+- For PubPeer-style writing, provide concrete file/sheet/column evidence and questions for the authors; do not say "fake", "fraud", "fabricated", "实锤", or name authors as wrongdoers.
 
-- ❌ Say "this paper is fake / fabricated / fraudulent"
-- ❌ Name authors as having "fabricated data"
-- ❌ Suggest the user post accusations on Weibo / Twitter / Zhihu
-- ❌ Use the word "实锤" (rock-solid proof) — it isn't
+## Output Shape
 
-Do:
+A normal scan summary should include:
 
-- ✅ Report as "N high-severity suspicious patterns" with concrete locations
-- ✅ Surface common false positives (shared controls, dose-axis duplication, count quantization)
-- ✅ Recommend the user verify against figure legend + Methods, then escalate via PubPeer / journal editor / research integrity office
+1. What was scanned and whether any files failed to parse.
+2. The highest-priority findings after manual/field-level triage, grouped by file.
+3. Concrete evidence snippets: detector kind, location, `rule`, `n`, and a small value sample when useful.
+4. Plausible benign explanations and what would resolve them.
+5. A pointer to `report.html` for highlighted table context.
 
-Full response template lives in [references/interpretation.md](references/interpretation.md).
+If the user asks "is this fraud?", answer that paperconan cannot determine that. The next step is to verify the original data and, if concerns remain, ask for clarification through PubPeer, the journal, or a research integrity office.
