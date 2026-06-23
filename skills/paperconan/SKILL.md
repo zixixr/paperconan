@@ -1,6 +1,6 @@
 ---
 name: paperconan
-version: 0.7.0
+version: 0.8.0
 description: Paper data sanity check — scan supplementary source data (.xlsx / .csv / .tsv files in a directory) for numerical fabrication red flags. Use when user mentions 论文数据检查, 论文数据造假, 数据 sanity check, 学术不端检测, 数据取证, 检查论文数据, paper data audit, source data audit, PubPeer prep, suspicious paper data, fabrication check, research integrity, or hands you a directory of supplementary data tables and asks "does this look real?". Produces structured findings (scan.json) the agent reads, plus a self-contained HTML report (report.html) the user opens in a browser, 从数据库下载论文数据, 找源数据, fetch paper data, download source data and analyze.
 ---
 

@@ -8,7 +8,7 @@ essentials; this file is the complete reference (it travels in the skill bundle)
 ```json
 {
   "tool": "paperconan",
-  "tool_version": "0.7.0",        // matches the pyproject version; provenance for archived reports
+  "tool_version": "0.8.0",        // matches the pyproject version; provenance for archived reports
   "scanned_at": "2026-05-29T02:08:53+00:00",
   "profile": "review",            // which FP profile ran (review|forensic|triage) — severities are post-filter unless "forensic"
   "input_dir": "...",

@@ -49,7 +49,8 @@ python make_demo_data.py demo_paper
 
 ## What paperconan finds (and what it means)
 
-Running on this dataset surfaces **5 high** + **6 medium** findings across 2 files.
+Running on this dataset with the default `review` profile surfaces **5 high** +
+**5 medium** + **2 low** findings across 2 files.
 Here's the guided tour — the order below mirrors how you should read the report.
 
 ### 1. Cross-sheet collision (read this first)
@@ -82,19 +83,21 @@ effects are not a fixed offset on every single animal.
 ### 3. Within-column fingerprints in qPCR
 
 ```
-[high]   within_col_value_duplication   col[1] has value 1.0837 repeated 8/12 times
+[low]    within_col_value_duplication   col[1] has value 1.0837 repeated 8/12 times
 [high]   within_col_decimal_repetition  col[1]: 8/12 values share last-2 decimals '.37'
 [medium] rounded_to_half_or_int         col[2]: 12/12 values end in 0 or 5
 ```
 
 `rel_expr` reuses the exact value `1.0837` in two-thirds of "independent" samples, and
 every `ct_value` lands on a 0/0.5 grid. Real measurements don't pile onto one value or
-snap perfectly to a grid.
+snap perfectly to a grid. The repeated-value finding is demoted in the default profile
+because `rel_expr` looks like a normalized / fold-change column; rerun with
+`--profile forensic` if you want the raw detector severity.
 
-### 4. Medium findings — useful, but read with care
+### 4. Medium and low findings — useful, but read with care
 
 ```
-[medium] arithmetic_progression   col[0] = arithmetic progression, step=3
+[low]    arithmetic_progression   col[0] = arithmetic progression, step=3
 [medium] many_equal_pairs         tumor_length == tumor_width in 7/8 rows
 [medium] small_diff_set / identical_after_rounding ...
 ```

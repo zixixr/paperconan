@@ -1,7 +1,7 @@
 {
   "tool": "paperconan",
-  "tool_version": "0.7.0",
-  "scanned_at": "2026-06-13T03:12:28+00:00",
+  "tool_version": "0.8.0",
+  "scanned_at": "2026-06-23T15:26:50+00:00",
   "profile": "review",
   "input_dir": "examples/demo_paper",
   "paper": null,
@@ -14,13 +14,13 @@
         "file": "ED_Fig2_tumor_volume.xlsx",
         "path": "examples/demo_paper/ED_Fig2_tumor_volume.xlsx",
         "n_sheets": 1,
-        "elapsed_ms": 2.055
+        "elapsed_ms": 2.069
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
         "path": "examples/demo_paper/ED_Fig4_qPCR.xlsx",
         "n_sheets": 2,
-        "elapsed_ms": 1.537
+        "elapsed_ms": 1.619
       }
     ],
     "sheets": [
@@ -31,7 +31,7 @@
         "n_cols": 6,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.102
+        "elapsed_ms": 0.115
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
@@ -40,7 +40,7 @@
         "n_cols": 5,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.067
+        "elapsed_ms": 0.084
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
@@ -49,10 +49,10 @@
         "n_cols": 5,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.051
+        "elapsed_ms": 0.075
       }
     ],
-    "elapsed_ms": 9.14
+    "elapsed_ms": 10.797
   },
   "relations_blocks": [
     {
@@ -80,6 +80,26 @@
           "n": 8,
           "offset": 120.0,
           "severity": "high",
+          "col_a_sample": [
+            98.2156,
+            142.8923,
+            201.5347,
+            268.7412,
+            339.2588,
+            418.6071,
+            502.4419,
+            591.8364
+          ],
+          "col_b_sample": [
+            218.2156,
+            262.8923,
+            321.5347,
+            388.7412,
+            459.2588,
+            538.6071,
+            622.4419,
+            711.8364
+          ],
           "rule": "col[2] = col[1] + 120",
           "evidence": {
             "headers": [
@@ -218,6 +238,26 @@
           "col_b_idx": 3,
           "n": 8,
           "severity": "high",
+          "col_a_sample": [
+            98.2156,
+            142.8923,
+            201.5347,
+            268.7412,
+            339.2588,
+            418.6071,
+            502.4419,
+            591.8364
+          ],
+          "col_b_sample": [
+            98.2156,
+            142.8923,
+            201.5347,
+            268.7412,
+            339.2588,
+            418.6071,
+            502.4419,
+            591.8364
+          ],
           "rule": "col[3] == col[1]",
           "evidence": {
             "headers": [
@@ -357,6 +397,26 @@
           "n": 8,
           "offset": -120.0,
           "severity": "high",
+          "col_a_sample": [
+            218.2156,
+            262.8923,
+            321.5347,
+            388.7412,
+            459.2588,
+            538.6071,
+            622.4419,
+            711.8364
+          ],
+          "col_b_sample": [
+            98.2156,
+            142.8923,
+            201.5347,
+            268.7412,
+            339.2588,
+            418.6071,
+            502.4419,
+            591.8364
+          ],
           "rule": "col[3] = col[2] + -120",
           "evidence": {
             "headers": [
@@ -499,6 +559,26 @@
             0.21
           ],
           "severity": "medium",
+          "col_a_sample": [
+            4.2156,
+            5.8923,
+            6.5347,
+            7.1412,
+            7.9588,
+            8.6071,
+            9.4419,
+            10.1364
+          ],
+          "col_b_sample": [
+            4.2156,
+            5.8923,
+            6.5347,
+            7.1412,
+            7.9588,
+            8.8171,
+            9.4419,
+            10.1364
+          ],
           "rule": "col[5] - col[4] only takes 2 discrete values",
           "evidence": {
             "headers": [
@@ -782,6 +862,26 @@
           "n": 8,
           "equal": 7,
           "severity": "medium",
+          "col_a_sample": [
+            4.2156,
+            5.8923,
+            6.5347,
+            7.1412,
+            7.9588,
+            8.6071,
+            9.4419,
+            10.1364
+          ],
+          "col_b_sample": [
+            4.2156,
+            5.8923,
+            6.5347,
+            7.1412,
+            7.9588,
+            8.8171,
+            9.4419,
+            10.1364
+          ],
           "rule": "col[4] == col[5] in 7/8 rows",
           "evidence": {
             "headers": [
@@ -941,7 +1041,17 @@
           "n": 12,
           "dup_value": 1.0837,
           "dup_count": 8,
-          "severity": "high",
+          "frac_repeat": 0.6666666666666666,
+          "n_distinct": 5,
+          "all_integer": false,
+          "value_sample": [
+            1.0837,
+            2.4519,
+            3.1142,
+            0.8734,
+            2.9913
+          ],
+          "severity": "low",
           "rule": "col[1] has value 1.0837 repeated 8/12 times",
           "evidence": {
             "headers": [
@@ -1088,8 +1198,13 @@
               }
             ]
           },
-          "profile_action": "kept",
-          "false_positive_context": []
+          "profile_action": "demoted",
+          "false_positive_context": [
+            "within_col_structural_filter"
+          ],
+          "prefilter": "drop",
+          "prefilter_reason": "normalized_or_fold_change",
+          "likely_benign": "within_col prefilter matched normalized_or_fold_change; this column pattern is usually categorical/integer-coded, an axis/index, a normalized or derived column, or a large-matrix flood rather than a fabricated measurement repeat"
         },
         {
           "kind": "within_col_decimal_repetition",
@@ -1098,6 +1213,16 @@
           "n": 12,
           "ending": "37",
           "count": 8,
+          "frac_repeat": 0.6666666666666666,
+          "n_distinct": 5,
+          "all_integer": false,
+          "value_sample": [
+            1.0837,
+            2.4519,
+            3.1142,
+            0.8734,
+            2.9913
+          ],
           "severity": "high",
           "rule": "col[1]: 8/12 values share last-2 decimals '.37'",
           "evidence": {
