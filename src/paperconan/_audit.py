@@ -717,6 +717,27 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
 # proteomics sheet produced ~20,000 such 'high' relations, drowning the genuine signal.
 RELATION_FLOOD_CAP = 40
 
+# Above this many within-column findings on ONE (file, sheet), the sheet is a large
+# data table whose columns are repetitive by construction (categorical codes, dose
+# grids, few-value panels). Genuine within-col signals live in low-count sheets
+# (offline corpus: genuine-signal sheets held <=2 within_col each), so a sheet-wide
+# flood is noise — demote it wholesale instead of flooding the judge.
+WITHIN_COL_SHEET_CAP = 25
+
+
+def _demote_within_col_flood(within_col, cap=WITHIN_COL_SHEET_CAP):
+    """Demote a per-sheet flood of within-column findings to low severity, dropping them
+    from the packet (prefilter='drop'). Kept in scan.json (reversible via forensic).
+    Mutates + returns the same list."""
+    if len(within_col) <= cap:
+        return within_col
+    for f in within_col:
+        f["severity"] = "low"
+        f["prefilter"] = "drop"
+        f["prefilter_reason"] = "within_col_sheet_flood"
+        f["within_col_flood_sheet"] = True
+    return within_col
+
 
 def _demote_dense_relations(relations, cap=RELATION_FLOOD_CAP):
     """Demote a flood of pairwise column relations to low severity (tagging them
@@ -737,12 +758,14 @@ def _demote_dense_sheets(report_blocks, cap=RELATION_FLOOD_CAP):
     by_sheet = {}
     for b in report_blocks:
         key = (b["file"], b["sheet"])
-        agg = by_sheet.setdefault(key, {"relations": [], "equal_pairs": []})
+        agg = by_sheet.setdefault(key, {"relations": [], "equal_pairs": [], "within_col": []})
         agg["relations"].extend(b.get("relations", []))
         agg["equal_pairs"].extend(b.get("equal_pairs", []))
+        agg["within_col"].extend(b.get("within_col", []))
     for agg in by_sheet.values():
         _demote_dense_relations(agg["relations"], cap)   # same dict objects as in blocks
         _demote_dense_relations(agg["equal_pairs"], cap)
+        _demote_within_col_flood(agg["within_col"])      # per-sheet within-col flood gate
     return report_blocks
 
 
@@ -780,14 +803,23 @@ def detect_within_column_patterns(sheet, r0, r1, c0, c1, header, min_n=6):
             continue
         col_name = header[c - c0] if c - c0 < len(header) else f"col{c}"
 
-        # 1) duplicate values within the column
+        # Cheap column descriptors shared by the within-col detectors below, so a
+        # downstream prefilter can decide precisely (categorical/integer column,
+        # low-cardinality, value peek) instead of guessing from the column name alone.
         vals_rounded = np.round(a_clean, 4)
         counts = Counter(vals_rounded.tolist())
+        n_distinct = int(len(counts))
+        all_integer = bool(np.all(np.abs(a_clean - np.round(a_clean)) < 1e-9))
+        value_sample = [float(v) for v, _ in counts.most_common(8)]
+        enrich = dict(n_distinct=n_distinct, all_integer=all_integer, value_sample=value_sample)
+
+        # 1) duplicate values within the column
         top_val, top_count = counts.most_common(1)[0]
         if top_count >= max(4, n // 2) and n - top_count >= 1:
             findings.append(dict(kind="within_col_value_duplication",
                                  col=col_name, col_idx=c, n=n,
                                  dup_value=float(top_val), dup_count=int(top_count),
+                                 frac_repeat=top_count / n, **enrich,
                                  severity="high",
                                  rule=f"col[{c}] has value {top_val} repeated {top_count}/{n} times"))
 
@@ -801,6 +833,7 @@ def detect_within_column_patterns(sheet, r0, r1, c0, c1, header, min_n=6):
                 findings.append(dict(kind="within_col_decimal_repetition",
                                      col=col_name, col_idx=c, n=len(endings),
                                      ending=top_end, count=int(top_end_count),
+                                     frac_repeat=top_end_count / len(endings), **enrich,
                                      severity="high",
                                      rule=f"col[{c}]: {top_end_count}/{len(endings)} values share last-2 decimals '.{top_end}'"))
 

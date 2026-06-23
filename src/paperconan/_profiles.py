@@ -10,7 +10,10 @@ import re
 from typing import Iterable
 
 from ._prefilter import make_finding as _make_relation_prefilter_finding
+from ._prefilter import prefilter_within_col as _prefilter_within_col
 from .schema import Profile, VALID_PROFILES
+
+_WITHIN_COL_KINDS = {"within_col_value_duplication", "within_col_decimal_repetition"}
 
 
 BOUNDARY_VALUES = {-1.0, 0.0, 1.0, 100.0}
@@ -157,6 +160,17 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
     return None
 
 
+def _within_col_prefilter(f: dict, sheet_high_count: int | None) -> tuple[str, str | None] | None:
+    if f.get("kind") not in _WITHIN_COL_KINDS:
+        return None
+    action, reason = _prefilter_within_col(f, sheet_high_count)
+    if action in {"drop", "downweight"} and reason:
+        f["prefilter"] = action
+        f["prefilter_reason"] = reason
+        return action, reason
+    return None
+
+
 def _is_omics_boundary_flood(f: dict, sheet_context: str = "") -> bool:
     if f.get("kind") not in {"within_col_value_duplication", "within_col_decimal_repetition"}:
         return False
@@ -181,6 +195,12 @@ def apply_profile_to_findings(findings: Iterable[dict], profile: str | None,
     initialize_profile_fields(findings)
     if profile_name == "forensic":
         return
+
+    # per-sheet/block within_col HIGH count powers the matrix-flood gate; callers pass
+    # one block's findings at a time (see _audit.scan), so this list is that block.
+    wc_high = sum(1 for f in findings
+                  if f.get("kind") in _WITHIN_COL_KINDS
+                  and str(f.get("severity")).lower() == "high")
 
     for f in findings:
         if _is_boundary_dup(f):
@@ -227,5 +247,20 @@ def apply_profile_to_findings(findings: Iterable[dict], profile: str | None,
             _add_context(
                 f, "omics_or_large_matrix_boundary_flood",
                 "large omics/statistical matrices commonly contain many zero, one, adjusted-p, or logFC boundary values",
+            )
+            _demote_or_hide(f, profile_name)
+        elif wc_decision := _within_col_prefilter(f, wc_high):
+            action, reason = wc_decision
+            ctx = (
+                "within_col_structural_filter"
+                if action == "drop"
+                else "within_col_downweight"
+            )
+            _add_context(
+                f,
+                ctx,
+                f"within_col prefilter matched {reason}; this column pattern is usually "
+                "categorical/integer-coded, an axis/index, a normalized or derived column, "
+                "or a large-matrix flood rather than a fabricated measurement repeat",
             )
             _demote_or_hide(f, profile_name)
