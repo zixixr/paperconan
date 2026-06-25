@@ -191,6 +191,46 @@ def test_delta_value_tweaked():
     assert delta["pattern"] == "value_tweaked"
 
 
+def test_detects_cross_sheet_decimal_tail_reuse_with_shifted_layout():
+    """B copies A's measurement block, shifts it up two rows, and edits only the
+    high-order decimal digit. Exact-value overlap misses this, but the long
+    fractional tails remain aligned at one table offset.
+    """
+    ga, gb = {}, {}
+    for r in range(12):
+        for c in range(3):
+            tail = f"{r:02d}{c:02d}731"
+            ga[(r + 5, c + 2)] = float(f"0.{(r + c) % 9}{tail}")
+            gb[(r + 3, c + 2)] = float(f"0.{((r + c) % 9 + 3) % 10}{tail}")
+
+    findings = detect_collisions({
+        ("M.xlsx", "Figure 5d"): ga,
+        ("M.xlsx", "Supplementary Figure 6g"): gb,
+    })
+
+    tail = _find(findings, "cross_sheet_decimal_tail_reuse")
+    assert tail is not None
+    assert tail["offset_rows"] == -2
+    assert tail["offset_cols"] == 0
+    assert tail["tail_match_count"] == 36
+    assert tail["severity"] == "high"
+    assert tail["examples"][0]["value_a"] != tail["examples"][0]["value_b"]
+
+
+def test_decimal_tail_reuse_requires_long_tail_cluster_not_short_decimals():
+    ga, gb = {}, {}
+    for r in range(20):
+        ga[(r, 0)] = round(1.1 + r * 0.1, 1)
+        gb[(r, 0)] = round(5.1 + r * 0.1, 1)
+
+    findings = detect_collisions({
+        ("M.xlsx", "Figure 1"): ga,
+        ("M.xlsx", "Figure 2"): gb,
+    })
+
+    assert _find(findings, "cross_sheet_decimal_tail_reuse") is None
+
+
 def test_delta_shifted_layout_is_perfect_dup_not_tweaked():
     """Same numbers stored at a different column offset (a main figure and an
     extended figure laying the cohort out differently). The value multiset is

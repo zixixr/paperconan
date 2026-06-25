@@ -1372,6 +1372,93 @@ def value_tweak_subtype(delta: dict | None) -> str | None:
     return "block_edit"
 
 
+def _decimal_tail_signature(v, min_tail_digits=5, skip_decimal_digits=1):
+    """Return a low-order decimal fingerprint for copy-then-edit detection.
+
+    A common manual-edit fingerprint is that the leading integer/decimal digit is
+    changed while the long fractional tail is left intact. For example,
+    0.808902488 -> 0.908902488 preserves ``08902488`` after the first decimal
+    digit. Short displayed decimals are ignored so ordinary one-decimal grids do
+    not become tail matches.
+    """
+    try:
+        fv = abs(float(v))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(fv):
+        return None
+    s = f"{fv:.9f}".rstrip("0").rstrip(".")
+    if "." not in s:
+        return None
+    frac = s.split(".", 1)[1]
+    if len(frac) < skip_decimal_digits + min_tail_digits:
+        return None
+    tail = frac[skip_decimal_digits:]
+    # Padded/quantized tails such as 00000 or 99999 have little forensic value.
+    if len(set(tail)) <= 1:
+        return None
+    return tail
+
+
+def _detect_decimal_tail_reuse_for_pair(
+    ga,
+    gb,
+    *,
+    min_tail_digits=5,
+    skip_decimal_digits=1,
+    min_matches=8,
+):
+    """Find one aligned block where values differ but decimal tails are reused.
+
+    This is layout-tolerant: if a table is pasted a few rows lower/upper, matching
+    cells still share the same (row_delta, col_delta). Grouping by that offset
+    distinguishes a copied block from isolated coincidental tail matches.
+    """
+    inv = {}
+    for kb, vb in gb.items():
+        sig = _decimal_tail_signature(
+            vb,
+            min_tail_digits=min_tail_digits,
+            skip_decimal_digits=skip_decimal_digits,
+        )
+        if sig:
+            inv.setdefault(sig, []).append((kb, vb))
+
+    by_offset = {}
+    for ka, va in ga.items():
+        sig = _decimal_tail_signature(
+            va,
+            min_tail_digits=min_tail_digits,
+            skip_decimal_digits=skip_decimal_digits,
+        )
+        if not sig:
+            continue
+        matches = inv.get(sig) or []
+        # A very frequent tail is usually a quantization artifact; do not let it
+        # create a combinatorial cloud of weak matches.
+        if len(matches) > 20:
+            continue
+        for kb, vb in matches:
+            if math.isclose(float(va), float(vb), rel_tol=1e-9, abs_tol=1e-12):
+                continue
+            off = (kb[0] - ka[0], kb[1] - ka[1])
+            by_offset.setdefault(off, []).append((ka, kb, float(va), float(vb), sig))
+
+    if not by_offset:
+        return None
+    off, pairs = max(by_offset.items(), key=lambda kv: len(kv[1]))
+    if len(pairs) < min_matches:
+        return None
+    pairs = sorted(pairs, key=lambda p: (p[0][0], p[0][1], p[1][0], p[1][1]))
+    return {
+        "offset": off,
+        "pairs": pairs,
+        "tail_match_count": len(pairs),
+        "min_tail_digits": min_tail_digits,
+        "skip_decimal_digits": skip_decimal_digits,
+    }
+
+
 def _column_cells(grid, c):
     """Row-ordered [(row, value)] for column ``c`` of a decimal grid."""
     return sorted(((r, v) for (r, cc), v in grid.items() if cc == c), key=lambda t: t[0])
@@ -1640,6 +1727,65 @@ def detect_collisions(grids, profile="review", sheets=None):
                     severity="low" if same_figure else "medium",
                     **ctx_fields,
                     rule=f"{la} and {lb} share {same_val} bit-identical decimal values ({same_val/smaller*100:.0f}% of smaller) across 2 {scope}",
+                ))
+
+            tail_min_matches = max(8, min(20, math.ceil(smaller * 0.03)))
+            tail_reuse = _detect_decimal_tail_reuse_for_pair(
+                ga,
+                gb,
+                min_matches=tail_min_matches,
+            )
+            if tail_reuse:
+                pairs = tail_reuse["pairs"]
+                cells_a = [(ka, va) for ka, _kb, va, _vb, _sig in pairs]
+                cells_b = [(kb, vb) for _ka, kb, _va, vb, _sig in pairs]
+                label_context_a = _label_context_for_matches((sheets or {}).get(keys[i]), cells_a)
+                label_context_b = _label_context_for_matches((sheets or {}).get(keys[j]), cells_b)
+                fraction_of_smaller = tail_reuse["tail_match_count"] / smaller
+                off_r, off_c = tail_reuse["offset"]
+                if same_figure:
+                    sev = "low"
+                elif tail_reuse["tail_match_count"] >= 12 or fraction_of_smaller >= 0.10:
+                    sev = "high"
+                else:
+                    sev = "medium"
+                examples = [
+                    {
+                        "row_a": ka[0] + 1,
+                        "col_a": ka[1] + 1,
+                        "value_a": va,
+                        "row_b": kb[0] + 1,
+                        "col_b": kb[1] + 1,
+                        "value_b": vb,
+                        "decimal_tail": sig,
+                    }
+                    for ka, kb, va, vb, sig in pairs[:8]
+                ]
+                tail_fields = dict(ctx_fields)
+                if same_figure and "context" not in tail_fields:
+                    tail_fields["context"] = context
+                findings.append(dict(
+                    kind="cross_sheet_decimal_tail_reuse",
+                    file=fa if same_file else f"{fa} + {fb}",
+                    file_a=fa, file_b=fb, same_file=same_file,
+                    sheet_a=la, sheet_b=lb,
+                    size_a=size_a, size_b=size_b,
+                    tail_match_count=tail_reuse["tail_match_count"],
+                    fraction_of_smaller=fraction_of_smaller,
+                    offset_rows=off_r,
+                    offset_cols=off_c,
+                    min_tail_digits=tail_reuse["min_tail_digits"],
+                    skip_decimal_digits=tail_reuse["skip_decimal_digits"],
+                    label_context_a=label_context_a,
+                    label_context_b=label_context_b,
+                    examples=examples,
+                    severity=sev,
+                    **tail_fields,
+                    rule=(
+                        f"{la} and {lb} share {tail_reuse['tail_match_count']}/{smaller} "
+                        f"changed decimal cells with the same long fractional tail at "
+                        f"offset ({off_r}, {off_c}) across 2 {scope}"
+                    ),
                 ))
     apply_profile_to_findings(findings, profile)
     return findings
