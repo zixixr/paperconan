@@ -25,8 +25,16 @@ def _distill_cross_sheet(scan: dict[str, Any]) -> list[dict[str, Any]]:
         if str(f.get("severity")).lower() != "high":
             continue
         n = int(f.get("same_position_count") or f.get("size_a") or 0)
+        # Preserve the decimal-tail-reuse identity: a long fractional tail shared across
+        # sheets is a near-zero-chance fabrication fingerprint, distinct from a generic
+        # value_tweaked partial overlap — it must not be relabeled away (or the judge sees
+        # only "a small partial overlap" and dismisses it as benign).
+        if f.get("kind") == "cross_sheet_decimal_tail_reuse":
+            distilled_kind = "cross_sheet:decimal_tail_reuse"
+        else:
+            distilled_kind = "cross_sheet:" + str((f.get("delta") or {}).get("pattern") or "")
         findings.append(_relation_finding(
-            "cross_sheet:" + str((f.get("delta") or {}).get("pattern") or ""),
+            distilled_kind,
             f.get("sheet_a"),
             f.get("sheet_b"),
             n,

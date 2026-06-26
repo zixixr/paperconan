@@ -84,3 +84,27 @@ def test_distill_review_findings_includes_relation_samples_and_within_col():
     assert findings[1]["within_col"] is True
     assert findings[1]["col_a"] == "score"
     assert findings[1]["prefilter"] == "keep"
+
+
+def test_decimal_tail_reuse_keeps_identity_and_is_protected():
+    # A long fractional-tail match is near-impossible by chance, so even a SMALL fraction /
+    # small n must keep its identity and survive (not be relabeled to value_tweaked nor
+    # downweighted as a benign partial overlap).
+    scan = {
+        "cross_sheet_findings": [{
+            "severity": "high",
+            "kind": "cross_sheet_decimal_tail_reuse",
+            "delta": {"pattern": "value_tweaked"},
+            "sheet_a": "Figure 5",
+            "sheet_b": "sp Figure 6",
+            "same_position_count": 8,
+            "fraction_of_smaller": 0.1,
+            "rule": "Figure 5 and sp Figure 6 share 8 cells with the same long fractional tail",
+        }],
+        "relations_blocks": [],
+    }
+    findings = distill_findings_for_review(scan)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f["kind"] == "cross_sheet:decimal_tail_reuse"   # identity preserved
+    assert f["prefilter"] == "keep"                        # protected, not downweighted

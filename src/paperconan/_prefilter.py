@@ -600,7 +600,10 @@ def _is_cross_sheet(kind: str | None) -> bool:
 def _cross_sheet_non_perfect(kind: str | None, frac: float | None, mass: bool) -> bool:
     if not _is_cross_sheet(kind):
         return False
-    if kind == "cross_sheet:perfect_dup" or mass:
+    # perfect_dup and decimal_tail_reuse are protected like a perfect duplicate: a shared
+    # LONG fractional tail is a near-zero-chance fingerprint, so it is never a benign
+    # partial overlap regardless of how few cells were copied.
+    if kind in ("cross_sheet:perfect_dup", "cross_sheet:decimal_tail_reuse") or mass:
         return False
     return frac is None or frac < 0.9
 
