@@ -1478,6 +1478,173 @@ def _decimal_tail_constant_transform(pairs):
     return len(ratios) >= 3 and _constant(ratios)
 
 
+_DT_FIXED_DENOM_MAX_N = 400
+_DT_FIXED_DENOM_TOL = 1e-6
+_DT_FIXED_DENOM_FRAC = 0.85
+_DT_AXIS_MIN_N = 6
+_DT_FEWTAIL_MIN_PAIRS = 12
+_DT_FEWTAIL_DOMINANCE = 0.80
+_DT_PERCOL_MIN_GROUP = 3
+_DT_LOGLABEL_RE = re.compile(
+    r"\b("
+    r"titer|titre|cfu|pfu|growth|log ?2|log ?10|log10|log2|"
+    r"nt50|ic50|ec50|dilution|dilut|fold|"
+    r"od600|od|absorbance|copy|copies|copy number|viral load|"
+    r"qpcr|rt-qpcr|pcr|ct|cq|cycle threshold"
+    r")\b",
+    re.I,
+)
+
+
+def _dt_is_fractional(v):
+    return v is not None and abs(float(v) - round(float(v))) > 1e-6
+
+
+def _dt_fixed_denominator(pairs):
+    """Return a benign reason when most decimal-tail values are k/N rates."""
+    vals = [
+        float(v)
+        for _ka, _kb, va, vb, _s in pairs
+        for v in (va, vb)
+        if v is not None and _dt_is_fractional(v)
+    ]
+    if len(vals) < 6:
+        return None
+    need = max(6, math.ceil(_DT_FIXED_DENOM_FRAC * len(vals)))
+    for n in range(2, _DT_FIXED_DENOM_MAX_N + 1):
+        hit = sum(
+            1
+            for v in vals
+            if abs(v * n - round(v * n)) < _DT_FIXED_DENOM_TOL * max(1, abs(v) * n)
+        )
+        if hit >= need:
+            return f"fixed_denominator:1/{n}"
+    return None
+
+
+def _dt_progression(seq):
+    """Conservative arithmetic/geometric progression test for axis-like values."""
+    vals = [float(v) for v in seq if v is not None]
+    if len(vals) < _DT_AXIS_MIN_N:
+        return False
+    if len({round(v, 9) for v in vals}) < _DT_AXIS_MIN_N:
+        return False
+    diffs = [vals[i + 1] - vals[i] for i in range(len(vals) - 1)]
+    increasing = all(d > 1e-12 for d in diffs)
+    decreasing = all(d < -1e-12 for d in diffs)
+    if not (increasing or decreasing):
+        return False
+
+    base = min(abs(d) for d in diffs)
+    if base and all(
+        abs(d / base - round(d / base)) < 1e-4 * max(1, abs(d / base))
+        for d in diffs
+    ):
+        return True
+
+    if all(v != 0 for v in vals) and (all(v > 0 for v in vals) or all(v < 0 for v in vals)):
+        ratios = [vals[i + 1] / vals[i] for i in range(len(vals) - 1)]
+        return (max(ratios) - min(ratios)) < 1e-3 * max(abs(max(ratios)), abs(min(ratios)), 1e-9)
+    return False
+
+
+def _dt_axis(pairs):
+    a = [va for _ka, _kb, va, _vb, _s in sorted(pairs, key=lambda p: (p[0][0], p[0][1]))]
+    b = [vb for _ka, _kb, _va, vb, _s in sorted(pairs, key=lambda p: (p[1][0], p[1][1]))]
+    return _dt_progression(a) and _dt_progression(b)
+
+
+def _dt_few_tails(pairs):
+    if len(pairs) < _DT_FEWTAIL_MIN_PAIRS:
+        return False
+    tails = [str(s) for _ka, _kb, _va, _vb, s in pairs if s is not None]
+    if not tails:
+        return False
+    top = max(Counter(tails).values())
+    return top >= _DT_FEWTAIL_DOMINANCE * len(tails)
+
+
+def _dt_per_column_constant(pairs):
+    """Return per-column constant offset/ratio reason, or None."""
+    groups = {}
+    for ka, _kb, va, vb, _s in pairs:
+        if va is None or vb is None:
+            continue
+        groups.setdefault(ka[1], []).append((float(va), float(vb)))
+    groups = {c: g for c, g in groups.items() if len(g) >= _DT_PERCOL_MIN_GROUP}
+    if len(groups) < 2:
+        return None
+
+    def _const(xs):
+        lo, hi = min(xs), max(xs)
+        return (hi - lo) <= 1e-4 * max(abs(lo), abs(hi), 1e-9)
+
+    offsets = []
+    for c, g in sorted(groups.items()):
+        diffs = [vb - va for va, vb in g]
+        ratios = [vb / va for va, vb in g if va]
+        if _const(diffs):
+            offsets.append("c%d:%+.4g" % (c, sum(diffs) / len(diffs)))
+        elif len(ratios) == len(g) and _const(ratios):
+            offsets.append("c%d:x%.4g" % (c, sum(ratios) / len(ratios)))
+        else:
+            return None
+    return "per_column_constant:[%s]" % ",".join(offsets)
+
+
+def _dt_label_values(v):
+    if not v:
+        return []
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, (list, tuple, set)):
+        return [str(x) for x in v if x is not None]
+    return [str(v)]
+
+
+def _dt_label_blob(labels):
+    parts = []
+    for lc in labels or ():
+        if not isinstance(lc, dict):
+            continue
+        for key in ("column_labels", "row_labels", "nearby_labels", "text"):
+            parts.extend(_dt_label_values(lc.get(key)))
+    return " ".join(parts)
+
+
+def _dt_log_dilution_candidate(pairs, labels):
+    """Return a note-only reason for likely log/dilution integer shifts."""
+    diffs = [
+        float(vb) - float(va)
+        for _ka, _kb, va, vb, _s in pairs
+        if va is not None and vb is not None
+    ]
+    if len(diffs) < 6:
+        return None
+    near_int = sum(1 for d in diffs if abs(d - round(d)) < 1e-6)
+    if near_int < 0.8 * len(diffs):
+        return None
+    return (
+        "log_or_dilution_integer_shift_candidate"
+        if _DT_LOGLABEL_RE.search(_dt_label_blob(labels))
+        else None
+    )
+
+
+def _decimal_tail_low_reason(pairs):
+    if _decimal_tail_constant_transform(pairs):
+        return "constant_transform"
+    return _dt_fixed_denominator(pairs) or _dt_per_column_constant(pairs)
+
+
+def _decimal_tail_note_reason(pairs, labels=None):
+    if _dt_axis(pairs):
+        return "axis_progression"
+    if _dt_few_tails(pairs):
+        return "constant_fraction_tail"
+    return _dt_log_dilution_candidate(pairs, labels)
+
+
 def _column_cells(grid, c):
     """Row-ordered [(row, value)] for column ``c`` of a decimal grid."""
     return sorted(((r, v) for (r, cc), v in grid.items() if cc == c), key=lambda t: t[0])
@@ -1762,14 +1929,20 @@ def detect_collisions(grids, profile="review", sheets=None):
                 label_context_b = _label_context_for_matches((sheets or {}).get(keys[j]), cells_b)
                 fraction_of_smaller = tail_reuse["tail_match_count"] / smaller
                 off_r, off_c = tail_reuse["offset"]
+                low_reason = None if same_figure else _decimal_tail_low_reason(pairs)
+                note_reason = None
                 if same_figure:
                     sev = "low"
-                elif _decimal_tail_constant_transform(tail_reuse["pairs"]):
-                    sev = "low"   # constant offset/ratio = benign linear relationship, not fabrication
+                elif low_reason:
+                    # Strong benign decimal-tail structures: constant transform,
+                    # fixed-denominator rates, or per-column shifts/ratios.
+                    sev = "low"
                 elif tail_reuse["tail_match_count"] >= 12 or fraction_of_smaller >= 0.10:
                     sev = "high"
+                    note_reason = _decimal_tail_note_reason(pairs, (label_context_a, label_context_b))
                 else:
                     sev = "medium"
+                    note_reason = _decimal_tail_note_reason(pairs, (label_context_a, label_context_b))
                 examples = [
                     {
                         "row_a": ka[0] + 1,
@@ -1785,6 +1958,9 @@ def detect_collisions(grids, profile="review", sheets=None):
                 tail_fields = dict(ctx_fields)
                 if same_figure and "context" not in tail_fields:
                     tail_fields["context"] = context
+                tail_benign_reason = low_reason or note_reason
+                if tail_benign_reason:
+                    tail_fields["tail_benign_reason"] = tail_benign_reason
                 findings.append(dict(
                     kind="cross_sheet_decimal_tail_reuse",
                     file=fa if same_file else f"{fa} + {fb}",

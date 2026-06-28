@@ -100,6 +100,7 @@ def test_decimal_tail_reuse_keeps_identity_and_is_protected():
             "same_position_count": 8,
             "fraction_of_smaller": 0.1,
             "rule": "Figure 5 and sp Figure 6 share 8 cells with the same long fractional tail",
+            "tail_benign_reason": "log_or_dilution_integer_shift_candidate",
         }],
         "relations_blocks": [],
     }
@@ -108,3 +109,4 @@ def test_decimal_tail_reuse_keeps_identity_and_is_protected():
     f = findings[0]
     assert f["kind"] == "cross_sheet:decimal_tail_reuse"   # identity preserved
     assert f["prefilter"] == "keep"                        # protected, not downweighted
+    assert f["tail_benign_reason"] == "log_or_dilution_integer_shift_candidate"

@@ -50,6 +50,7 @@ def _distill_cross_sheet(scan: dict[str, Any]) -> list[dict[str, Any]]:
             label_context_a=f.get("label_context_a"),
             label_context_b=f.get("label_context_b"),
             shared_context=f.get("shared_context"),
+            tail_benign_reason=f.get("tail_benign_reason"),
         ))
     return findings
 

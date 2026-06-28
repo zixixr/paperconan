@@ -231,6 +231,25 @@ def test_decimal_tail_reuse_requires_long_tail_cluster_not_short_decimals():
     assert _find(findings, "cross_sheet_decimal_tail_reuse") is None
 
 
+def test_decimal_tail_reuse_fixed_denominator_is_downgraded_with_reason():
+    ga, gb = {}, {}
+    shifts = [1, 3, 2, 4, 1, 5, 2, 6, 3, 7, 4, 8]
+    for r, shift in enumerate(shifts):
+        va = (r + 1) / 7
+        ga[(r, 0)] = va
+        gb[(r, 0)] = va + shift
+
+    findings = detect_collisions({
+        ("M.xlsx", "Figure 2"): ga,
+        ("M.xlsx", "Figure 3"): gb,
+    }, profile="forensic")
+
+    tail = _find(findings, "cross_sheet_decimal_tail_reuse")
+    assert tail is not None
+    assert tail["severity"] == "low"
+    assert tail["tail_benign_reason"] == "fixed_denominator:1/7"
+
+
 def test_delta_shifted_layout_is_perfect_dup_not_tweaked():
     """Same numbers stored at a different column offset (a main figure and an
     extended figure laying the cohort out differently). The value multiset is
