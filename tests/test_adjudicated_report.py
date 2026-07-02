@@ -7,6 +7,7 @@ import sys
 from build_fixture import build
 
 from paperconan import scan_dir, write_adjudicated_report
+from paperconan._adjudicated_html import _render_md, render_adjudicated_report
 
 
 def _verdict() -> dict:
@@ -98,3 +99,37 @@ def test_report_subcommand_writes_adjudicated_html(tmp_path):
     assert "关键证据" in html
     assert "identical_column" in html
     assert str(out) in proc.stdout
+
+
+def test_render_md_sections_are_balanced_not_nested():
+    md = (
+        "## Title\n\n### 论文主结论\nA.\n\n### 异常位置\n- one\n- two\n\n"
+        "### 证据\nC.\n"
+    )
+    out = _render_md(md)
+    # every opened report section must be closed, so sections are siblings
+    assert out.count("<section") == out.count("</section>") == 3
+
+
+def test_profile_hidden_findings_do_not_surface_as_key_evidence():
+    scan = {
+        "relations_blocks": [
+            {
+                "file": "F.xlsx",
+                "sheet": "S1",
+                "block": {"rows": "1-4", "cols": "A-B", "header": ["a", "b"]},
+                "within_col": [
+                    {
+                        "kind": "within_col_value_duplication",
+                        "severity": "high",
+                        "rule": "r",
+                        "profile_action": "hidden",
+                        "evidence": {"rows": [{"row_idx": 1, "values": [1]}], "headers": ["a"]},
+                    }
+                ],
+            }
+        ],
+        "cross_sheet_findings": [],
+    }
+    html = render_adjudicated_report(scan, {"verdict": "DROP", "report_md": "## x"})
+    assert "within_col_value_duplication" not in html

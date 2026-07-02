@@ -43,6 +43,7 @@ def _render_md(md: str | None) -> str:
         return ""
     out: list[str] = []
     para: list[str] = []
+    section_open = [False]
     lines = md.replace("\r\n", "\n").split("\n")
     i = 0
 
@@ -50,6 +51,11 @@ def _render_md(md: str | None) -> str:
         if para:
             out.append("<p>" + _inline_md(" ".join(para).strip()) + "</p>")
             para.clear()
+
+    def close_section() -> None:
+        if section_open[0]:
+            out.append("</section>")
+            section_open[0] = False
 
     while i < len(lines):
         raw = lines[i]
@@ -60,14 +66,17 @@ def _render_md(md: str | None) -> str:
             continue
         if s.startswith("### "):
             flush_para()
+            close_section()
             title = s[4:].strip()
             sec_id = ""
             if title in _SECTION_TITLES:
                 sec_id = f' id="sec-{_SECTION_TITLES.index(title) + 1}"'
             out.append(f'<section class="report-section"{sec_id}>'
                        f'<h2>{_inline_md(title)}</h2>')
+            section_open[0] = True
         elif s.startswith("## "):
             flush_para()
+            close_section()
             out.append(f'<h1 class="report-title">{_inline_md(s[3:].strip())}</h1>')
         elif re.match(r"[-*]\s+", s):
             flush_para()
@@ -82,6 +91,7 @@ def _render_md(md: str | None) -> str:
             para.append(s)
         i += 1
     flush_para()
+    close_section()
     return "\n".join(out)
 
 
@@ -211,7 +221,13 @@ footer { margin-top:20px; color:var(--muted); font-size:12px; }
 def render_adjudicated_report(scan: dict[str, Any], verdict: dict[str, Any]) -> str:
     """Return a self-contained HTML page for a judged PaperConan scan."""
     title = _scan_title(scan, verdict)
-    findings = sorted(_all_findings(scan), key=_finding_score)
+    # Mirror the deterministic report: findings the active profile suppressed as
+    # likely false positives must not resurface as top "key evidence" here.
+    visible = [
+        item for item in _all_findings(scan)
+        if str(item["finding"].get("profile_action") or "").lower() != "hidden"
+    ]
+    findings = sorted(visible, key=_finding_score)
     key_findings = findings[:8]
     report_html = _render_md(verdict.get("report_md")) or (
         "<p>No formal report_md was supplied. Use this page as an evidence "
