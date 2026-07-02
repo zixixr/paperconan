@@ -128,6 +128,11 @@ it does not require a database or remote service.
 Use `null` for fields that do not apply. Do not include author names or
 speculation about intent.
 
+For a paper with more than one distinct finding, use a paper-level object with
+a `findings` array (each entry has its own tier/status and `finding_ref`); see
+[adjudication-tiers.md](adjudication-tiers.md) › "Multiple Findings In One
+Paper". `paperconan report` then renders one self-contained block per finding.
+
 ## DROP Note
 
 DROP records should be short:

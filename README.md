@@ -36,6 +36,24 @@
 
 ---
 
+## 先看一眼：一份真实的判定后报告
+
+下面这份报告来自一个**已经公开、机构也已处理**的案例——Nature 论文 *Human HDAC6 senses valine abundancy to regulate DNA damage*（Nature 637, 215–223, 2025；DOI [10.1038/s41586-024-08248-5](https://doi.org/10.1038/s41586-024-08248-5)）。该文的 source data 问题自 2025 年起在 [PubPeer](https://pubpeer.com/search?q=10.1038%2Fs41586-024-08248-5) 被公开提出，2026 年经科普账号进一步传播；随后所在高校通报，通讯作者被免去院长职务并降级、第一作者被解除聘用。
+
+我们只做一件可复现的事：把这篇论文的 Nature 公开 source data 交给 `paperconan` 跑一遍，再让 AI agent 按 skill 的[判定协议](#2-把-skill-接到你的-agent-上)写出 `verdict.json`，最后用 `paperconan report` 渲染成这份报告。
+
+![paperconan 判定后报告示例：Nature HDAC6 论文 Fig.4c 的 constant_offset 信号](docs/images/adjudication-report.png)
+
+paperconan 的 `constant_offset` 检测器**独立地**指出：`Source Data Fig.4`（表内标注 `Fig.4c`）里 **shHDAC6** 组标为 **VR (0 h)** 与 **VR (24 h)** 的两列（本应是同批样本 0 h 与 24 h 的独立测量），在整整 35 行里**逐行严格相差固定的 0.3**（0.45/0.15、0.60/0.30、3.34/3.04……）。这正是公众此前指出的 Figure 4c 异常点——工具没有"看图猜"，它是从原始 source data 里把这条数字规律精确定位到了「哪个文件、哪张表、哪几行、哪条规则」。
+
+这份判定还经过了一轮**红队对抗复核**（默认假设它是误报去反驳，10 类良性机制逐一排除）才标为 `confirmed`。同一次扫描其实抛出了 700+ 个信号，报告只把**扛得住反向质疑的那一条**纳入判定、其余降级——这份克制正是 signal-not-verdict 的落地。
+
+> **守住红线**：paperconan 输出的是**可复核的数值模式**，不是"造假"结论。上面的机构处理是**已公开事实**，不是 paperconan 的判定。工具只负责把任何人都能复现的信号定位清楚；是否上升为不端，仍要靠原始数据、作者回应和机构/期刊核实。
+>
+> 复现这份报告的完整命令见下文[判定后 HTML 报告](#判定后-html-报告)。
+
+---
+
 ## 快速开始（推荐：Agent + Skill）
 
 ### 1. 装好 CLI（skill 在背后调它）
@@ -322,6 +340,14 @@ scan = audit_dir(
 ```
 
 `write_html=True` 需要 evidence，会强制打开。CLI 入口是 `paperconan._audit:main`，库入口推荐 `paperconan.audit_dir()`。
+
+判定后报告也能直接从库里渲染（等价于 `paperconan report` 子命令）：
+
+```python
+from paperconan import write_adjudicated_report
+
+write_adjudicated_report(scan, verdict, "adjudication.html")  # scan/verdict 均为 dict
+```
 
 ### 内存 / 输出保护
 

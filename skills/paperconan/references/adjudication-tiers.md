@@ -165,7 +165,10 @@ Batch or agent-to-agent workflows may emit one JSON object per paper:
   "innocent_explanation": "source-data assembly or label error remains possible",
   "needs_author_data": "correct raw values and source-data mapping for the affected panel",
   "report_md": "## ...",
-  "review_status": "unreviewed"
+  "review_status": "unreviewed",
+  "finding_refs": [
+    {"file": "MOESM7", "sheet": "Source Data Fig.4", "rows": "5-39", "kind": "constant_offset"}
+  ]
 }
 ```
 
@@ -176,3 +179,54 @@ Rules:
 - `DROP` requires `drop_reason` and should not include a long `report_md`.
 - `NEEDS_HUMAN` requires `tier_why` explaining the missing premise.
 - `review_status` is `unreviewed`, `confirmed`, or `rejected`.
+- `finding_refs` is optional: a list of selectors naming which scan finding(s)
+  the verdict actually adjudicated. Each selector may set any subset of
+  `file` (substring), `sheet` (exact), `rows` (exact block range), `kind`
+  (exact), `rule` (substring); a finding matches when every field it sets
+  matches. `paperconan report` scopes the evidence panel to these findings and
+  demotes the rest, so the report does not read as if every top scan signal
+  were part of the verdict. Omit it to fall back to showing the top signals by
+  severity.
+
+## Multiple Findings In One Paper
+
+When a paper has more than one distinct data-integrity signal, use a
+paper-level object with a `findings` array instead of one flat verdict. Each
+entry is adjudicated on its own — its own tier, impact, and review status — and
+`paperconan report` renders one self-contained block per finding (badge +
+reasoning + its own evidence table) under a paper header and a findings index.
+
+```json
+{
+  "title": "...",
+  "verdict": "KEEP",
+  "paper_conclusion": "论文主结论 ...",
+  "overall_impact": "core",
+  "review_note": "方法 / 版本 / 背景 ...",
+  "findings": [
+    {
+      "title": "Fig.4c shHDAC6 组 VR 两列恒定 +0.3",
+      "finding_ref": {"file": "MOESM7", "sheet": "Source Data Fig.4", "rows": "5-39", "kind": "constant_offset"},
+      "suspicion_tier": 1, "impact_scope": "core", "review_status": "confirmed",
+      "report_md": "**位置** ...\n\n**为什么是问题** ...\n\n**无辜解释** ...\n\n**需要作者澄清** ..."
+    },
+    {
+      "title": "ED Fig.6c 跨条件列多行相同",
+      "finding_ref": {"file": "MOESM13", "sheet": "Source Data ED Fig.6", "rows": "5-39", "kind": "small_diff_set", "rule": "col[5] - col[3]"},
+      "suspicion_tier": null, "impact_scope": "core", "review_status": "needs_human",
+      "report_md": "..."
+    }
+  ]
+}
+```
+
+Rules:
+
+- Paper-level `verdict` stays explicit; the report hero shows the highest
+  (numerically smallest) `suspicion_tier` across findings.
+- Each finding carries its own `finding_ref`, `suspicion_tier`,
+  `impact_scope`, `review_status`, `title`, and `report_md`.
+- Each `report_md` here describes only that finding (position, labels, why,
+  innocent explanation, questions) — the paper conclusion lives once at the top.
+- The single flat form above (one `report_md` + `finding_refs`) is still valid
+  and unchanged; use it when a paper has a single adjudicated finding.

@@ -137,7 +137,12 @@ A normal scan summary should include:
 
 For batch or agent-to-agent workflows, an optional verdict JSON may use:
 `verdict`, `suspicion_tier`, `impact_scope`, `tier_why`, `drop_reason`,
-`innocent_explanation`, `needs_author_data`, `report_md`, and `review_status`.
+`innocent_explanation`, `needs_author_data`, `report_md`, `review_status`, and
+`finding_refs` (selectors naming which scan finding(s) the verdict adjudicated,
+so the rendered report scopes its evidence panel to them). When a paper has
+more than one distinct finding, use a paper-level object with a `findings`
+array (each entry adjudicated on its own tier/status with its own
+`finding_ref`); the report then renders one self-contained block per finding.
 See [references/adjudication-tiers.md](references/adjudication-tiers.md) and
 [references/report-templates.md](references/report-templates.md).
 

@@ -133,3 +133,132 @@ def test_profile_hidden_findings_do_not_surface_as_key_evidence():
     }
     html = render_adjudicated_report(scan, {"verdict": "DROP", "report_md": "## x"})
     assert "within_col_value_duplication" not in html
+
+
+def _scan_two_findings() -> dict:
+    return {
+        "relations_blocks": [
+            {
+                "file": "A.xlsx",
+                "sheet": "Alpha",
+                "block": {"rows": "5-39", "cols": "A-B", "header": ["x", "y"]},
+                "relations": [
+                    {
+                        "kind": "constant_offset",
+                        "severity": "high",
+                        "rule": "col[1] = col[2] + 0.3",
+                        "n": 35,
+                        "evidence": {"headers": ["x", "y"], "rows": [{"row_idx": 5, "values": [1, 2]}]},
+                    }
+                ],
+            },
+            {
+                "file": "B.xlsx",
+                "sheet": "Beta",
+                "block": {"rows": "1-9", "cols": "C-D", "header": ["p", "q"]},
+                "within_col": [
+                    {
+                        "kind": "within_col_value_duplication",
+                        "severity": "medium",
+                        "rule": "dup",
+                        "n": 9,
+                        "evidence": {"headers": ["p"], "rows": [{"row_idx": 1, "values": [9]}]},
+                    }
+                ],
+            },
+        ],
+        "cross_sheet_findings": [],
+    }
+
+
+def test_finding_refs_scope_key_evidence_to_the_selected_finding():
+    scan = _scan_two_findings()
+    verdict = {
+        "verdict": "KEEP",
+        "suspicion_tier": 1,
+        "report_md": "## t",
+        "finding_refs": [{"sheet": "Alpha", "kind": "constant_offset"}],
+    }
+    html = render_adjudicated_report(scan, verdict)
+    # only the selected finding is rendered as a full evidence card
+    assert html.count('class="finding-card"') == 1
+    assert "constant_offset" in html
+    # the other signal is demoted, not presented as part of the verdict
+    assert "未纳入本次判定" in html
+
+
+def test_without_finding_refs_shows_top_findings_as_before():
+    scan = _scan_two_findings()
+    html = render_adjudicated_report(scan, {"verdict": "KEEP", "report_md": "## t"})
+    assert html.count('class="finding-card"') == 2
+    assert "未纳入本次判定" not in html
+
+
+def test_finding_refs_with_no_match_falls_back_to_top_findings():
+    scan = _scan_two_findings()
+    verdict = {"verdict": "KEEP", "report_md": "## t", "finding_refs": [{"sheet": "Nonexistent"}]}
+    html = render_adjudicated_report(scan, verdict)
+    assert html.count('class="finding-card"') == 2
+    assert "未纳入本次判定" not in html
+
+
+def _multi_finding_verdict() -> dict:
+    return {
+        "title": "Paper X",
+        "verdict": "KEEP",
+        "paper_conclusion": "Main claim under review.",
+        "overall_impact": "core",
+        "findings": [
+            {
+                "title": "Finding one",
+                "finding_ref": {"sheet": "Alpha", "kind": "constant_offset"},
+                "suspicion_tier": 3,
+                "impact_scope": "core",
+                "review_status": "confirmed",
+                "report_md": "**位置** alpha loc.",
+            },
+            {
+                "title": "Finding two",
+                "finding_ref": {"sheet": "Beta", "kind": "within_col_value_duplication"},
+                "suspicion_tier": 2,
+                "impact_scope": "supporting",
+                "review_status": "needs_human",
+                "report_md": "**位置** beta loc.",
+            },
+        ],
+    }
+
+
+def test_findings_array_renders_per_finding_blocks_with_own_evidence():
+    scan = _scan_two_findings()
+    html = render_adjudicated_report(scan, _multi_finding_verdict())
+    # each finding is its own self-contained block
+    assert html.count('class="finding-block"') == 2
+    assert "Finding one" in html and "Finding two" in html
+    # each block carries its own status badge
+    assert "confirmed" in html and "needs_human" in html
+    # each finding's evidence table is rendered adjacent to its block
+    assert html.count('class="ev"') == 2
+    # a findings index summarises them
+    assert "findings-index" in html
+
+
+def test_hero_shows_highest_tier_across_findings():
+    scan = _scan_two_findings()
+    html = render_adjudicated_report(scan, _multi_finding_verdict())  # tiers 3 and 2
+    hero = html.split("</section>")[0]  # the hero is the first <section>
+    assert "Tier 2" in hero  # highest severity across findings
+    assert "Tier 3" not in hero
+
+
+def test_legacy_single_finding_format_still_renders():
+    scan = _scan_two_findings()
+    verdict = {
+        "verdict": "KEEP",
+        "report_md": "## t",
+        "finding_refs": [{"sheet": "Alpha", "kind": "constant_offset"}],
+    }
+    html = render_adjudicated_report(scan, verdict)
+    assert 'class="finding-block"' not in html
+    assert html.count('class="finding-card"') == 1
+    assert "未纳入本次判定" in html
