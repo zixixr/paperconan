@@ -1,12 +1,13 @@
 {
   "tool": "paperconan",
-  "tool_version": "0.8.0",
-  "scanned_at": "2026-06-23T15:26:50+00:00",
+  "tool_version": "0.8.2",
+  "scanned_at": "2026-07-07T02:48:43+00:00",
   "profile": "review",
   "input_dir": "examples/demo_paper",
   "paper": null,
   "n_files": 2,
   "n_blocks_with_findings": 3,
+  "findings_omitted": 0,
   "scan_errors": [],
   "scan_stats": {
     "files": [
@@ -14,13 +15,13 @@
         "file": "ED_Fig2_tumor_volume.xlsx",
         "path": "examples/demo_paper/ED_Fig2_tumor_volume.xlsx",
         "n_sheets": 1,
-        "elapsed_ms": 2.069
+        "elapsed_ms": 7.945
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
         "path": "examples/demo_paper/ED_Fig4_qPCR.xlsx",
         "n_sheets": 2,
-        "elapsed_ms": 1.619
+        "elapsed_ms": 0.338
       }
     ],
     "sheets": [
@@ -31,7 +32,7 @@
         "n_cols": 6,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.115
+        "elapsed_ms": 0.128
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
@@ -40,7 +41,7 @@
         "n_cols": 5,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.084
+        "elapsed_ms": 0.08
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
@@ -49,10 +50,10 @@
         "n_cols": 5,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.075
+        "elapsed_ms": 0.08
       }
     ],
-    "elapsed_ms": 10.797
+    "elapsed_ms": 16.435
   },
   "relations_blocks": [
     {
@@ -715,6 +716,7 @@
           "kind": "arithmetic_progression",
           "col": "day",
           "col_idx": 0,
+          "block_c0": 0,
           "n": 8,
           "step": 3.0,
           "first": 0.0,
@@ -1013,9 +1015,11 @@
           "false_positive_context": []
         }
       ],
+      "row_pairs": [],
       "within_col": [],
       "identical_after_rounding": [],
-      "grim": []
+      "grim": [],
+      "findings_omitted": 0
     },
     {
       "file": "ED_Fig4_qPCR.xlsx",
@@ -1033,6 +1037,7 @@
       "relations": [],
       "progressions": [],
       "equal_pairs": [],
+      "row_pairs": [],
       "within_col": [
         {
           "kind": "within_col_value_duplication",
@@ -1581,7 +1586,14 @@
               "input_ng"
             ],
             "col_offset": 1,
-            "highlight_cols": [],
+            "highlight_cols": [
+              3,
+              3,
+              3,
+              3,
+              3,
+              3
+            ],
             "highlight_rows": [
               2,
               3,
@@ -1728,7 +1740,8 @@
           "false_positive_context": []
         }
       ],
-      "grim": []
+      "grim": [],
+      "findings_omitted": 0
     },
     {
       "file": "ED_Fig4_qPCR.xlsx",
@@ -1746,6 +1759,7 @@
       "relations": [],
       "progressions": [],
       "equal_pairs": [],
+      "row_pairs": [],
       "within_col": [],
       "identical_after_rounding": [
         {
@@ -1797,7 +1811,14 @@
               "input_ng"
             ],
             "col_offset": 1,
-            "highlight_cols": [],
+            "highlight_cols": [
+              3,
+              3,
+              3,
+              3,
+              3,
+              1
+            ],
             "highlight_rows": [
               2,
               3,
@@ -1944,7 +1965,8 @@
           "false_positive_context": []
         }
       ],
-      "grim": []
+      "grim": [],
+      "findings_omitted": 0
     }
   ],
   "digit_distribution": [
@@ -2065,6 +2087,63 @@
       "size_b": 36,
       "same_position_count": 22,
       "fraction_of_smaller": 0.6111111111111112,
+      "label_context_a": {
+        "column_labels": [
+          "efficiency",
+          "input_ng"
+        ],
+        "row_labels": [
+          "A1",
+          "A2",
+          "A3",
+          "A4",
+          "A6",
+          "A7",
+          "A8",
+          "A9",
+          "A10",
+          "A11",
+          "A12"
+        ],
+        "nearby_labels": [
+          "rel_expr",
+          "ct_value",
+          "efficiency",
+          "input_ng"
+        ],
+        "text": "efficiency input_ng A1 A2 A3 A4 A6 A7 A8 A9 A10 A11 A12 rel_expr ct_value efficiency input_ng"
+      },
+      "label_context_b": {
+        "column_labels": [
+          "efficiency",
+          "input_ng"
+        ],
+        "row_labels": [
+          "B1",
+          "B2",
+          "B3",
+          "B4",
+          "B6",
+          "B7",
+          "B8",
+          "B9",
+          "B10",
+          "B11",
+          "B12"
+        ],
+        "nearby_labels": [
+          "rel_expr",
+          "ct_value",
+          "efficiency",
+          "input_ng"
+        ],
+        "text": "efficiency input_ng B1 B2 B3 B4 B6 B7 B8 B9 B10 B11 B12 rel_expr ct_value efficiency input_ng"
+      },
+      "shared_context": {
+        "shared_control_or_baseline": false,
+        "shared_axis_or_coordinate": false,
+        "context_reason": null
+      },
       "examples": [
         {
           "row": 2,

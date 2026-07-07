@@ -235,13 +235,21 @@ paperconan fetch "<DOI>" --auto --out runs/<paper-id>/data/
 
 ## 报告怎么读
 
-`report.html` 是首选入口（顶部摘要 + 左侧 severity/detector/文件/关键词过滤 + finding 卡片 + last-digit histogram + cross-sheet 专段）。建议顺序：
+> **先分清两种报告。** `paperconan <dir>` 直接生成的 `audit/report.html` 是**确定性检测器的原始信号 / 人工复核工作台**——它按设计就含**大量 false positive**（共享对照、重绘坐标轴、单位换算、派生列、固定分母比值、四舍五入网格……多数命中都有完全良性的解释），而且**不代表任何结论**，不适合当作成品直接看或对外给出。
+>
+> **要得到一份正规、可读、经过判断的报告，请搭配 AI Agent + skill 使用**（见[快速开始](#快速开始推荐agent--skill)）：检测器只产出可复现的原始信号，Agent 在其上逐条判定（对照原表、图注、Methods，排除良性解释，再做对抗式复核），最后生成[判定后报告](#判定后-html-报告)。纯 CLI 拿不到这一步——判定本身需要一个会读上下文、会推理的 Agent 在环里。
+>
+> 下面讲的是**怎么把这份原始信号当作分诊清单来用**。
+
+`report.html`（分诊工作台）：顶部摘要 + "如何阅读本报告"说明 + 左侧 severity/detector/文件/关键词过滤 + finding 卡片 + last-digit histogram + cross-sheet 专段。为便于分诊，误报偏多的 **low 级信号默认折叠**（左侧一键展开），cross-sheet 等重点信号始终可见。建议顺序：
 
 1. 先看 `scan_errors` —— 解析失败或超大文件被跳过时，不能解读成"没问题"。
 2. 先看跨 sheet / 跨文件重复，再看列关系，最后才看 within-column。
 3. 对降级为 low 的 finding，核 `likely_benign` / `false_positive_context` / `prefilter_reason` 是否成立。
 4. 打开原始表，按 evidence 的文件、sheet、行列复核。
 5. 再读 figure legend 和 Methods，确认 shared control / 重复展示 / 单位换算 / 派生指标。
+
+（若某张密集/高相关表触发了海量成对信号，报告会按 severity 保留每个 block 的前若干条并在顶部提示省略数量，可用 `PAPERCONAN_MAX_FINDINGS_PER_BLOCK` 调整，见[内存 / 输出保护](#内存--输出保护)。）
 
 `scan.json` 完整结构见 [`output-schema.md`](skills/paperconan/references/output-schema.md)。
 

@@ -15,4 +15,4 @@ from ._html import write_html_report  # noqa: F401
 from .packet import distill_findings_for_review  # noqa: F401
 from .schema import PaperconanInputError  # noqa: F401
 
-__version__ = "0.8.0"
+__version__ = "0.8.2"

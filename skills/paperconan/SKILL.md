@@ -1,6 +1,6 @@
 ---
 name: paperconan
-version: 0.8.0
+version: 0.8.2
 description: Use when auditing paper source-data tables for numerical integrity signals, interpreting paperconan scan.json/report.html, preparing cautious PubPeer or research-integrity notes, or finding open supplementary data from a DOI/title. Trigger on 论文数据检查, source data audit, paper data audit, suspicious numeric tables, fabrication red flags, PubPeer prep, research integrity, DOI/title data fetch. Covers .xlsx/.csv/.tsv and tables in .pdf/.docx; not image forensics or chart digitization.
 ---
 
