@@ -191,8 +191,10 @@ def _render_finding_card(item: dict) -> str:
 
     open_attr = " open" if sev == "high" else ""
     hidden_style = ' style="display:none"' if profile_action == "hidden" else ""
+    scope = item.get("scope", "block")
     return (
-        f'<details class="finding" data-severity="{sev}" data-kind="{_esc(kind)}" '
+        f'<details class="finding" data-severity="{sev}" data-scope="{_esc(scope)}" '
+        f'data-kind="{_esc(kind)}" '
         f'data-file="{_esc(file_)}" data-profile-action="{_esc(profile_action)}" '
         f'data-searchable="{_esc(searchable)}"{open_attr}{hidden_style}>'
         '<summary>'
@@ -212,13 +214,17 @@ def _render_filter_sidebar(findings: list[dict]) -> str:
     kinds = sorted({item["finding"].get("kind", "?") for item in findings})
     files = sorted({item["file"] for item in findings if item["file"]})
 
-    def cb(cls: str, value: str, label: str) -> str:
+    def cb(cls: str, value: str, label: str, checked: bool = True) -> str:
+        checked_attr = " checked" if checked else ""
         return (
-            f'<label><input type="checkbox" class="{cls}" value="{_esc(value)}" checked>'
+            f'<label><input type="checkbox" class="{cls}" value="{_esc(value)}"{checked_attr}>'
             f' {_esc(label)}</label>'
         )
 
-    sev_box = "".join(cb("f-sev", s, s) for s in ("high", "medium", "low"))
+    # low-severity is false-positive-heavy (within-column repeats, derived columns, rounded
+    # grids…), so it is hidden by default to keep the initial view triage-worthy. The "How to
+    # read" banner tells the reader it is one click away.
+    sev_box = "".join(cb("f-sev", s, s, checked=(s != "low")) for s in ("high", "medium", "low"))
     kind_box = "".join(cb("f-kind", k, k) for k in kinds) or '<span class="muted">none</span>'
     file_box = "".join(cb("f-file", f, f) for f in files) or '<span class="muted">none</span>'
 
@@ -334,6 +340,12 @@ header.top { padding:18px 24px; border-bottom:1px solid var(--border); backgroun
 .stat.sev-low strong { color:var(--low); }
 .warn { margin-top:10px; font-size:12px; color:var(--muted); }
 .warn::before { content:"⚠ "; color:var(--medium); }
+.how-to-read { background:var(--panel-2); border:1px solid var(--border); border-left:3px solid var(--accent);
+  border-radius:6px; padding:12px 16px; margin:0 0 22px; font-size:13px; line-height:1.6; color:var(--text); }
+.how-to-read h3 { margin:0 0 6px; font-size:13.5px; color:var(--accent); font-weight:600; }
+.how-to-read p { margin:0 0 6px; color:var(--muted); }
+.how-to-read strong { color:var(--text); }
+.how-to-read code { background:var(--panel); padding:1px 5px; border-radius:3px; }
 .layout { display:grid; grid-template-columns:240px 1fr; min-height:calc(100vh - 110px); }
 aside.filters { border-right:1px solid var(--border); padding:16px;
   background:var(--panel); position:sticky; top:0; align-self:start;
@@ -437,7 +449,10 @@ _JS = """
     const files = getChecked('f-file');
     const q = (search.value || '').trim().toLowerCase();
     findings.forEach(el => {
-      const matchSev = sev.has(el.dataset.severity);
+      // Cross-sheet collisions are the flagship section and stay visible regardless of the
+      // severity filter — otherwise a low/blank-severity collision would hide the whole
+      // "most worth reviewing" section on load (low is unchecked by default).
+      const matchSev = el.dataset.scope === 'cross_sheet' || sev.has(el.dataset.severity);
       const matchKind = kinds.has(el.dataset.kind);
       const matchFile = files.has(el.dataset.file);
       const matchQ = !q || (el.dataset.searchable || '').indexOf(q) !== -1;
@@ -457,8 +472,12 @@ _JS = """
   search.addEventListener('input', applyFilters);
   showNoisy.addEventListener('change', applyFilters);
   reset.addEventListener('click', () => {
-    document.querySelectorAll('input.f-sev, input.f-kind, input.f-file')
+    document.querySelectorAll('input.f-kind, input.f-file')
             .forEach(i => i.checked = true);
+    // Restore the initial triage view exactly: low severity stays unchecked on reset
+    // (it is hidden by default), so reset matches a fresh page load rather than showing more.
+    document.querySelectorAll('input.f-sev')
+            .forEach(i => i.checked = (i.value !== 'low'));
     showNoisy.checked = false;
     search.value = '';
     applyFilters();
@@ -504,6 +523,19 @@ def write_html_report(scan: dict, out_path: str) -> None:
     if not sections:
         sections = '<p class="empty">no findings — nothing flagged in this dataset.</p>'
 
+    how_to_read = (
+        '<div class="how-to-read">'
+        '<h3>如何阅读本报告 · How to read this</h3>'
+        '<p>这是 paperconan 检测器的<strong>原始信号</strong>,不是结论,也不是经过人工/AI 判定的报告。'
+        '每条 finding 只是一个统计异常,<strong>大多数都有良性解释</strong>'
+        '(共享对照、重绘坐标轴、单位换算、派生列、固定分母比值、边界值、四舍五入网格…)。</p>'
+        '<p>请把它当作<strong>待逐条人工复核的线索清单</strong>:对照原始表格、图注与 Methods 之后再判断,'
+        '不要据此对论文或作者下任何结论。经判定的正式报告(含逐条裁决)是另一份单独产物。</p>'
+        '<p>为便于分诊,<strong>low 级信号默认隐藏</strong>(误报偏多);在左侧勾选 <code>low</code> 可显示。'
+        '优先看 cross-sheet 与 high。</p>'
+        '</div>'
+    )
+
     sidebar = _render_filter_sidebar(findings) if findings else \
         '<aside class="filters"><p class="muted">no findings</p></aside>'
 
@@ -514,6 +546,17 @@ def write_html_report(scan: dict, out_path: str) -> None:
         f'<span class="stat sev-medium"><strong>{sev["medium"]}</strong> medium</span>',
         f'<span class="stat sev-low"><strong>{sev["low"]}</strong> low</span>',
     ])
+
+    omitted = int(scan.get("findings_omitted") or 0)
+    omitted_html = ""
+    if omitted:
+        omitted_html = (
+            f'<div class="warn">{omitted:,} lower-severity findings were omitted to bound '
+            'report size (dense/correlated blocks emit thousands of near-duplicate pairwise '
+            'signals). The highest-severity findings per block are kept; raise '
+            '<code>PAPERCONAN_MAX_FINDINGS_PER_BLOCK</code> / '
+            '<code>PAPERCONAN_MAX_TOTAL_FINDINGS</code> to see more.</div>'
+        )
 
     ver = scan.get("tool_version", "")
     ts = scan.get("scanned_at", "")
@@ -541,10 +584,11 @@ def write_html_report(scan: dict, out_path: str) -> None:
   <div class="brand">paperconan<span class="brand-sub">paper data audit · {_esc(input_label)}</span></div>
   <div class="stats">{stats}</div>
   <div class="warn">Statistical anomalies — signal, not verdict. Take findings to PubPeer / journal editor / research integrity office, not social media.</div>
+  {omitted_html}
 </header>
 <div class="layout">
   {sidebar}
-  <main>{sections}</main>
+  <main>{how_to_read}{sections}</main>
   {footer}
 </div>
 <script>{_JS}</script>

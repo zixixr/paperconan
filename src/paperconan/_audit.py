@@ -2456,6 +2456,46 @@ _MAX_REPORT_BLOCKS = int(os.environ.get("PAPERCONAN_MAX_REPORT_BLOCKS", "2000"))
 # including the highlighted cells). Small blocks are emitted whole and stay byte-identical.
 _MAX_EV_ROWS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_ROWS", "50"))
 _MAX_EV_COLS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_COLS", "30"))
+# Per-block finding cap: the pairwise detectors are O(col²), so a single dense, highly
+# correlated block (a correlation matrix, an expression panel with many proportional columns)
+# can emit thousands of findings. Each carries its own embedded evidence snippet, so the count —
+# not just the per-snippet size — is what balloons scan.json / report.html past 1 GB (GH #15).
+# Keep at most this many findings per block, retaining the highest-severity ones, and record how
+# many were dropped in the block's `findings_omitted` field (never a silent truncation). 0 disables.
+_MAX_FINDINGS_PER_BLOCK = int(os.environ.get("PAPERCONAN_MAX_FINDINGS_PER_BLOCK", "150"))
+# Global backstop across all blocks: MAX_REPORT_BLOCKS × MAX_FINDINGS_PER_BLOCK could still be
+# large on a pathological corpus, so stop retaining findings once this many have been kept.
+_MAX_TOTAL_FINDINGS = int(os.environ.get("PAPERCONAN_MAX_TOTAL_FINDINGS", "5000"))
+
+# Severity rank for deterministic, highest-first truncation when a block is over budget.
+_SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2}
+
+
+def _cap_block_findings(groups, cap):
+    """Trim a block's findings to at most `cap`, keeping the highest-severity ones.
+
+    `groups` maps a BLOCK_FINDING_GROUPS key to its list of findings; each list is
+    trimmed IN PLACE. Selection is by severity (high > medium > low); ties keep the
+    original detector/emission order, so output stays deterministic. Returns the number
+    of findings dropped. `cap is None` means unlimited (no trimming); `cap == 0` drops all."""
+    if cap is None:
+        return 0
+    cap = max(0, cap)
+    total = sum(len(v) for v in groups.values())
+    if total <= cap:
+        return 0
+    flat = [(name, idx, f)
+            for name, lst in groups.items()
+            for idx, f in enumerate(lst)]
+    # Stable sort by severity keeps original order within a severity band.
+    flat.sort(key=lambda t: _SEVERITY_RANK.get((t[2].get("severity") or "low").lower(), 3))
+    keep = {(name, idx) for name, idx, _ in flat[:cap]}
+    omitted = 0
+    for name, lst in groups.items():
+        kept = [f for i, f in enumerate(lst) if (name, i) in keep]
+        omitted += len(lst) - len(kept)
+        lst[:] = kept
+    return omitted
 
 
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
@@ -2475,6 +2515,8 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         )
 
     report_blocks = []
+    findings_omitted_total = 0   # findings dropped by the per-block / global finding caps
+    findings_kept_total = 0      # findings retained across all blocks (for the global backstop)
     per_sheet_numbers = {}
     grids = {}  # (file, sheet) -> decimal grid, for the unified collision pass
     grid_sheets = {}  # (file, sheet) -> Sheet, for local cross-sheet label context
@@ -2543,6 +2585,8 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             for (r0, r1, c0, c1) in blocks:
                 if len(report_blocks) >= _MAX_REPORT_BLOCKS:   # output budget reached; stop collecting
                     break
+                if _MAX_TOTAL_FINDINGS > 0 and findings_kept_total >= _MAX_TOTAL_FINDINGS:
+                    break   # global finding budget spent; stop collecting (subsequent sheets short-circuit here too)
                 header = header_for(sheet, r0, c0, c1)
                 # On very wide blocks (dense correlation matrices) the O(col²) relation and
                 # equal-pair detectors explode in compute + output, so skip just those two; the
@@ -2557,7 +2601,32 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 gg = detect_grim_grimmer(sheet, r0, r1, c0, c1, header)
                 if rel or ap or eq or rp or wc or iar or gg:
                     sheet_context = " ".join([os.path.basename(f), sn, *[str(h) for h in header]])
-                    for group in (rel, ap, eq, rp, wc, iar, gg):
+                    # Bound this block's finding count BEFORE attaching evidence, so trimmed
+                    # findings never pay the (large) embedded-snippet cost. The per-block cap is
+                    # further clamped by the remaining global budget; keep highest severity first.
+                    # NOTE: this precedes the count-based demotion passes below
+                    # (_demote_reused_progressions / _demote_dense_relations / _demote_within_col_flood),
+                    # which judge floods by cross-block counts. Trimming can lower those counts, so a
+                    # benign finding may keep an elevated severity that demotion would have lowered —
+                    # an over-report only (never drops a genuine high; keeping highest-severity first
+                    # protects exactly the findings demotion targets). Capping after demotion would
+                    # require attaching evidence to every finding first, re-introducing the GH#15 OOM.
+                    groups = {"relations": rel, "progressions": ap, "equal_pairs": eq,
+                              "row_pairs": rp, "within_col": wc,
+                              "identical_after_rounding": iar, "grim": gg}
+                    # Effective cap = the tighter of the per-block limit and the remaining global
+                    # budget; None means unlimited (both caps disabled). A spent global budget
+                    # yields 0, which drops the whole block (recorded via `omitted`).
+                    per_block = _MAX_FINDINGS_PER_BLOCK if _MAX_FINDINGS_PER_BLOCK > 0 else None
+                    if _MAX_TOTAL_FINDINGS > 0:
+                        remaining = max(0, _MAX_TOTAL_FINDINGS - findings_kept_total)
+                        block_cap = remaining if per_block is None else min(per_block, remaining)
+                    else:
+                        block_cap = per_block
+                    omitted = _cap_block_findings(groups, block_cap)
+                    findings_omitted_total += omitted
+                    findings_kept_total += sum(len(v) for v in groups.values())
+                    for group in groups.values():
                         if evidence:
                             _attach_evidence(group, sheet, r0, r1, c0, c1, header)
                         _attach_benign(group)
@@ -2565,10 +2634,13 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                                                   sheet_context=sheet_context)
                     report_blocks.append(dict(file=os.path.basename(f), sheet=sn,
                                               block=dict(rows=f"{r0+1}-{r1}", cols=f"{c0+1}-{c1}", header=header),
-                                              relations=rel, progressions=ap, equal_pairs=eq,
-                                              row_pairs=rp,
-                                              within_col=wc, identical_after_rounding=iar,
-                                              grim=gg))
+                                              relations=groups["relations"], progressions=groups["progressions"],
+                                              equal_pairs=groups["equal_pairs"],
+                                              row_pairs=groups["row_pairs"],
+                                              within_col=groups["within_col"],
+                                              identical_after_rounding=groups["identical_after_rounding"],
+                                              grim=groups["grim"],
+                                              findings_omitted=omitted))
 
     # Down-weight dense/correlated sheets: judged by per-sheet relation totals, so a
     # wide matrix's expected identical/linear columns don't flood high-severity output.
@@ -2612,6 +2684,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                paper=_load_provenance(in_dir, paper),
                n_files=len(files),
                n_blocks_with_findings=len(report_blocks),
+               findings_omitted=findings_omitted_total,
                scan_errors=scan_errors,
                scan_stats={**scan_stats,
                            "elapsed_ms": round((time.perf_counter() - scan_start) * 1000, 3)},

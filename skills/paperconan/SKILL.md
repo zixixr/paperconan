@@ -16,7 +16,7 @@ Tool repository: https://github.com/zixixr/paperconan
 1. Confirm what the user supplied:
    - Local source-data directory: run `paperconan <input-dir>`.
    - DOI or title: run `paperconan fetch "<DOI or title>"`, choose a matched tabular dataset, download it, then scan the downloaded directory.
-   - Only an existing audit: read `audit/scan.json` and point the user to `audit/report.html`.
+   - Only an existing audit: read `audit/scan.json` and use `audit/report.html` as the evidence browser to triage — then give an adjudicated answer. Do not hand the raw `report.html` over as "the result" (see Report Positioning below).
 2. Prefer the real CLI. Do not invent findings from eyeballing tables.
 3. Parse `scan.json`, then load the reference file needed for the task.
 4. Open the original table when describing a serious finding as worth follow-up. If the original data is unavailable, say the finding is unverified.
@@ -46,6 +46,26 @@ Choose the lightest mode that satisfies the user request:
 Do not write a full eight-section report for ordinary scan summaries. Use the
 full report only for Tier 1/Tier 2 KEEP, PubPeer-style drafting, formal
 research-integrity notes, or when the user explicitly asks for it.
+
+## Report Positioning
+
+The pipeline is **scan → agent triage/judgment → adjudicated report**. Keep the
+two report artifacts distinct:
+
+- `audit/report.html` (from the bare CLI) is a **deterministic detector /
+  evidence browser** — a triage worklist. It is false-positive-heavy by design
+  and represents **no judgment**. It is an intermediate artifact, not the
+  user-facing deliverable. Never present it as "the audit result".
+- The **user-facing deliverable is always agent-adjudicated**, produced only
+  after you triage `scan.json`, open the source tables for serious findings, and
+  weigh benign explanations: a short adjudicated summary for ordinary cases, or
+  the eight-section report (`paperconan report scan.json --verdict verdict.json
+  --out …`) for Tier 1/Tier 2 KEEP and formal/public writing.
+
+So the raw `report.html` is what *you* read to triage; the adjudicated summary or
+eight-section report is what the *user* receives. A plain CLI user who only runs
+`paperconan <dir>` has no agent in the loop, so they see only the raw browser —
+tell them the findings still need human/agent triage before they mean anything.
 
 ## Install And Run
 
