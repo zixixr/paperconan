@@ -89,3 +89,20 @@ def test_monte_carlo_continuous_columns_have_near_zero_fp():
         if [f for f in out if f["kind"] == "within_col_dispersed_repeats"]:
             fp += 1
     assert fp <= 2, f"false-positive rate too high: {fp}/{trials}"
+
+
+from paperconan._audit import _attach_evidence
+
+def test_finding_gets_evidence_with_highlighted_cells():
+    rng = np.random.default_rng(7)
+    col = [round(float(rng.uniform(1, 599)), 2) for _ in range(120)]
+    injected = [round(float(rng.uniform(1, 599)), 2) for _ in range(12)]
+    for i, val in enumerate(injected):
+        for slot in (i, 40 + i, 80 + i):
+            col[slot] = val
+    s = _sheet(col)
+    out = detect_dispersed_repeats(s, 1, len(col) + 1, 0, 1, ["boldness"])
+    _attach_evidence(out, s, 1, len(col) + 1, 0, 1, ["boldness"])
+    ev = out[0]["evidence"]
+    assert ev["highlight_cols"] == [0]
+    assert ev["highlight_rows"], "expected highlighted duplicate rows"

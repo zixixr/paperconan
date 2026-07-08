@@ -588,13 +588,18 @@ def _attach_evidence(findings, sheet, r0, r1, c0, c1, header):
         for k in ("row_a_idx", "row_b_idx", "row_idx"):
             if k in f and isinstance(f[k], int):
                 hi_rows.append(f[k] + 1)
-        # identical_after_rounding lists specific (row, col) example cells (1-based).
+        # identical_after_rounding / within_col_dispersed_repeats list specific
+        # (row, col) example cells (1-based).
         for ex in f.get("example_cells", []) or []:
             try:
                 hi_rows.append(int(ex[0]))
                 hi_cols.append(int(ex[1]) - 1)
             except (TypeError, ValueError, IndexError):
                 pass
+        # De-duplicate (order-preserving): a column/row referenced by both an *_idx
+        # field and one or more example_cells should highlight once, not N times.
+        hi_cols = list(dict.fromkeys(hi_cols))
+        hi_rows = list(dict.fromkeys(hi_rows))
         f["evidence"] = _block_evidence(sheet, r0, r1, c0, c1, header,
                                         highlight_cols=hi_cols,
                                         highlight_rows=hi_rows)
@@ -2697,6 +2702,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 eq = [] if wide else detect_equal_pairs(sheet, r0, r1, c0, c1, header)
                 rp = [] if wide else detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header)
                 wc = detect_within_column_patterns(sheet, r0, r1, c0, c1, header)
+                wc = wc + detect_dispersed_repeats(sheet, r0, r1, c0, c1, header)
                 iar = detect_identical_after_rounding(sheet, r0, r1, c0, c1, header)
                 gg = detect_grim_grimmer(sheet, r0, r1, c0, c1, header)
                 if rel or ap or eq or rp or wc or iar or gg:

@@ -905,7 +905,8 @@ def prefilter_within_col(f: dict[str, Any],
     Relies on the detector enrichment fields all_integer / n_distinct / frac_repeat.
     """
     kind = f.get("kind")
-    if kind not in {"within_col_value_duplication", "within_col_decimal_repetition"}:
+    if kind not in {"within_col_value_duplication", "within_col_decimal_repetition",
+                    "within_col_dispersed_repeats"}:
         return "keep", None
 
     name = _wc_name(f)
