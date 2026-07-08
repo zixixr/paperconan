@@ -46,3 +46,22 @@ def test_single_verdict_renders_rich_layout():
 def test_single_finding_hides_findings_index():
     html = render_adjudicated_report(SCAN, SINGLE_VERDICT)
     assert "findings-index" not in html   # 1 finding -> no silly 1-row index
+
+
+def test_drop_verdict_renders_without_crash():
+    v = {"title": "T", "verdict": "DROP", "drop_reason": "fixed_denominator",
+         "innocent_explanation": "percentages from a common denominator",
+         "report_md": None, "review_status": "unreviewed"}
+    html = render_adjudicated_report(SCAN, v)
+    assert "DROP" in html
+    assert "finding-block" in html          # falls back to strongest scan finding evidence
+    assert 'class="panel side"' not in html
+
+
+def test_needs_human_verdict_renders_without_crash():
+    v = {"title": "T", "verdict": "NEEDS_HUMAN",
+         "tier_why": "sample provenance missing", "report_md": None,
+         "review_status": "unreviewed"}
+    html = render_adjudicated_report(SCAN, v)
+    assert "NEEDS_HUMAN" in html
+    assert "sample provenance missing" in html
