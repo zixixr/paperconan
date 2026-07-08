@@ -73,3 +73,19 @@ def test_low_cardinality_ratio_column_does_not_fire():
            (denoms[int(rng.integers(0, 5))] for _ in range(200))]
     out = _detect(col)
     assert not [f for f in out if f["kind"] == "within_col_dispersed_repeats"]
+
+
+def test_monte_carlo_continuous_columns_have_near_zero_fp():
+    # Genuinely continuous columns (varied precision/scale/n) must almost never fire.
+    fp = 0
+    trials = 200
+    for seed in range(trials):
+        rng = np.random.default_rng(1000 + seed)
+        n = int(rng.integers(40, 400))
+        scale = float(rng.choice([1.0, 10.0, 100.0, 600.0]))
+        decimals = int(rng.choice([2, 3, 4]))
+        col = [round(float(rng.uniform(0, scale)), decimals) for _ in range(n)]
+        out = _detect(col)
+        if [f for f in out if f["kind"] == "within_col_dispersed_repeats"]:
+            fp += 1
+    assert fp <= 2, f"false-positive rate too high: {fp}/{trials}"
