@@ -42,9 +42,9 @@
 paperconan report audit/scan.json --verdict verdict.json --out adjudication.html
 ```
 
-`verdict.json` 使用公开 schema：`verdict`、`suspicion_tier`、`impact_scope`、`tier_why`、`drop_reason`、
-`innocent_explanation`、`needs_author_data`、`report_md`、`review_status`。这份 HTML 会把 8 段式
-`report_md`、Tier/impact/review 状态和 `scan.json` 的关键 evidence 放在一起，适合单篇论文复核或批量审计后的归档。
+流程是一套：**Agent 写判断 → `paperconan report` 渲染**。渲染器**对任何 verdict 都输出同一种高保真版式**（论文头 + Tier/impact/review 徽章 + 每条 finding 的独立卡片 + 紧跟其后的 evidence 热力表）——README 顶部那份示例报告就是这条命令的直接产物，没有任何私有管线。
+
+`verdict.json` 的**主形态**是带 `findings` 数组的论文级对象（每条 finding 各带 `finding_ref` / `suspicion_tier` / `impact_scope` / `review_status` / `report_md`，论文级另有 `paper_conclusion` / `overall_impact` / `review_note`）；**单条 finding 只是"列了一条"**，同样富渲染，不再是旧版朴素排版。完整 schema 与例子见 [`references/adjudication-tiers.md`](../skills/paperconan/references/adjudication-tiers.md) › "Multiple Findings In One Paper"。旧的扁平 `report_md` + `finding_refs` 形态向后兼容，现在也会渲染成同样的高保真版式。适合单篇论文复核或批量审计后的归档。
 
 注意：`paperconan report` 是本地、公开、无私有依赖的渲染器；不读取 Postgres、Blob、云端队列或任何
 `recheck/` 私有缓存。真实论文 PDF、截图、主图等材料若要展示，应由使用者在自己的审计目录中合法保存并另行归档。

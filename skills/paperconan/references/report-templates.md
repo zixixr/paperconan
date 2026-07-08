@@ -128,10 +128,14 @@ it does not require a database or remote service.
 Use `null` for fields that do not apply. Do not include author names or
 speculation about intent.
 
-For a paper with more than one distinct finding, use a paper-level object with
-a `findings` array (each entry has its own tier/status and `finding_ref`); see
-[adjudication-tiers.md](adjudication-tiers.md) › "Multiple Findings In One
-Paper". `paperconan report` then renders one self-contained block per finding.
+**The primary shape for a rendered adjudicated report is the paper-level object
+with a `findings` array** (each entry has its own tier/status and `finding_ref`);
+see [adjudication-tiers.md](adjudication-tiers.md) › "Multiple Findings In One
+Paper". A single finding is just a one-element `findings` list — `paperconan
+report` renders it in the same high-fidelity layout (paper header + per-finding
+card + evidence heatmap), so single vs multiple is only a matter of how many
+findings you list, not of presentation. The flat single-verdict schema above
+stays valid and now renders in that same rich layout too.
 
 ## DROP Note
 

@@ -190,11 +190,16 @@ Rules:
 
 ## Multiple Findings In One Paper
 
-When a paper has more than one distinct data-integrity signal, use a
-paper-level object with a `findings` array instead of one flat verdict. Each
-entry is adjudicated on its own — its own tier, impact, and review status — and
-`paperconan report` renders one self-contained block per finding (badge +
-reasoning + its own evidence table) under a paper header and a findings index.
+This paper-level object with a `findings` array is the **primary shape** for a
+rendered adjudicated report. Use it even for a single finding (a one-element
+`findings` list): `paperconan report` renders every shape in the same
+high-fidelity layout, so this is not a "multi-only" format.
+
+When a paper has more than one distinct data-integrity signal, list each in the
+`findings` array. Each entry is adjudicated on its own — its own tier, impact,
+and review status — and `paperconan report` renders one self-contained block per
+finding (badge + reasoning + its own evidence table) under a paper header; the
+findings index appears only when there is more than one finding.
 
 ```json
 {
