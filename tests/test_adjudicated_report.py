@@ -96,7 +96,7 @@ def test_report_subcommand_writes_adjudicated_html(tmp_path):
     assert out.exists()
     html = out.read_text(encoding="utf-8")
     assert "Synthetic paper" in html
-    assert "关键证据" in html
+    assert 'class="finding-block"' in html
     assert "identical_column" in html
     assert str(out) in proc.stdout
 
@@ -183,23 +183,25 @@ def test_finding_refs_scope_key_evidence_to_the_selected_finding():
     # only the selected finding is rendered as a full evidence card
     assert html.count('class="finding-card"') == 1
     assert "constant_offset" in html
-    # the other signal is demoted, not presented as part of the verdict
-    assert "未纳入本次判定" in html
+    # the other signal is not presented as part of the verdict's evidence
+    assert "within_col_value_duplication" not in html
 
 
-def test_without_finding_refs_shows_top_findings_as_before():
+def test_without_finding_refs_falls_back_to_strongest_finding():
     scan = _scan_two_findings()
     html = render_adjudicated_report(scan, {"verdict": "KEEP", "report_md": "## t"})
-    assert html.count('class="finding-card"') == 2
-    assert "未纳入本次判定" not in html
+    # no finding_ref -> evidence falls back to the single strongest scan signal
+    assert html.count('class="finding-card"') == 1
+    assert "constant_offset" in html
 
 
-def test_finding_refs_with_no_match_falls_back_to_top_findings():
+def test_finding_refs_with_no_match_falls_back_to_strongest_finding():
     scan = _scan_two_findings()
     verdict = {"verdict": "KEEP", "report_md": "## t", "finding_refs": [{"sheet": "Nonexistent"}]}
     html = render_adjudicated_report(scan, verdict)
-    assert html.count('class="finding-card"') == 2
-    assert "未纳入本次判定" not in html
+    # an unmatched ref falls back to the single strongest scan signal
+    assert html.count('class="finding-card"') == 1
+    assert "constant_offset" in html
 
 
 def _multi_finding_verdict() -> dict:
@@ -251,7 +253,7 @@ def test_hero_shows_highest_tier_across_findings():
     assert "Tier 3" not in hero
 
 
-def test_legacy_single_finding_format_still_renders():
+def test_legacy_single_finding_format_now_renders_rich():
     scan = _scan_two_findings()
     verdict = {
         "verdict": "KEEP",
@@ -259,6 +261,7 @@ def test_legacy_single_finding_format_still_renders():
         "finding_refs": [{"sheet": "Alpha", "kind": "constant_offset"}],
     }
     html = render_adjudicated_report(scan, verdict)
-    assert 'class="finding-block"' not in html
+    # legacy single verdicts now render in the same rich per-finding layout
+    assert 'class="finding-block"' in html
     assert html.count('class="finding-card"') == 1
-    assert "未纳入本次判定" in html
+    assert "constant_offset" in html

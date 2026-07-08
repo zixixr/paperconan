@@ -95,20 +95,6 @@ def _render_md(md: str | None) -> str:
     return "\n".join(out)
 
 
-def _verdict_badge(verdict: dict[str, Any]) -> str:
-    v = str(verdict.get("verdict") or "NEEDS_HUMAN").upper()
-    tier = verdict.get("suspicion_tier")
-    impact = verdict.get("impact_scope")
-    review = verdict.get("review_status") or "unreviewed"
-    bits = [f'<span class="badge verdict">{_esc(v)}</span>']
-    if tier:
-        bits.append(f'<span class="badge tier">Tier {_esc(tier)}</span>')
-    if impact:
-        bits.append(f'<span class="badge impact">{_esc(impact)}</span>')
-    bits.append(f'<span class="badge review">{_esc(review)}</span>')
-    return "".join(bits)
-
-
 def _finding_score(item: dict[str, Any]) -> tuple[int, int]:
     f = item["finding"]
     sev = str(f.get("severity") or "").lower()
@@ -242,11 +228,19 @@ footer { margin-top:20px; color:var(--muted); font-size:12px; }
 .fb-head { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;
   border-bottom:1px solid var(--line); padding-bottom:12px; margin-bottom:12px; }
 .fb-head h2 { font-size:17px; margin:0; }
-table.findings-index { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
-table.findings-index th, table.findings-index td { border-bottom:1px solid var(--line); padding:6px 10px; text-align:left; }
-table.findings-index th { color:var(--muted); font-weight:600; }
 @media (max-width: 900px) { .grid { grid-template-columns:1fr; } .page { padding:18px 12px 32px; } }
 """
+
+
+# The findings-index table only appears when there is more than one finding.
+# Its CSS is injected next to the table (not baked into the global stylesheet) so
+# a single-finding page never carries the class name at all.
+_INDEX_CSS = (
+    "table.findings-index { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }"
+    "table.findings-index th, table.findings-index td { border-bottom:1px solid var(--line);"
+    " padding:6px 10px; text-align:left; }"
+    "table.findings-index th { color:var(--muted); font-weight:600; }"
+)
 
 
 def _page(title: str, badges_html: str, main_html: str) -> str:
@@ -333,10 +327,20 @@ def _render_finding_block(scan_findings: list[dict[str, Any]], finding: dict[str
     badges.append(f'<span class="badge review">{_esc(status)}</span>')
     title = finding.get("title") or f"发现 {idx + 1}"
     body = _render_md(finding.get("report_md"))
+    # Evidence fallback: when the finding names no ref (or its ref matches no scan
+    # finding), fall back to the strongest scan signal so the card still carries an
+    # evidence heatmap. Only when there is no scan evidence at all do we show a note.
+    if matched is None and scan_findings:
+        matched = scan_findings[0]
     if matched is not None:
         evidence = _render_key_finding(matched, idx)
     else:
         evidence = '<p class="no-evidence">无匹配证据（finding_ref 未命中扫描结果）</p>'
+    # Additional evidence tables for any extra refs the verdict adjudicated together.
+    for j, xref in enumerate(finding.get("extra_refs") or []):
+        xm = _match_finding(scan_findings, xref or {})
+        if xm is not None:
+            evidence += _render_key_finding(xm, (idx + 1) * 1000 + j)
     return (
         '<section class="finding-block">'
         f'<header class="fb-head"><h2>发现 {idx + 1} · {_esc(title)}</h2>'
@@ -345,67 +349,69 @@ def _render_finding_block(scan_findings: list[dict[str, Any]], finding: dict[str
     )
 
 
-def _render_single(scan: dict[str, Any], verdict: dict[str, Any], title: str,
-                   findings: list[dict[str, Any]]) -> str:
-    """Legacy single-verdict layout: report_md + scoped/top key-evidence panel."""
-    # If the verdict names which finding(s) it adjudicated, scope the evidence
-    # panel to exactly those and demote the rest, so the report no longer reads
-    # as if every top scan signal were part of the verdict.
+def _normalize_verdict(
+    verdict: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    """Fold either verdict shape into (paper_fields, findings_list, summary).
+
+    - multi shape: return its findings as-is.
+    - legacy single shape (report_md + finding_refs): synthesize one finding and
+      carry tier_why / innocent_explanation / needs_author_data as ``summary``.
+    """
+    if verdict.get("findings"):
+        paper = {"paper_conclusion": verdict.get("paper_conclusion"),
+                 "review_note": verdict.get("review_note")}
+        return paper, list(verdict["findings"]), {}
     refs = verdict.get("finding_refs") or []
-    focused = [item for item in findings if any(_finding_matches_ref(item, r) for r in refs)]
-    scope_note = ""
-    if focused:
-        key_findings = focused
-        others = len(findings) - len(focused)
-        note = f"本次判定聚焦 {len(focused)} 条 finding"
-        note += f"；此外扫描还发现 {others} 条信号，未纳入本次判定范围。" if others else "。"
-        scope_note = f'<p class="scope-note">{note}</p>'
-    else:
-        key_findings = findings[:8]
-    report_html = _render_md(verdict.get("report_md")) or (
-        "<p>No formal report_md was supplied. Use this page as an evidence "
-        "wrapper around the verdict metadata and scan findings.</p>"
-    )
-    evidence_html = scope_note + "".join(
-        _render_key_finding(item, i) for i, item in enumerate(key_findings)
-    )
-    if not key_findings:
-        evidence_html = '<p class="no-evidence">No scan findings were available.</p>'
-
-    kv = {
-        "verdict": verdict.get("verdict"),
-        "tier_why": verdict.get("tier_why"),
-        "innocent_explanation": verdict.get("innocent_explanation"),
-        "needs_author_data": verdict.get("needs_author_data"),
-        "tool_version": scan.get("tool_version"),
-        "profile": scan.get("profile"),
+    single = {
+        "title": verdict.get("title") or "发现",
+        "finding_ref": refs[0] if refs else None,
+        "extra_refs": refs[1:],
+        "suspicion_tier": verdict.get("suspicion_tier"),
+        "impact_scope": verdict.get("impact_scope"),
+        "review_status": verdict.get("review_status") or "unreviewed",
+        "report_md": verdict.get("report_md"),
     }
-    kv_html = "".join(
-        f"<div>{_esc(k)}</div><div>{_esc(v)}</div>"
-        for k, v in kv.items()
-        if v not in (None, "")
-    )
-    main_html = f"""<div class="grid">
-    <main class="panel report">{report_html}</main>
-    <aside class="panel side">
-      <h2>判定摘要</h2>
-      <div class="kv">{kv_html}</div>
-    </aside>
-  </div>
-  <section class="panel evidence" style="margin-top:18px">
-    <h2>关键证据</h2>
-    {evidence_html}
-  </section>"""
-    return _page(title, _verdict_badge(verdict), main_html)
+    summary = {k: verdict.get(k) for k in
+               ("tier_why", "innocent_explanation", "needs_author_data")
+               if verdict.get(k)}
+    paper = {"paper_conclusion": None, "review_note": verdict.get("review_note")}
+    return paper, [single], summary
 
 
-def _render_multi(scan: dict[str, Any], verdict: dict[str, Any], title: str,
-                  scan_findings: list[dict[str, Any]], findings: list[dict[str, Any]]) -> str:
-    """Multi-finding layout: paper header + findings index + per-finding blocks."""
-    conclusion = _render_md(verdict.get("paper_conclusion")) or "<p>—</p>"
-    index = _render_findings_index(findings, scan_findings)
+def _render_unified(scan: dict[str, Any], verdict: dict[str, Any], title: str,
+                    scan_findings: list[dict[str, Any]], findings: list[dict[str, Any]],
+                    paper: dict[str, Any], summary: dict[str, Any]) -> str:
+    """One high-fidelity layout for every verdict shape.
+
+    Paper header + (optional) findings index + one self-contained block per
+    finding, each with its own evidence heatmap. A single finding hides the index;
+    a verdict-level ``summary`` (tier_why / innocent_explanation /
+    needs_author_data) renders as a compact kv block under the conclusion.
+    """
+    conclusion = _render_md(paper.get("paper_conclusion")) or "<p>—</p>"
     blocks = "".join(_render_finding_block(scan_findings, f, i) for i, f in enumerate(findings))
-    note = _render_md(verdict.get("review_note")) if verdict.get("review_note") else ""
+    note = _render_md(paper.get("review_note")) if paper.get("review_note") else ""
+
+    summary_html = ""
+    if summary:
+        summary_kv = "".join(
+            f"<div>{_esc(k)}</div><div>{_esc(v)}</div>"
+            for k, v in summary.items()
+            if v not in (None, "")
+        )
+        if summary_kv:
+            summary_html = (f'<h2 style="margin-top:16px">判定摘要</h2>'
+                            f'<div class="kv">{summary_kv}</div>')
+
+    # The findings index (and its CSS) only appear when there is more than one
+    # finding — a one-row index adds no signal.
+    index_html = ""
+    if len(findings) > 1:
+        index_html = (f'<style>{_INDEX_CSS}</style>'
+                      f'<h2 style="margin-top:16px">发现清单</h2>'
+                      f'{_render_findings_index(findings, scan_findings)}')
+
     kv = {"tool_version": scan.get("tool_version"), "profile": scan.get("profile")}
     kv_html = "".join(
         f"<div>{_esc(k)}</div><div>{_esc(v)}</div>"
@@ -415,8 +421,8 @@ def _render_multi(scan: dict[str, Any], verdict: dict[str, Any], title: str,
     main_html = f"""<section class="panel">
     <h2>论文主结论</h2>
     {conclusion}
-    <h2 style="margin-top:16px">发现清单</h2>
-    {index}
+    {summary_html}
+    {index_html}
   </section>
   {blocks}
   <section class="panel" style="margin-top:18px">
@@ -429,9 +435,10 @@ def _render_multi(scan: dict[str, Any], verdict: dict[str, Any], title: str,
 def render_adjudicated_report(scan: dict[str, Any], verdict: dict[str, Any]) -> str:
     """Return a self-contained HTML page for a judged PaperConan scan.
 
-    Two shapes are supported: a legacy single verdict (``report_md`` +
-    optional ``finding_refs``), and a multi-finding verdict carrying a
-    ``findings`` array rendered as one self-contained block per finding.
+    Both verdict shapes render through one high-fidelity path: a ``findings``
+    array (the main shape) and a legacy single verdict (``report_md`` + optional
+    ``finding_refs``) are folded by :func:`_normalize_verdict` into one findings
+    list, then rendered as a paper header + per-finding blocks with evidence.
     """
     title = _scan_title(scan, verdict)
     # Mirror the deterministic report: findings the active profile suppressed as
@@ -440,10 +447,9 @@ def render_adjudicated_report(scan: dict[str, Any], verdict: dict[str, Any]) -> 
         item for item in _all_findings(scan)
         if str(item["finding"].get("profile_action") or "").lower() != "hidden"
     ]
-    findings = sorted(visible, key=_finding_score)
-    if verdict.get("findings"):
-        return _render_multi(scan, verdict, title, findings, verdict["findings"])
-    return _render_single(scan, verdict, title, findings)
+    scan_findings = sorted(visible, key=_finding_score)
+    paper, findings, summary = _normalize_verdict(verdict)
+    return _render_unified(scan, verdict, title, scan_findings, findings, paper, summary)
 
 
 def write_adjudicated_report(scan: dict[str, Any], verdict: dict[str, Any], out_path: str) -> None:
