@@ -1,7 +1,6 @@
 """within_col_dispersed_repeats: many DISTINCT high-precision values each
 repeated across DISPERSED rows (Laskowski/Pruitt fingerprint), with FP guards."""
 import numpy as np
-import pytest
 from paperconan._sheet import Sheet
 from paperconan._audit import detect_dispersed_repeats
 
