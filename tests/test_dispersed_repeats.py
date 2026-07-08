@@ -36,3 +36,40 @@ def test_dispersed_high_precision_repeats_fire():
     # example_cells (1-based row,col) must point at injected duplicate rows
     assert f["example_cells"], "expected example_cells for the evidence heatmap"
     assert all(c == 1 for _, c in f["example_cells"])
+
+
+def test_adjacent_technical_replicates_do_not_fire():
+    # 60 distinct values (passes the distinct/support gates) but each repeated in
+    # ADJACENT rows (fill-down / technical replicate) -> dispersion guard must reject.
+    col = []
+    rng = np.random.default_rng(1)
+    for _ in range(60):
+        v = round(float(rng.uniform(1, 599)), 2)
+        col += [v, v, v]   # 3 adjacent copies
+    out = _detect(col)
+    assert not [f for f in out if f["kind"] == "within_col_dispersed_repeats"]
+
+
+def test_censored_ceiling_does_not_fire():
+    # a continuous column dominated by a 600s ceiling, rest unique -> benign
+    rng = np.random.default_rng(2)
+    col = [600.0] * 90 + [round(float(rng.uniform(1, 599)), 2) for _ in range(60)]
+    out = _detect(col)
+    assert not [f for f in out if f["kind"] == "within_col_dispersed_repeats"]
+
+
+def test_small_integer_column_does_not_fire():
+    rng = np.random.default_rng(3)
+    col = [int(rng.integers(0, 8)) for _ in range(150)]
+    out = _detect(col)
+    assert not [f for f in out if f["kind"] == "within_col_dispersed_repeats"]
+
+
+def test_low_cardinality_ratio_column_does_not_fire():
+    # ratios of small integers -> few distinct, naturally collide -> benign
+    denoms = [2, 3, 4, 5, 6]
+    rng = np.random.default_rng(4)
+    col = [round(int(rng.integers(0, d + 1)) / d, 4) for d in
+           (denoms[int(rng.integers(0, 5))] for _ in range(200))]
+    out = _detect(col)
+    assert not [f for f in out if f["kind"] == "within_col_dispersed_repeats"]
