@@ -30,7 +30,7 @@ import os
 import re
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from fractions import Fraction
 
 import openpyxl
@@ -1187,6 +1187,106 @@ def detect_within_column_patterns(sheet, r0, r1, c0, c1, header, min_n=6):
                                      missing=missing,
                                      severity="medium",
                                      rule=f"col[{c}]: last digits {missing} never appear in {len(last1)} values"))
+    return findings
+
+
+def detect_dispersed_repeats(sheet, r0, r1, c0, c1, header, min_n=30):
+    """Many DISTINCT high-precision values each repeated across DISPERSED rows.
+
+    Complements within_col_value_duplication (single dominant value). Targets a
+    continuous, high-precision column whose exact-duplicate mass far exceeds the
+    near-zero birthday expectation, where repeats are scattered across the table
+    (not adjacent fill-down / technical replicates). Thresholds are conservative
+    defaults pinned by tests; not env-tunable.
+    """
+    findings = []
+
+    def _dec_places(v):
+        s = f"{v:.10f}".rstrip("0")
+        return len(s.split(".")[1]) if "." in s else 0
+
+    for c in range(c0, c1):
+        rows_vals = []
+        for r in range(r0, r1):
+            v = sheet.cell(r, c)
+            if is_num(v) and not (isinstance(v, float) and np.isnan(v)):
+                rows_vals.append((r, float(v)))
+        n = len(rows_vals)
+        if n < min_n:
+            continue
+        vals = [v for _, v in rows_vals]
+
+        # quick reject: pure-integer columns (counts / codes)
+        if all(abs(v - round(v)) < 1e-9 for v in vals):
+            continue
+
+        # Strip a dominant boundary/censor value FIRST (e.g. 600s ceiling), so it
+        # neither drags down the precision fraction nor counts as a "repeat".
+        cnt_all = Counter(round(v, 6) for v in vals)
+        top_v, top_c = cnt_all.most_common(1)[0]
+        boundary = top_v if top_c > 0.25 * n else None
+        core = [(r, v) for (r, v) in rows_vals
+                if boundary is None or round(v, 6) != boundary]
+        m = len(core)
+        if m < min_n:
+            continue
+        core_vals = [v for _, v in core]
+
+        # Gate 1 — continuity / high precision (computed on core)
+        frac_hi_prec = sum(1 for v in core_vals if _dec_places(v) >= 2) / m
+        if frac_hi_prec < 0.6:
+            continue
+        distinct = len({round(v, 6) for v in core_vals})
+        if distinct < 50 or distinct / m < 0.3:
+            continue
+
+        # Gate 1b — birthday / effective-support gate: the recording precision must
+        # be fine ENOUGH relative to the value range that exact collisions are
+        # near-zero-expected. A coarse column (e.g. 2 decimals over [0,1] -> only
+        # ~100 possible values) collides naturally and must NOT fire.
+        dps = sorted(_dec_places(v) for v in core_vals)
+        med_dp = dps[len(dps) // 2]
+        support = (max(core_vals) - min(core_vals)) * (10 ** med_dp)
+        if support < 20 * m:
+            continue
+
+        # Gate 2 + 3 — dispersed exact-duplicate groups
+        positions = defaultdict(list)
+        for r, v in core:
+            positions[round(v, 6)].append(r)
+        block_h = r1 - r0
+        dispersed = []
+        dup_cells = 0
+        for val, rs in positions.items():
+            if len(rs) < 2:
+                continue
+            rs_sorted = sorted(rs)
+            span = rs_sorted[-1] - rs_sorted[0]
+            non_adjacent = any(b - a > 1 for a, b in zip(rs_sorted, rs_sorted[1:]))
+            if span >= 0.5 * block_h and non_adjacent:
+                dispersed.append((val, rs_sorted))
+                dup_cells += len(rs_sorted)
+
+        if len(dispersed) >= 10 and dup_cells >= 0.15 * m:
+            dispersed.sort(key=lambda kv: -len(kv[1]))
+            example_cells = []
+            for _, rs in dispersed[:3]:
+                for rr in rs[:8]:
+                    example_cells.append((rr + 1, c + 1))
+            col_name = header[c - c0] if c - c0 < len(header) else f"col{c}"
+            core_arr = np.round(np.array([v for _, v in core]), 4)
+            counts = Counter(core_arr.tolist())
+            findings.append(dict(
+                kind="within_col_dispersed_repeats",
+                col=col_name, col_idx=c, n=m,
+                n_repeat_groups=len(dispersed), dup_cells=dup_cells,
+                frac_repeat=dup_cells / m,
+                n_distinct=int(len(counts)), all_integer=False,
+                value_sample=[float(v) for v, _ in counts.most_common(8)],
+                example_cells=example_cells,
+                severity="medium",
+                rule=(f"col[{c}]: {len(dispersed)} distinct high-precision values "
+                      f"each recur across dispersed rows ({dup_cells}/{m} cells)")))
     return findings
 
 
