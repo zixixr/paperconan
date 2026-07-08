@@ -105,3 +105,35 @@ def test_finding_gets_evidence_with_highlighted_cells():
     ev = out[0]["evidence"]
     assert ev["highlight_cols"] == [0]
     assert ev["highlight_rows"], "expected highlighted duplicate rows"
+
+
+# ----------------------- prefilter interaction -----------------------
+from paperconan._prefilter import prefilter_within_col
+from paperconan._profiles import _WITHIN_COL_KINDS
+
+
+def _dispersed(col="boldness", value_sample=None, frac_repeat=0.34, n_distinct=560):
+    # high-precision continuous value_sample (2-decimal latencies) by default
+    vs = value_sample or [143.37, 404.35, 191.54, 69.47, 554.88, 276.03, 317.35, 114.79]
+    return dict(kind="within_col_dispersed_repeats", col=col, col_idx=0, n=1064,
+                n_repeat_groups=119, dup_cells=359, frac_repeat=frac_repeat,
+                n_distinct=n_distinct, all_integer=False, value_sample=vs,
+                rule="col[0]: dispersed repeats")
+
+
+def test_prefilter_routes_the_new_kind():
+    # wiring must be consistent: the profile gate that decides whether to CALL the
+    # within_col prefilter must include the new kind (else name-based demotion is dead).
+    assert "within_col_dispersed_repeats" in _WITHIN_COL_KINDS
+
+
+def test_prefilter_keeps_genuine_continuous_dispersed_finding():
+    # 2-decimal continuous latencies trivially satisfy N=100, so the fixed_denominator
+    # rule (and the single-value weak-dominance rule) must NOT drop/downweight them.
+    assert prefilter_within_col(_dispersed(), sheet_high_count=None) == ("keep", None)
+
+
+def test_prefilter_still_demotes_axis_named_dispersed_finding():
+    # name-based demotion (the reason the kind is routed at all) must still apply.
+    decision, reason = prefilter_within_col(_dispersed(col="Frame index"), sheet_high_count=None)
+    assert decision in {"drop", "downweight"} and reason

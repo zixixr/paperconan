@@ -13,7 +13,8 @@ from ._prefilter import make_finding as _make_relation_prefilter_finding
 from ._prefilter import prefilter_within_col as _prefilter_within_col
 from .schema import Profile, VALID_PROFILES
 
-_WITHIN_COL_KINDS = {"within_col_value_duplication", "within_col_decimal_repetition"}
+_WITHIN_COL_KINDS = {"within_col_value_duplication", "within_col_decimal_repetition",
+                     "within_col_dispersed_repeats"}
 
 
 BOUNDARY_VALUES = {-1.0, 0.0, 1.0, 100.0}

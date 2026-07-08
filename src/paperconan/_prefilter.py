@@ -949,8 +949,11 @@ def prefilter_within_col(f: dict[str, Any],
         if dv is not None and WC_NEAR_UNIT[0] <= dv <= WC_NEAR_UNIT[1] and abs(dv - 1.0) > 1e-9:
             return "drop", "normalized_or_fold_change"
     # 7) values explained by a small fixed denominator k/N -> sample-size / ratio arithmetic
-    #    (also subsumes coarse rounding grids, which are just k/N with N = 1/step)
-    if _wc_fixed_denominator(value_sample):
+    #    (also subsumes coarse rounding grids, which are just k/N with N = 1/step).
+    #    Skipped for dispersed_repeats: its value_sample is high-precision continuous
+    #    values (e.g. 2-decimal latencies), which trivially satisfy N=100 and would be
+    #    dropped wholesale — the detector's own support/continuity gates handle ratios.
+    if kind != "within_col_dispersed_repeats" and _wc_fixed_denominator(value_sample):
         return "drop", "fixed_denominator"
     # 8) decimal repetition: a constant / two-value /3-family fraction column hard-drops; a
     #    high-cardinality precise column merely sharing a /3 ending is kept for the judge.
@@ -961,8 +964,10 @@ def prefilter_within_col(f: dict[str, Any],
     # 10) too few rows to judge -> insufficient context (kept visible, low priority)
     if n_rows is not None and n_rows < WC_N_MIN:
         return "downweight", "low_n_or_insufficient_context"
-    # 11) weak repeat dominance -> downweight (only ~half the column repeats)
-    if frac_repeat is not None and frac_repeat < WC_DOM_MIN:
+    # 11) weak repeat dominance -> downweight (only ~half the column repeats). This is a
+    #    single-dominant-value metric; dispersed_repeats' frac_repeat is the dispersed-dup
+    #    cell fraction (different semantics, already gated inside the detector), so skip it.
+    if kind != "within_col_dispersed_repeats" and frac_repeat is not None and frac_repeat < WC_DOM_MIN:
         return "downweight", "weak_repeat_dominance"
     # 12) low-cardinality column -> downweight (a genuine measurement-repeat signal needs a
     #     high-cardinality column where one value still recurs).
