@@ -2797,9 +2797,9 @@ _MAX_FILE_BYTES = int(_MAX_FILE_MB * 1024 * 1024)
 # budget now bounds far less RAM. Skip a sheet whose cell count exceeds this, checked from
 # the sheet dimensions BEFORE materializing. Default 10M cells ≈ an 80MB numeric array.
 _MAX_CELLS = int(os.environ.get("PAPERCONAN_MAX_CELLS", "10000000"))
-# Wide blocks (dense correlation matrices) blow up the O(col²) relation/equal-pair detectors in
-# both compute time and output size (scan.json / report.html). Skip just those two detectors when
-# a block is wider than this; the cheap column-wise detectors still run. 0 disables the skip.
+# Wide blocks (dense correlation matrices) can make relation, equal-pair, and row-pair
+# coupling detector paths expensive in compute time and output size. Skip those three paths
+# above this width while the column-wise detectors still run. 0 disables the skip.
 _MAX_BLOCK_COLS = int(os.environ.get("PAPERCONAN_MAX_BLOCK_COLS", "120"))
 # Output cap: each finding embeds a table-snippet as evidence, so a paper with thousands of
 # findings balloons scan.json to many GB. Stop collecting blocks once this many have findings.
