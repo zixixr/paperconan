@@ -197,6 +197,39 @@ def test_b5_no_fp_on_large_integer_coordinate_column():
     assert _b5_oracle(frac_score, dist_to_tss) is False
 
 
+def test_high_baseline_half_unit_difference_is_not_identical():
+    x = [1_000_000_000.0 + i for i in range(6)]
+    y = [v + 0.5 for v in x]
+    findings = _kinds(x, y)
+    assert not any(f["kind"] == "identical_column" for f in findings)
+    assert any(f["kind"] == "constant_offset" for f in findings)
+
+
+def test_tiny_nonzero_pure_scaling_is_detected():
+    x = [1e-14, 2e-14, 3e-14, 4e-14, 5e-14, 6e-14]
+    y = [2 * v for v in x]
+    findings = _kinds(x, y)
+    assert any(f["kind"] == "constant_ratio" for f in findings)
+    assert not any(f["kind"] == "identical_column" for f in findings)
+
+
+def test_high_baseline_near_values_are_not_many_equal_pairs():
+    x = [1_000_000_000.0 + i for i in range(8)]
+    y = [v + 0.5 for v in x]
+    sheet = _sheet([x, y])
+    assert detect_equal_pairs(sheet, 1, 9, 0, 2, ["x", "y"]) == []
+
+
+def test_adjacent_wide_integer_columns_are_not_identical_or_equal_pairs():
+    x = [2**53 + i * 2 for i in range(8)]
+    y = [v + 1 for v in x]
+    sheet = _sheet([x, y])
+    findings = detect_relations(sheet, 1, 9, 0, 2, ["x", "y"])
+    assert not any(f["kind"] == "identical_column" for f in findings)
+    assert any(f["kind"] == "constant_offset" for f in findings)
+    assert detect_equal_pairs(sheet, 1, 9, 0, 2, ["x", "y"]) == []
+
+
 # ---------------------------------------------------------------------------
 # B4: partial_constant_offset — a long CONSECUTIVE run where B = A + k (k const,
 # non-zero) while the rest of the column diverges.

@@ -131,3 +131,15 @@ def test_b3_finding_fields_are_internally_consistent():
     assert x["figure_a"] is None and x["figure_b"] is None
     assert x["same_figure"] is False
     assert x["sheet_a"] == x["sheet_b"]
+
+
+def test_b3_no_flag_when_high_baseline_differences_are_not_integers():
+    a = [[1_000_000_000.125 + r * 10 + c for c in range(5)]
+         for r in range(5)]
+    b = [[v + 0.5 + ((r + c) % 3) * 0.125 for c, v in enumerate(row)]
+         for r, row in enumerate(a)]
+    findings = detect_within_sheet_fraction_reuse(
+        _grid_sheets_two_blocks(a, b)
+    )
+    assert not any(f["kind"] == "within_table_fraction_reuse"
+                   for f in findings)

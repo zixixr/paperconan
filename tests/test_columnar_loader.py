@@ -117,3 +117,14 @@ def test_calamine_huge_bounding_box_is_none_not_oom(tmp_path, monkeypatch):
     out = A._load_workbook_calamine(str(p))   # must NOT OOM; oversized -> None
     assert out["Sheet"] is None
     assert calls["n"] == 0                     # never materialized the huge box
+
+
+def test_streaming_loader_preserves_adjacent_wide_integers(tmp_path):
+    import paperconan._audit as audit
+
+    p = tmp_path / "wide.xlsx"
+    _write_xlsx(p, [["a", "b"], [2**53, 2**53 + 1]])
+    sheet = audit._load_workbook_openpyxl(str(p))["S1"]
+    assert sheet.cell(1, 0) == 2**53
+    assert sheet.cell(1, 1) == 2**53 + 1
+    assert sheet.cell(1, 0) != sheet.cell(1, 1)

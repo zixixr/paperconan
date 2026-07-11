@@ -55,3 +55,19 @@ def test_int_zero_keeps_int_fidelity():
     s = Sheet.from_rows([[0, 0.0]])
     assert s.cell(0, 0) == 0 and isinstance(s.cell(0, 0), int)
     assert s.cell(0, 1) == 0.0 and not isinstance(s.cell(0, 1), int)
+
+
+def test_wide_adjacent_integers_roundtrip_without_merging():
+    left = 2**53
+    right = left + 1
+    sheet = Sheet.from_rows([[left, right]])
+    assert sheet.cell(0, 0) == left
+    assert sheet.cell(0, 1) == right
+    assert sheet.cell(0, 0) != sheet.cell(0, 1)
+    assert left in sheet.numeric_values()
+    assert right in sheet.numeric_values()
+
+
+def test_wide_integer_cells_remain_numeric_in_mask():
+    sheet = Sheet.from_rows([[2**53], [2**53 + 1], [2**53 + 2]])
+    assert sheet.numeric_mask()[:, 0].tolist() == [True, True, True]
