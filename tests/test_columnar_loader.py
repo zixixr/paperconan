@@ -119,21 +119,24 @@ def test_calamine_huge_bounding_box_is_none_not_oom(tmp_path, monkeypatch):
     ws["C1000000"] = 2          # ~3M declared cells > 1M cap (within Excel's row limit)
     wb.save(str(p))
 
-    # The oversized sheet must be rejected from its DECLARED dimensions, BEFORE
-    # to_python materializes the full bounding box (that materialization is what
-    # OOMs in prod). Spy on to_python to prove it is never called on this sheet.
+    # The oversized sheet must be rejected from its DECLARED dimensions before
+    # its row stream starts.
     import python_calamine as pc
-    orig = pc.CalamineSheet.to_python
+    orig = pc.CalamineSheet.iter_rows
     calls = {"n": 0}
 
     def spy(self, *a, **k):
         calls["n"] += 1
         return orig(self, *a, **k)
 
-    monkeypatch.setattr(pc.CalamineSheet, "to_python", spy)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("to_python must not be called")
+
+    monkeypatch.setattr(pc.CalamineSheet, "iter_rows", spy)
+    monkeypatch.setattr(pc.CalamineSheet, "to_python", forbidden)
     out = A._load_workbook_calamine(str(p))   # must NOT OOM; oversized -> None
     assert out["Sheet"] is None
-    assert calls["n"] == 0                     # never materialized the huge box
+    assert calls["n"] == 0                     # never started the huge row stream
 
 
 def test_calamine_actual_size_guard_precedes_wide_ooxml_fallback(monkeypatch):
@@ -144,12 +147,15 @@ def test_calamine_actual_size_guard_precedes_wide_ooxml_fallback(monkeypatch):
         height = 1
         width = 1
 
-        def to_python(self, skip_empty_area=False):
-            return [
+        def iter_rows(self):
+            yield from [
                 [float(2**53), 1.0],
                 [2.0, 3.0],
                 [4.0, 5.0],
             ]
+
+        def to_python(self, skip_empty_area=False):
+            raise AssertionError("to_python must not be called")
 
     class StubWorkbook:
         sheet_names = ["S1"]
@@ -188,8 +194,15 @@ def test_calamine_releases_reader_state_before_openpyxl_fallback(monkeypatch):
     class Probe:
         pass
 
-    class ProbeRows(list):
-        pass
+    class ProbeRows:
+        def __init__(self, values):
+            self._values = iter(values)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._values)
 
     class StubSheet:
         height = 1
@@ -199,10 +212,13 @@ def test_calamine_releases_reader_state_before_openpyxl_fallback(monkeypatch):
             self.name = name
             self.values = values
 
-        def to_python(self, skip_empty_area=False):
+        def iter_rows(self):
             rows = ProbeRows(self.values)
             refs[f"{self.name}_rows"] = weakref.ref(rows)
             return rows
+
+        def to_python(self, skip_empty_area=False):
+            raise AssertionError("to_python must not be called")
 
     class StubWorkbook:
         sheet_names = ["first", "wide"]
@@ -291,8 +307,11 @@ def test_legacy_workbooks_do_not_use_wide_integer_openpyxl_fallback(
         height = 1
         width = 1
 
+        def iter_rows(self):
+            yield [float(2**53)]
+
         def to_python(self, skip_empty_area=False):
-            return [[float(2**53)]]
+            raise AssertionError("to_python must not be called")
 
     class StubWorkbook:
         sheet_names = ["S1"]
@@ -315,3 +334,48 @@ def test_legacy_workbooks_do_not_use_wide_integer_openpyxl_fallback(
     sheet = audit.load_workbook_rows(str(tmp_path / f"wide{suffix}"))["S1"]
 
     assert sheet.cell(0, 0) == 2**53
+
+
+def test_ragged_csv_budget_uses_dense_geometry(tmp_path, monkeypatch):
+    import paperconan._audit as audit
+
+    monkeypatch.setattr(audit, "_MAX_CELLS", 12)
+    path = tmp_path / "ragged.csv"
+    path.write_text(
+        "a\nb\nc\n" + ",".join(str(i) for i in range(5)) + "\n",
+        encoding="utf-8",
+    )
+    assert audit.load_csv_rows(str(path), ",")["ragged"] is None
+
+
+def test_second_workbook_sheet_is_rejected_before_allocation(tmp_path, monkeypatch):
+    import paperconan._audit as audit
+
+    monkeypatch.setattr(audit, "_MAX_CELLS", 10)
+    path = tmp_path / "two.xlsx"
+    wb = openpyxl.Workbook()
+    ws1 = wb.active
+    ws1.title = "one"
+    ws1.append([1, 2, 3])
+    ws1.append([4, 5, 6])
+    ws2 = wb.create_sheet("two")
+    ws2.append([1, 2, 3])
+    ws2.append([4, 5, 6])
+    wb.save(path)
+    out = audit._load_workbook_openpyxl(str(path))
+    assert out["one"] is not None
+    assert out["two"] is None
+
+
+def test_calamine_streams_rows_without_to_python(tmp_path, monkeypatch):
+    import python_calamine as pc
+    import paperconan._audit as audit
+
+    path = tmp_path / "a.xlsx"
+    _write_xlsx(path, [["a", "b"], [1, 2], [3, 4]])
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("to_python must not be called")
+
+    monkeypatch.setattr(pc.CalamineSheet, "to_python", forbidden)
+    assert audit._load_workbook_calamine(str(path))["S1"] is not None

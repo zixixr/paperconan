@@ -294,6 +294,10 @@ def grimmer_consistent(mean, sd, n, mean_decimals, sd_decimals):
 
 # ---------- sheet I/O ----------
 
+def _dense_cells(row_count, max_width):
+    return row_count * max_width
+
+
 def _fill_sheet_from_rows(rows_iter, mr, mc, loaded):
     """Stream rows of openpyxl-shaped cell values (int/float/str/datetime/bool/None)
     into a Sheet, honouring the cumulative `_MAX_CELLS` budget that `loaded` cells
@@ -308,19 +312,25 @@ def _fill_sheet_from_rows(rows_iter, mr, mc, loaded):
     consumed, ncols == max row width seen (trailing all-empty rows/cols are kept as
     NaN padding, not trimmed). `mr`/`mc` are only the pre-allocation hint; the array
     grows on demand if a reader under-declares dimensions."""
+    declared = _dense_cells(mr, mc)
+    if loaded >= _MAX_CELLS or loaded + declared > _MAX_CELLS:
+        return None, declared
     numeric = np.full((mr, mc), np.nan, dtype=float) if (mr and mc) else np.empty((0, 0))
     text = {}
     ints = set()
     wide_ints = {}
     r = 0                                        # rows consumed (== final nrows)
-    cells = 0
     max_w = 0                                    # max row width seen (== final ncols)
-    oversized = False
     for row in rows_iter:
+        width = len(row)
+        projected_rows = r + 1
+        projected_width = max(max_w, width)
+        cells = _dense_cells(projected_rows, projected_width)
+        if loaded + cells > _MAX_CELLS:
+            return None, cells
         if r >= numeric.shape[0]:                # reader under-reported rows: grow by one
             grow = np.full((1, numeric.shape[1]), np.nan)
             numeric = np.vstack([numeric, grow]) if numeric.size or numeric.shape[1] else grow
-        width = len(row)
         if width > numeric.shape[1]:             # row wider than declared: grow columns
             pad = np.full((numeric.shape[0], width - numeric.shape[1]), np.nan)
             numeric = np.hstack([numeric, pad]) if numeric.shape[1] else pad
@@ -334,15 +344,9 @@ def _fill_sheet_from_rows(rows_iter, mr, mc, loaded):
                         ints.add((r, c))
             elif v is not None:
                 text[(r, c)] = v
-        if width > max_w:
-            max_w = width
-        cells += width
-        if loaded + cells > _MAX_CELLS:          # per-file cumulative budget — bail mid-stream
-            oversized = True
-            break
+        max_w = projected_width
         r += 1
-    if oversized:
-        return None, cells
+    cells = _dense_cells(r, max_w)
     # Trim to the geometry Sheet.from_rows would produce: nrows == rows consumed,
     # ncols == max(len(row)). (numeric may be larger if the reader over-declared.)
     n_rows, n_cols = r, max_w
@@ -377,9 +381,10 @@ def _load_workbook_openpyxl(path):
     for s in wb.sheetnames:
         ws = wb[s]
         mr, mc = ws.max_row or 0, ws.max_column or 0
+        declared = _dense_cells(mr, mc)
         # Skip a sheet that is too big on its own, OR once this file's cumulative cell budget is
         # spent (a many-sheet workbook materialized at once OOMs even if each sheet is under cap).
-        if loaded >= _MAX_CELLS or (mr and mc and mr * mc > _MAX_CELLS):
+        if loaded >= _MAX_CELLS or loaded + declared > _MAX_CELLS:
             out[s] = None
             continue
         sheet, cells = _fill_sheet_from_rows(ws.iter_rows(values_only=True), mr, mc, loaded)
@@ -418,8 +423,8 @@ _CALAMINE_OPENPYXL_FALLBACK = object()
 def _load_workbook_calamine_scoped(path):
     """Read with Calamine, returning a fallback signal before openpyxl is opened.
 
-    Keeping Calamine state in this helper ensures its workbook, sheets, materialized
-    rows, and any partial output leave scope before the outer loader starts openpyxl.
+    Keeping Calamine state in this helper ensures its workbook, sheets, row iterators,
+    and any partial output leave scope before the outer loader starts openpyxl.
     """
     import python_calamine
     wb = python_calamine.CalamineWorkbook.from_path(path)
@@ -428,33 +433,34 @@ def _load_workbook_calamine_scoped(path):
     is_ooxml = os.path.splitext(path)[1].lower() in {".xlsx", ".xlsm"}
     for name in wb.sheet_names:
         sh = wb.get_sheet_by_name(name)
-        # Reject from the cheap DECLARED dimensions BEFORE to_python materializes the
-        # full bounding box: a sheet that declares e.g. C1000000 would otherwise
-        # allocate millions of cells just to be discarded — that materialization is
-        # what OOMs in prod. `height` × `width` matches to_python(skip_empty_area=False).
         h, w = sh.height, sh.width
-        if loaded >= _MAX_CELLS or (h and w and h * w > _MAX_CELLS):
+        declared = _dense_cells(h, w)
+        if loaded >= _MAX_CELLS or loaded + declared > _MAX_CELLS:
             out[name] = None
             continue
-        rows = sh.to_python(skip_empty_area=False)
-        mr = len(rows)
-        mc = max((len(row) for row in rows), default=0)
-        if loaded >= _MAX_CELLS or (mr and mc and mr * mc > _MAX_CELLS):
-            out[name] = None
-            continue
-        if is_ooxml and any(
-            isinstance(value, float)
-            and math.isfinite(value)
-            and value.is_integer()
-            and abs(value) >= _MAX_EXACT_FLOAT_INT
-            for row in rows
-            for value in row
-        ):
-            return _CALAMINE_OPENPYXL_FALLBACK
-        norm = ([_calamine_cell(v) for v in row] for row in rows)
-        sheet, cells = _fill_sheet_from_rows(norm, mr, mc, loaded)
+        wide_ooxml_integer = False
+
+        def normalized_rows():
+            nonlocal wide_ooxml_integer
+            for row in sh.iter_rows():
+                normalized = []
+                for value in row:
+                    if (
+                        is_ooxml
+                        and isinstance(value, float)
+                        and math.isfinite(value)
+                        and value.is_integer()
+                        and abs(value) >= _MAX_EXACT_FLOAT_INT
+                    ):
+                        wide_ooxml_integer = True
+                    normalized.append(_calamine_cell(value))
+                yield normalized
+
+        sheet, cells = _fill_sheet_from_rows(normalized_rows(), h, w, loaded)
         out[name] = sheet
         if sheet is not None:
+            if wide_ooxml_integer:
+                return _CALAMINE_OPENPYXL_FALLBACK
             loaded += cells
     return out
 
@@ -511,23 +517,22 @@ def load_csv_rows(path, delimiter):
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
         try:
             rows = []
-            cells = 0
+            row_count = 0
+            max_width = 0
+            oversized = False
             with open(path, newline="", encoding=enc) as fh:
                 for r in _csv.reader(fh, delimiter=delimiter):
-                    rows.append([_coerce_cell(c) for c in r])
-                    cells += len(r)
-                    if cells > _MAX_CELLS:           # oversized: stop before exhausting memory
+                    row_count += 1
+                    max_width = max(max_width, len(r))
+                    if _dense_cells(row_count, max_width) > _MAX_CELLS:
                         oversized = True
                         break
+                    rows.append([_coerce_cell(c) for c in r])
             break
         except UnicodeDecodeError:
             continue
     if oversized:
         return {stem: None}
-    maxc = max((len(r) for r in rows), default=0)
-    for r in rows:
-        if len(r) < maxc:
-            r.extend([None] * (maxc - len(r)))
     return {stem: Sheet.from_rows(rows)}
 
 
