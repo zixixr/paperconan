@@ -1874,7 +1874,7 @@ def _grid_from_rows(
     these are the values whose bit-identical reuse across tables warrants review."""
     grid = {}
     nm = sheet.numeric
-    rmax = min(sheet.nrows, max_rows)
+    rmax = max(0, min(sheet.nrows, max_rows))
     cell_limit = None if max_cells is None else max(0, int(max_cells))
     cell_limited = False
     for ri in range(rmax):
@@ -2694,7 +2694,15 @@ def _column_fingerprints(file, sheet, source, blocks, min_column_length):
             if len(values) < min_column_length:
                 continue
             exact_values = [_numeric_ratio(value) for value in values]
-            try:
+            requires_exact_qualification = any(
+                isinstance(value, int)
+                and abs(value) > _MAX_EXACT_FLOAT_INT
+                for value in values
+            )
+            if requires_exact_qualification:
+                axis_like = _exact_column_axis_like(exact_values)
+                rounded_distinct = len(set(exact_values))
+            else:
                 qualified = np.asarray(
                     [float(value) for value in values],
                     dtype=float,
@@ -2704,9 +2712,6 @@ def _column_fingerprints(file, sheet, source, blocks, min_column_length):
                     round(float(value), 9)
                     for value in values
                 })
-            except OverflowError:
-                axis_like = _exact_column_axis_like(exact_values)
-                rounded_distinct = len(set(exact_values))
             if axis_like:
                 continue
             if rounded_distinct < max(6, len(values) // 2):
@@ -2876,24 +2881,6 @@ def detect_cross_sheet_column_duplicates(grid_sheets, profile="review", min_len=
                 break
     apply_profile_to_findings(findings, profile)
     return findings
-
-
-def _vector_is_patterned(vec):
-    """Reject low-information tuples whose recurrence is mundane: near-constant, arithmetic or
-    geometric ladders, and all-round-number (multiples of 10 / boundary) tuples."""
-    if len({round(v, 6) for v in vec}) < 3:
-        return True                                   # near-constant / too few distinct
-    d = [vec[i + 1] - vec[i] for i in range(len(vec) - 1)]
-    if all(abs(x - d[0]) < 1e-9 for x in d):
-        return True                                   # arithmetic ladder
-    nz = [v for v in vec if abs(v) > 1e-12]
-    if len(nz) == len(vec):
-        rat = [vec[i + 1] / vec[i] for i in range(len(vec) - 1)]
-        if all(abs(r - rat[0]) < 1e-9 for r in rat):
-            return True                               # geometric ladder
-    if all(abs(v - round(v / 10.0) * 10.0) < 1e-9 for v in vec):
-        return True                                   # all multiples of 10
-    return False
 
 
 def detect_recurring_row_vectors(grid_sheets, profile="review",

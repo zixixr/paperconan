@@ -195,3 +195,91 @@ def test_b2_site_count_survives_bounded_site_evidence():
 
     assert match["n_occurrences"] == 20
     assert meta == {"findings_omitted": 0}
+
+
+def test_b2_repeated_start_columns_in_one_row_count_as_one_occurrence():
+    index = RecurringRowIndex()
+    source_a = Sheet.from_rows([VEC + VEC])
+    source_b = Sheet.from_rows([VEC])
+    index.add_sheet(
+        "M1.xls",
+        "Figure 1a",
+        source_a,
+        blocks=[(0, 1, 0, source_a.ncols)],
+        figure_id="main:1",
+        min_k=6,
+        max_k=6,
+    )
+    index.add_sheet(
+        "M2.xls",
+        "Figure 2a",
+        source_b,
+        blocks=[(0, 1, 0, source_b.ncols)],
+        figure_id="main:2",
+        min_k=6,
+        max_k=6,
+    )
+
+    findings, meta = index.findings()
+
+    assert not any(finding["vector"] == VEC for finding in findings)
+    assert meta == {"findings_omitted": 0}
+
+
+def test_b2_location_metadata_includes_occurrences_after_site_cap():
+    index = RecurringRowIndex()
+    for number in range(100, 116):
+        source = Sheet.from_rows([VEC])
+        index.add_sheet(
+            "A.xls",
+            f"Figure {number:03d}a",
+            source,
+            blocks=[(0, 1, 0, source.ncols)],
+            figure_id=f"main:{number}",
+            min_k=6,
+            max_k=6,
+        )
+    source = Sheet.from_rows([VEC])
+    index.add_sheet(
+        "Z.xls",
+        "Figure 002a",
+        source,
+        blocks=[(0, 1, 0, source.ncols)],
+        figure_id="main:2",
+        min_k=6,
+        max_k=6,
+    )
+
+    findings, _meta = index.findings()
+    finding = next(item for item in findings if item["vector"] == VEC)
+
+    assert finding["n_occurrences"] == 17
+    assert finding["same_file"] is False
+    assert finding["file_a"] == "A.xls"
+    assert finding["file_b"] == "Z.xls"
+    assert "Z.xls" in finding["file"]
+    assert finding["sheet_a"] == "Figure 002a"
+    assert finding["sheet_b"] == "Figure 115a"
+    assert "Figure 002a" in finding["sheet"]
+    assert "Figure 002a" in finding["rule"]
+
+
+def test_b2_findings_reports_exact_truncation_metadata():
+    index = RecurringRowIndex()
+    vector_b = [311.0, 277.0, 203.0, 255.0, 199.0, 241.0]
+    for number in range(1, 4):
+        source = Sheet.from_rows([VEC, vector_b])
+        index.add_sheet(
+            f"M{number}.xls",
+            f"Figure {number}a",
+            source,
+            blocks=[(0, 2, 0, source.ncols)],
+            figure_id=f"main:{number}",
+            min_k=6,
+            max_k=6,
+        )
+
+    findings, meta = index.findings(max_findings=1)
+
+    assert len(findings) == 1
+    assert meta == {"findings_omitted": 1}

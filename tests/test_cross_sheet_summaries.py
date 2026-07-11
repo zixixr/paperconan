@@ -3,7 +3,9 @@ from __future__ import annotations
 import numpy as np
 
 from paperconan import _audit as audit
+from paperconan import _summaries as summaries_module
 from paperconan._audit import (
+    _grid_from_rows,
     build_cross_sheet_summary,
     detect_cross_sheet_column_duplicates,
 )
@@ -159,6 +161,28 @@ def test_exact_fingerprints_do_not_merge_values_that_only_round_equal():
     assert detect_cross_sheet_column_duplicates(summaries) == []
 
 
+def test_float_convertible_wide_integers_use_exact_qualification():
+    base = 2**54
+    offsets = [
+        0, 17, 3, 21, 8, 14, 1, 24, 6, 19, 11, 4, 22,
+        9, 16, 2, 20, 7, 13, 5, 23, 10, 18, 12, 15,
+    ]
+    values = [base + offset for offset in offsets]
+    changed = list(values)
+    changed[7] += 1
+    source_a = Sheet.from_rows([["value"]] + [[value] for value in values])
+    source_b = Sheet.from_rows([["value"]] + [[value] for value in values])
+    source_c = Sheet.from_rows([["value"]] + [[value] for value in changed])
+
+    summary_a, _ = build_cross_sheet_summary("a.xlsx", "Figure 1", source_a)
+    summary_b, _ = build_cross_sheet_summary("b.xlsx", "Figure 2", source_b)
+    summary_c, _ = build_cross_sheet_summary("c.xlsx", "Figure 3", source_c)
+
+    assert len(summary_a.columns) == 1
+    assert detect_cross_sheet_column_duplicates([summary_a, summary_b])
+    assert detect_cross_sheet_column_duplicates([summary_a, summary_c]) == []
+
+
 def test_recurring_index_reports_budget_exhaustion():
     source = Sheet.from_rows([
         ["a", "b", "c", "d", "e"],
@@ -189,6 +213,83 @@ def test_recurring_index_does_not_spend_budget_on_invalid_windows():
         figure_id="main:1",
     )
     assert meta == {"budget_exhausted": False, "windows_skipped": 0}
+
+
+def test_recurring_budget_stops_window_materialization_but_counts_skips(
+    monkeypatch,
+):
+    class CountingSource:
+        nrows = 2
+        ncols = 10
+
+        def __init__(self):
+            self.cell_calls = 0
+
+        def cell(self, row, col):
+            self.cell_calls += 1
+            return row * 100.0 + col + 0.125
+
+    source = CountingSource()
+    materialized = []
+    iterator_limits = []
+    original_iterator = summaries_module._iter_valid_window_specs
+
+    def materialize(row, start, width):
+        materialized.append((start, width))
+        return tuple(round(float(value), 6) for value in row[start:start + width])
+
+    def iter_specs(run_lengths, min_k, max_k, limit):
+        iterator_limits.append(limit)
+        yield from original_iterator(run_lengths, min_k, max_k, limit)
+
+    monkeypatch.setattr(
+        summaries_module,
+        "_materialize_window",
+        materialize,
+    )
+    monkeypatch.setattr(
+        summaries_module,
+        "_iter_valid_window_specs",
+        iter_specs,
+    )
+    index = RecurringRowIndex(budget=3)
+
+    meta = index.add_sheet(
+        "a.xlsx",
+        "Figure 1",
+        source,
+        blocks=[(0, source.nrows, 0, source.ncols)],
+        figure_id="main:1",
+    )
+
+    assert source.cell_calls == 20
+    assert len(materialized) == 3
+    assert iterator_limits == [3]
+    assert meta == {"budget_exhausted": True, "windows_skipped": 47}
+
+
+def test_negative_collision_row_limit_uses_zero_rows():
+    source = Sheet.from_rows([
+        [1.1234, 2.2345],
+        [3.3456, 4.4567],
+    ])
+
+    grid, meta = _grid_from_rows(
+        source,
+        max_rows=-3,
+        with_coverage=True,
+    )
+
+    assert grid == {}
+    assert meta == {
+        "rows_total": 2,
+        "rows_used": 0,
+        "row_limited": True,
+    }
+
+
+def test_patterned_vector_helper_has_single_implementation():
+    assert not hasattr(audit, "_vector_is_patterned")
 
 
 def test_scan_uses_compact_cross_sheet_state(tmp_path, monkeypatch):

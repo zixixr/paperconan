@@ -68,6 +68,67 @@ def _numeric_value(value):
     return None
 
 
+def _numeric_run_lengths(row):
+    remaining = [0] * len(row)
+    run_length = 0
+    for index in range(len(row) - 1, -1, -1):
+        if row[index] is None:
+            run_length = 0
+        else:
+            run_length += 1
+        remaining[index] = run_length
+    return remaining
+
+
+def _valid_window_count(run_lengths, min_k, max_k):
+    total = 0
+    for start, available in enumerate(run_lengths):
+        if available < min_k:
+            continue
+        total += min(max_k, available) - min_k + 1
+    return total
+
+
+def _iter_valid_window_specs(run_lengths, min_k, max_k, limit):
+    emitted = 0
+    for start, available in enumerate(run_lengths):
+        for width in range(min_k, min(max_k, available) + 1):
+            if emitted >= limit:
+                return
+            emitted += 1
+            yield start, width
+
+
+def _materialize_window(row, start, width):
+    return tuple(
+        round(float(value), 6)
+        for value in row[start:start + width]
+    )
+
+
+def _add_bounded_representative(values, value, limit=6):
+    values.add(value)
+    if len(values) > limit:
+        values.remove(max(values))
+
+
+def _record_location(record, file, sheet):
+    record["file_min"] = min(record["file_min"], file)
+    record["file_max"] = max(record["file_max"], file)
+    record["sheet_min"] = min(record["sheet_min"], sheet)
+    record["sheet_max"] = max(record["sheet_max"], sheet)
+    _add_bounded_representative(record["file_representatives"], file)
+    _add_bounded_representative(record["sheet_representatives"], sheet)
+
+
+def _location_names(record, prefix):
+    return sorted({
+        *record[f"{prefix}_representatives"],
+        record[f"{prefix}_min"],
+        record[f"{prefix}_max"],
+    })
+
+
 class RecurringRowIndex:
     def __init__(self, budget=3_000_000):
         self._budget = max(0, int(budget))
@@ -86,40 +147,56 @@ class RecurringRowIndex:
         max_rows=300,
     ) -> dict[str, int | bool]:
         windows_skipped = 0
+        counted_rows = set()
         for r0, r1, c0, c1 in blocks:
             for row_idx in range(r0, min(r1, r0 + max_rows)):
                 row = [
                     _numeric_value(source.cell(row_idx, col_idx))
                     for col_idx in range(c0, c1)
                 ]
-                for start in range(len(row)):
-                    for width in range(min_k, max_k + 1):
-                        window = row[start:start + width]
-                        if (
-                            len(window) < width
-                            or any(value is None for value in window)
-                        ):
-                            continue
-                        if self._budget <= 0:
-                            windows_skipped += 1
-                            continue
-                        self._budget -= 1
-                        vector = tuple(round(float(value), 6) for value in window)
-                        site = (file, sheet, row_idx, c0 + start)
-                        record = self._vectors.setdefault(
-                            vector,
-                            {
-                                "vector": vector,
-                                "site_count": 0,
-                                "sites": set(),
-                                "figures": set(),
-                            },
-                        )
+                run_lengths = _numeric_run_lengths(row)
+                valid_windows = _valid_window_count(
+                    run_lengths,
+                    min_k,
+                    max_k,
+                )
+                accepted = min(self._budget, valid_windows)
+                windows_skipped += valid_windows - accepted
+                if accepted == 0:
+                    continue
+                for start, width in _iter_valid_window_specs(
+                    run_lengths,
+                    min_k,
+                    max_k,
+                    accepted,
+                ):
+                    self._budget -= 1
+                    vector = _materialize_window(row, start, width)
+                    site = (file, sheet, row_idx, c0 + start)
+                    record = self._vectors.setdefault(
+                        vector,
+                        {
+                            "vector": vector,
+                            "site_count": 0,
+                            "sites": set(),
+                            "figures": set(),
+                            "file_min": file,
+                            "file_max": file,
+                            "sheet_min": sheet,
+                            "sheet_max": sheet,
+                            "file_representatives": set(),
+                            "sheet_representatives": set(),
+                        },
+                    )
+                    row_site = (vector, file, sheet, row_idx)
+                    if row_site not in counted_rows:
+                        counted_rows.add(row_site)
                         record["site_count"] += 1
-                        if len(record["sites"]) < 16:
-                            record["sites"].add(site)
+                        _record_location(record, file, sheet)
                         if figure_id is not None:
                             record["figures"].add(figure_id)
+                    if len(record["sites"]) < 16:
+                        record["sites"].add(site)
         return {
             "budget_exhausted": windows_skipped > 0,
             "windows_skipped": windows_skipped,
@@ -171,21 +248,20 @@ class RecurringRowIndex:
 
         findings = []
         for vector, record, _cells in kept:
-            sites = record["sites"]
-            sheets_hit = sorted({site[1] for site in sites})
-            files_hit = sorted({site[0] for site in sites})
+            sheets_hit = _location_names(record, "sheet")
+            files_hit = _location_names(record, "file")
             site_count = record["site_count"]
             figures = record["figures"]
             location = "; ".join(sheets_hit[:6])
             findings.append(dict(
                 kind="recurring_row_vector",
                 file="; ".join(files_hit)[:120],
-                file_a=files_hit[0],
-                file_b=files_hit[-1],
-                same_file=len(files_hit) == 1,
+                file_a=record["file_min"],
+                file_b=record["file_max"],
+                same_file=record["file_min"] == record["file_max"],
                 sheet="; ".join(sheets_hit)[:120],
-                sheet_a=sheets_hit[0],
-                sheet_b=sheets_hit[-1],
+                sheet_a=record["sheet_min"],
+                sheet_b=record["sheet_max"],
                 vector=[float(value) for value in vector],
                 size_a=site_count,
                 size_b=site_count,
