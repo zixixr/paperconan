@@ -1,6 +1,6 @@
 import pytest
 
-from paperconan._audit import write_markdown_report
+from paperconan._audit import _markdown_inline_code, write_markdown_report
 from paperconan._html import write_html_report
 
 
@@ -387,6 +387,33 @@ def test_hostile_markdown_status_and_limitations_stay_in_code_spans(tmp_path):
         line.startswith(("<details", "<script>", "*em*", "[link]"))
         for line in first.splitlines()
     )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param(" ", "` `", id="one-space"),
+        pytest.param("  ", "`  `", id="two-spaces"),
+        pytest.param(" lead", "`  lead `", id="leading-space"),
+        pytest.param("trail ", "` trail  `", id="trailing-space"),
+        pytest.param(" both ", "`  both  `", id="boundary-spaces"),
+        pytest.param("`tick", "`` `tick ``", id="leading-backtick"),
+        pytest.param("tick`", "`` tick` ``", id="trailing-backtick"),
+        pytest.param("``tick", "``` ``tick ```", id="leading-backtick-run"),
+        pytest.param("tick``", "``` tick`` ```", id="trailing-backtick-run"),
+    ],
+)
+def test_markdown_inline_code_preserves_boundary_spaces_and_backticks(
+    tmp_path, value, expected
+):
+    assert _markdown_inline_code(value) == expected
+
+    markdown = _render_markdown(
+        tmp_path,
+        _scan("partial", [{"scope": "file", "reason": value}]),
+    )
+
+    assert f"- {expected} · `scope`: `file`" in markdown
 
 
 @pytest.mark.parametrize(

@@ -3200,7 +3200,13 @@ def _markdown_inline_code(value):
         else:
             current_run = 0
     fence = "`" * (longest_run + 1)
-    pad = " " if text.startswith(("`", " ")) or text.endswith(("`", " ")) else ""
+    has_non_space = any(char != " " for char in text)
+    pad = (
+        " "
+        if has_non_space
+        and (text.startswith(("`", " ")) or text.endswith(("`", " ")))
+        else ""
+    )
     return f"{fence}{pad}{text}{pad}{fence}"
 
 
