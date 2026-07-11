@@ -83,6 +83,85 @@ def _severity_counts(findings: list[dict]) -> dict[str, int]:
     return c
 
 
+def _status_value(value: Any) -> str:
+    if isinstance(value, dict):
+        return ", ".join(
+            f"{key}={_status_value(value[key])}" for key in sorted(value)
+        )
+    if isinstance(value, (list, tuple)):
+        return ", ".join(_status_value(item) for item in value)
+    return str(value)
+
+
+def _render_scan_status(scan: dict) -> str:
+    status = scan.get("scan_status")
+    coverage = scan.get("coverage") or {}
+    limitations = coverage.get("limitations") or []
+
+    if status is None:
+        return (
+            '<section class="scan-status status-legacy" aria-label="Scan status">'
+            '<h2>Legacy scan</h2>'
+            '<p>Detailed coverage status is unavailable for this archived scan.</p>'
+            '</section>'
+        )
+
+    normalized = str(status).lower()
+    if normalized == "complete":
+        return (
+            '<section class="scan-status status-complete" aria-label="Scan status">'
+            '<h2>Scan complete</h2>'
+            '<p>Detailed coverage metadata reports no scan limitations.</p>'
+            '</section>'
+        )
+
+    if normalized == "failed":
+        summary = (
+            "No input table reached numeric scanning. "
+            "This report does not represent a completed scan."
+        )
+    elif normalized == "partial":
+        summary = (
+            "Findings below reflect completed numeric scanning, "
+            "but the listed coverage limitations apply."
+        )
+    else:
+        summary = "Detailed coverage status is unavailable for this scan."
+
+    items = []
+    for limitation in limitations:
+        if isinstance(limitation, dict):
+            reason = limitation.get("reason") or "unspecified"
+            detail_keys = ["scope"] + sorted(
+                key for key in limitation if key not in {"reason", "scope"}
+            )
+            details = "".join(
+                f'<span><strong>{_esc(key.replace("_", " "))}:</strong> '
+                f'{_esc(_status_value(limitation[key]))}</span>'
+                for key in detail_keys
+                if limitation.get(key) is not None
+            )
+        else:
+            reason = limitation
+            details = ""
+        detail_html = f'<span class="status-limit-detail">{details}</span>' if details else ""
+        items.append(
+            f'<li><code>{_esc(reason)}</code>{detail_html}</li>'
+        )
+
+    list_html = (
+        '<h3>Coverage limitations</h3>'
+        f'<ul class="status-limits">{"".join(items)}</ul>'
+        if items else ""
+    )
+    status_class = normalized if normalized in {"partial", "failed"} else "legacy"
+    label = f"Scan {_esc(normalized)}" if normalized else "Scan status unavailable"
+    return (
+        f'<section class="scan-status status-{status_class}" aria-label="Scan status">'
+        f'<h2>{label}</h2><p>{summary}</p>{list_html}</section>'
+    )
+
+
 # ---------- evidence table rendering ----------
 
 def _render_evidence_table(ev: dict | None) -> str:
@@ -340,6 +419,20 @@ header.top { padding:18px 24px; border-bottom:1px solid var(--border); backgroun
 .stat.sev-low strong { color:var(--low); }
 .warn { margin-top:10px; font-size:12px; color:var(--muted); }
 .warn::before { content:"⚠ "; color:var(--medium); }
+.scan-status { background:var(--panel); border:1px solid var(--border);
+  border-left:3px solid var(--low); border-radius:6px; padding:11px 14px;
+  margin:0 0 14px; }
+.scan-status h2 { margin:0; font-size:13.5px; }
+.scan-status p { margin:3px 0 0; color:var(--muted); font-size:12.5px; }
+.scan-status h3 { margin:10px 0 4px; color:var(--text); font-size:12px; }
+.scan-status.status-complete { border-left-color:#16a34a; }
+.scan-status.status-partial { border-left-color:var(--medium); }
+.scan-status.status-failed { border-left-color:var(--high); }
+.status-limits { margin:4px 0 0; padding-left:20px; color:var(--muted); font-size:12px; }
+.status-limits li { margin:3px 0; }
+.status-limits code { color:var(--text); }
+.status-limit-detail { margin-left:8px; }
+.status-limit-detail span + span::before { content:" · "; color:var(--border); }
 .how-to-read { background:var(--panel-2); border:1px solid var(--border); border-left:3px solid var(--accent);
   border-radius:6px; padding:12px 16px; margin:0 0 22px; font-size:13px; line-height:1.6; color:var(--text); }
 .how-to-read h3 { margin:0 0 6px; font-size:13.5px; color:var(--accent); font-weight:600; }
@@ -490,6 +583,9 @@ _JS = """
 def write_html_report(scan: dict, out_path: str) -> None:
     input_dir = scan.get("input_dir", "")
     input_label = os.path.basename(os.path.normpath(input_dir)) or input_dir or "audit"
+    raw_scan_status = scan.get("scan_status")
+    scan_status = str(raw_scan_status).lower() if raw_scan_status is not None else None
+    status_html = _render_scan_status(scan)
     findings = _all_findings(scan)
     n_sheets = len({(it["file"], it["sheet"]) for it in findings if it["scope"] == "block"})
     sev = _severity_counts(findings)
@@ -521,7 +617,22 @@ def write_html_report(scan: dict, out_path: str) -> None:
         _render_decimal_section(scan),
     ])
     if not sections:
-        sections = '<p class="empty">no findings — nothing flagged in this dataset.</p>'
+        if scan_status == "failed":
+            sections = (
+                '<p class="empty">scan failed — no input table reached numeric scanning.</p>'
+            )
+        elif scan_status == "partial":
+            sections = (
+                '<p class="empty">no findings recorded in the completed portion '
+                'of this partial scan.</p>'
+            )
+        elif scan_status is None:
+            sections = (
+                '<p class="empty">no findings recorded in this legacy scan; '
+                'detailed coverage is unavailable.</p>'
+            )
+        else:
+            sections = '<p class="empty">no findings — nothing flagged in this dataset.</p>'
 
     how_to_read = (
         '<div class="how-to-read">'
@@ -588,7 +699,7 @@ def write_html_report(scan: dict, out_path: str) -> None:
 </header>
 <div class="layout">
   {sidebar}
-  <main>{how_to_read}{sections}</main>
+  <main>{status_html}{how_to_read}{sections}</main>
   {footer}
 </div>
 <script>{_JS}</script>

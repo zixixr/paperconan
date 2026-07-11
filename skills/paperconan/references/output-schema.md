@@ -7,12 +7,25 @@ essentials; this file is the complete reference (it travels in the skill bundle)
 
 ```json
 {
+  "schema_version": 2,
   "tool": "paperconan",
   "tool_version": "0.8.2",        // matches the pyproject version; provenance for archived reports
   "scanned_at": "2026-05-29T02:08:53+00:00",
   "profile": "review",            // which FP profile ran (review|forensic|triage) — severities are post-filter unless "forensic"
   "input_dir": "...",
   "paper": {"doi": "10.1038/...", "title": "..."},  // provenance, or null (see below)
+  "scan_status": "complete",      // complete | partial | failed
+  "coverage": {
+    "files_discovered": 3,
+    "files_succeeded": 3,
+    "files_failed": 0,
+    "sheets_succeeded": 8,
+    "sheets_skipped": 0,
+    "blocks_analyzed": 12,
+    "blocks_skipped": 0,
+    "truncated": false,
+    "limitations": []
+  },
   "n_files": 3,
   "n_blocks_with_findings": 8,
   "scan_errors": [                // files that failed to parse — surface these, don't imply a clean scan
@@ -44,6 +57,54 @@ essentials; this file is the complete reference (it travels in the skill bundle)
   "cross_sheet_findings": [...]
 }
 ```
+
+## Scan completion and coverage
+
+Schema version 2 adds `scan_status` and `coverage` so an empty finding list can
+be interpreted together with the amount of input that actually reached numeric
+scanning:
+
+- `complete`: at least one sheet reached numeric scanning and no coverage
+  limitation was recorded.
+- `partial`: some input reached numeric scanning, but one or more files, sheets,
+  detector paths, rows, blocks, or retained findings were limited.
+- `failed`: no sheet reached numeric scanning. The CLI still writes diagnostic
+  `scan.json` and requested HTML/Markdown reports, then exits nonzero.
+
+Coverage counters are cumulative for the scan:
+
+- `files_discovered`, `files_succeeded`, `files_failed`
+- `sheets_succeeded`, `sheets_skipped`
+- `blocks_analyzed`, `blocks_skipped`
+- `truncated`: `true` when a configured row/block/finding limit reduced coverage
+  or retained output
+- `limitations`: deterministic limitation objects in scan order
+
+Every limitation object has `scope` and `reason`. Location and threshold fields
+depend on the limitation:
+
+```json
+{
+  "scope": "block",
+  "reason": "wide_block_detector_limit",
+  "file": "table.xlsx",
+  "sheet": "Data",
+  "rows": "2-80",
+  "cols": "1-240",
+  "detectors": ["relations", "equal_pairs", "row_pairs"],
+  "max_cols": 120
+}
+```
+
+Other optional fields include `count`, `limit`, `omitted_findings`,
+`rows_total`, `rows_used`, `max_rows`, `max_bytes`, and `max_cells`. Reports
+list these limitations before findings. A partial report keeps all retained
+findings; a failed report never presents an empty finding list as a completed
+scan.
+
+Archived schema-version-1 scans may omit `schema_version`, `scan_status`, and
+`coverage`. Both HTML and Markdown renderers accept that shape and label it as a
+legacy scan whose detailed coverage status is unavailable.
 
 `paper` provenance is populated from a `paperconan_source.json` sidecar that
 `paperconan fetch --download/--auto` writes alongside the data, or from

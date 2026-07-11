@@ -3160,11 +3160,85 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     return out
 
 
+def _markdown_status_value(value):
+    if isinstance(value, dict):
+        return ", ".join(
+            f"{key}={_markdown_status_value(value[key])}" for key in sorted(value)
+        )
+    if isinstance(value, (list, tuple)):
+        return ", ".join(_markdown_status_value(item) for item in value)
+    return str(value).replace("`", "'").replace("\r", " ").replace("\n", " ")
+
+
+def _markdown_scan_status(out):
+    status = out.get("scan_status")
+    coverage = out.get("coverage") or {}
+    limitations = coverage.get("limitations") or []
+    lines = ["## Scan status\n"]
+
+    if status is None:
+        lines.append(
+            "**Legacy scan.** Detailed coverage status is unavailable for this archived scan.\n"
+        )
+        return lines
+
+    normalized = str(status).lower()
+    if normalized == "complete":
+        lines.append(
+            "**Scan complete.** Detailed coverage metadata reports no scan limitations.\n"
+        )
+        return lines
+    if normalized == "failed":
+        lines.append(
+            "**Scan failed.** No input table reached numeric scanning. "
+            "This report does not represent a completed scan.\n"
+        )
+    elif normalized == "partial":
+        lines.append(
+            "**Scan partial.** Findings below reflect completed numeric scanning, "
+            "but the listed coverage limitations apply.\n"
+        )
+    else:
+        lines.append(
+            f"**Scan status: {_markdown_status_value(normalized)}.** "
+            "Detailed coverage status is unavailable for this scan.\n"
+        )
+
+    if limitations:
+        lines.append("### Coverage limitations\n")
+        for limitation in limitations:
+            if isinstance(limitation, dict):
+                reason = _markdown_status_value(
+                    limitation.get("reason") or "unspecified"
+                )
+                detail_keys = ["scope"] + sorted(
+                    key for key in limitation if key not in {"reason", "scope"}
+                )
+                details = " · ".join(
+                    f"{key.replace('_', ' ')}: "
+                    f"`{_markdown_status_value(limitation[key])}`"
+                    for key in detail_keys
+                    if limitation.get(key) is not None
+                )
+            else:
+                reason = _markdown_status_value(limitation)
+                details = ""
+            suffix = f" · {details}" if details else ""
+            lines.append(f"- `{reason}`{suffix}")
+        lines.append("")
+    return lines
+
+
 def write_markdown_report(out, path):
-    lines = ["# Paper data audit report\n",
-             f"- Input: `{out['input_dir']}`",
-             f"- Files scanned: {out['n_files']}",
-             f"- Blocks with findings: {out['n_blocks_with_findings']}\n"]
+    raw_scan_status = out.get("scan_status")
+    scan_status = str(raw_scan_status).lower() if raw_scan_status is not None else None
+    lines = ["# Paper data audit report\n"]
+    lines.extend(_markdown_scan_status(out))
+    lines.extend([
+        f"- Input: `{out['input_dir']}`",
+        f"- Files scanned: {out['n_files']}",
+        f"- Blocks with findings: {out['n_blocks_with_findings']}\n",
+    ])
 
     high = []
     medium = []
@@ -3191,6 +3265,31 @@ def write_markdown_report(out, path):
             push(b, r)
 
     csf = out.get("cross_sheet_findings", [])
+    has_findings = bool(
+        high
+        or medium
+        or csf
+        or any(
+            d["fdr_significant"] if "fdr_significant" in d else d.get("p", 1) < 1e-6
+            for d in out["digit_distribution"]
+        )
+        or any(d.get("top") for d in out["decimal_endings"])
+    )
+    if not has_findings:
+        if scan_status == "failed":
+            lines.append("No findings are listed because numeric scanning did not start.\n")
+        elif scan_status == "partial":
+            lines.append(
+                "No findings were recorded in the completed portion of this partial scan.\n"
+            )
+        elif scan_status is None:
+            lines.append(
+                "No findings were recorded in this legacy scan; "
+                "detailed coverage is unavailable.\n"
+            )
+        else:
+            lines.append("Nothing flagged in this dataset.\n")
+
     if csf:
         lines.append(f"## ⚠️ Cross-sheet bit-identical collisions ({len(csf)})\n")
         for cf in csf:

@@ -6,7 +6,16 @@
 >
 > **要得到一份正规、可读、经过判断的报告，请搭配 AI Agent + skill 使用**（见 [README › 快速开始](../README.md#快速开始推荐agent--skill)）：检测器只产出可复现的原始信号，Agent 在其上逐条判定（对照原表、图注、Methods，排除良性解释，再做对抗式复核），最后生成[判定后报告](#判定后-html-报告)。纯 CLI 拿不到这一步——判定本身需要一个会读上下文、会推理的 Agent 在环里。
 
-`report.html`（分诊工作台）：顶部摘要 + "如何阅读本报告"说明 + 左侧 severity/detector/文件/关键词过滤 + finding 卡片 + last-digit histogram + cross-sheet 专段。为便于分诊，误报偏多的 **low 级信号默认折叠**（左侧一键展开），cross-sheet 等重点信号始终可见。建议顺序：
+`report.html`（分诊工作台）：顶部摘要 + 扫描状态 + "如何阅读本报告"说明 + 左侧 severity/detector/文件/关键词过滤 + finding 卡片 + last-digit histogram + cross-sheet 专段。扫描状态在 findings 之前，含义如下：
+
+- **complete**：覆盖信息未记录限制；只有这种状态下，空 finding 列表才会显示为本次扫描未标记统计信号。
+- **partial**：保留并展示已完成部分的 findings，同时先列出文件、sheet、block、detector 或输出上限等 coverage limitations。
+- **failed**：没有输入表到达数值扫描；报告显示失败诊断，不会把空 finding 列表写成一次完整扫描的空结果。CLI 会先写出诊断产物，再以非零状态退出。
+- **legacy**：旧 `scan.json` 没有 `scan_status` / `coverage`；HTML 和 Markdown 仍可渲染，但明确提示详细覆盖状态不可用。
+
+`REPORT.md` 使用同样的 complete / partial / failed / legacy 语义，并按确定顺序列出 coverage limitations。
+
+为便于分诊，误报偏多的 **low 级信号默认折叠**（左侧一键展开），cross-sheet 等重点信号始终可见。建议顺序：
 
 1. 先看 `scan_errors` —— 解析失败或超大文件被跳过时，不能解读成"没问题"。
 2. 先看跨 sheet / 跨文件重复，再看列关系，最后才看 within-column。
@@ -45,6 +54,9 @@ paperconan report audit/scan.json --verdict verdict.json --out adjudication.html
 流程是一套：**Agent 写判断 → `paperconan report` 渲染**。渲染器**对任何 verdict 都输出同一种高保真版式**（论文头 + Tier/impact/review 徽章 + 每条 finding 的独立卡片 + 紧跟其后的 evidence 热力表）——README 顶部那份示例报告就是这条命令的直接产物，没有任何私有管线。
 
 `verdict.json` 的**主形态**是带 `findings` 数组的论文级对象（每条 finding 各带 `finding_ref` / `suspicion_tier` / `impact_scope` / `review_status` / `report_md`，论文级另有 `paper_conclusion` / `overall_impact` / `review_note`）；**单条 finding 只是"列了一条"**，同样富渲染，不再是旧版朴素排版。完整 schema 与例子见 [`references/adjudication-tiers.md`](../skills/paperconan/references/adjudication-tiers.md) › "Multiple Findings In One Paper"。旧的扁平 `report_md` + `finding_refs` 形态向后兼容，现在也会渲染成同样的高保真版式。适合单篇论文复核或批量审计后的归档。
+
+扫描状态只改变确定性 `report.html` / `REPORT.md` 的覆盖说明；`paperconan report`
+的判定后报告布局和两种 verdict JSON 形态保持不变，旧 scan 也不需要补写新字段。
 
 注意：`paperconan report` 是本地、公开、无私有依赖的渲染器；不读取 Postgres、Blob、云端队列或任何
 `recheck/` 私有缓存。真实论文 PDF、截图、主图等材料若要展示，应由使用者在自己的审计目录中合法保存并另行归档。
