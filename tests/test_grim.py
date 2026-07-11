@@ -213,3 +213,24 @@ def test_grimmer_stays_conservative_when_search_budget_is_exceeded(monkeypatch):
     ) is None
     monkeypatch.setattr(audit, "_GRIMMER_MAX_STATES", 1)
     assert audit.grimmer_consistent(0.6, 4.6, 5, 1, 1) is True
+
+
+def test_grimmer_is_translation_invariant_for_large_integer_offsets():
+    assert grimmer_consistent(0.3, 0.6, 3, 1, 1) is True
+    assert grimmer_consistent(100000000.3, 0.6, 3, 1, 1) is True
+
+
+def test_grimmer_bounds_candidate_generation_before_iteration(monkeypatch):
+    import paperconan._audit as audit
+
+    calls = []
+
+    def candidate_spy(*args):
+        calls.append(args)
+        return []
+
+    monkeypatch.setattr(audit, "_GRIMMER_MAX_CANDIDATES", 1, raising=False)
+    monkeypatch.setattr(audit, "_candidate_sum_squares", candidate_spy)
+
+    assert audit.grimmer_consistent(0.0, 1_000_000, 99, 2, 0) is True
+    assert calls == []

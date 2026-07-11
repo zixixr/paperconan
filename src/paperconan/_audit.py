@@ -130,6 +130,7 @@ def grim_consistent(mean, n, decimals):
 
 
 _GRIMMER_MAX_STATES = 200_000
+_GRIMMER_MAX_CANDIDATES = 200_000
 
 
 def _candidate_integer_totals(mean, n, decimals):
@@ -144,24 +145,59 @@ def _candidate_integer_totals(mean, n, decimals):
     ]
 
 
-def _candidate_sum_squares(total, sd, n, decimals, ddof):
+def _candidate_moment_bounds(total, sd, n, decimals, ddof):
     denom = n - ddof
     if denom <= 0:
-        return []
+        return None
     scale = 10 ** decimals
     target = round(sd * scale)
-    lo_sd = max(0.0, (target - 0.5) / scale)
-    hi_sd = (target + 0.5) / scale
-    correction = (total * total) / n
-    first = max(0, math.floor(lo_sd * lo_sd * denom + correction) - 2)
-    last = math.ceil(hi_sd * hi_sd * denom + correction) + 2
+    edge_scale = 2 * scale
+    lower_edge = max(0, 2 * target - 1)
+    upper_edge = 2 * target + 1
+    moment_factor = n * denom
+    squared_edge_scale = edge_scale * edge_scale
+    first = (
+        lower_edge * lower_edge * moment_factor
+    ) // squared_edge_scale
+    last_numerator = upper_edge * upper_edge * moment_factor
+    last = (
+        last_numerator + squared_edge_scale - 1
+    ) // squared_edge_scale
+
+    residue = (-(total * total)) % n
+    first += (residue - first) % n
+    last -= (last - residue) % n
+    return first, last
+
+
+def _candidate_moment_count(bounds, n):
+    if bounds is None:
+        return 0
+    first, last = bounds
+    if first > last:
+        return 0
+    return ((last - first) // n) + 1
+
+
+def _candidate_sum_squares(total, sd, n, decimals, ddof):
+    bounds = _candidate_moment_bounds(total, sd, n, decimals, ddof)
+    if bounds is None:
+        return []
+    if _candidate_moment_count(bounds, n) > _GRIMMER_MAX_CANDIDATES:
+        return []
+
+    denom = n - ddof
+    scale = 10 ** decimals
+    target = round(sd * scale)
+    total_squared = total * total
+    first, last = bounds
     out = []
-    for sum_squares in range(first, last + 1):
-        variance = (sum_squares - correction) / denom
-        if variance < -1e-12:
-            continue
-        candidate_sd = math.sqrt(max(0.0, variance))
+    for moment_numerator in range(first, last + 1, n):
+        candidate_sd = math.sqrt(
+            moment_numerator / (n * denom)
+        )
         if round(candidate_sd * scale) == target:
+            sum_squares = (moment_numerator + total_squared) // n
             out.append(sum_squares)
     return out
 
@@ -232,6 +268,15 @@ def grimmer_consistent(mean, sd, n, mean_decimals, sd_decimals):
     unknown = False
     for total in _candidate_integer_totals(mean, n, mean_decimals):
         for ddof in (1, 0):
+            bounds = _candidate_moment_bounds(
+                total, sd, n, sd_decimals, ddof
+            )
+            if (
+                _candidate_moment_count(bounds, n)
+                > _GRIMMER_MAX_CANDIDATES
+            ):
+                unknown = True
+                continue
             for sum_squares in _candidate_sum_squares(
                 total, sd, n, sd_decimals, ddof
             ):
