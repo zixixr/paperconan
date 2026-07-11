@@ -21,6 +21,42 @@ from paperconan._sheet import Sheet
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+_POLICY_TOKEN_HEX_BY_ID = (
+    ("T1", "6672617564"),
+    ("T2", "6661627269636174"),
+    ("T3", "66616b65"),
+    ("T4", "6d6973636f6e64756374"),
+    ("T5", "6775696c7479"),
+    ("T6", "61636375736174696f6e"),
+    ("T7", "72656420666c6167"),
+    ("T8", "73757370696369"),
+    ("T9", "6d616e6970756c6174"),
+    ("T10", "646563657074696f6e"),
+    ("T11", "646973686f6e657374"),
+    ("T12", "6368656174"),
+    ("T13", "63756c706162"),
+)
+
+
+def _policy_token_ids(source):
+    folded = source.casefold()
+    return [
+        token_id
+        for token_id, encoded in _POLICY_TOKEN_HEX_BY_ID
+        if bytes.fromhex(encoded).decode("utf-8").casefold() in folded
+    ]
+
+
+def _enforce_neutral_language(module_name, source):
+    token_ids = _policy_token_ids(source)
+    if token_ids:
+        pytest.fail(
+            "neutral-language policy mismatch: "
+            f"module={module_name} count={len(token_ids)} "
+            f"token_ids={','.join(token_ids)}",
+            pytrace=False,
+        )
+
 
 # --- pure normalization (no optional deps) ---------------------------------
 
@@ -171,27 +207,33 @@ def test_rejected_table_closes_generators_before_sibling_processing():
 
 
 def test_owned_production_modules_use_neutral_language():
-    blocked_fragments = (
-        ("f", "raud"),
-        ("f", "abricat"),
-        ("f", "ake"),
-        ("mis", "conduct"),
-        ("guil", "ty"),
-        ("accus", "ation"),
-        ("red", " flag"),
-        ("susp", "ici"),
-        ("manip", "ulat"),
-        ("decept", "ion"),
-        ("dishon", "est"),
-        ("che", "at"),
-        ("culp", "ab"),
-    )
-    blocked = tuple("".join(parts) for parts in blocked_fragments)
-
     for module in (extract, audit):
         source = Path(module.__file__).read_text(encoding="utf-8").lower()
-        matches = [term for term in blocked if term in source]
-        assert matches == [], f"{module.__name__}: {matches}"
+        _enforce_neutral_language(module.__name__, source)
+
+
+def test_neutral_language_failure_reports_only_token_ids(
+    tmp_path, monkeypatch
+):
+    encoded_token = "6672617564"
+    decoded_token = bytes.fromhex(encoded_token).decode("utf-8")
+    source_path = tmp_path / "module.py"
+    source_path.write_text(decoded_token, encoding="utf-8")
+    monkeypatch.setattr(extract, "__file__", str(source_path))
+
+    with pytest.raises(pytest.fail.Exception) as exc_info:
+        test_owned_production_modules_use_neutral_language()
+
+    message = str(exc_info.value)
+    if decoded_token in message:
+        pytest.fail(
+            "neutral-language gate exposed decoded policy vocabulary",
+            pytrace=False,
+        )
+    assert message == (
+        "neutral-language policy mismatch: "
+        "module=paperconan._extract count=1 token_ids=T1"
+    )
 
 
 def test_extracted_tables_share_one_dense_cell_budget():
