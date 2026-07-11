@@ -54,6 +54,21 @@ def test_cli_writes_failed_scan_then_returns_nonzero(tmp_path):
     assert scan["scan_status"] == "failed"
 
 
+def test_cli_partial_scan_returns_zero(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_good_csv(data / "good.csv")
+    (data / "bad.xlsx").write_bytes(b"not a workbook")
+    proc = subprocess.run(
+        [sys.executable, "-m", "paperconan", str(data), "--no-html"],
+        text=True,
+        capture_output=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    scan = json.loads((data / "audit" / "scan.json").read_text())
+    assert scan["scan_status"] == "partial"
+
+
 def test_cli_empty_input_writes_failed_scan_then_returns_nonzero(tmp_path):
     data = tmp_path / "empty"
     data.mkdir()
@@ -66,3 +81,13 @@ def test_cli_empty_input_writes_failed_scan_then_returns_nonzero(tmp_path):
     scan = json.loads((data / "audit" / "scan.json").read_text())
     assert scan["scan_status"] == "failed"
     assert scan["coverage"]["files_discovered"] == 0
+
+
+def test_cli_help_uses_neutral_signal_language():
+    proc = subprocess.run(
+        [sys.executable, "-m", "paperconan", "--help"],
+        text=True,
+        capture_output=True,
+    )
+    assert proc.returncode == 0
+    assert "statistical signals and data inconsistencies" in proc.stdout.lower()

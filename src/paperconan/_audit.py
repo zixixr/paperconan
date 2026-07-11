@@ -3191,7 +3191,12 @@ def main():
         write_adjudicated_report(scan, verdict, rargs.out)
         print(f"wrote {rargs.out}")
         return
-    ap = argparse.ArgumentParser(description="Scan a paper's source data (xlsx/csv/tsv, or tables inside pdf/docx) for fabrication red flags")
+    ap = argparse.ArgumentParser(
+        description=(
+            "Surface statistical signals and data inconsistencies in a paper's "
+            "supplementary source data (xlsx/csv/tsv or tables inside pdf/docx)"
+        )
+    )
     ap.add_argument("in_dir", help="Directory with the paper's source data (*.xlsx/*.csv/*.tsv, or *.pdf/*.docx supplements)")
     ap.add_argument("--out", default=None, help="Output directory (default: <in_dir>/audit)")
     ap.add_argument("--md", action="store_true",

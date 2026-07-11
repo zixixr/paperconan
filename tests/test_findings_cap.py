@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import csv
 
+import openpyxl
+
 import paperconan._audit as A
 from paperconan._audit import (
     BLOCK_FINDING_GROUPS,
@@ -39,10 +41,26 @@ def _block_finding_count(blk):
     return sum(len(blk.get(g) or []) for g in BLOCK_FINDING_GROUPS)
 
 
-def test_dense_block_findings_are_capped(tmp_path):
+def _write_two_sheet_blocks(path):
+    wb = openpyxl.Workbook()
+    first = wb.active
+    first.title = "First"
+    second = wb.create_sheet("Second")
+    for ws, base in ((first, 0), (second, 1000)):
+        ws.append(["a", "b"])
+        for i in range(5):
+            ws.append([base + i + 1, base + i + 11])
+        ws.append([None, None])
+        for i in range(5):
+            ws.append([base + i + 101, base + i + 121])
+    wb.save(path)
+
+
+def test_dense_block_findings_are_capped(tmp_path, monkeypatch):
     data = tmp_path / "dense"
     data.mkdir()
     _write_dense_csv(str(data / "dense.csv"))
+    monkeypatch.setattr(A, "_MAX_TOTAL_FINDINGS", 0)
 
     scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
 
@@ -60,33 +78,98 @@ def test_dense_block_findings_are_capped(tmp_path):
     total_omitted = sum(int(blk.get("findings_omitted") or 0) for blk in blocks)
     assert total_omitted > 0, "dense block exceeded the cap but omission was not recorded"
     assert scan["scan_status"] == "partial"
+    finding_limits = [
+        item
+        for item in scan["coverage"]["limitations"]
+        if item["reason"] == "finding_limit"
+    ]
     assert any(
         item["reason"] == "finding_limit"
         and item.get("omitted_findings", 0) > 0
-        for item in scan["coverage"]["limitations"]
+        for item in finding_limits
     )
+    assert scan["coverage"]["blocks_analyzed"] == 1
+    assert scan["coverage"]["blocks_skipped"] == 0
+    assert all(item["scope"] == "block" for item in finding_limits)
 
 
-def test_report_block_cap_records_remaining_blocks_once(tmp_path, monkeypatch):
+def test_report_block_cap_counts_remaining_blocks_once_per_sheet(
+    tmp_path, monkeypatch
+):
     data = tmp_path / "blocks"
     data.mkdir()
-    (data / "two-blocks.csv").write_text(
-        "a,b\n"
-        "1,2\n2,3\n3,4\n4,5\n5,6\n"
-        ",\n"
-        "10,20\n11,21\n12,22\n13,23\n14,24\n",
-        encoding="utf-8",
-    )
+    _write_two_sheet_blocks(data / "multi.xlsx")
     monkeypatch.setattr(A, "_MAX_REPORT_BLOCKS", 1)
+    monkeypatch.setattr(A, "_MAX_TOTAL_FINDINGS", 0)
 
     scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
 
     assert scan["scan_status"] == "partial"
-    assert scan["coverage"]["blocks_skipped"] >= 1
-    assert any(
-        item["reason"] == "report_block_limit"
-        for item in scan["coverage"]["limitations"]
-    )
+    assert scan["coverage"]["blocks_analyzed"] == 1
+    assert scan["coverage"]["blocks_skipped"] == 3
+    assert scan["coverage"]["limitations"] == [
+        {
+            "scope": "sheet",
+            "reason": "report_block_limit",
+            "count": 1,
+            "file": "multi.xlsx",
+            "sheet": "First",
+        },
+        {
+            "scope": "sheet",
+            "reason": "report_block_limit",
+            "count": 2,
+            "file": "multi.xlsx",
+            "sheet": "Second",
+        },
+    ]
+
+
+def test_global_finding_cap_counts_skipped_blocks_without_duplicates(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "blocks"
+    data.mkdir()
+    _write_two_sheet_blocks(data / "multi.xlsx")
+    monkeypatch.setattr(A, "_MAX_REPORT_BLOCKS", 100)
+    monkeypatch.setattr(A, "_MAX_TOTAL_FINDINGS", 1)
+    monkeypatch.setattr(A, "_MAX_FINDINGS_PER_BLOCK", 0)
+
+    scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+
+    coverage = scan["coverage"]
+    assert scan["scan_status"] == "partial"
+    assert coverage["blocks_analyzed"] == 1
+    assert coverage["blocks_skipped"] == 3
+    block_limits = [
+        item
+        for item in coverage["limitations"]
+        if item["scope"] == "block" and item["reason"] == "finding_limit"
+    ]
+    assert len(block_limits) == 1
+    assert block_limits[0]["omitted_findings"] > 0
+    assert scan["findings_omitted"] == block_limits[0]["omitted_findings"]
+    assert [
+        item
+        for item in coverage["limitations"]
+        if item["scope"] == "sheet" and item["reason"] == "finding_limit"
+    ] == [
+        {
+            "scope": "sheet",
+            "reason": "finding_limit",
+            "count": 1,
+            "file": "multi.xlsx",
+            "sheet": "First",
+        },
+        {
+            "scope": "sheet",
+            "reason": "finding_limit",
+            "count": 2,
+            "file": "multi.xlsx",
+            "sheet": "Second",
+        },
+    ]
+    assert len(coverage["limitations"]) == 3
 
 
 def test_cap_keeps_highest_severity_first():
