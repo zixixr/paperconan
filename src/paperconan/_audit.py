@@ -1144,7 +1144,9 @@ def _row_pair_low_cardinality_integer_like(x, y):
     return bool(near_integer >= 0.9 and max_abs <= 20 and distinct <= max(5, len(finite) // 4))
 
 
-def detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header, min_n=10):
+def detect_row_pair_digit_coupling(
+    sheet, r0, r1, c0, c1, header, min_n=10, *, with_coverage=False
+):
     """Detect suspicious paired rows that preserve low-order digits across many cells.
 
     This targets source-data layouts where replicate/condition rows are aligned by
@@ -1278,7 +1280,11 @@ def detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header, min_n=10):
         -f["coarse_10_diff_frac"],
         -f["n"],
     ))
-    return findings[:_ROW_PAIR_MAX_FINDINGS_PER_BLOCK]
+    omitted = max(0, len(findings) - _ROW_PAIR_MAX_FINDINGS_PER_BLOCK)
+    kept = findings[:_ROW_PAIR_MAX_FINDINGS_PER_BLOCK]
+    if with_coverage:
+        return kept, {"findings_omitted": omitted}
+    return kept
 
 
 # Above this many pairwise column relations in ONE block, the sheet is a dense /
@@ -1745,7 +1751,9 @@ def detect_equal_pairs(sheet, r0, r1, c0, c1, header):
 
 # ---------- driver ----------
 
-def _grid_from_rows(sheet, min_decimal_places=3, max_rows=200):
+def _grid_from_rows(
+    sheet, min_decimal_places=3, max_rows=200, *, with_coverage=False
+):
     """Build {(r, c): rounded_value} of decimal-bearing numeric cells from a Sheet.
     Only keeps non-integer values with >= min_decimal_places decimals in a sane range —
     these are the values whose bit-identical reuse across tables is suspicious."""
@@ -1763,7 +1771,12 @@ def _grid_from_rows(sheet, min_decimal_places=3, max_rows=200):
                     frac = s.split(".", 1)[1]
                     if len(frac) >= min_decimal_places:
                         grid[(ri, ci)] = round(fv, 9)
-    return grid
+    meta = {
+        "rows_total": sheet.nrows,
+        "rows_used": rmax,
+        "row_limited": sheet.nrows > rmax,
+    }
+    return (grid, meta) if with_coverage else grid
 
 
 import re as _re
@@ -2920,7 +2933,17 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 continue
             coverage.mark_sheet_succeeded()
             sheet = rows if isinstance(rows, Sheet) else Sheet.from_rows(rows)
-            grids[(os.path.basename(f), sn)] = _grid_from_rows(sheet)
+            grid, grid_meta = _grid_from_rows(sheet, with_coverage=True)
+            grids[(os.path.basename(f), sn)] = grid
+            if grid_meta["row_limited"]:
+                coverage.add_limitation(
+                    "sheet",
+                    "collision_row_limit",
+                    file=os.path.basename(f),
+                    sheet=sn,
+                    rows_total=grid_meta["rows_total"],
+                    rows_used=grid_meta["rows_used"],
+                )
             grid_sheets[(os.path.basename(f), sn)] = sheet
             sheet_nums = sheet.numeric_values()
             per_sheet_numbers[(os.path.basename(f), sn)] = sheet_nums
@@ -2960,10 +2983,60 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 # equal-pair detectors explode in compute + output, so skip just those two; the
                 # column-wise detectors below still run. (_MAX_BLOCK_COLS=0 disables the skip.)
                 wide = _MAX_BLOCK_COLS and (c1 - c0) > _MAX_BLOCK_COLS
+                if wide:
+                    coverage.add_limitation(
+                        "block",
+                        "wide_block_detector_limit",
+                        file=os.path.basename(f),
+                        sheet=sn,
+                        rows=f"{r0 + 1}-{r1}",
+                        cols=f"{c0 + 1}-{c1}",
+                        detectors=["relations", "equal_pairs", "row_pairs"],
+                        max_cols=_MAX_BLOCK_COLS,
+                    )
+                row_pair_dimension_limited = (
+                    not wide
+                    and (
+                        (r1 - r0) > _ROW_PAIR_MAX_ROWS
+                        or (c1 - c0) > _ROW_PAIR_MAX_COLS
+                    )
+                )
+                if row_pair_dimension_limited:
+                    coverage.add_limitation(
+                        "block",
+                        "row_pair_dimension_limit",
+                        file=os.path.basename(f),
+                        sheet=sn,
+                        rows=r1 - r0,
+                        cols=c1 - c0,
+                        max_rows=_ROW_PAIR_MAX_ROWS,
+                        max_cols=_ROW_PAIR_MAX_COLS,
+                    )
                 rel = [] if wide else detect_relations(sheet, r0, r1, c0, c1, header)
                 ap = detect_arithmetic_progression(sheet, r0, r1, c0, c1, header)
                 eq = [] if wide else detect_equal_pairs(sheet, r0, r1, c0, c1, header)
-                rp = [] if wide else detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header)
+                row_pair_meta = {"findings_omitted": 0}
+                if wide or row_pair_dimension_limited:
+                    rp = []
+                else:
+                    row_pair_result = detect_row_pair_digit_coupling(
+                        sheet, r0, r1, c0, c1, header, with_coverage=True
+                    )
+                    if isinstance(row_pair_result, tuple):
+                        rp, row_pair_meta = row_pair_result
+                    else:
+                        rp = row_pair_result
+                if row_pair_meta["findings_omitted"] > 0:
+                    coverage.add_limitation(
+                        "block",
+                        "row_pair_finding_limit",
+                        file=os.path.basename(f),
+                        sheet=sn,
+                        rows=f"{r0 + 1}-{r1}",
+                        cols=f"{c0 + 1}-{c1}",
+                        limit=_ROW_PAIR_MAX_FINDINGS_PER_BLOCK,
+                        omitted_findings=row_pair_meta["findings_omitted"],
+                    )
                 wc = detect_within_column_patterns(sheet, r0, r1, c0, c1, header)
                 wc = wc + detect_dispersed_repeats(sheet, r0, r1, c0, c1, header)
                 iar = detect_identical_after_rounding(sheet, r0, r1, c0, c1, header)
