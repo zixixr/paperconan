@@ -234,3 +234,26 @@ def test_grimmer_bounds_candidate_generation_before_iteration(monkeypatch):
 
     assert audit.grimmer_consistent(0.0, 1_000_000, 99, 2, 0) is True
     assert calls == []
+
+
+def test_detector_checks_multiple_labeled_mean_groups():
+    rows = [
+        ["group", "score mean A", "sd A", "n A",
+         "score mean B", "sd B", "n B"],
+        ["x", 3.40, 1.0, 10, 2.25, 1.0, 10],
+        ["y", 3.45, 1.0, 10, 2.20, 1.0, 10],
+    ]
+    findings = detect_grim_grimmer(*_block(rows))
+    mean_columns = {f["mean_col"] for f in findings}
+    assert "score mean A" in mean_columns
+    assert "score mean B" in mean_columns
+
+
+def test_detector_may_share_one_global_n_column():
+    rows = [
+        ["group", "score mean A", "sd A",
+         "score mean B", "sd B", "n"],
+        ["x", 3.45, 1.0, 2.25, 1.0, 10],
+    ]
+    findings = detect_grim_grimmer(*_block(rows))
+    assert {f["n_col"] for f in findings} == {"n"}

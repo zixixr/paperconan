@@ -807,6 +807,7 @@ def _sample_exact(values, k=8):
 
 _GRIM_MEAN_RE = re.compile(r"\b(mean|average|avg)\b|均值|平均", re.I)
 _GRIM_SD_RE = re.compile(r"\b(s\.?d\.?|std)\b|标准差", re.I)
+_GRIM_SE_RE = re.compile(r"\b(?:sem|s\.?e\.?|standard error)\b", re.I)
 _GRIM_N_RE = re.compile(r"\bn\b|sample.?size|样本量|例数", re.I)
 _GRIM_INT_RE = re.compile(
     r"count|number|cells|foci|colon|nuclei|score|rating|likert"
@@ -814,6 +815,63 @@ _GRIM_INT_RE = re.compile(
 _GRIM_RATIO_RE = re.compile(
     r"%|percent|percentage|\bratio\b|\brate\b|\bindex\b|proportion|fraction"
     r"|百分|比例|比率|占比|指数", re.I)
+_GRIM_ROLE_WORDS = {
+    "mean", "average", "avg", "sd", "std", "stdev",
+    "n", "sample", "size",
+}
+
+
+def _grim_role_tokens(label):
+    words = re.findall(r"[a-z0-9]+", str(label or "").lower())
+    return {word for word in words if word not in _GRIM_ROLE_WORDS}
+
+
+def _grim_best_partner(mean_i, candidates, header):
+    if not candidates:
+        return None
+    mean_tokens = _grim_role_tokens(header[mean_i])
+    ranked = sorted(
+        candidates,
+        key=lambda idx: (
+            -len(mean_tokens & _grim_role_tokens(header[idx])),
+            abs(idx - mean_i),
+            idx,
+        ),
+    )
+    best = ranked[0]
+    overlap = len(mean_tokens & _grim_role_tokens(header[best]))
+    if overlap == 0 and len(candidates) == 1:
+        return candidates[0]
+    return best
+
+
+def _grim_column_groups(header):
+    mean_cols = [
+        i for i, value in enumerate(header)
+        if _GRIM_MEAN_RE.search(str(value or ""))
+        and _GRIM_INT_RE.search(str(value or ""))
+        and not _GRIM_RATIO_RE.search(str(value or ""))
+    ]
+    sd_cols = [
+        i for i, value in enumerate(header)
+        if _GRIM_SD_RE.search(str(value or ""))
+        and not _GRIM_SE_RE.search(str(value or ""))
+        and i not in mean_cols
+    ]
+    n_cols = [
+        i for i, value in enumerate(header)
+        if _GRIM_N_RE.search(str(value or ""))
+        and i not in mean_cols
+        and i not in sd_cols
+    ]
+    groups = []
+    for mean_i in mean_cols:
+        n_i = _grim_best_partner(mean_i, n_cols, header)
+        if n_i is None:
+            continue
+        sd_i = _grim_best_partner(mean_i, sd_cols, header)
+        groups.append((mean_i, n_i, sd_i))
+    return groups
 
 
 def detect_relations(sheet, r0, r1, c0, c1, header):
@@ -1543,99 +1601,71 @@ def detect_identical_after_rounding(sheet, r0, r1, c0, c1, header):
 
 def detect_grim_grimmer(sheet, r0, r1, c0, c1, header):
     """GRIM/GRIMMER: flag reported means (and SDs) impossible for integer-valued
-    data at the stated n. Strictly gated — needs a header-located mean+n triple
+    data at the stated n. Strictly gated — needs a header-located mean+n group
     AND a count/score keyword in the MEAN column header signalling integer items —
     to stay false-positive-safe on continuous measurements where GRIM does not apply.
     GRIMMER runs only on a true SD column (SEM/SE columns are deliberately ignored,
     since GRIMMER is undefined for a standard error)."""
     findings = []
+    for mean_i, n_i, sd_i in _grim_column_groups(header):
+        mean_c, n_c = c0 + mean_i, c0 + n_i
+        sd_c = c0 + sd_i if sd_i is not None else None
+        grim_fail, grimmer_fail = [], []
+        checked = grimmer_checked = 0
+        for r in range(r0, r1):
+            mv = sheet.cell(r, mean_c)
+            nv = sheet.cell(r, n_c)
+            if not (is_num(mv) and is_num(nv)):
+                continue
+            n = int(round(float(nv)))
+            if n < 2:
+                continue
+            mean = float(mv)
+            d = _decimals_of(mean)
+            if n >= 10 ** d:                 # power gate: no discriminating power
+                continue
+            checked += 1
+            if not grim_consistent(mean, n, d):
+                grim_fail.append((r, mean, n, d))
+                continue                     # GRIM-failing rows are not re-reported
+            if sd_c is not None:
+                sv = sheet.cell(r, sd_c)
+                if is_num(sv):
+                    sd = float(sv)
+                    ds = _decimals_of(sd)
+                    grimmer_checked += 1
+                    if not grimmer_consistent(mean, sd, n, d, ds):
+                        grimmer_fail.append((r, mean, sd, n, ds))
 
-    def _find(rx, taken):
-        for idx, h in enumerate(header):
-            if idx not in taken and rx.search(str(h or "")):
-                return idx
-        return None
+        mean_name = str(header[mean_i] or f"col{mean_c}")
+        n_name = str(header[n_i] or f"col{n_c}")
+        sd_name = str(header[sd_i] or f"col{sd_c}") if sd_i is not None else None
 
-    taken = set()
-    mean_i = _find(_GRIM_MEAN_RE, taken)
-    if mean_i is not None:
-        taken.add(mean_i)
-    n_i = _find(_GRIM_N_RE, taken)
-    if n_i is not None:
-        taken.add(n_i)
-    sd_i = _find(_GRIM_SD_RE, taken)
-    if mean_i is None or n_i is None:
-        return findings
-    # Integer-data gate: the count/score keyword must be in the MEAN column header
-    # itself, not anywhere in the row — otherwise a bookkeeping column such as
-    # "number of replicates" would license GRIM on a continuous measurement.
-    if not _GRIM_INT_RE.search(str(header[mean_i] or "")):
-        return findings
-    # Negative gate: a continuous ratio / percentage / index mean is not integer
-    # data even when its header also contains a count word (e.g. "% positive cells").
-    # NB: deliberately excludes "score"/"count" — GRIM's original domain is integer
-    # composite/Likert scores, which must still be checked.
-    if _GRIM_RATIO_RE.search(str(header[mean_i] or "")):
-        return findings
-
-    mean_c, n_c = c0 + mean_i, c0 + n_i
-    sd_c = c0 + sd_i if sd_i is not None else None
-    grim_fail, grimmer_fail = [], []
-    checked = grimmer_checked = 0
-    for r in range(r0, r1):
-        mv = sheet.cell(r, mean_c)
-        nv = sheet.cell(r, n_c)
-        if not (is_num(mv) and is_num(nv)):
-            continue
-        n = int(round(float(nv)))
-        if n < 2:
-            continue
-        mean = float(mv)
-        d = _decimals_of(mean)
-        if n >= 10 ** d:                 # power gate: no discriminating power
-            continue
-        checked += 1
-        if not grim_consistent(mean, n, d):
-            grim_fail.append((r, mean, n, d))
-            continue                     # GRIM-failing rows are not re-reported
-        if sd_c is not None:
-            sv = sheet.cell(r, sd_c)
-            if is_num(sv):
-                sd = float(sv)
-                ds = _decimals_of(sd)
-                grimmer_checked += 1
-                if not grimmer_consistent(mean, sd, n, d, ds):
-                    grimmer_fail.append((r, mean, sd, n, ds))
-
-    mean_name = str(header[mean_i] or f"col{mean_c}")
-    n_name = str(header[n_i] or f"col{n_c}")
-    sd_name = str(header[sd_i] or f"col{sd_c}") if sd_i is not None else None
-
-    if grim_fail:
-        f = dict(kind="grim_inconsistent", severity="high",
-                 mean_col=mean_name, n_col=n_name, sd_col=sd_name,
-                 col_a_idx=mean_c,
-                 n=checked, n_rows_checked=checked, n_failed=len(grim_fail),
-                 failed_rows=[dict(row=r + 1, mean=m, n=nn, decimals=dd,
-                                   nearest_consistent=round(round(m * nn) / nn, dd))
-                              for (r, m, nn, dd) in grim_fail[:8]],
-                 example_cells=[[r + 1, mean_c + 1] for (r, *_rest) in grim_fail[:8]],
-                 rule=(f"{len(grim_fail)}/{checked} rows report a mean impossible for "
-                       f"integer data at the stated n (GRIM): col '{mean_name}'"))
-        if sd_c is not None:
-            f["col_b_idx"] = sd_c
-        findings.append(f)
-    if grimmer_fail:
-        findings.append(dict(
-            kind="grimmer_inconsistent", severity="high",
-            mean_col=mean_name, n_col=n_name, sd_col=sd_name,
-            col_a_idx=mean_c, col_b_idx=sd_c,
-            n=grimmer_checked, n_rows_checked=grimmer_checked, n_failed=len(grimmer_fail),
-            failed_rows=[dict(row=r + 1, mean=m, sd=s, n=nn, sd_decimals=ds)
-                         for (r, m, s, nn, ds) in grimmer_fail[:8]],
-            example_cells=[[r + 1, sd_c + 1] for (r, *_rest) in grimmer_fail[:8]],
-            rule=(f"{len(grimmer_fail)}/{grimmer_checked} rows report an SD impossible for "
-                  f"integer data at the stated mean & n (GRIMMER): col '{sd_name}'")))
+        if grim_fail:
+            f = dict(kind="grim_inconsistent", severity="high",
+                     mean_col=mean_name, n_col=n_name, sd_col=sd_name,
+                     col_a_idx=mean_c,
+                     n=checked, n_rows_checked=checked, n_failed=len(grim_fail),
+                     failed_rows=[dict(row=r + 1, mean=m, n=nn, decimals=dd,
+                                       nearest_consistent=round(round(m * nn) / nn, dd))
+                                  for (r, m, nn, dd) in grim_fail[:8]],
+                     example_cells=[[r + 1, mean_c + 1] for (r, *_rest) in grim_fail[:8]],
+                     rule=(f"{len(grim_fail)}/{checked} rows report a mean impossible for "
+                           f"integer data at the stated n (GRIM): col '{mean_name}'"))
+            if sd_c is not None:
+                f["col_b_idx"] = sd_c
+            findings.append(f)
+        if grimmer_fail:
+            findings.append(dict(
+                kind="grimmer_inconsistent", severity="high",
+                mean_col=mean_name, n_col=n_name, sd_col=sd_name,
+                col_a_idx=mean_c, col_b_idx=sd_c,
+                n=grimmer_checked, n_rows_checked=grimmer_checked, n_failed=len(grimmer_fail),
+                failed_rows=[dict(row=r + 1, mean=m, sd=s, n=nn, sd_decimals=ds)
+                             for (r, m, s, nn, ds) in grimmer_fail[:8]],
+                example_cells=[[r + 1, sd_c + 1] for (r, *_rest) in grimmer_fail[:8]],
+                rule=(f"{len(grimmer_fail)}/{grimmer_checked} rows report an SD impossible for "
+                      f"integer data at the stated mean & n (GRIMMER): col '{sd_name}'")))
     return findings
 
 
