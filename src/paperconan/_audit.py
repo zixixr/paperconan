@@ -280,10 +280,15 @@ def _calamine_cell(v):
     return v
 
 
-def _load_workbook_calamine(path):
-    """Return dict of sheet_name -> Sheet via python-calamine (a fast Rust reader),
-    producing a Sheet byte-identical to _load_workbook_openpyxl. Same _MAX_CELLS
-    per-sheet + cumulative guard, same oversized->None, same trim-to-max-width."""
+_CALAMINE_OPENPYXL_FALLBACK = object()
+
+
+def _load_workbook_calamine_scoped(path):
+    """Read with Calamine, returning a fallback signal before openpyxl is opened.
+
+    Keeping Calamine state in this helper ensures its workbook, sheets, materialized
+    rows, and any partial output leave scope before the outer loader starts openpyxl.
+    """
     import python_calamine
     wb = python_calamine.CalamineWorkbook.from_path(path)
     out = {}
@@ -300,6 +305,11 @@ def _load_workbook_calamine(path):
             out[name] = None
             continue
         rows = sh.to_python(skip_empty_area=False)
+        mr = len(rows)
+        mc = max((len(row) for row in rows), default=0)
+        if loaded >= _MAX_CELLS or (mr and mc and mr * mc > _MAX_CELLS):
+            out[name] = None
+            continue
         if is_ooxml and any(
             isinstance(value, float)
             and math.isfinite(value)
@@ -308,18 +318,23 @@ def _load_workbook_calamine(path):
             for row in rows
             for value in row
         ):
-            return _load_workbook_openpyxl(path)
-        mr = len(rows)
-        mc = max((len(row) for row in rows), default=0)
-        if loaded >= _MAX_CELLS or (mr and mc and mr * mc > _MAX_CELLS):
-            out[name] = None
-            continue
+            return _CALAMINE_OPENPYXL_FALLBACK
         norm = ([_calamine_cell(v) for v in row] for row in rows)
         sheet, cells = _fill_sheet_from_rows(norm, mr, mc, loaded)
         out[name] = sheet
         if sheet is not None:
             loaded += cells
     return out
+
+
+def _load_workbook_calamine(path):
+    """Return dict of sheet_name -> Sheet via python-calamine (a fast Rust reader),
+    producing a Sheet byte-identical to _load_workbook_openpyxl. Same _MAX_CELLS
+    per-sheet + cumulative guard, same oversized->None, same trim-to-max-width."""
+    result = _load_workbook_calamine_scoped(path)
+    if result is _CALAMINE_OPENPYXL_FALLBACK:
+        return _load_workbook_openpyxl(path)
+    return result
 
 
 def load_workbook_rows(path):

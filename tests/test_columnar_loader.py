@@ -1,7 +1,9 @@
+import weakref
+from zipfile import ZIP_DEFLATED, ZipFile
+
 import numpy as np
 import openpyxl
 import pytest
-from zipfile import ZIP_DEFLATED, ZipFile
 from paperconan._audit import load_workbook_rows
 from paperconan._sheet import Sheet
 
@@ -134,6 +136,114 @@ def test_calamine_huge_bounding_box_is_none_not_oom(tmp_path, monkeypatch):
     assert calls["n"] == 0                     # never materialized the huge box
 
 
+def test_calamine_actual_size_guard_precedes_wide_ooxml_fallback(monkeypatch):
+    import paperconan._audit as audit
+    import python_calamine
+
+    class StubSheet:
+        height = 1
+        width = 1
+
+        def to_python(self, skip_empty_area=False):
+            return [
+                [float(2**53), 1.0],
+                [2.0, 3.0],
+                [4.0, 5.0],
+            ]
+
+    class StubWorkbook:
+        sheet_names = ["S1"]
+
+        def get_sheet_by_name(self, name):
+            assert name == "S1"
+            return StubSheet()
+
+    class StubCalamineWorkbook:
+        @staticmethod
+        def from_path(path):
+            return StubWorkbook()
+
+    fallback_calls = []
+
+    def openpyxl_spy(path):
+        fallback_calls.append(path)
+        return {"fallback": Sheet.from_rows([])}
+
+    monkeypatch.setattr(audit, "_MAX_CELLS", 5)
+    monkeypatch.setattr(python_calamine, "CalamineWorkbook", StubCalamineWorkbook)
+    monkeypatch.setattr(audit, "_load_workbook_openpyxl", openpyxl_spy)
+
+    out = audit._load_workbook_calamine("oversized.xlsx")
+
+    assert fallback_calls == []
+    assert out["S1"] is None
+
+
+def test_calamine_releases_reader_state_before_openpyxl_fallback(monkeypatch):
+    import paperconan._audit as audit
+    import python_calamine
+
+    refs = {}
+
+    class Probe:
+        pass
+
+    class ProbeRows(list):
+        pass
+
+    class StubSheet:
+        height = 1
+        width = 1
+
+        def __init__(self, name, values):
+            self.name = name
+            self.values = values
+
+        def to_python(self, skip_empty_area=False):
+            rows = ProbeRows(self.values)
+            refs[f"{self.name}_rows"] = weakref.ref(rows)
+            return rows
+
+    class StubWorkbook:
+        sheet_names = ["first", "wide"]
+
+        def __init__(self):
+            self.sheets = {
+                "first": StubSheet("first", [[1.0]]),
+                "wide": StubSheet("wide", [[float(2**53)]]),
+            }
+            refs["workbook"] = weakref.ref(self)
+            for name, sheet in self.sheets.items():
+                refs[f"{name}_sheet"] = weakref.ref(sheet)
+
+        def get_sheet_by_name(self, name):
+            return self.sheets[name]
+
+    class StubCalamineWorkbook:
+        @staticmethod
+        def from_path(path):
+            return StubWorkbook()
+
+    def fill_spy(rows_iter, mr, mc, loaded):
+        list(rows_iter)
+        partial = Probe()
+        refs["partial_output"] = weakref.ref(partial)
+        return partial, mr * mc
+
+    def openpyxl_spy(path):
+        retained = sorted(name for name, ref in refs.items() if ref() is not None)
+        assert retained == []
+        return {"fallback": Sheet.from_rows([])}
+
+    monkeypatch.setattr(python_calamine, "CalamineWorkbook", StubCalamineWorkbook)
+    monkeypatch.setattr(audit, "_fill_sheet_from_rows", fill_spy)
+    monkeypatch.setattr(audit, "_load_workbook_openpyxl", openpyxl_spy)
+
+    out = audit._load_workbook_calamine("wide.xlsx")
+
+    assert list(out) == ["fallback"]
+
+
 def test_streaming_loader_preserves_adjacent_wide_integers(tmp_path):
     import paperconan._audit as audit
 
@@ -145,12 +255,13 @@ def test_streaming_loader_preserves_adjacent_wide_integers(tmp_path):
     assert sheet.cell(1, 0) != sheet.cell(1, 1)
 
 
+@pytest.mark.parametrize("suffix", [".xlsx", ".xlsm"])
 def test_default_loader_falls_back_to_openpyxl_for_wide_ooxml_integers(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, suffix
 ):
     import paperconan._audit as audit
 
-    p = tmp_path / "wide.xlsx"
+    p = tmp_path / f"wide{suffix}"
     _write_xlsx_with_exact_adjacent_wide_integers(p)
     openpyxl_load = audit._load_workbook_openpyxl
     calls = []
