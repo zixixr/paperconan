@@ -22,6 +22,7 @@ Dependencies: openpyxl, numpy, scipy
 from __future__ import annotations
 import argparse
 import csv as _csv
+import ctypes
 import datetime
 import glob
 import json
@@ -298,6 +299,44 @@ def _dense_cells(row_count, max_width):
     return row_count * max_width
 
 
+def _move_numeric_rows_in_place(numeric, old_cols, new_cols, used_rows, used_cols):
+    if not used_rows or not used_cols or old_cols == new_cols:
+        return
+    rows = (
+        range(used_rows)
+        if new_cols < old_cols
+        else range(used_rows - 1, -1, -1)
+    )
+    address = numeric.ctypes.data
+    row_bytes = used_cols * numeric.itemsize
+    for row in rows:
+        source = address + row * old_cols * numeric.itemsize
+        target = address + row * new_cols * numeric.itemsize
+        if source != target:
+            ctypes.memmove(target, source, row_bytes)
+
+
+def _resize_numeric_in_place(
+    numeric, target_rows, target_cols, used_rows, used_cols
+):
+    old_rows, old_cols = numeric.shape
+    if (old_rows, old_cols) == (target_rows, target_cols):
+        return
+    if target_cols < old_cols:
+        _move_numeric_rows_in_place(
+            numeric, old_cols, target_cols, used_rows, used_cols
+        )
+    numeric.resize((target_rows, target_cols), refcheck=False)
+    if target_cols > old_cols:
+        _move_numeric_rows_in_place(
+            numeric, old_cols, target_cols, used_rows, used_cols
+        )
+    if used_rows and target_cols > used_cols:
+        numeric[:used_rows, used_cols:target_cols] = np.nan
+    if target_rows > used_rows:
+        numeric[used_rows:target_rows, :] = np.nan
+
+
 def _fill_sheet_from_rows(rows_iter, mr, mc, loaded):
     """Stream rows of openpyxl-shaped cell values (int/float/str/datetime/bool/None)
     into a Sheet, honouring the cumulative `_MAX_CELLS` budget that `loaded` cells
@@ -336,10 +375,9 @@ def _fill_sheet_from_rows(rows_iter, mr, mc, loaded):
                 target_rows, target_cols = projected_rows, projected_width
             if _dense_cells(target_rows, target_cols) > remaining:
                 return None, cells
-            resized = np.full((target_rows, target_cols), np.nan, dtype=float)
-            if r and max_w:
-                resized[:r, :max_w] = numeric[:r, :max_w]
-            numeric = resized
+            _resize_numeric_in_place(
+                numeric, target_rows, target_cols, r, max_w
+            )
         for c, v in enumerate(row):
             if is_num(v):
                 if isinstance(v, int) and abs(v) > _MAX_EXACT_FLOAT_INT:
@@ -356,8 +394,7 @@ def _fill_sheet_from_rows(rows_iter, mr, mc, loaded):
     # Trim to the geometry Sheet.from_rows would produce: nrows == rows consumed,
     # ncols == max(len(row)). (numeric may be larger if the reader over-declared.)
     n_rows, n_cols = r, max_w
-    if numeric.shape != (n_rows, n_cols) or not numeric.flags.owndata:
-        numeric = numeric[:n_rows, :n_cols].copy()
+    _resize_numeric_in_place(numeric, n_rows, n_cols, n_rows, n_cols)
     text = {(rr, cc): val for (rr, cc), val in text.items()
             if rr < n_rows and cc < n_cols}
     ints = {(rr, cc) for (rr, cc) in ints if rr < n_rows and cc < n_cols}
