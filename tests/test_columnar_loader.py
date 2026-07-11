@@ -352,6 +352,14 @@ def test_second_workbook_sheet_is_rejected_before_allocation(tmp_path, monkeypat
     import paperconan._audit as audit
 
     monkeypatch.setattr(audit, "_MAX_CELLS", 10)
+    fill_calls = []
+    original_fill = audit._fill_sheet_from_rows
+
+    def fill_spy(rows_iter, mr, mc, loaded):
+        fill_calls.append((mr, mc, loaded))
+        return original_fill(rows_iter, mr, mc, loaded)
+
+    monkeypatch.setattr(audit, "_fill_sheet_from_rows", fill_spy)
     path = tmp_path / "two.xlsx"
     wb = openpyxl.Workbook()
     ws1 = wb.active
@@ -365,6 +373,7 @@ def test_second_workbook_sheet_is_rejected_before_allocation(tmp_path, monkeypat
     out = audit._load_workbook_openpyxl(str(path))
     assert out["one"] is not None
     assert out["two"] is None
+    assert fill_calls == [(2, 3, 0)]
 
 
 def test_calamine_streams_rows_without_to_python(tmp_path, monkeypatch):
@@ -379,3 +388,153 @@ def test_calamine_streams_rows_without_to_python(tmp_path, monkeypatch):
 
     monkeypatch.setattr(pc.CalamineSheet, "to_python", forbidden)
     assert audit._load_workbook_calamine(str(path))["S1"] is not None
+
+
+def test_calamine_second_sheet_rejected_before_iterator_starts(monkeypatch):
+    import paperconan._audit as audit
+    import python_calamine
+
+    iterator_starts = []
+
+    class StubSheet:
+        height = 2
+        width = 3
+
+        def __init__(self, name):
+            self.name = name
+
+        def iter_rows(self):
+            iterator_starts.append(self.name)
+            yield [1.0, 2.0, 3.0]
+            yield [4.0, 5.0, 6.0]
+
+    class StubWorkbook:
+        sheet_names = ["one", "two"]
+
+        def __init__(self):
+            self.sheets = {name: StubSheet(name) for name in self.sheet_names}
+
+        def get_sheet_by_name(self, name):
+            return self.sheets[name]
+
+    class StubCalamineWorkbook:
+        @staticmethod
+        def from_path(path):
+            return StubWorkbook()
+
+    monkeypatch.setattr(audit, "_MAX_CELLS", 10)
+    monkeypatch.setattr(python_calamine, "CalamineWorkbook", StubCalamineWorkbook)
+
+    out = audit._load_workbook_calamine("two.xlsx")
+
+    assert out["one"] is not None
+    assert out["two"] is None
+    assert iterator_starts == ["one"]
+
+
+def test_ooxml_exception_releases_calamine_state_before_openpyxl_fallback(
+    monkeypatch,
+):
+    import paperconan._audit as audit
+    import python_calamine
+
+    refs = {}
+
+    class ReaderFailure(RuntimeError):
+        pass
+
+    class ProbeRows:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise ReaderFailure("stream failed")
+
+    class StubSheet:
+        height = 1
+        width = 1
+
+        def __init__(self):
+            refs["sheet"] = weakref.ref(self)
+
+        def iter_rows(self):
+            rows = ProbeRows()
+            refs["iterator"] = weakref.ref(rows)
+            return rows
+
+    class StubWorkbook:
+        sheet_names = ["S1"]
+
+        def __init__(self):
+            self.sheet = StubSheet()
+            refs["workbook"] = weakref.ref(self)
+
+        def get_sheet_by_name(self, name):
+            assert name == "S1"
+            return self.sheet
+
+    class StubCalamineWorkbook:
+        @staticmethod
+        def from_path(path):
+            return StubWorkbook()
+
+    def openpyxl_spy(path):
+        retained = sorted(name for name, ref in refs.items() if ref() is not None)
+        assert retained == []
+        return {"fallback": Sheet.from_rows([])}
+
+    monkeypatch.setattr(python_calamine, "CalamineWorkbook", StubCalamineWorkbook)
+    monkeypatch.setattr(audit, "_load_workbook_openpyxl", openpyxl_spy)
+
+    out = audit.load_workbook_rows("broken.xlsx")
+
+    assert list(out) == ["fallback"]
+
+
+@pytest.mark.parametrize("suffix", [".xls", ".xlsb"])
+def test_legacy_reader_exception_does_not_fallback_to_openpyxl(
+    monkeypatch, suffix
+):
+    import paperconan._audit as audit
+    import python_calamine
+
+    class ReaderFailure(RuntimeError):
+        pass
+
+    class StubCalamineWorkbook:
+        @staticmethod
+        def from_path(path):
+            raise ReaderFailure("legacy read failed")
+
+    def forbidden(path):
+        raise AssertionError("legacy reader errors must not use openpyxl")
+
+    monkeypatch.setattr(python_calamine, "CalamineWorkbook", StubCalamineWorkbook)
+    monkeypatch.setattr(audit, "_load_workbook_openpyxl", forbidden)
+
+    with pytest.raises(ReaderFailure, match="legacy read failed"):
+        audit.load_workbook_rows(f"broken{suffix}")
+
+
+@pytest.mark.parametrize("suffix", [".xls", ".xlsb"])
+def test_legacy_calamine_import_failure_does_not_fallback_to_openpyxl(
+    monkeypatch, suffix
+):
+    import builtins
+    import paperconan._audit as audit
+
+    original_import = builtins.__import__
+
+    def blocked_import(name, *args, **kwargs):
+        if name == "python_calamine":
+            raise ModuleNotFoundError("python_calamine unavailable")
+        return original_import(name, *args, **kwargs)
+
+    def forbidden(path):
+        raise AssertionError("legacy import errors must not use openpyxl")
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+    monkeypatch.setattr(audit, "_load_workbook_openpyxl", forbidden)
+
+    with pytest.raises(ModuleNotFoundError, match="python_calamine unavailable"):
+        audit.load_workbook_rows(f"broken{suffix}")

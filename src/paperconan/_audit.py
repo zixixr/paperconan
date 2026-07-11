@@ -315,6 +315,7 @@ def _fill_sheet_from_rows(rows_iter, mr, mc, loaded):
     declared = _dense_cells(mr, mc)
     if loaded >= _MAX_CELLS or loaded + declared > _MAX_CELLS:
         return None, declared
+    remaining = _MAX_CELLS - loaded
     numeric = np.full((mr, mc), np.nan, dtype=float) if (mr and mc) else np.empty((0, 0))
     text = {}
     ints = set()
@@ -328,12 +329,17 @@ def _fill_sheet_from_rows(rows_iter, mr, mc, loaded):
         cells = _dense_cells(projected_rows, projected_width)
         if loaded + cells > _MAX_CELLS:
             return None, cells
-        if r >= numeric.shape[0]:                # reader under-reported rows: grow by one
-            grow = np.full((1, numeric.shape[1]), np.nan)
-            numeric = np.vstack([numeric, grow]) if numeric.size or numeric.shape[1] else grow
-        if width > numeric.shape[1]:             # row wider than declared: grow columns
-            pad = np.full((numeric.shape[0], width - numeric.shape[1]), np.nan)
-            numeric = np.hstack([numeric, pad]) if numeric.shape[1] else pad
+        if projected_rows > numeric.shape[0] or projected_width > numeric.shape[1]:
+            target_rows = max(numeric.shape[0], projected_rows)
+            target_cols = max(numeric.shape[1], projected_width)
+            if _dense_cells(target_rows, target_cols) > remaining:
+                target_rows, target_cols = projected_rows, projected_width
+            if _dense_cells(target_rows, target_cols) > remaining:
+                return None, cells
+            resized = np.full((target_rows, target_cols), np.nan, dtype=float)
+            if r and max_w:
+                resized[:r, :max_w] = numeric[:r, :max_w]
+            numeric = resized
         for c, v in enumerate(row):
             if is_num(v):
                 if isinstance(v, int) and abs(v) > _MAX_EXACT_FLOAT_INT:
@@ -350,10 +356,8 @@ def _fill_sheet_from_rows(rows_iter, mr, mc, loaded):
     # Trim to the geometry Sheet.from_rows would produce: nrows == rows consumed,
     # ncols == max(len(row)). (numeric may be larger if the reader over-declared.)
     n_rows, n_cols = r, max_w
-    if n_rows and n_cols:
-        numeric = numeric[:n_rows, :n_cols]
-    else:
-        numeric = np.full((n_rows, n_cols), np.nan, dtype=float)
+    if numeric.shape != (n_rows, n_cols) or not numeric.flags.owndata:
+        numeric = numeric[:n_rows, :n_cols].copy()
     text = {(rr, cc): val for (rr, cc), val in text.items()
             if rr < n_rows and cc < n_cols}
     ints = {(rr, cc) for (rr, cc) in ints if rr < n_rows and cc < n_cols}
@@ -418,6 +422,7 @@ def _calamine_cell(v):
 
 
 _CALAMINE_OPENPYXL_FALLBACK = object()
+_CALAMINE_READER_ERROR = object()
 
 
 def _load_workbook_calamine_scoped(path):
@@ -475,18 +480,26 @@ def _load_workbook_calamine(path):
     return result
 
 
-def load_workbook_rows(path):
-    """Return dict of sheet_name -> Sheet. Uses python-calamine (a fast Rust xlsx
-    reader) when installed, falling back to the openpyxl reference path otherwise or
-    on any reader quirk. Both paths produce a byte-identical Sheet."""
-    try:
-        import python_calamine  # noqa: F401
-    except Exception:
-        return _load_workbook_openpyxl(path)
+def _try_load_workbook_calamine(path):
+    """Return a detached error signal after Calamine exception state unwinds."""
     try:
         return _load_workbook_calamine(path)
     except Exception:
-        return _load_workbook_openpyxl(path)  # any reader quirk → reference path
+        return _CALAMINE_READER_ERROR
+
+
+def load_workbook_rows(path):
+    """Return dict of sheet_name -> Sheet. Uses python-calamine (a fast Rust xlsx
+    reader) when installed. OOXML inputs fall back to the openpyxl reference path
+    after Calamine errors; legacy inputs remain on Calamine because openpyxl cannot
+    read them. Both successful paths produce a byte-identical Sheet."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in {".xlsx", ".xlsm"}:
+        return _load_workbook_calamine(path)
+    result = _try_load_workbook_calamine(path)
+    if result is _CALAMINE_READER_ERROR:
+        return _load_workbook_openpyxl(path)
+    return result
 
 
 def _coerce_cell(s):
