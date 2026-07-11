@@ -33,6 +33,7 @@ import re
 import sys
 import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from fractions import Fraction
 
 import openpyxl
@@ -3033,9 +3034,35 @@ _MAX_FINDINGS_PER_BLOCK = int(os.environ.get("PAPERCONAN_MAX_FINDINGS_PER_BLOCK"
 # Global backstop across all blocks: MAX_REPORT_BLOCKS × MAX_FINDINGS_PER_BLOCK could still be
 # large on a pathological corpus, so stop retaining findings once this many have been kept.
 _MAX_TOTAL_FINDINGS = int(os.environ.get("PAPERCONAN_MAX_TOTAL_FINDINGS", "5000"))
+# Directory-wide recurrence budgets. The vector budget preserves the historical
+# RecurringRowIndex default while giving scan orchestration a stable control point.
+_RECURRING_ROW_VECTOR_BUDGET = 3_000_000
+_RECURRING_ROW_VECTOR_MAX_FINDINGS = 20
 
 # Severity rank for deterministic, highest-first truncation when a block is over budget.
 _SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2}
+
+
+@dataclass
+class ScanBudgetState:
+    coverage: ScanCoverage
+    recurring_index: RecurringRowIndex
+    profile: str
+    evidence: bool
+    findings_kept: int = 0
+    findings_omitted: int = 0
+    report_blocks_kept: int = 0
+
+
+@dataclass
+class FileScanResult:
+    report_blocks: list[dict]
+    digit_reports: list[dict]
+    decimal_reports: list[dict]
+    summaries: list[CrossSheetSummary]
+    within_sheet_findings: list[dict]
+    stats: dict
+    errors: list[dict]
 
 
 def _cap_block_findings(groups, cap):
@@ -3065,11 +3092,407 @@ def _cap_block_findings(groups, cap):
     return omitted
 
 
+def _process_file(path, *, input_dir, state) -> FileScanResult:
+    report_blocks = []
+    digit_reports = []
+    decimal_reports = []
+    summaries = []
+    within_sheet_findings = []
+    errors = []
+    sheet_stats = []
+    file_start = time.perf_counter()
+    file_name = os.path.basename(path)
+    file_stat = {"file": file_name, "path": path}
+
+    try:
+        fsize = os.path.getsize(path)
+    except OSError:
+        fsize = 0
+    if fsize > _MAX_FILE_BYTES:
+        msg = (f"oversized: {fsize / 1048576:.1f}MB exceeds {_MAX_FILE_MB:.0f}MB cap "
+               f"(set PAPERCONAN_MAX_FILE_MB to raise) — skipped to bound memory")
+        print(f"  skipping {file_name}: {msg}", file=sys.stderr)
+        errors.append({"file": file_name, "error": msg})
+        state.coverage.mark_file_failed(
+            file_name, "file_size_limit", max_bytes=_MAX_FILE_BYTES
+        )
+        file_stat["error"] = msg
+        file_stat["oversized"] = True
+        file_stat["elapsed_ms"] = round(
+            (time.perf_counter() - file_start) * 1000, 3
+        )
+        return FileScanResult(
+            report_blocks=report_blocks,
+            digit_reports=digit_reports,
+            decimal_reports=decimal_reports,
+            summaries=summaries,
+            within_sheet_findings=within_sheet_findings,
+            stats={"files": [file_stat], "sheets": sheet_stats},
+            errors=errors,
+        )
+
+    try:
+        load_result = load_table_result(path)
+    except Exception as exc:
+        print(f"  failed to read {file_name}: {exc}", file=sys.stderr)
+        errors.append({"file": file_name, "error": str(exc)})
+        state.coverage.mark_file_failed(file_name, "parse_error")
+        file_stat["error"] = str(exc)
+        file_stat["elapsed_ms"] = round(
+            (time.perf_counter() - file_start) * 1000, 3
+        )
+        return FileScanResult(
+            report_blocks=report_blocks,
+            digit_reports=digit_reports,
+            decimal_reports=decimal_reports,
+            summaries=summaries,
+            within_sheet_findings=within_sheet_findings,
+            stats={"files": [file_stat], "sheets": sheet_stats},
+            errors=errors,
+        )
+
+    state.coverage.mark_file_succeeded()
+    sheets = load_result.sheets
+    deferred_cell_limits = {}
+    for limitation in load_result.limitations:
+        details = limitation.to_dict()
+        scope = details.pop("scope")
+        reason = details.pop("reason")
+        details.pop("file", None)
+        sheet_name = details.get("sheet")
+        if (
+            scope == "sheet"
+            and reason == "cell_limit"
+            and sheet_name in sheets
+            and sheets[sheet_name] is None
+        ):
+            deferred_cell_limits.setdefault(
+                sheet_name,
+                {
+                    key: value
+                    for key, value in details.items()
+                    if key != "sheet"
+                },
+            )
+            continue
+        state.coverage.add_limitation(
+            scope,
+            reason,
+            file=file_name,
+            **details,
+        )
+    file_stat["n_sheets"] = len(sheets)
+    file_stat["elapsed_ms"] = round(
+        (time.perf_counter() - file_start) * 1000, 3
+    )
+
+    for sheet_name, loaded_sheet in sheets.items():
+        sheet_start = time.perf_counter()
+        if loaded_sheet is None:
+            msg = (f"oversized sheet exceeds {_MAX_CELLS} cells "
+                   f"(set PAPERCONAN_MAX_CELLS to raise) — skipped to bound memory")
+            errors.append({
+                "file": file_name,
+                "sheet": sheet_name,
+                "error": msg,
+            })
+            limitation_details = deferred_cell_limits.pop(sheet_name, None)
+            state.coverage.mark_sheet_skipped(
+                file_name,
+                sheet_name,
+                "cell_limit",
+                **(
+                    limitation_details
+                    if limitation_details is not None
+                    else {"max_cells": _MAX_CELLS}
+                ),
+            )
+            sheet_stats.append({
+                "file": file_name,
+                "sheet": sheet_name,
+                "oversized": True,
+                "elapsed_ms": round(
+                    (time.perf_counter() - sheet_start) * 1000, 3
+                ),
+            })
+            continue
+
+        state.coverage.mark_sheet_succeeded()
+        sheet = (
+            loaded_sheet
+            if isinstance(loaded_sheet, Sheet)
+            else Sheet.from_rows(loaded_sheet)
+        )
+        blocks = find_numeric_blocks(sheet)
+
+        for block_index, (r0, r1, c0, c1) in enumerate(blocks):
+            if state.report_blocks_kept >= _MAX_REPORT_BLOCKS:
+                state.coverage.mark_blocks_skipped(
+                    len(blocks) - block_index,
+                    scope="sheet",
+                    reason="report_block_limit",
+                    file=file_name,
+                    sheet=sheet_name,
+                )
+                break
+            if (
+                _MAX_TOTAL_FINDINGS > 0
+                and state.findings_kept >= _MAX_TOTAL_FINDINGS
+            ):
+                state.coverage.mark_blocks_skipped(
+                    len(blocks) - block_index,
+                    scope="sheet",
+                    reason="finding_limit",
+                    file=file_name,
+                    sheet=sheet_name,
+                )
+                break
+            state.coverage.mark_block_analyzed()
+            header = header_for(sheet, r0, c0, c1)
+            wide = _MAX_BLOCK_COLS and (c1 - c0) > _MAX_BLOCK_COLS
+            if wide:
+                state.coverage.add_limitation(
+                    "block",
+                    "wide_block_detector_limit",
+                    file=file_name,
+                    sheet=sheet_name,
+                    rows=f"{r0 + 1}-{r1}",
+                    cols=f"{c0 + 1}-{c1}",
+                    detectors=["relations", "equal_pairs", "row_pairs"],
+                    max_cols=_MAX_BLOCK_COLS,
+                )
+            row_pair_dimension_limited = (
+                not wide
+                and (
+                    (r1 - r0) > _ROW_PAIR_MAX_ROWS
+                    or (c1 - c0) > _ROW_PAIR_MAX_COLS
+                )
+            )
+            if row_pair_dimension_limited:
+                state.coverage.add_limitation(
+                    "block",
+                    "row_pair_dimension_limit",
+                    file=file_name,
+                    sheet=sheet_name,
+                    rows=r1 - r0,
+                    cols=c1 - c0,
+                    max_rows=_ROW_PAIR_MAX_ROWS,
+                    max_cols=_ROW_PAIR_MAX_COLS,
+                )
+            rel = [] if wide else detect_relations(
+                sheet, r0, r1, c0, c1, header
+            )
+            ap = detect_arithmetic_progression(
+                sheet, r0, r1, c0, c1, header
+            )
+            eq = [] if wide else detect_equal_pairs(
+                sheet, r0, r1, c0, c1, header
+            )
+            row_pair_meta = {"findings_omitted": 0}
+            if wide or row_pair_dimension_limited:
+                rp = []
+            else:
+                row_pair_result = detect_row_pair_digit_coupling(
+                    sheet,
+                    r0,
+                    r1,
+                    c0,
+                    c1,
+                    header,
+                    with_coverage=True,
+                )
+                if isinstance(row_pair_result, tuple):
+                    rp, row_pair_meta = row_pair_result
+                else:
+                    rp = row_pair_result
+            if row_pair_meta["findings_omitted"] > 0:
+                state.coverage.add_limitation(
+                    "block",
+                    "row_pair_finding_limit",
+                    file=file_name,
+                    sheet=sheet_name,
+                    rows=f"{r0 + 1}-{r1}",
+                    cols=f"{c0 + 1}-{c1}",
+                    limit=_ROW_PAIR_MAX_FINDINGS_PER_BLOCK,
+                    omitted_findings=row_pair_meta["findings_omitted"],
+                )
+            wc = detect_within_column_patterns(
+                sheet, r0, r1, c0, c1, header
+            )
+            wc += detect_dispersed_repeats(
+                sheet, r0, r1, c0, c1, header
+            )
+            iar = detect_identical_after_rounding(
+                sheet, r0, r1, c0, c1, header
+            )
+            gg = detect_grim_grimmer(
+                sheet, r0, r1, c0, c1, header
+            )
+            if not (rel or ap or eq or rp or wc or iar or gg):
+                continue
+
+            sheet_context = " ".join([
+                file_name,
+                sheet_name,
+                *[str(value) for value in header],
+            ])
+            groups = {
+                "relations": rel,
+                "progressions": ap,
+                "equal_pairs": eq,
+                "row_pairs": rp,
+                "within_col": wc,
+                "identical_after_rounding": iar,
+                "grim": gg,
+            }
+            per_block = (
+                _MAX_FINDINGS_PER_BLOCK
+                if _MAX_FINDINGS_PER_BLOCK > 0
+                else None
+            )
+            if _MAX_TOTAL_FINDINGS > 0:
+                remaining = max(
+                    0, _MAX_TOTAL_FINDINGS - state.findings_kept
+                )
+                block_cap = (
+                    remaining
+                    if per_block is None
+                    else min(per_block, remaining)
+                )
+            else:
+                block_cap = per_block
+            omitted = _cap_block_findings(groups, block_cap)
+            state.findings_omitted += omitted
+            if omitted:
+                state.coverage.add_limitation(
+                    "block",
+                    "finding_limit",
+                    file=file_name,
+                    sheet=sheet_name,
+                    rows=f"{r0 + 1}-{r1}",
+                    cols=f"{c0 + 1}-{c1}",
+                    omitted_findings=omitted,
+                    limit=block_cap,
+                )
+            state.findings_kept += sum(
+                len(group) for group in groups.values()
+            )
+            for group in groups.values():
+                if state.evidence:
+                    _attach_evidence(
+                        group, sheet, r0, r1, c0, c1, header
+                    )
+                _attach_benign(group)
+                apply_profile_to_findings(
+                    group,
+                    state.profile,
+                    sheet_context=sheet_context,
+                )
+            report_blocks.append({
+                "file": file_name,
+                "sheet": sheet_name,
+                "block": {
+                    "rows": f"{r0 + 1}-{r1}",
+                    "cols": f"{c0 + 1}-{c1}",
+                    "header": header,
+                },
+                "relations": groups["relations"],
+                "progressions": groups["progressions"],
+                "equal_pairs": groups["equal_pairs"],
+                "row_pairs": groups["row_pairs"],
+                "within_col": groups["within_col"],
+                "identical_after_rounding": groups[
+                    "identical_after_rounding"
+                ],
+                "grim": groups["grim"],
+                "findings_omitted": omitted,
+            })
+            state.report_blocks_kept += 1
+
+        within_sheet_findings.extend(
+            detect_within_sheet_fraction_reuse(
+                {(file_name, sheet_name): sheet},
+                profile=state.profile,
+            )
+        )
+
+        sheet_numbers = sheet.numeric_values()
+        label = f"{file_name}::{sheet_name}"
+        digit_report = detect_last_digit(sheet_numbers, label=label)
+        if digit_report:
+            digit_reports.append(digit_report)
+        decimal_report = detect_repeated_decimals(
+            sheet_numbers, label=label
+        )
+        if decimal_report:
+            decimal_reports.append(decimal_report)
+
+        recurring_meta = state.recurring_index.add_sheet(
+            file_name,
+            sheet_name,
+            sheet,
+            blocks=blocks,
+            figure_id=figure_key(sheet_name),
+        )
+        if recurring_meta["windows_skipped"] > 0:
+            state.coverage.add_limitation(
+                "sheet",
+                "recurring_row_vector_budget",
+                file=file_name,
+                sheet=sheet_name,
+                windows_skipped=recurring_meta["windows_skipped"],
+                limit=_RECURRING_ROW_VECTOR_BUDGET,
+            )
+
+        summary, summary_limitations = build_cross_sheet_summary(
+            file_name,
+            sheet_name,
+            sheet,
+            blocks=blocks,
+        )
+        summaries.append(summary)
+        for limitation in summary_limitations:
+            reason = (
+                "collision_grid_cell_limit"
+                if limitation.reason == "collision_cell_limit"
+                else limitation.reason
+            )
+            state.coverage.add_limitation(
+                limitation.scope,
+                reason,
+                file=file_name,
+                sheet=limitation.sheet,
+                **limitation.details,
+            )
+
+        sheet_stats.append({
+            "file": file_name,
+            "sheet": sheet_name,
+            "n_rows": sheet.nrows,
+            "n_cols": sheet.ncols,
+            "numeric_cells": len(sheet_numbers),
+            "n_blocks": len(blocks),
+            "elapsed_ms": round(
+                (time.perf_counter() - sheet_start) * 1000, 3
+            ),
+        })
+        del sheet_numbers
+
+    return FileScanResult(
+        report_blocks=report_blocks,
+        digit_reports=digit_reports,
+        decimal_reports=decimal_reports,
+        summaries=summaries,
+        within_sheet_findings=within_sheet_findings,
+        stats={"files": [file_stat], "sheets": sheet_stats},
+        errors=errors,
+    )
+
+
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
              profile="review", write_json=True, evidence=True,
              diagnostic_on_empty=False):
     profile = normalize_profile(profile)
-    # The HTML report renders the evidence snippets, so it requires them.
     if write_html:
         evidence = True
     files = sorted({p for pat in ("*.xlsx", "*.xls", "*.xlsm", "*.xlsb",
@@ -3083,336 +3506,90 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         )
 
     coverage = ScanCoverage(files_discovered=len(files))
+    state = ScanBudgetState(
+        coverage=coverage,
+        recurring_index=RecurringRowIndex(
+            budget=_RECURRING_ROW_VECTOR_BUDGET
+        ),
+        profile=profile,
+        evidence=evidence,
+    )
     report_blocks = []
-    findings_omitted_total = 0   # findings dropped by the per-block / global finding caps
-    findings_kept_total = 0      # findings retained across all blocks (for the global backstop)
-    per_sheet_numbers = {}
-    grids = {}  # (file, sheet) -> decimal grid, for the unified collision pass
-    cross_sheet_summaries = []
-    recurring_rows = RecurringRowIndex()
+    digit_reports = []
+    decimal_reports = []
+    summaries = []
     within_sheet_fraction_findings = []
     scan_errors = []
     scan_stats = {"files": [], "sheets": []}
     scan_start = time.perf_counter()
 
-    for f in files:
-        file_start = time.perf_counter()
-        file_stat = {"file": os.path.basename(f), "path": f}
-        # Memory guard: a large workbook expands to many GB of Python objects when fully
-        # loaded, so cap file size BEFORE loading. Oversized files are recorded (never
-        # silently treated as clean) and skipped. Raise PAPERCONAN_MAX_FILE_MB on big-RAM hosts.
-        try:
-            fsize = os.path.getsize(f)
-        except OSError:
-            fsize = 0
-        if fsize > _MAX_FILE_BYTES:
-            msg = (f"oversized: {fsize / 1048576:.1f}MB exceeds {_MAX_FILE_MB:.0f}MB cap "
-                   f"(set PAPERCONAN_MAX_FILE_MB to raise) — skipped to bound memory")
-            print(f"  skipping {os.path.basename(f)}: {msg}", file=sys.stderr)
-            scan_errors.append({"file": os.path.basename(f), "error": msg})
-            coverage.mark_file_failed(
-                os.path.basename(f), "file_size_limit", max_bytes=_MAX_FILE_BYTES
-            )
-            file_stat["error"] = msg
-            file_stat["oversized"] = True
-            file_stat["elapsed_ms"] = round((time.perf_counter() - file_start) * 1000, 3)
-            scan_stats["files"].append(file_stat)
-            continue
-        try:
-            load_result = load_table_result(f)
-        except Exception as e:
-            print(f"  failed to read {os.path.basename(f)}: {e}", file=sys.stderr)
-            scan_errors.append({"file": os.path.basename(f), "error": str(e)})
-            coverage.mark_file_failed(os.path.basename(f), "parse_error")
-            file_stat["error"] = str(e)
-            file_stat["elapsed_ms"] = round((time.perf_counter() - file_start) * 1000, 3)
-            scan_stats["files"].append(file_stat)
-            continue
-        coverage.mark_file_succeeded()
-        sheets = load_result.sheets
-        deferred_cell_limits = {}
-        for limitation in load_result.limitations:
-            details = limitation.to_dict()
-            scope = details.pop("scope")
-            reason = details.pop("reason")
-            details.pop("file", None)
-            sheet = details.get("sheet")
-            if (
-                scope == "sheet"
-                and reason == "cell_limit"
-                and sheet in sheets
-                and sheets[sheet] is None
-            ):
-                deferred_cell_limits.setdefault(
-                    sheet,
-                    {
-                        key: value
-                        for key, value in details.items()
-                        if key != "sheet"
-                    },
-                )
-                continue
-            coverage.add_limitation(
-                scope,
-                reason,
-                file=os.path.basename(f),
-                **details,
-            )
-        file_stat["n_sheets"] = len(sheets)
-        file_stat["elapsed_ms"] = round((time.perf_counter() - file_start) * 1000, 3)
-        scan_stats["files"].append(file_stat)
-        for sn, rows in sheets.items():
-            sheet_start = time.perf_counter()
-            if rows is None:        # oversized sheet (>_MAX_CELLS): recorded, never audited
-                msg = (f"oversized sheet exceeds {_MAX_CELLS} cells "
-                       f"(set PAPERCONAN_MAX_CELLS to raise) — skipped to bound memory")
-                scan_errors.append({"file": os.path.basename(f), "sheet": sn, "error": msg})
-                limitation_details = deferred_cell_limits.pop(sn, None)
-                coverage.mark_sheet_skipped(
-                    os.path.basename(f),
-                    sn,
-                    "cell_limit",
-                    **(
-                        limitation_details
-                        if limitation_details is not None
-                        else {"max_cells": _MAX_CELLS}
-                    ),
-                )
-                scan_stats["sheets"].append({
-                    "file": os.path.basename(f), "sheet": sn, "oversized": True,
-                    "elapsed_ms": round((time.perf_counter() - sheet_start) * 1000, 3)})
-                continue
-            coverage.mark_sheet_succeeded()
-            sheet = rows if isinstance(rows, Sheet) else Sheet.from_rows(rows)
-            file_name = os.path.basename(f)
-            blocks = find_numeric_blocks(sheet)
-            summary, summary_limitations = build_cross_sheet_summary(
-                file_name,
-                sn,
-                sheet,
-                blocks=blocks,
-            )
-            cross_sheet_summaries.append(summary)
-            grids[(file_name, sn)] = summary.grid
-            for limitation in summary_limitations:
-                coverage.add_limitation(
-                    limitation.scope,
-                    limitation.reason,
-                    file=file_name,
-                    sheet=limitation.sheet,
-                    **limitation.details,
-                )
-            recurring_rows.add_sheet(
-                file_name,
-                sn,
-                sheet,
-                blocks=blocks,
-                figure_id=figure_key(sn),
-            )
-            within_sheet_fraction_findings.extend(
-                detect_within_sheet_fraction_reuse(
-                    {(file_name, sn): sheet},
-                    profile=profile,
-                )
-            )
-            sheet_nums = sheet.numeric_values()
-            per_sheet_numbers[(file_name, sn)] = sheet_nums
-            max_cols = sheet.ncols
-            scan_stats["sheets"].append({
-                "file": file_name,
-                "sheet": sn,
-                "n_rows": sheet.nrows,
-                "n_cols": max_cols,
-                "numeric_cells": len(sheet_nums),
-                "n_blocks": len(blocks),
-                "elapsed_ms": round((time.perf_counter() - sheet_start) * 1000, 3),
-            })
-            for block_index, (r0, r1, c0, c1) in enumerate(blocks):
-                if len(report_blocks) >= _MAX_REPORT_BLOCKS:   # output budget reached; stop collecting
-                    coverage.mark_blocks_skipped(
-                        len(blocks) - block_index,
-                        scope="sheet",
-                        reason="report_block_limit",
-                        file=os.path.basename(f),
-                        sheet=sn,
-                    )
-                    break
-                if _MAX_TOTAL_FINDINGS > 0 and findings_kept_total >= _MAX_TOTAL_FINDINGS:
-                    coverage.mark_blocks_skipped(
-                        len(blocks) - block_index,
-                        scope="sheet",
-                        reason="finding_limit",
-                        file=os.path.basename(f),
-                        sheet=sn,
-                    )
-                    break   # global finding budget spent; stop collecting (subsequent sheets short-circuit here too)
-                coverage.mark_block_analyzed()
-                header = header_for(sheet, r0, c0, c1)
-                # On very wide blocks (dense correlation matrices), skip the relation and
-                # equal-pair O(col²) paths plus row-pair coupling; the column-wise detectors
-                # below still run. (_MAX_BLOCK_COLS=0 disables the skip.)
-                wide = _MAX_BLOCK_COLS and (c1 - c0) > _MAX_BLOCK_COLS
-                if wide:
-                    coverage.add_limitation(
-                        "block",
-                        "wide_block_detector_limit",
-                        file=os.path.basename(f),
-                        sheet=sn,
-                        rows=f"{r0 + 1}-{r1}",
-                        cols=f"{c0 + 1}-{c1}",
-                        detectors=["relations", "equal_pairs", "row_pairs"],
-                        max_cols=_MAX_BLOCK_COLS,
-                    )
-                row_pair_dimension_limited = (
-                    not wide
-                    and (
-                        (r1 - r0) > _ROW_PAIR_MAX_ROWS
-                        or (c1 - c0) > _ROW_PAIR_MAX_COLS
-                    )
-                )
-                if row_pair_dimension_limited:
-                    coverage.add_limitation(
-                        "block",
-                        "row_pair_dimension_limit",
-                        file=os.path.basename(f),
-                        sheet=sn,
-                        rows=r1 - r0,
-                        cols=c1 - c0,
-                        max_rows=_ROW_PAIR_MAX_ROWS,
-                        max_cols=_ROW_PAIR_MAX_COLS,
-                    )
-                rel = [] if wide else detect_relations(sheet, r0, r1, c0, c1, header)
-                ap = detect_arithmetic_progression(sheet, r0, r1, c0, c1, header)
-                eq = [] if wide else detect_equal_pairs(sheet, r0, r1, c0, c1, header)
-                row_pair_meta = {"findings_omitted": 0}
-                if wide or row_pair_dimension_limited:
-                    rp = []
-                else:
-                    row_pair_result = detect_row_pair_digit_coupling(
-                        sheet, r0, r1, c0, c1, header, with_coverage=True
-                    )
-                    if isinstance(row_pair_result, tuple):
-                        rp, row_pair_meta = row_pair_result
-                    else:
-                        rp = row_pair_result
-                if row_pair_meta["findings_omitted"] > 0:
-                    coverage.add_limitation(
-                        "block",
-                        "row_pair_finding_limit",
-                        file=os.path.basename(f),
-                        sheet=sn,
-                        rows=f"{r0 + 1}-{r1}",
-                        cols=f"{c0 + 1}-{c1}",
-                        limit=_ROW_PAIR_MAX_FINDINGS_PER_BLOCK,
-                        omitted_findings=row_pair_meta["findings_omitted"],
-                    )
-                wc = detect_within_column_patterns(sheet, r0, r1, c0, c1, header)
-                wc = wc + detect_dispersed_repeats(sheet, r0, r1, c0, c1, header)
-                iar = detect_identical_after_rounding(sheet, r0, r1, c0, c1, header)
-                gg = detect_grim_grimmer(sheet, r0, r1, c0, c1, header)
-                if rel or ap or eq or rp or wc or iar or gg:
-                    sheet_context = " ".join([os.path.basename(f), sn, *[str(h) for h in header]])
-                    # Bound this block's finding count BEFORE attaching evidence, so trimmed
-                    # findings never pay the (large) embedded-snippet cost. The per-block cap is
-                    # further clamped by the remaining global budget; keep highest severity first.
-                    # NOTE: this precedes the count-based demotion passes below
-                    # (_demote_reused_progressions / _demote_dense_relations / _demote_within_col_flood),
-                    # which judge floods by cross-block counts. Trimming can lower those counts, so a
-                    # benign finding may keep an elevated severity that demotion would have lowered —
-                    # an over-report only (never drops a review-relevant high; keeping highest-severity first
-                    # protects exactly the findings demotion targets). Capping after demotion would
-                    # require attaching evidence to every finding first, re-introducing the GH#15 OOM.
-                    groups = {"relations": rel, "progressions": ap, "equal_pairs": eq,
-                              "row_pairs": rp, "within_col": wc,
-                              "identical_after_rounding": iar, "grim": gg}
-                    # Effective cap = the tighter of the per-block limit and the remaining global
-                    # budget; None means unlimited (both caps disabled). A spent global budget
-                    # yields 0, which drops the whole block (recorded via `omitted`).
-                    per_block = _MAX_FINDINGS_PER_BLOCK if _MAX_FINDINGS_PER_BLOCK > 0 else None
-                    if _MAX_TOTAL_FINDINGS > 0:
-                        remaining = max(0, _MAX_TOTAL_FINDINGS - findings_kept_total)
-                        block_cap = remaining if per_block is None else min(per_block, remaining)
-                    else:
-                        block_cap = per_block
-                    omitted = _cap_block_findings(groups, block_cap)
-                    findings_omitted_total += omitted
-                    if omitted:
-                        coverage.add_limitation(
-                            "block",
-                            "finding_limit",
-                            file=os.path.basename(f),
-                            sheet=sn,
-                            rows=f"{r0 + 1}-{r1}",
-                            cols=f"{c0 + 1}-{c1}",
-                            omitted_findings=omitted,
-                            limit=block_cap,
-                        )
-                    findings_kept_total += sum(len(v) for v in groups.values())
-                    for group in groups.values():
-                        if evidence:
-                            _attach_evidence(group, sheet, r0, r1, c0, c1, header)
-                        _attach_benign(group)
-                        apply_profile_to_findings(group, profile,
-                                                  sheet_context=sheet_context)
-                    report_blocks.append(dict(file=os.path.basename(f), sheet=sn,
-                                              block=dict(rows=f"{r0+1}-{r1}", cols=f"{c0+1}-{c1}", header=header),
-                                              relations=groups["relations"], progressions=groups["progressions"],
-                                              equal_pairs=groups["equal_pairs"],
-                                              row_pairs=groups["row_pairs"],
-                                              within_col=groups["within_col"],
-                                              identical_after_rounding=groups["identical_after_rounding"],
-                                              grim=groups["grim"],
-                                              findings_omitted=omitted))
+    for path in files:
+        result = _process_file(path, input_dir=in_dir, state=state)
+        report_blocks.extend(result.report_blocks)
+        digit_reports.extend(result.digit_reports)
+        decimal_reports.extend(result.decimal_reports)
+        summaries.extend(result.summaries)
+        within_sheet_fraction_findings.extend(
+            result.within_sheet_findings
+        )
+        scan_errors.extend(result.errors)
+        scan_stats["files"].extend(result.stats["files"])
+        scan_stats["sheets"].extend(result.stats["sheets"])
+        del result
 
-    # Down-weight dense/correlated sheets: judged by per-sheet relation totals, so a
-    # wide matrix's expected identical/linear columns don't flood high-severity output.
     _demote_dense_sheets(report_blocks, profile=profile)
     _demote_reused_progressions(report_blocks, profile=profile)
 
-    # Unified collision pass: every (file, sheet) grid against every other —
-    # covers both intra-workbook sheet pairs and cross-file duplicates.
+    grids = {
+        (summary.file, summary.sheet): summary.grid
+        for summary in summaries
+    }
     label_contexts = {
         (summary.file, summary.sheet): summary.labels
-        for summary in cross_sheet_summaries
+        for summary in summaries
     }
     cross_sheet_findings = detect_collisions(
         grids,
         profile=profile,
         sheets=label_contexts,
     )
-    # B1: full-column duplication across panels, incl. the integer / 1-decimal columns the
-    # >=3-decimal collision grids miss.
     cross_sheet_findings += detect_cross_sheet_column_duplicates(
-        cross_sheet_summaries,
+        summaries,
         profile=profile,
     )
-    # B3: matrix-to-matrix decimal-fraction reuse between two blocks of the same sheet.
     cross_sheet_findings += within_sheet_fraction_findings
-    # B2: a fixed high-information row-vector recurring across >=2 figures.
-    recurring_findings, _recurring_meta = recurring_rows.findings(profile=profile)
+    recurring_findings, recurring_meta = state.recurring_index.findings(
+        profile=profile,
+        max_findings=_RECURRING_ROW_VECTOR_MAX_FINDINGS,
+    )
+    recurring_omitted = recurring_meta["findings_omitted"]
+    if recurring_omitted > 0:
+        coverage.add_limitation(
+            "scan",
+            "recurring_row_vector_finding_limit",
+            limit=_RECURRING_ROW_VECTOR_MAX_FINDINGS,
+            omitted_findings=recurring_omitted,
+        )
+        state.findings_omitted += recurring_omitted
     cross_sheet_findings += recurring_findings
     _attach_benign(cross_sheet_findings)
 
-    digit_reports, decimal_reports = [], []
-    for key, nums in per_sheet_numbers.items():
-        d = detect_last_digit(nums, label=f"{key[0]}::{key[1]}")
-        if d:
-            digit_reports.append(d)
-        dec = detect_repeated_decimals(nums, label=f"{key[0]}::{key[1]}")
-        if dec:
-            decimal_reports.append(dec)
-
-    # Multiple-testing control: dozens of per-sheet χ² tests run at once, so a raw
-    # p-threshold over-reports. Attach a BH-adjusted q-value + significance flag.
     if digit_reports:
         adj, sig = benjamini_hochberg([d["p"] for d in digit_reports], alpha=0.05)
         for d, a, s in zip(digit_reports, adj, sig):
             d["p_adj"] = a
             d["fdr_significant"] = bool(s)
 
+    coverage_output = coverage.to_dict()
+    if any(
+        item.get("reason") == "recurring_row_vector_budget"
+        for item in coverage_output["limitations"]
+    ):
+        coverage_output["truncated"] = True
+
     out = dict(schema_version=2,
                scan_status=coverage.status,
-               coverage=coverage.to_dict(),
+               coverage=coverage_output,
                tool="paperconan",
                tool_version=_version(),
                scanned_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
@@ -3421,7 +3598,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                paper=_load_provenance(in_dir, paper),
                n_files=len(files),
                n_blocks_with_findings=len(report_blocks),
-               findings_omitted=findings_omitted_total,
+               findings_omitted=state.findings_omitted,
                scan_errors=scan_errors,
                scan_stats={**scan_stats,
                            "elapsed_ms": round((time.perf_counter() - scan_start) * 1000, 3)},

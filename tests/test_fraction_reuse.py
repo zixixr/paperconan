@@ -4,7 +4,10 @@ while integer parts differ by whole numbers (e.g. two dose-response matrices whe
 cell was shifted by an integer). Includes a brute-force oracle."""
 from __future__ import annotations
 
+import paperconan._audit as audit
+from paperconan._coverage import ScanCoverage
 from paperconan._audit import Sheet, detect_within_sheet_fraction_reuse
+from paperconan._summaries import RecurringRowIndex
 
 
 def _sheet(rows):
@@ -162,3 +165,47 @@ def test_b3_no_flag_on_quarter_offsets_at_large_fraction_resolving_baseline():
 
     assert not any(f["kind"] == "within_table_fraction_reuse"
                    for f in findings)
+
+
+def test_process_file_runs_fraction_reuse_while_sheet_is_live(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    path = data / "source.csv"
+    path.write_text("a\n1.125\n2.375\n3.625\n", encoding="utf-8")
+    marker = {
+        "kind": "within_table_fraction_reuse",
+        "file": "source.csv",
+        "sheet": "source",
+        "severity": "high",
+    }
+    seen = []
+
+    def capture(sheets, profile="review", min_cells=10):
+        assert profile == "review"
+        assert min_cells == 10
+        assert list(sheets) == [("source.csv", "source")]
+        sheet = sheets[("source.csv", "source")]
+        assert isinstance(sheet, Sheet)
+        seen.append(sheet.numeric.shape)
+        return [marker]
+
+    monkeypatch.setattr(
+        audit, "detect_within_sheet_fraction_reuse", capture
+    )
+    state = audit.ScanBudgetState(
+        coverage=ScanCoverage(files_discovered=1),
+        recurring_index=RecurringRowIndex(),
+        profile="review",
+        evidence=False,
+    )
+
+    result = audit._process_file(
+        str(path),
+        input_dir=str(data),
+        state=state,
+    )
+
+    assert seen == [(4, 1)]
+    assert result.within_sheet_findings == [marker]

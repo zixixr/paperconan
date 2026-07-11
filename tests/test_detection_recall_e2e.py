@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import collections
 
+import paperconan._audit as audit
 from paperconan._audit import scan_dir, BLOCK_FINDING_GROUPS
 from paperconan.packet import distill_findings_for_review
 from tests import build_nbs1_regression as B
@@ -78,3 +79,23 @@ def test_distill_surfaces_new_high_kinds_but_not_axis(tmp_path):
         f.get("kind") for f in dist
         if f.get("prefilter") != "drop" and f.get("rule", "").find("week") >= 0
     }
+
+
+def test_file_scoped_pipeline_preserves_detection_recall(
+    tmp_path, monkeypatch
+):
+    calls = []
+    original = audit._process_file
+
+    def tracked(path, *, input_dir, state):
+        result = original(path, input_dir=input_dir, state=state)
+        calls.append((path, result))
+        return result
+
+    monkeypatch.setattr(audit, "_process_file", tracked)
+
+    scan = _scan(tmp_path)
+
+    assert len(calls) == scan["n_files"]
+    kinds = _high_kinds(scan)
+    assert _TARGETS <= set(kinds)

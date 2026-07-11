@@ -4,6 +4,7 @@ multiple-testing control over-reports; BH gives each sheet a q-value instead.
 """
 from __future__ import annotations
 
+import paperconan._audit as audit
 from paperconan._audit import benjamini_hochberg, scan_dir
 
 
@@ -50,3 +51,36 @@ def test_scan_attaches_fdr_fields_to_digit_distribution(tmp_path):
         assert "p_adj" in d, "every digit report should carry a BH-adjusted q-value"
         assert "fdr_significant" in d
         assert d["p_adj"] >= d["p"] - 1e-12
+
+
+def test_scan_keeps_fdr_directory_wide_across_file_results(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "d"
+    data.mkdir()
+    (data / "a.csv").write_text("x\n1.1\n2.2\n3.3\n", encoding="utf-8")
+    (data / "b.csv").write_text("x\n4.4\n5.5\n6.6\n", encoding="utf-8")
+    raw_pvalues = {
+        "a.csv::a": 0.01,
+        "b.csv::b": 0.04,
+    }
+
+    def digit_report(_values, label):
+        return {"label": label, "p": raw_pvalues[label]}
+
+    monkeypatch.setattr(audit, "detect_last_digit", digit_report)
+    monkeypatch.setattr(
+        audit,
+        "detect_repeated_decimals",
+        lambda _values, label: None,
+    )
+
+    scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+
+    reports = scan["digit_distribution"]
+    expected_adj, expected_sig = benjamini_hochberg(
+        [raw_pvalues[report["label"]] for report in reports],
+        alpha=0.05,
+    )
+    assert [report["p_adj"] for report in reports] == expected_adj
+    assert [report["fdr_significant"] for report in reports] == expected_sig
