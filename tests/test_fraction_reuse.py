@@ -145,3 +145,20 @@ def test_b3_no_flag_when_high_baseline_differences_are_not_integers():
     )
     assert not any(f["kind"] == "within_table_fraction_reuse"
                    for f in findings)
+
+
+def test_b3_no_flag_on_quarter_offsets_at_large_fraction_resolving_baseline():
+    fractions = [0.125, 0.234375, 0.34375, 0.453125, 0.5625]
+    offsets = [1.25, 2.25, 3.25]
+    a = [[100_000_000_000_000 + r * 10 + c
+          + fractions[(r + c) % len(fractions)]
+          for c in range(5)] for r in range(5)]
+    b = [[v + offsets[(r + c) % len(offsets)] for c, v in enumerate(row)]
+         for r, row in enumerate(a)]
+
+    findings = detect_within_sheet_fraction_reuse(
+        _grid_sheets_two_blocks(a, b)
+    )
+
+    assert not any(f["kind"] == "within_table_fraction_reuse"
+                   for f in findings)

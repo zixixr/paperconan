@@ -248,13 +248,18 @@ def integer_shift_close(left, right, *, ulps=16):
     right = np.asarray(right, dtype=float)
     diff = right - left
     nearest = np.rint(diff)
-    arithmetic_noise = (
-        ulp_tolerance(left, left, ulps=ulps)
-        + ulp_tolerance(right, right, ulps=ulps)
-        + ulp_tolerance(diff, nearest, ulps=ulps)
+    arithmetic_noise = ulp_tolerance(diff, nearest, ulps=ulps)
+    return (
+        (arithmetic_noise < 0.5)
+        & (np.abs(diff - nearest) <= arithmetic_noise)
     )
-    return np.abs(diff - nearest) <= arithmetic_noise
 ```
+
+The integer-shift policy uses only the computed subtraction result and its nearest
+integer. Operand ULPs are not added because that can create a half-unit acceptance
+band at a large, still fraction-resolving baseline. If the difference itself is too
+coarse for the ULP tolerance to stay strictly below `0.5`, the result is conservative
+`False`.
 
 - [ ] **Step 2: Replace relation identity and transform checks**
 
@@ -331,7 +336,10 @@ Run:
 ```
 
 Expected: high-baseline, tiny-scale, mixed-scale, B4, B5, and B3 tests pass.
-Wide-integer tests may remain red until Task 3.
+The direct large-baseline integer-shift regression must reject quarter-unit residuals
+while accepting true integer shifts at the same baseline. The detector-level
+large-baseline fraction-reuse regression must not emit a finding. Wide-integer tests
+may remain red until Task 3.
 
 - [ ] **Step 5: Commit**
 

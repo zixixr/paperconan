@@ -40,9 +40,8 @@ def integer_shift_close(left, right, *, ulps=16):
     right = np.asarray(right, dtype=float)
     diff = right - left
     nearest = np.rint(diff)
-    arithmetic_noise = (
-        ulp_tolerance(left, left, ulps=ulps)
-        + ulp_tolerance(right, right, ulps=ulps)
-        + ulp_tolerance(diff, nearest, ulps=ulps)
+    arithmetic_noise = ulp_tolerance(diff, nearest, ulps=ulps)
+    return (
+        (arithmetic_noise < 0.5)
+        & (np.abs(diff - nearest) <= arithmetic_noise)
     )
-    return np.abs(diff - nearest) <= arithmetic_noise

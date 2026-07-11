@@ -4,6 +4,7 @@ use relative precision so small-magnitude columns aren't trivially 'equal'."""
 import numpy as np
 from paperconan._sheet import Sheet
 from paperconan._audit import detect_relations, detect_arithmetic_progression, detect_equal_pairs
+from paperconan._numeric import integer_shift_close
 
 def _sheet(cols):
     rows = [[f"c{j}" for j in range(len(cols))]]
@@ -219,6 +220,19 @@ def test_high_baseline_near_values_are_not_many_equal_pairs():
     assert not any(left == right for left, right in zip(x, y))
     sheet = _sheet([x, y])
     assert detect_equal_pairs(sheet, 1, 9, 0, 2, ["x", "y"]) == []
+
+
+def test_integer_shift_close_distinguishes_quarter_offsets_at_large_baseline():
+    left = np.array([
+        100_000_000_000_000.125,
+        100_000_000_000_000.25,
+        100_000_000_000_000.375,
+    ])
+    non_integer = left + np.array([1.25, 2.25, 3.25])
+    integer = left + np.array([1.0, 2.0, 3.0])
+
+    assert integer_shift_close(left, non_integer).tolist() == [False, False, False]
+    assert integer_shift_close(left, integer).tolist() == [True, True, True]
 
 
 def test_adjacent_wide_integer_columns_are_not_identical_or_equal_pairs():
