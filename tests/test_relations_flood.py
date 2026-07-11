@@ -7,6 +7,8 @@ must not drown the genuine signal in high-severity output.
 """
 from __future__ import annotations
 
+from copy import deepcopy
+
 from paperconan._audit import (_demote_dense_relations, _demote_dense_sheets,
                                RELATION_FLOOD_CAP)
 
@@ -58,6 +60,11 @@ def test_forensic_dense_sheet_keeps_original_high_severity():
                 "kind": "identical_column",
                 "severity": "high",
                 "rule": f"synthetic relation {i}",
+                "profile_action": "kept",
+                "prefilter": "downweight",
+                "prefilter_reason": "existing_relation_prefilter",
+                "likely_benign": "existing relation context",
+                "false_positive_context": ["existing_relation_context"],
             }
             for i in range(half)
         ]
@@ -70,10 +77,27 @@ def test_forensic_dense_sheet_keeps_original_high_severity():
          "relations": relations(), "equal_pairs": [],
          "within_col": []},
     ]
-    _demote_dense_sheets(blocks, profile="forensic")
+    before = deepcopy(blocks)
+    returned = _demote_dense_sheets(blocks, profile="forensic")
+
+    assert returned is blocks
+    assert blocks == before
     findings = [f for block in blocks for f in block["relations"]]
     assert all(f["severity"] == "high" for f in findings)
-    assert all(f.get("dense_block") is not True for f in findings)
+    assert all(f["profile_action"] == "kept" for f in findings)
+    assert all(f["prefilter"] == "downweight" for f in findings)
+    assert all(
+        f["prefilter_reason"] == "existing_relation_prefilter"
+        for f in findings
+    )
+    assert all(f["likely_benign"] == "existing relation context" for f in findings)
+    assert all(
+        f["false_positive_context"] == ["existing_relation_context"]
+        for f in findings
+    )
+    assert all("dense_block" not in f for f in findings)
+    assert all("reused_progression" not in f for f in findings)
+    assert all("within_col_flood_sheet" not in f for f in findings)
 
 
 def test_separate_sheets_each_below_cap_keep_high():

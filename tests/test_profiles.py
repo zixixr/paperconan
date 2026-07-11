@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import os
 import subprocess
@@ -103,13 +104,21 @@ def test_scan_dir_forensic_preserves_reused_progression(tmp_path):
     assert all(f["severity"] == "low" for f in review_progressions)
     assert all(f["profile_action"] == "kept" for f in review_progressions)
     assert all(f.get("prefilter") == "drop" for f in review_progressions)
+    assert all(
+        f.get("prefilter_reason") == "reused_progression_axis"
+        for f in review_progressions
+    )
     assert all(f.get("reused_progression") is True for f in review_progressions)
+    assert all("likely_benign" in f for f in review_progressions)
 
     assert len(forensic_progressions) == 2
     assert all(f["severity"] == "high" for f in forensic_progressions)
     assert all(f["profile_action"] == "kept" for f in forensic_progressions)
-    assert all(f.get("prefilter") != "drop" for f in forensic_progressions)
-    assert all(f.get("reused_progression") is not True for f in forensic_progressions)
+    assert all("prefilter" not in f for f in forensic_progressions)
+    assert all("prefilter_reason" not in f for f in forensic_progressions)
+    assert all("reused_progression" not in f for f in forensic_progressions)
+    assert all("likely_benign" not in f for f in forensic_progressions)
+    assert all(f["false_positive_context"] == [] for f in forensic_progressions)
 
 
 def test_forensic_within_column_flood_remains_kept():
@@ -120,6 +129,10 @@ def test_forensic_within_column_flood_remains_kept():
             "kind": "within_col_value_duplication",
             "severity": "high",
             "profile_action": "kept",
+            "prefilter": "downweight",
+            "prefilter_reason": "existing_within_col_prefilter",
+            "likely_benign": "existing within-column context",
+            "false_positive_context": ["existing_within_col_context"],
         }
         for _ in range(audit.WITHIN_COL_SHEET_CAP + 1)
     ]
@@ -130,10 +143,29 @@ def test_forensic_within_column_flood_remains_kept():
         "equal_pairs": [],
         "within_col": findings,
     }]
-    audit._demote_dense_sheets(blocks, profile="forensic")
+    before = deepcopy(blocks)
+    returned = audit._demote_dense_sheets(blocks, profile="forensic")
+
+    assert returned is blocks
+    assert blocks == before
     assert all(f["severity"] == "high" for f in findings)
     assert all(f["profile_action"] == "kept" for f in findings)
-    assert all(f.get("prefilter") != "drop" for f in findings)
+    assert all(f["prefilter"] == "downweight" for f in findings)
+    assert all(
+        f["prefilter_reason"] == "existing_within_col_prefilter"
+        for f in findings
+    )
+    assert all(
+        f["likely_benign"] == "existing within-column context"
+        for f in findings
+    )
+    assert all(
+        f["false_positive_context"] == ["existing_within_col_context"]
+        for f in findings
+    )
+    assert all("dense_block" not in f for f in findings)
+    assert all("reused_progression" not in f for f in findings)
+    assert all("within_col_flood_sheet" not in f for f in findings)
 
 
 def test_review_profile_demotes_unit_conversion_relation(tmp_path):

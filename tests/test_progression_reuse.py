@@ -3,6 +3,8 @@ appears in >=2 numeric blocks/sheets — is an independent-variable axis re-plot
 (magnetic-field / 2-theta / time / dose sweep), not fabricated data. Real measured data is never
 a perfect progression, so a reused one is an axis and must not flood the high-severity output.
 A ONE-OFF perfect progression keeps its severity (that is the genuinely-suspicious linear-fill)."""
+from copy import deepcopy
+
 from paperconan._audit import _demote_reused_progressions, benign_reason
 
 
@@ -31,12 +33,34 @@ def test_reused_axis_progression_demoted_out_of_high():
 def test_forensic_reused_progression_remains_kept():
     blocks = [_block(f"Fig {i}", [_prog(0.5, 30, 1.25)]) for i in range(2)]
     for block in blocks:
-        block["progressions"][0]["profile_action"] = "kept"
-    _demote_reused_progressions(blocks, profile="forensic")
+        block["progressions"][0].update({
+            "profile_action": "kept",
+            "prefilter": "downweight",
+            "prefilter_reason": "existing_progression_prefilter",
+            "likely_benign": "existing progression context",
+            "false_positive_context": ["existing_progression_context"],
+        })
+    before = deepcopy(blocks)
+    returned = _demote_reused_progressions(blocks, profile="forensic")
+
+    assert returned is blocks
+    assert blocks == before
     findings = [block["progressions"][0] for block in blocks]
     assert all(f["severity"] == "high" for f in findings)
     assert all(f["profile_action"] == "kept" for f in findings)
-    assert all(f.get("prefilter") != "drop" for f in findings)
+    assert all(f["prefilter"] == "downweight" for f in findings)
+    assert all(
+        f["prefilter_reason"] == "existing_progression_prefilter"
+        for f in findings
+    )
+    assert all(f["likely_benign"] == "existing progression context" for f in findings)
+    assert all(
+        f["false_positive_context"] == ["existing_progression_context"]
+        for f in findings
+    )
+    assert all("dense_block" not in f for f in findings)
+    assert all("reused_progression" not in f for f in findings)
+    assert all("within_col_flood_sheet" not in f for f in findings)
 
 
 def test_one_off_non_integer_progression_keeps_high():
