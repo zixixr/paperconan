@@ -176,29 +176,29 @@ def test_legacy_workbooks_do_not_use_wide_integer_openpyxl_fallback(
     import paperconan._audit as audit
     import python_calamine
 
-    class FakeSheet:
+    class StubSheet:
         height = 1
         width = 1
 
         def to_python(self, skip_empty_area=False):
             return [[float(2**53)]]
 
-    class FakeWorkbook:
+    class StubWorkbook:
         sheet_names = ["S1"]
 
         def get_sheet_by_name(self, name):
             assert name == "S1"
-            return FakeSheet()
+            return StubSheet()
 
-    class FakeCalamineWorkbook:
+    class StubCalamineWorkbook:
         @staticmethod
         def from_path(path):
-            return FakeWorkbook()
+            return StubWorkbook()
 
     def forbidden(path):
         raise AssertionError("legacy workbook must stay on the Calamine path")
 
-    monkeypatch.setattr(python_calamine, "CalamineWorkbook", FakeCalamineWorkbook)
+    monkeypatch.setattr(python_calamine, "CalamineWorkbook", StubCalamineWorkbook)
     monkeypatch.setattr(audit, "_load_workbook_openpyxl", forbidden)
 
     sheet = audit.load_workbook_rows(str(tmp_path / f"wide{suffix}"))["S1"]
