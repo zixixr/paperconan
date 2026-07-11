@@ -22,6 +22,10 @@ def test_oversized_file_is_skipped_and_recorded(tmp_path, monkeypatch):
     assert scan["scan_errors"], "oversized files must be recorded in scan_errors"
     assert any("oversized" in e["error"] for e in scan["scan_errors"])
     assert any(s.get("oversized") for s in scan["scan_stats"]["files"])
+    assert any(
+        item["reason"] == "file_size_limit"
+        for item in scan["coverage"]["limitations"]
+    )
 
 
 def test_normal_file_under_cap_is_audited(tmp_path):

@@ -21,6 +21,10 @@ def test_oversized_sheet_skipped_and_recorded(tmp_path, monkeypatch):
     assert any("oversized sheet" in e.get("error", "") for e in scan["scan_errors"])
     assert any(s.get("oversized") for s in scan["scan_stats"]["sheets"])
     assert scan["n_blocks_with_findings"] == 0          # the skipped sheet produced nothing
+    assert any(
+        item["reason"] == "cell_limit"
+        for item in scan["coverage"]["limitations"]
+    )
 
 
 def test_normal_sheet_under_cap_is_audited(tmp_path, monkeypatch):

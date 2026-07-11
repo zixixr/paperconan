@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 
+import paperconan._audit as A
 from paperconan._audit import (
     BLOCK_FINDING_GROUPS,
     _MAX_FINDINGS_PER_BLOCK,
@@ -58,6 +59,34 @@ def test_dense_block_findings_are_capped(tmp_path):
     # more than the cap, so at least one block reports omitted findings.
     total_omitted = sum(int(blk.get("findings_omitted") or 0) for blk in blocks)
     assert total_omitted > 0, "dense block exceeded the cap but omission was not recorded"
+    assert scan["scan_status"] == "partial"
+    assert any(
+        item["reason"] == "finding_limit"
+        and item.get("omitted_findings", 0) > 0
+        for item in scan["coverage"]["limitations"]
+    )
+
+
+def test_report_block_cap_records_remaining_blocks_once(tmp_path, monkeypatch):
+    data = tmp_path / "blocks"
+    data.mkdir()
+    (data / "two-blocks.csv").write_text(
+        "a,b\n"
+        "1,2\n2,3\n3,4\n4,5\n5,6\n"
+        ",\n"
+        "10,20\n11,21\n12,22\n13,23\n14,24\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(A, "_MAX_REPORT_BLOCKS", 1)
+
+    scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+
+    assert scan["scan_status"] == "partial"
+    assert scan["coverage"]["blocks_skipped"] >= 1
+    assert any(
+        item["reason"] == "report_block_limit"
+        for item in scan["coverage"]["limitations"]
+    )
 
 
 def test_cap_keeps_highest_severity_first():

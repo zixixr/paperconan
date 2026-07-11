@@ -37,6 +37,7 @@ import openpyxl
 import numpy as np
 from scipy import stats
 
+from ._coverage import ScanCoverage
 from ._numeric import integer_shift_close, relation_close
 from ._profiles import apply_profile_to_findings, normalize_profile
 from ._sheet import Sheet, _MAX_EXACT_FLOAT_INT
@@ -2840,7 +2841,8 @@ def _cap_block_findings(groups, cap):
 
 
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
-             profile="review", write_json=True, evidence=True):
+             profile="review", write_json=True, evidence=True,
+             diagnostic_on_empty=False):
     profile = normalize_profile(profile)
     # The HTML report renders the evidence snippets, so it requires them.
     if write_html:
@@ -2848,13 +2850,14 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     files = sorted({p for pat in ("*.xlsx", "*.xls", "*.xlsm", "*.xlsb",
                                   "*.csv", "*.tsv", "*.pdf", "*.docx")
                     for p in glob.glob(os.path.join(in_dir, pat))})
-    if not files:
+    if not files and not diagnostic_on_empty:
         raise PaperconanInputError(
             f"no .xlsx / .xls / .xlsm / .xlsb / .csv / .tsv / .pdf / .docx files in {in_dir}\n"
             f"(paperconan reads .xlsx via openpyxl, legacy .xls / .xlsm / .xlsb via calamine, "
             f".csv / .tsv, and tables inside .pdf / .docx)"
         )
 
+    coverage = ScanCoverage(files_discovered=len(files))
     report_blocks = []
     findings_omitted_total = 0   # findings dropped by the per-block / global finding caps
     findings_kept_total = 0      # findings retained across all blocks (for the global backstop)
@@ -2880,6 +2883,9 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                    f"(set PAPERCONAN_MAX_FILE_MB to raise) — skipped to bound memory")
             print(f"  skipping {os.path.basename(f)}: {msg}", file=sys.stderr)
             scan_errors.append({"file": os.path.basename(f), "error": msg})
+            coverage.mark_file_failed(
+                os.path.basename(f), "file_size_limit", max_bytes=_MAX_FILE_BYTES
+            )
             file_stat["error"] = msg
             file_stat["oversized"] = True
             file_stat["elapsed_ms"] = round((time.perf_counter() - file_start) * 1000, 3)
@@ -2890,10 +2896,12 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         except Exception as e:
             print(f"  failed to read {os.path.basename(f)}: {e}", file=sys.stderr)
             scan_errors.append({"file": os.path.basename(f), "error": str(e)})
+            coverage.mark_file_failed(os.path.basename(f), "parse_error")
             file_stat["error"] = str(e)
             file_stat["elapsed_ms"] = round((time.perf_counter() - file_start) * 1000, 3)
             scan_stats["files"].append(file_stat)
             continue
+        coverage.mark_file_succeeded()
         file_stat["n_sheets"] = len(sheets)
         file_stat["elapsed_ms"] = round((time.perf_counter() - file_start) * 1000, 3)
         scan_stats["files"].append(file_stat)
@@ -2903,10 +2911,14 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 msg = (f"oversized sheet exceeds {_MAX_CELLS} cells "
                        f"(set PAPERCONAN_MAX_CELLS to raise) — skipped to bound memory")
                 scan_errors.append({"file": os.path.basename(f), "sheet": sn, "error": msg})
+                coverage.mark_sheet_skipped(
+                    os.path.basename(f), sn, "cell_limit", max_cells=_MAX_CELLS
+                )
                 scan_stats["sheets"].append({
                     "file": os.path.basename(f), "sheet": sn, "oversized": True,
                     "elapsed_ms": round((time.perf_counter() - sheet_start) * 1000, 3)})
                 continue
+            coverage.mark_sheet_succeeded()
             sheet = rows if isinstance(rows, Sheet) else Sheet.from_rows(rows)
             grids[(os.path.basename(f), sn)] = _grid_from_rows(sheet)
             grid_sheets[(os.path.basename(f), sn)] = sheet
@@ -2923,11 +2935,26 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 "n_blocks": len(blocks),
                 "elapsed_ms": round((time.perf_counter() - sheet_start) * 1000, 3),
             })
-            for (r0, r1, c0, c1) in blocks:
+            for block_index, (r0, r1, c0, c1) in enumerate(blocks):
                 if len(report_blocks) >= _MAX_REPORT_BLOCKS:   # output budget reached; stop collecting
+                    coverage.mark_blocks_skipped(
+                        len(blocks) - block_index,
+                        scope="sheet",
+                        reason="report_block_limit",
+                        file=os.path.basename(f),
+                        sheet=sn,
+                    )
                     break
                 if _MAX_TOTAL_FINDINGS > 0 and findings_kept_total >= _MAX_TOTAL_FINDINGS:
+                    coverage.mark_blocks_skipped(
+                        len(blocks) - block_index,
+                        scope="sheet",
+                        reason="finding_limit",
+                        file=os.path.basename(f),
+                        sheet=sn,
+                    )
                     break   # global finding budget spent; stop collecting (subsequent sheets short-circuit here too)
+                coverage.mark_block_analyzed()
                 header = header_for(sheet, r0, c0, c1)
                 # On very wide blocks (dense correlation matrices) the O(col²) relation and
                 # equal-pair detectors explode in compute + output, so skip just those two; the
@@ -2967,6 +2994,17 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                         block_cap = per_block
                     omitted = _cap_block_findings(groups, block_cap)
                     findings_omitted_total += omitted
+                    if omitted:
+                        coverage.add_limitation(
+                            "block",
+                            "finding_limit",
+                            file=os.path.basename(f),
+                            sheet=sn,
+                            rows=f"{r0 + 1}-{r1}",
+                            cols=f"{c0 + 1}-{c1}",
+                            omitted_findings=omitted,
+                            limit=block_cap,
+                        )
                     findings_kept_total += sum(len(v) for v in groups.values())
                     for group in groups.values():
                         if evidence:
@@ -3018,7 +3056,10 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             d["p_adj"] = a
             d["fdr_significant"] = bool(s)
 
-    out = dict(tool="paperconan",
+    out = dict(schema_version=2,
+               scan_status=coverage.status,
+               coverage=coverage.to_dict(),
+               tool="paperconan",
                tool_version=_version(),
                scanned_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
                profile=profile,
@@ -3173,9 +3214,12 @@ def main():
         paper = {"doi": args.doi, "title": args.title}
     try:
         res = scan_dir(args.in_dir, out_dir, write_md=args.md, write_html=write_html,
-                       paper=paper, profile=args.profile)
+                       paper=paper, profile=args.profile, diagnostic_on_empty=True)
     except PaperconanInputError as e:
         sys.exit(str(e))
+    if res["scan_status"] == "failed":
+        print("scan failed: no input table reached numeric scanning", file=sys.stderr)
+        raise SystemExit(1)
     outputs = [f"{out_dir}/scan.json"]
     if write_html:
         outputs.append(f"{out_dir}/report.html")
