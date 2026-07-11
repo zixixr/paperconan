@@ -1,11 +1,10 @@
 """Extract tabular data locked inside supplementary PDF / Word files.
 
-A great deal of fabrication is visible in numbers that are presented *in the
-paper itself* — supplementary PDF tables, Word appendix tables — rather than in
-a downloadable .xlsx source-data file. This module pulls those real tables out
-and normalizes them into the same ``{sheet_name: rows}`` shape the rest of
-paperconan already consumes, so every existing numeric detector applies with no
-change.
+Statistical signals and data inconsistencies can appear in numbers presented
+inside supplementary PDF tables and Word appendix tables rather than in a
+downloadable .xlsx source-data file. This module pulls those tables out and
+normalizes them into the same ``{sheet_name: rows}`` shape the rest of
+paperconan consumes, so every existing numeric detector applies unchanged.
 
 Scope: real ruled/structured tables only. It does NOT digitize data points off
 bar charts or curves (pixel digitization introduces error that would itself trip
@@ -20,6 +19,12 @@ import os
 
 from ._audit import _coerce_cell
 from ._input import ExtractedTableResult, InputLimitation
+
+
+def _close_iterator(iterator):
+    close = getattr(iterator, "close", None)
+    if callable(close):
+        close()
 
 
 def tables_to_sheets(
@@ -46,31 +51,81 @@ def tables_to_sheets(
         rows = []
         row_count = 0
         max_width = 0
+        leading_empty_rows = 0
         has_content = False
+        over_budget = False
         rejected = False
-        for row in table or ():
-            normalized = [_coerce_cell(_as_text(c)) for c in row]
+        table_cells = 0
+        table_iter = iter(table if table is not None else ())
+        for row in table_iter:
+            row_iter = iter(row)
+            normalized = []
+            row_width = 0
             row_count += 1
-            max_width = max(max_width, len(normalized))
             table_cells = row_count * max_width
-            if max_cells is not None and loaded + table_cells > max_cells:
-                sheets[sheet_name] = None
-                limitations.append(InputLimitation(
-                    scope="sheet",
-                    reason="cell_limit",
-                    sheet=sheet_name,
-                    details={
-                        "cells": table_cells,
-                        "max_cells": max_cells,
-                    },
-                ))
-                rejected = True
+            if (
+                not over_budget
+                and max_cells is not None
+                and loaded + table_cells > max_cells
+            ):
+                over_budget = True
+                rows.clear()
+                leading_empty_rows = 0
+                if has_content:
+                    _close_iterator(row_iter)
+                    _close_iterator(table_iter)
+                    rejected = True
+                    break
+            for cell in row_iter:
+                row_width += 1
+                max_width = max(max_width, row_width)
+                table_cells = row_count * max_width
+                if (
+                    not over_budget
+                    and max_cells is not None
+                    and loaded + table_cells > max_cells
+                ):
+                    over_budget = True
+                    rows.clear()
+                    normalized.clear()
+                    leading_empty_rows = 0
+                    if has_content:
+                        _close_iterator(row_iter)
+                        _close_iterator(table_iter)
+                        rejected = True
+                        break
+                value = _coerce_cell(_as_text(cell))
+                if value is not None:
+                    has_content = True
+                    if over_budget:
+                        _close_iterator(row_iter)
+                        _close_iterator(table_iter)
+                        rejected = True
+                        break
+                if not over_budget:
+                    normalized.append(value)
+            if rejected:
                 break
-            has_content = has_content or any(
-                cell is not None for cell in normalized
-            )
+            if over_budget:
+                continue
+            if not has_content:
+                leading_empty_rows += 1
+                continue
+            if leading_empty_rows:
+                rows.extend([] for _ in range(leading_empty_rows))
+                leading_empty_rows = 0
             rows.append(normalized)
         if rejected:
+            sheets[sheet_name] = None
+            limitations.append(InputLimitation(
+                scope="sheet",
+                reason="cell_limit",
+                sheet=sheet_name,
+                details={
+                    "cells": table_cells,
+                    "max_cells": max_cells,
+                },
+            ))
             continue
         if not has_content:
             continue  # nothing in this table — drop it rather than emit noise

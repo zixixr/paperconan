@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-paper_audit.py — scan a paper's published source data (xlsx) for data-fabrication red flags.
+paper_audit.py — scan published source data for statistical signals and data inconsistencies.
 
 Usage:
     python3 paper_audit.py <dir-with-xlsx-files> [--out OUT_DIR]
@@ -9,13 +9,13 @@ Outputs to <OUT_DIR or <dir>/audit>:
   - scan.json   structured findings (every block, every detector)
   - REPORT.md   ranked top-5 + supporting evidence in markdown
 
-What it detects (red flags for fabricated numeric data):
+What it detects (signals requiring contextual review):
   1. Identical / constant-offset / constant-ratio / exact-linear column relations
   2. Arithmetic-progression columns (constant first difference)
   3. Repeated last-two-decimal endings beyond chance
-  4. Last-digit chi-square (true measurements have ~uniform last digits)
-  5. Suspicious row pairs that sum to integer / equal-value column pairs
-  6. Reverse-engineered generation rules (col_b = col_a + k, col_b = K - col_a, etc.)
+  4. Last-digit chi-square departures from an approximately uniform reference
+  5. Row pairs that sum to integers / equal-value column pairs
+  6. Candidate arithmetic relationships (col_b = col_a + k, col_b = K - col_a, etc.)
 
 Dependencies: openpyxl, numpy, scipy
 """
@@ -1082,7 +1082,7 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                     # identity (slope~=1, caught by identical_column) or a pure scaling. When a
                     # constant_ratio already captured that scaling, a second exact_linear finding
                     # is redundant (same relationship, b==0 to round-off) and only inflates the
-                    # count — suppress it. exact_linear is reserved for a genuine non-zero
+                    # count — suppress it. exact_linear is reserved for a non-zero
                     # intercept (an affine offset constant_ratio cannot express), and still fires
                     # when no constant_ratio covered the pair (e.g. a zero in x skips its guard).
                     intercept_is_zero = abs(intercept) < tol
@@ -1118,7 +1118,7 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                 col_hp = sum(1 for v in x if _sig_frac_digits(v) >= 2) >= 0.6 * len(x)
                 # The benign case to exclude is a run shifted by a small WHOLE number on
                 # low-precision data (e.g. B = A + 5). Test that scale-relatively (tol), so a
-                # genuine small-magnitude offset like 3e-14 is not mistaken for "integer 0".
+                # A small-magnitude offset like 3e-14 is not mistaken for "integer 0".
                 off_is_small_integer = abs(best_val - round(best_val)) < tol and abs(round(best_val)) >= 1
                 non_trivial_offset = (not off_is_small_integer) or col_hp
                 if (best_len >= run_floor and best_len < n
@@ -1151,7 +1151,7 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                 hp_fracs = [float(v) for v in frac_x[hp_rows] if _sig_frac_digits(v) >= 4]
                 distinct_hp = len({round(v, 6) for v in hp_fracs})
                 int_diffs = np.unique(np.round(diff[diff_is_int]))
-                n_real_frac = int(hp_rows.sum())        # rows sharing a genuine (non-.0) fraction
+                n_real_frac = int(hp_rows.sum())        # rows sharing a non-.0 fraction
                 if (int(diff_is_int.sum()) >= max(5, int(round(0.8 * n)))
                         and distinct_hp >= 3
                         and len(int_diffs) >= 2):
@@ -1240,12 +1240,13 @@ def _row_pair_low_cardinality_integer_like(x, y):
 def detect_row_pair_digit_coupling(
     sheet, r0, r1, c0, c1, header, min_n=10, *, with_coverage=False
 ):
-    """Detect suspicious paired rows that preserve low-order digits across many cells.
+    """Detect paired rows that preserve low-order digits across many cells.
 
     This targets source-data layouts where replicate/condition rows are aligned by
-    measurement column. A concerning pattern is: row B differs from row A in value,
-    but the first decimal digit and often the ones digit are preserved across many
-    paired cells, with differences frequently landing on coarse multiples of 10.
+    measurement column. The statistical signal is: row B differs from row A in
+    value, but the first decimal digit and often the ones digit are preserved
+    across many paired cells, with differences frequently landing on coarse
+    multiples of 10.
     """
     findings = []
     n_rows = r1 - r0
@@ -1382,14 +1383,15 @@ def detect_row_pair_digit_coupling(
 
 # Above this many pairwise column relations in ONE block, the sheet is a dense /
 # correlated matrix (correlation tables, normalized replicate panels) where identical or
-# linear columns are expected by construction — not a duplication red flag. One real
-# proteomics sheet produced ~20,000 such 'high' relations, drowning the genuine signal.
+# linear columns are expected by construction rather than an independent duplication
+# signal. One proteomics sheet produced ~20,000 such 'high' relations, obscuring
+# review-relevant signals.
 RELATION_FLOOD_CAP = 40
 
 # Above this many within-column findings on ONE (file, sheet), the sheet is a large
 # data table whose columns are repetitive by construction (categorical codes, dose
-# grids, few-value panels). Genuine within-col signals live in low-count sheets
-# (offline corpus: genuine-signal sheets held <=2 within_col each), so a sheet-wide
+# grids, few-value panels). Review-relevant within-col signals live in low-count sheets
+# (offline corpus: those sheets held <=2 within_col each), so a sheet-wide
 # flood is noise — demote it wholesale instead of flooding the judge.
 WITHIN_COL_SHEET_CAP = 25
 
@@ -1446,12 +1448,12 @@ def _demote_dense_sheets(
 def _demote_reused_progressions(report_blocks, profile="review"):
     """A perfect arithmetic progression that is REUSED — the identical (step, n, first)
     appears in >=2 numeric blocks/sheets — is an independent-variable axis re-plotted across
-    panels (magnetic-field / 2-theta / time / dose / wavelength sweep), not fabricated data.
-    Real measured data is never a perfect progression; a reused perfect progression is an axis.
+    panels (magnetic-field / 2-theta / time / dose / wavelength sweep).
+    Reuse across panels supports treating the progression as an axis.
     Demote these out of the high/medium review priority (kept in scan.json, reversible via
-    forensic). A ONE-OFF perfect progression keeps its severity — that is the genuinely
-    suspicious linear-fill case (and matches the golden fixture's single ap_col). Mutates in
-    place and returns report_blocks."""
+    forensic). A ONE-OFF perfect progression keeps its severity as a review-relevant
+    linear-fill signal (and matches the golden fixture's single ap_col). Mutates in place
+    and returns report_blocks."""
     if normalize_profile(profile) == "forensic":
         return report_blocks
 
@@ -1690,15 +1692,15 @@ def detect_identical_after_rounding(sheet, r0, r1, c0, c1, header):
         if abs(v) < 100:  # only meaningful for measurement-scale numbers
             buckets[round(v, 1)].append((r, c, v))
     # Find buckets where multiple DIFFERENT (>1e-4 apart) values map to the same rounded value
-    suspicious = []
+    rounding_groups = []
     for k, lst in buckets.items():
         if len(lst) >= 4:
             uniq = set(round(v, 4) for _, _, v in lst)
             if len(uniq) >= 3:
-                suspicious.append((k, lst))
-    suspicious.sort(key=lambda kv: -len(kv[1]))
-    if suspicious:
-        top = suspicious[:5]
+                rounding_groups.append((k, lst))
+    rounding_groups.sort(key=lambda kv: -len(kv[1]))
+    if rounding_groups:
+        top = rounding_groups[:5]
         for k, lst in top:
             uniq = sorted(set(round(v, 4) for _, _, v in lst))
             findings.append(dict(kind="identical_after_rounding",
@@ -1857,7 +1859,7 @@ def _grid_from_rows(
 ):
     """Build {(r, c): rounded_value} of decimal-bearing numeric cells from a Sheet.
     Only keeps non-integer values with >= min_decimal_places decimals in a sane range —
-    these are the values whose bit-identical reuse across tables is suspicious."""
+    these are the values whose bit-identical reuse across tables warrants review."""
     grid = {}
     nm = sheet.numeric
     rmax = min(sheet.nrows, max_rows)
@@ -1917,13 +1919,13 @@ def figure_key(sheet_name):
 
 def _value_delta(ga, gb):
     """Characterize HOW two near-duplicate grids differ, so a clean re-plot can be
-    told apart from a copy-then-tweak.
+    distinguished from aligned values that differ at selected positions.
 
     - modified_cells: same (row,col) position, different value — only meaningful when
-      the two tables share a layout; the copy-then-tweak fingerprint.
+      the two tables share a layout and contain aligned value changes.
     - only_in_a / only_in_b: value-multiset members unique to each side (layout-robust).
     - pattern:
-        value_tweaked : >=1 cell changed in place (most interesting — possible edit)
+        value_tweaked : >=1 aligned cell has a different value
         perfect_dup   : identical value multisets, no in-place edits (clean re-plot)
         superset      : one side's values strictly contain the other's (e.g. an extra
                         replicate column — main shows n=5, extended shows n=6)
@@ -2061,8 +2063,8 @@ def _detect_decimal_tail_reuse_for_pair(
 def _decimal_tail_constant_transform(pairs):
     """True if the matched value pairs share a constant additive offset (vb = va + k) or a constant
     ratio (vb = va * r). That is a benign linear/derived relationship between the two sheets (a shift,
-    rescale, or baseline correction that incidentally preserves the fractional tail), NOT the
-    leading-digit fabrication the detector targets (which produces *irregular* per-pair differences)."""
+    rescale, or baseline correction that incidentally preserves the fractional tail), not the
+    irregular per-pair decimal-tail signal this detector targets."""
     vp = [(va, vb) for _ka, _kb, va, vb, _sig in pairs if va is not None and vb is not None]
     if len(vp) < 3:
         return False
@@ -2387,11 +2389,11 @@ def _shared_cross_sheet_context(ctx_a, ctx_b, pattern, fraction):
 
 def detect_collisions(grids, profile="review", sheets=None):
     """Find pairs of tables (sheets and/or flat files) with many bit-identical decimal
-    values at the SAME (row, col). Catches "copy a table, then tweak a few values" fraud,
-    whether the copy lives in another sheet of the same workbook or in a separate file.
+    values at the SAME (row, col), including repeated tables with changed cells in another
+    sheet of the same workbook or in a separate file.
 
     `grids` maps (file, sheet) -> grid (from _grid_from_rows). Returns one dict per
-    suspicious pair, with file_a/file_b set so same-file and cross-file pairs are
+    candidate pair, with file_a/file_b set so same-file and cross-file pairs are
     distinguishable.
 
     Severity is context-aware on two axes:
@@ -3188,7 +3190,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                     # (_demote_reused_progressions / _demote_dense_relations / _demote_within_col_flood),
                     # which judge floods by cross-block counts. Trimming can lower those counts, so a
                     # benign finding may keep an elevated severity that demotion would have lowered —
-                    # an over-report only (never drops a genuine high; keeping highest-severity first
+                    # an over-report only (never drops a review-relevant high; keeping highest-severity first
                     # protects exactly the findings demotion targets). Capping after demotion would
                     # require attaching evidence to every finding first, re-introducing the GH#15 OOM.
                     groups = {"relations": rel, "progressions": ap, "equal_pairs": eq,

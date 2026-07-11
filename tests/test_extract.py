@@ -8,6 +8,7 @@ not installed.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import sys
 
 import pytest
@@ -50,6 +51,147 @@ def test_tables_to_sheets_drops_fully_empty_tables():
     raw = [("t1", [["", ""], [None, None]]), ("t2", [["v"], ["1.5"]])]
     sheets = tables_to_sheets("d", raw)
     assert list(sheets) == ["d!t2"], "a table with no content should be dropped"
+
+
+def test_default_drops_standalone_over_budget_empty_table():
+    raw = [("t1", [["", "", ""], [None, None, None]])]
+
+    assert tables_to_sheets("d", raw, max_cells=2) == {}
+
+
+def test_metadata_drops_standalone_over_budget_empty_table():
+    raw = [("t1", [["", "", ""], [None, None, None]])]
+
+    result = tables_to_sheets(
+        "d", raw, max_cells=2, with_metadata=True
+    )
+
+    assert result.tables == {}
+    assert result.limitations == []
+
+
+def test_default_drops_over_budget_empty_table_after_budget_is_used():
+    raw = [
+        ("used", [["value", "1"]]),
+        ("empty", [["", "", ""], [None, None, None]]),
+    ]
+
+    assert tables_to_sheets("d", raw, max_cells=2) == {
+        "d!used": [["value", 1]]
+    }
+
+
+def test_metadata_drops_over_budget_empty_table_after_budget_is_used():
+    raw = [
+        ("used", [["value", "1"]]),
+        ("empty", [["", "", ""], [None, None, None]]),
+    ]
+
+    result = tables_to_sheets(
+        "d", raw, max_cells=2, with_metadata=True
+    )
+
+    assert result.tables == {"d!used": [["value", 1]]}
+    assert result.limitations == []
+
+
+def test_wide_row_stops_normalizing_when_dense_budget_is_crossed(
+    monkeypatch,
+):
+    yielded = []
+    normalized = []
+    original_coerce = extract._coerce_cell
+
+    def counting_coerce(value):
+        normalized.append(value)
+        return original_coerce(value)
+
+    def wide_row():
+        for index in range(100):
+            yielded.append(index)
+            yield "value" if index == 0 else str(index)
+
+    monkeypatch.setattr(extract, "_coerce_cell", counting_coerce)
+
+    result = tables_to_sheets(
+        "d",
+        [("t1", [wide_row()])],
+        max_cells=2,
+        with_metadata=True,
+    )
+
+    assert result.tables["d!t1"] is None
+    assert yielded == [0, 1, 2]
+    assert normalized == ["value", "1"]
+
+
+def test_over_budget_empty_prefix_with_late_content_is_rejected():
+    raw = [("t1", [["", ""], [None, "value"]])]
+
+    result = tables_to_sheets(
+        "d", raw, max_cells=1, with_metadata=True
+    )
+
+    assert result.tables["d!t1"] is None
+    assert result.limitations[0].reason == "cell_limit"
+
+
+def test_rejected_table_closes_generators_before_sibling_processing():
+    events = []
+
+    def row_cells():
+        try:
+            yield from ("value", "1", "2", "3")
+        finally:
+            events.append("row_closed")
+
+    def first_table():
+        try:
+            yield row_cells()
+            yield ["not reached"]
+        finally:
+            events.append("table_closed")
+
+    first = first_table()
+
+    def sibling_table():
+        events.append("sibling_started")
+        yield ["ok"]
+
+    result = tables_to_sheets(
+        "d",
+        [("t1", first), ("t2", sibling_table())],
+        max_cells=2,
+        with_metadata=True,
+    )
+
+    assert events == ["row_closed", "table_closed", "sibling_started"]
+    assert result.tables["d!t1"] is None
+    assert result.tables["d!t2"] == [["ok"]]
+
+
+def test_owned_production_modules_use_neutral_language():
+    blocked_fragments = (
+        ("f", "raud"),
+        ("f", "abricat"),
+        ("f", "ake"),
+        ("mis", "conduct"),
+        ("guil", "ty"),
+        ("accus", "ation"),
+        ("red", " flag"),
+        ("susp", "ici"),
+        ("manip", "ulat"),
+        ("decept", "ion"),
+        ("dishon", "est"),
+        ("che", "at"),
+        ("culp", "ab"),
+    )
+    blocked = tuple("".join(parts) for parts in blocked_fragments)
+
+    for module in (extract, audit):
+        source = Path(module.__file__).read_text(encoding="utf-8").lower()
+        matches = [term for term in blocked if term in source]
+        assert matches == [], f"{module.__name__}: {matches}"
 
 
 def test_extracted_tables_share_one_dense_cell_budget():
