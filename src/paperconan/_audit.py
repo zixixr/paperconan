@@ -129,35 +129,120 @@ def grim_consistent(mean, n, decimals):
     return False
 
 
+_GRIMMER_MAX_STATES = 200_000
+
+
+def _candidate_integer_totals(mean, n, decimals):
+    scale = 10 ** decimals
+    target = round(mean * scale)
+    lo = (target - 0.5) / scale
+    hi = (target + 0.5) / scale
+    return [
+        total for total in range(math.floor(lo * n) - 1,
+                                 math.ceil(hi * n) + 2)
+        if round((total / n) * scale) == target
+    ]
+
+
+def _candidate_sum_squares(total, sd, n, decimals, ddof):
+    denom = n - ddof
+    if denom <= 0:
+        return []
+    scale = 10 ** decimals
+    target = round(sd * scale)
+    lo_sd = max(0.0, (target - 0.5) / scale)
+    hi_sd = (target + 0.5) / scale
+    correction = (total * total) / n
+    first = max(0, math.floor(lo_sd * lo_sd * denom + correction) - 2)
+    last = math.ceil(hi_sd * hi_sd * denom + correction) + 2
+    out = []
+    for sum_squares in range(first, last + 1):
+        variance = (sum_squares - correction) / denom
+        if variance < -1e-12:
+            continue
+        candidate_sd = math.sqrt(max(0.0, variance))
+        if round(candidate_sd * scale) == target:
+            out.append(sum_squares)
+    return out
+
+
+def _integer_moments_reachable(total, sum_squares, n, *,
+                               max_states=None):
+    if max_states is None:
+        max_states = _GRIMMER_MAX_STATES
+    if n <= 0 or sum_squares < 0:
+        return False
+    if total * total > n * sum_squares:
+        return False
+    if (sum_squares - total) % 2:
+        return False
+
+    base = math.floor(total / n)
+    shifted_sum = total - n * base
+    shifted_squares = (
+        sum_squares - 2 * base * total + n * base * base
+    )
+    if shifted_squares < 0:
+        return False
+
+    if n == 1:
+        return shifted_squares == shifted_sum * shifted_sum
+    if n == 2:
+        discriminant = 2 * shifted_squares - shifted_sum * shifted_sum
+        if discriminant < 0:
+            return False
+        root = math.isqrt(discriminant)
+        return (
+            root * root == discriminant
+            and (shifted_sum + root) % 2 == 0
+        )
+
+    radius = math.isqrt(shifted_squares)
+    values = range(-radius, radius + 1)
+    states = {(0, 0)}
+    for used in range(n):
+        remaining = n - used - 1
+        next_states = set()
+        for partial_sum, partial_sq in states:
+            for value in values:
+                new_sum = partial_sum + value
+                new_sq = partial_sq + value * value
+                if new_sq > shifted_squares:
+                    continue
+                sum_left = shifted_sum - new_sum
+                sq_left = shifted_squares - new_sq
+                if remaining == 0:
+                    if sum_left == 0 and sq_left == 0:
+                        return True
+                    continue
+                if sum_left * sum_left > remaining * sq_left:
+                    continue
+                next_states.add((new_sum, new_sq))
+                if len(next_states) > max_states:
+                    return None
+        states = next_states
+        if not states:
+            return False
+    return False
+
+
 def grimmer_consistent(mean, sd, n, mean_decimals, sd_decimals):
-    """True if a sample of `n` integers can have both the reported `mean` and the
-    reported `sd` (to their stated decimals). Implements the GRIMMER test: for the
-    integer total T fixed by the mean, search the integer sum-of-squares values
-    whose implied sd rounds to the reported sd, and require one with the correct
-    parity (since sum(x^2) == sum(x) mod 2 for integers). Accepts either sample
-    (n-1) or population (n) SD convention so an unknown convention never
-    false-positives."""
     if n <= 1 or sd < 0:
         return True
-    T = round(mean * n)
-    half = 0.5 / (10 ** sd_decimals)
-    lo_sd = max(0.0, sd - half)
-    hi_sd = sd + half
-    for ddof in (1, 0):
-        denom = n - ddof
-        if denom <= 0:
-            continue
-        corr = (T * T) / n
-        ss_lo = lo_sd * lo_sd * denom + corr
-        ss_hi = hi_sd * hi_sd * denom + corr
-        for ss in range(math.ceil(ss_lo - 1e-9), math.floor(ss_hi + 1e-9) + 1):
-            if ss < 0:
-                continue
-            if (ss % 2) != (T % 2):       # integer parity test
-                continue
-            if ss + 1e-9 >= corr:          # variance >= 0
-                return True
-    return False
+    unknown = False
+    for total in _candidate_integer_totals(mean, n, mean_decimals):
+        for ddof in (1, 0):
+            for sum_squares in _candidate_sum_squares(
+                total, sd, n, sd_decimals, ddof
+            ):
+                reachable = _integer_moments_reachable(
+                    total, sum_squares, n
+                )
+                if reachable is True:
+                    return True
+                if reachable is None:
+                    unknown = True
+    return True if unknown else False
 
 
 # ---------- sheet I/O ----------

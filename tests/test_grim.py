@@ -191,3 +191,25 @@ def test_detector_still_checks_composite_score_mean():
     ]
     findings = detect_grim_grimmer(*_block(rows))
     assert any(f["kind"] == "grim_inconsistent" for f in findings)
+
+
+def test_grimmer_rejects_parity_only_false_consistency():
+    assert grimmer_consistent(0.5, 1.12, 2, 1, 2) is False
+
+
+def test_grimmer_two_value_closed_form():
+    assert grimmer_consistent(0.5, 0.71, 2, 1, 2) is True
+    assert grimmer_consistent(0.5, 0.50, 2, 1, 2) is True
+
+
+def test_grimmer_stays_conservative_when_search_budget_is_exceeded(monkeypatch):
+    import paperconan._audit as audit
+
+    assert audit._integer_moments_reachable(
+        total=3,
+        sum_squares=101,
+        n=5,
+        max_states=1,
+    ) is None
+    monkeypatch.setattr(audit, "_GRIMMER_MAX_STATES", 1)
+    assert audit.grimmer_consistent(0.6, 4.6, 5, 1, 1) is True
