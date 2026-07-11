@@ -807,7 +807,8 @@ def _sample_exact(values, k=8):
 
 _GRIM_MEAN_RE = re.compile(r"\b(mean|average|avg)\b|均值|平均", re.I)
 _GRIM_SD_RE = re.compile(r"\b(s\.?d\.?|std)\b|标准差", re.I)
-_GRIM_SE_RE = re.compile(r"\b(?:sem|s\.?e\.?|standard error)\b", re.I)
+_GRIM_SE_RE = re.compile(
+    r"\b(?:sem|s\.?e\.?|(?:standard|std\.?)\s+error)\b", re.I)
 _GRIM_N_RE = re.compile(r"\bn\b|sample.?size|样本量|例数", re.I)
 _GRIM_INT_RE = re.compile(
     r"count|number|cells|foci|colon|nuclei|score|rating|likert"
@@ -829,6 +830,8 @@ def _grim_role_tokens(label):
 def _grim_best_partner(mean_i, candidates, header):
     if not candidates:
         return None
+    if len(candidates) == 1:
+        return candidates[0]
     mean_tokens = _grim_role_tokens(header[mean_i])
     ranked = sorted(
         candidates,
@@ -840,8 +843,8 @@ def _grim_best_partner(mean_i, candidates, header):
     )
     best = ranked[0]
     overlap = len(mean_tokens & _grim_role_tokens(header[best]))
-    if overlap == 0 and len(candidates) == 1:
-        return candidates[0]
+    if overlap == 0:
+        return None
     return best
 
 

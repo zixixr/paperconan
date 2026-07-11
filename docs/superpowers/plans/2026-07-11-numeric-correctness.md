@@ -832,15 +832,17 @@ git commit -m "fix: strengthen integer SD feasibility checks"
 **Files:**
 - Modify: `src/paperconan/_audit.py`
 - Modify: `tests/test_grim.py`
-- Modify: `tests/test_grim_e2e.py`
+- Modify: `docs/superpowers/plans/2026-07-11-numeric-correctness.md`
+- Verify: `tests/test_grim_e2e.py`
 
 **Interfaces:**
 - `_grim_column_groups(header) -> list[tuple[int, int, int | None]]`
 - `detect_grim_grimmer` emits findings independently for each matched group.
 
-- [ ] **Step 1: Add multi-group detector tests**
+- [ ] **Step 1: Add and strengthen header-grouping tests**
 
-Append to `tests/test_grim.py`:
+Import `_grim_column_groups` from `paperconan._audit`, then append to
+`tests/test_grim.py`:
 
 ```python
 def test_detector_checks_multiple_labeled_mean_groups():
@@ -850,10 +852,24 @@ def test_detector_checks_multiple_labeled_mean_groups():
         ["x", 3.40, 1.0, 10, 2.25, 1.0, 10],
         ["y", 3.45, 1.0, 10, 2.20, 1.0, 10],
     ]
+    assert _grim_column_groups(rows[0]) == [(1, 3, 2), (4, 6, 5)]
     findings = detect_grim_grimmer(*_block(rows))
-    mean_columns = {f["mean_col"] for f in findings}
-    assert "score mean A" in mean_columns
-    assert "score mean B" in mean_columns
+    partners = [
+        (
+            f["kind"],
+            f["mean_col"],
+            f["n_col"],
+            f["sd_col"],
+            f["col_a_idx"],
+            f.get("col_b_idx"),
+        )
+        for f in findings
+    ]
+    assert partners == [
+        ("grim_inconsistent", "score mean A", "n A", "sd A", 1, 2),
+        ("grim_inconsistent", "score mean B", "n B", "sd B", 4, 5),
+    ]
+    assert len(partners) == len(set(partners))
 
 
 def test_detector_may_share_one_global_n_column():
@@ -862,8 +878,69 @@ def test_detector_may_share_one_global_n_column():
          "score mean B", "sd B", "n"],
         ["x", 3.45, 1.0, 2.25, 1.0, 10],
     ]
+    assert _grim_column_groups(rows[0]) == [(1, 5, 2), (3, 5, 4)]
     findings = detect_grim_grimmer(*_block(rows))
-    assert {f["n_col"] for f in findings} == {"n"}
+    partners = [
+        (
+            f["kind"],
+            f["mean_col"],
+            f["n_col"],
+            f["sd_col"],
+            f["col_a_idx"],
+            f.get("col_b_idx"),
+        )
+        for f in findings
+    ]
+    assert partners == [
+        ("grim_inconsistent", "score mean A", "n", "sd A", 1, 2),
+        ("grim_inconsistent", "score mean B", "n", "sd B", 3, 4),
+    ]
+    assert len(partners) == len(set(partners))
+
+
+def test_detector_excludes_standard_error_header_variants():
+    for error_header in (
+        "SEM",
+        "SE",
+        "S.E.",
+        "standard error",
+        "Std. Error",
+        "Std Error",
+    ):
+        rows = [
+            ["group", "score mean", error_header, "n"],
+            ["A", 2.3, 1.05, 3],
+        ]
+        assert _grim_column_groups(rows[0]) == [(1, 3, None)]
+        findings = detect_grim_grimmer(*_block(rows))
+        assert all(f["kind"] != "grimmer_inconsistent" for f in findings)
+
+    for sd_header in ("SD", "Std", "Std. Dev."):
+        header = ["group", "score mean", sd_header, "n"]
+        assert _grim_column_groups(header) == [(1, 3, 2)]
+
+
+def test_grouping_rejects_multiple_unrelated_partner_candidates():
+    ambiguous_sd_rows = [
+        ["group", "score mean A", "sd B", "sd C", "n A"],
+        ["A", 3.45, 1.0, 1.1, 10],
+    ]
+    assert _grim_column_groups(ambiguous_sd_rows[0]) == [(1, 4, None)]
+    findings = detect_grim_grimmer(*_block(ambiguous_sd_rows))
+    assert len(findings) == 1
+    assert findings[0]["kind"] == "grim_inconsistent"
+    assert findings[0]["mean_col"] == "score mean A"
+    assert findings[0]["n_col"] == "n A"
+    assert findings[0]["sd_col"] is None
+    assert findings[0]["col_a_idx"] == 1
+    assert "col_b_idx" not in findings[0]
+
+    ambiguous_n_rows = [
+        ["group", "score mean A", "sd A", "n B", "n C"],
+        ["A", 3.45, 1.0, 10, 10],
+    ]
+    assert _grim_column_groups(ambiguous_n_rows[0]) == []
+    assert detect_grim_grimmer(*_block(ambiguous_n_rows)) == []
 ```
 
 - [ ] **Step 2: Run and verify RED**
@@ -872,18 +949,22 @@ Run:
 
 ```bash
 .venv/bin/python -m pytest \
-  tests/test_grim.py::test_detector_checks_multiple_labeled_mean_groups \
-  tests/test_grim.py::test_detector_may_share_one_global_n_column -q
+  tests/test_grim.py::test_detector_excludes_standard_error_header_variants -q
+
+.venv/bin/python -m pytest \
+  tests/test_grim.py::test_grouping_rejects_multiple_unrelated_partner_candidates -q
 ```
 
-Expected: current first-match implementation misses the later group.
+Expected: `Std. Error` / `Std Error` are incorrectly admitted as SD candidates,
+and multiple zero-overlap candidates are incorrectly resolved by proximity.
 
 - [ ] **Step 3: Implement header-role grouping**
 
 Add:
 
 ```python
-_GRIM_SE_RE = re.compile(r"\b(?:sem|s\.?e\.?|standard error)\b", re.I)
+_GRIM_SE_RE = re.compile(
+    r"\b(?:sem|s\.?e\.?|(?:standard|std\.?)\s+error)\b", re.I)
 _GRIM_ROLE_WORDS = {
     "mean", "average", "avg", "sd", "std", "stdev",
     "n", "sample", "size",
@@ -898,6 +979,8 @@ def _grim_role_tokens(label):
 def _grim_best_partner(mean_i, candidates, header):
     if not candidates:
         return None
+    if len(candidates) == 1:
+        return candidates[0]
     mean_tokens = _grim_role_tokens(header[mean_i])
     ranked = sorted(
         candidates,
@@ -909,8 +992,8 @@ def _grim_best_partner(mean_i, candidates, header):
     )
     best = ranked[0]
     overlap = len(mean_tokens & _grim_role_tokens(header[best]))
-    if overlap == 0 and len(candidates) == 1:
-        return candidates[0]
+    if overlap == 0:
+        return None
     return best
 
 
@@ -943,9 +1026,22 @@ def _grim_column_groups(header):
     return groups
 ```
 
+Partner selection is conservative:
+
+- No candidates means no partner.
+- Exactly one candidate may serve as a global partner even when its label has
+  no non-role token overlap with the mean.
+- With multiple candidates, the selected candidate must have nonzero token
+  overlap. If every overlap count is zero, no partner is selected; proximity
+  alone must not bind unrelated columns.
+- An ambiguous SD leaves the group eligible for GRIM with `sd_i=None`. An
+  ambiguous n omits the mean group because n is required.
+- A sole global n candidate remains reusable across multiple mean groups.
+
 The public detector loops over `_grim_column_groups(header)` and runs the
 existing row checks once per group. Findings keep their group-specific column
-names and indices.
+names and indices, and the tests assert exact groups, partner fields, indices,
+global-n reuse, and finding uniqueness.
 
 - [ ] **Step 4: Run GRIM unit and end-to-end tests**
 
@@ -960,7 +1056,8 @@ Expected: all pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/paperconan/_audit.py tests/test_grim.py tests/test_grim_e2e.py
+git add src/paperconan/_audit.py tests/test_grim.py \
+  docs/superpowers/plans/2026-07-11-numeric-correctness.md
 git commit -m "fix: inspect every integer-summary column group"
 ```
 

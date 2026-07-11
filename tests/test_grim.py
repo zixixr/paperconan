@@ -64,7 +64,7 @@ def test_grimmer_never_flags_achievable_integer_sds():
                 assert grimmer_consistent(mean, sd, n, d, d) is True, (combo, n, d, mean, sd)
 
 
-from paperconan._audit import detect_grim_grimmer
+from paperconan._audit import _grim_column_groups, detect_grim_grimmer
 from paperconan._sheet import Sheet
 
 
@@ -243,10 +243,24 @@ def test_detector_checks_multiple_labeled_mean_groups():
         ["x", 3.40, 1.0, 10, 2.25, 1.0, 10],
         ["y", 3.45, 1.0, 10, 2.20, 1.0, 10],
     ]
+    assert _grim_column_groups(rows[0]) == [(1, 3, 2), (4, 6, 5)]
     findings = detect_grim_grimmer(*_block(rows))
-    mean_columns = {f["mean_col"] for f in findings}
-    assert "score mean A" in mean_columns
-    assert "score mean B" in mean_columns
+    partners = [
+        (
+            f["kind"],
+            f["mean_col"],
+            f["n_col"],
+            f["sd_col"],
+            f["col_a_idx"],
+            f.get("col_b_idx"),
+        )
+        for f in findings
+    ]
+    assert partners == [
+        ("grim_inconsistent", "score mean A", "n A", "sd A", 1, 2),
+        ("grim_inconsistent", "score mean B", "n B", "sd B", 4, 5),
+    ]
+    assert len(partners) == len(set(partners))
 
 
 def test_detector_may_share_one_global_n_column():
@@ -255,5 +269,66 @@ def test_detector_may_share_one_global_n_column():
          "score mean B", "sd B", "n"],
         ["x", 3.45, 1.0, 2.25, 1.0, 10],
     ]
+    assert _grim_column_groups(rows[0]) == [(1, 5, 2), (3, 5, 4)]
     findings = detect_grim_grimmer(*_block(rows))
-    assert {f["n_col"] for f in findings} == {"n"}
+    partners = [
+        (
+            f["kind"],
+            f["mean_col"],
+            f["n_col"],
+            f["sd_col"],
+            f["col_a_idx"],
+            f.get("col_b_idx"),
+        )
+        for f in findings
+    ]
+    assert partners == [
+        ("grim_inconsistent", "score mean A", "n", "sd A", 1, 2),
+        ("grim_inconsistent", "score mean B", "n", "sd B", 3, 4),
+    ]
+    assert len(partners) == len(set(partners))
+
+
+def test_detector_excludes_standard_error_header_variants():
+    for error_header in (
+        "SEM",
+        "SE",
+        "S.E.",
+        "standard error",
+        "Std. Error",
+        "Std Error",
+    ):
+        rows = [
+            ["group", "score mean", error_header, "n"],
+            ["A", 2.3, 1.05, 3],
+        ]
+        assert _grim_column_groups(rows[0]) == [(1, 3, None)]
+        findings = detect_grim_grimmer(*_block(rows))
+        assert all(f["kind"] != "grimmer_inconsistent" for f in findings)
+
+    for sd_header in ("SD", "Std", "Std. Dev."):
+        header = ["group", "score mean", sd_header, "n"]
+        assert _grim_column_groups(header) == [(1, 3, 2)]
+
+
+def test_grouping_rejects_multiple_unrelated_partner_candidates():
+    ambiguous_sd_rows = [
+        ["group", "score mean A", "sd B", "sd C", "n A"],
+        ["A", 3.45, 1.0, 1.1, 10],
+    ]
+    assert _grim_column_groups(ambiguous_sd_rows[0]) == [(1, 4, None)]
+    findings = detect_grim_grimmer(*_block(ambiguous_sd_rows))
+    assert len(findings) == 1
+    assert findings[0]["kind"] == "grim_inconsistent"
+    assert findings[0]["mean_col"] == "score mean A"
+    assert findings[0]["n_col"] == "n A"
+    assert findings[0]["sd_col"] is None
+    assert findings[0]["col_a_idx"] == 1
+    assert "col_b_idx" not in findings[0]
+
+    ambiguous_n_rows = [
+        ["group", "score mean A", "sd A", "n B", "n C"],
+        ["A", 3.45, 1.0, 10, 10],
+    ]
+    assert _grim_column_groups(ambiguous_n_rows[0]) == []
+    assert detect_grim_grimmer(*_block(ambiguous_n_rows)) == []
