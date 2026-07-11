@@ -1,3 +1,5 @@
+import pytest
+
 from paperconan._audit import write_markdown_report
 from paperconan._html import write_html_report
 
@@ -32,7 +34,7 @@ def _scan(status, limitations=None):
     }
 
 
-def _add_finding(scan):
+def _add_finding(scan, severity="medium"):
     scan["n_blocks_with_findings"] = 1
     scan["relations_blocks"] = [{
         "file": "good.xlsx",
@@ -40,7 +42,7 @@ def _add_finding(scan):
         "block": {"rows": "2-5", "cols": "A-B", "header": ["a", "b"]},
         "relations": [{
             "kind": "constant_offset",
-            "severity": "medium",
+            "severity": severity,
             "rule": "col[1] = col[0] + 1",
             "n": 4,
         }],
@@ -63,6 +65,95 @@ def _render_markdown(tmp_path, scan, name="REPORT.md"):
     out = tmp_path / name
     write_markdown_report(scan, str(out))
     return out.read_text(encoding="utf-8")
+
+
+def _nested_limitations(reordered=False):
+    if reordered:
+        first_reason = {
+            "a": "alpha",
+            "z": ["reason`one", {
+                "a": "first",
+                "line\nkey": "<value>",
+                "line\rkey": "other",
+            }],
+        }
+        first_meta = {
+            "a": "<tag>",
+            "outer": [{"a": "line\nvalue", "z": "last"}],
+        }
+        second_detail = {
+            "x": ["one", {"a": None, "b": False}],
+            "y": "two",
+        }
+        return [
+            {
+                "meta`key\n": first_meta,
+                "reason": first_reason,
+                "scope": "block",
+            },
+            {
+                "detail": second_detail,
+                "scope": "file",
+                "reason": ["second", {"a": 1, "b": 2}],
+            },
+        ]
+    return [
+        {
+            "scope": "block",
+            "reason": {
+                "z": ["reason`one", {
+                    "line\rkey": "other",
+                    "line\nkey": "<value>",
+                    "a": "first",
+                }],
+                "a": "alpha",
+            },
+            "meta`key\n": {
+                "outer": [{"z": "last", "a": "line\nvalue"}],
+                "a": "<tag>",
+            },
+        },
+        {
+            "reason": ["second", {"b": 2, "a": 1}],
+            "scope": "file",
+            "detail": {
+                "y": "two",
+                "x": ["one", {"b": False, "a": None}],
+            },
+        },
+    ]
+
+
+def _add_reportable_signal(scan, signal):
+    if signal in {"high_block", "low_block"}:
+        _add_finding(scan, severity=signal.removesuffix("_block"))
+    elif signal == "cross_sheet":
+        scan["cross_sheet_findings"] = [{
+            "kind": "cross_sheet_position_identical",
+            "severity": "high",
+            "file": "good.xlsx",
+            "sheet_a": "Data",
+            "sheet_b": "Repeat",
+            "rule": "matching numeric positions require review",
+        }]
+    elif signal == "digit":
+        scan["digit_distribution"] = [{
+            "label": "good.xlsx::Data",
+            "n": 90,
+            "chi2": 45.0,
+            "p": 1e-8,
+            "p_adj": 1e-7,
+            "fdr_significant": True,
+            "counts": {str(digit): 9 for digit in range(10)},
+            "top": [["1", 18]],
+        }]
+    elif signal == "decimal":
+        scan["decimal_endings"] = [{
+            "label": "good.xlsx::Data",
+            "n": 40,
+            "n_unique": 7,
+            "top": [["12", 11]],
+        }]
 
 
 def test_complete_html_reports_status_before_findings(tmp_path):
@@ -163,3 +254,77 @@ def test_legacy_markdown_reports_unknown_detailed_coverage(tmp_path):
     assert "legacy scan" in markdown.lower()
     assert "detailed coverage status is unavailable" in markdown.lower()
     assert "nothing flagged in this dataset" not in markdown.lower()
+
+
+def test_nested_limitations_render_canonically_and_escape_html(tmp_path):
+    first = _scan("partial", _nested_limitations())
+    reordered = _scan("partial", _nested_limitations(reordered=True))
+
+    first_html = _render_html(tmp_path, first, "first.html")
+    reordered_html = _render_html(tmp_path, reordered, "reordered.html")
+
+    assert first_html == reordered_html
+    assert "&lt;value&gt;" in first_html
+    assert "&lt;tag&gt;" in first_html
+    assert "<value>" not in first_html
+    assert "<tag>" not in first_html
+    assert "line\nkey" not in first_html
+    assert "line key" in first_html
+    assert first_html.index("alpha") < first_html.index("reason`one")
+    assert first_html.index("reason`one") < first_html.index("second")
+
+
+def test_nested_limitations_render_canonically_and_sanitize_markdown(tmp_path):
+    first = _scan("partial", _nested_limitations())
+    reordered = _scan("partial", _nested_limitations(reordered=True))
+
+    first_md = _render_markdown(tmp_path, first, "first.md")
+    reordered_md = _render_markdown(tmp_path, reordered, "reordered.md")
+    limitations = first_md.split("### Coverage limitations\n", 1)[1].split("\n\n", 1)[0]
+
+    assert first_md == reordered_md
+    assert limitations.strip().splitlines() == [
+        "- `{a: alpha, z: [reason'one, "
+        "{a: first, line key: <value>, line key: other}]}` "
+        "· scope: `block` · meta'key: `{a: <tag>, outer: [{a: line value, z: last}]}`",
+        "- `[second, {a: 1, b: 2}]` · scope: `file` "
+        "· detail: `{x: [one, {a: None, b: False}], y: two}`",
+    ]
+    assert "reason`one" not in limitations
+    assert "meta`key" not in limitations
+    assert "line\nkey" not in limitations
+
+
+@pytest.mark.parametrize(
+    "signal",
+    ["high_block", "low_block", "cross_sheet", "digit", "decimal"],
+)
+def test_reportable_signals_never_render_completed_empty_claim(
+    tmp_path, signal
+):
+    scan = _scan("complete")
+    _add_reportable_signal(scan, signal)
+
+    html = _render_html(tmp_path, scan)
+    markdown = _render_markdown(tmp_path, scan)
+
+    assert "nothing flagged in this dataset" not in html.lower()
+    assert "nothing flagged in this dataset" not in markdown.lower()
+
+
+def test_unknown_html_status_never_uses_completed_empty_claim(tmp_path):
+    html = _render_html(tmp_path, _scan("cancelled"))
+
+    assert "scan cancelled" in html.lower()
+    assert "detailed coverage status is unavailable" in html.lower()
+    assert "nothing flagged in this dataset" not in html.lower()
+    assert "no findings recorded" in html.lower()
+
+
+def test_unknown_markdown_status_never_uses_completed_empty_claim(tmp_path):
+    markdown = _render_markdown(tmp_path, _scan("cancelled"))
+
+    assert "scan status: cancelled" in markdown.lower()
+    assert "detailed coverage status is unavailable" in markdown.lower()
+    assert "nothing flagged in this dataset" not in markdown.lower()
+    assert "no findings were recorded" in markdown.lower()

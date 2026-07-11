@@ -3162,12 +3162,28 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
 
 def _markdown_status_value(value):
     if isinstance(value, dict):
-        return ", ".join(
-            f"{key}={_markdown_status_value(value[key])}" for key in sorted(value)
+        items = sorted(
+            value.items(),
+            key=lambda item: _markdown_status_sort_key(item[0]),
         )
+        return "{" + ", ".join(
+            f"{_markdown_status_value(key)}: {_markdown_status_value(item)}"
+            for key, item in items
+        ) + "}"
     if isinstance(value, (list, tuple)):
-        return ", ".join(_markdown_status_value(item) for item in value)
+        left, right = ("[", "]") if isinstance(value, list) else ("(", ")")
+        return left + ", ".join(
+            _markdown_status_value(item) for item in value
+        ) + right
     return str(value).replace("`", "'").replace("\r", " ").replace("\n", " ")
+
+
+def _markdown_status_sort_key(value):
+    return (
+        _markdown_status_value(value),
+        type(value).__name__,
+        str(value),
+    )
 
 
 def _markdown_scan_status(out):
@@ -3182,7 +3198,7 @@ def _markdown_scan_status(out):
         )
         return lines
 
-    normalized = str(status).lower()
+    normalized = str(status).strip().lower()
     if normalized == "complete":
         lines.append(
             "**Scan complete.** Detailed coverage metadata reports no scan limitations.\n"
@@ -3211,11 +3227,14 @@ def _markdown_scan_status(out):
                 reason = _markdown_status_value(
                     limitation.get("reason") or "unspecified"
                 )
-                detail_keys = ["scope"] + sorted(
-                    key for key in limitation if key not in {"reason", "scope"}
+                detail_keys = (
+                    ["scope"] if "scope" in limitation else []
+                ) + sorted(
+                    (key for key in limitation if key not in {"reason", "scope"}),
+                    key=_markdown_status_sort_key,
                 )
                 details = " · ".join(
-                    f"{key.replace('_', ' ')}: "
+                    f"{_markdown_status_value(key).replace('_', ' ').strip()}: "
                     f"`{_markdown_status_value(limitation[key])}`"
                     for key in detail_keys
                     if limitation.get(key) is not None
@@ -3231,7 +3250,10 @@ def _markdown_scan_status(out):
 
 def write_markdown_report(out, path):
     raw_scan_status = out.get("scan_status")
-    scan_status = str(raw_scan_status).lower() if raw_scan_status is not None else None
+    scan_status = (
+        str(raw_scan_status).strip().lower()
+        if raw_scan_status is not None else None
+    )
     lines = ["# Paper data audit report\n"]
     lines.extend(_markdown_scan_status(out))
     lines.extend([
@@ -3287,8 +3309,13 @@ def write_markdown_report(out, path):
                 "No findings were recorded in this legacy scan; "
                 "detailed coverage is unavailable.\n"
             )
-        else:
+        elif scan_status == "complete":
             lines.append("Nothing flagged in this dataset.\n")
+        else:
+            lines.append(
+                "No findings were recorded; detailed coverage status "
+                "is unavailable for this scan.\n"
+            )
 
     if csf:
         lines.append(f"## ⚠️ Cross-sheet bit-identical collisions ({len(csf)})\n")

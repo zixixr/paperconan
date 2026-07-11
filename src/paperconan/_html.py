@@ -85,12 +85,22 @@ def _severity_counts(findings: list[dict]) -> dict[str, int]:
 
 def _status_value(value: Any) -> str:
     if isinstance(value, dict):
-        return ", ".join(
-            f"{key}={_status_value(value[key])}" for key in sorted(value)
+        items = sorted(
+            value.items(),
+            key=lambda item: _status_sort_key(item[0]),
         )
+        return "{" + ", ".join(
+            f"{_status_value(key)}: {_status_value(item)}"
+            for key, item in items
+        ) + "}"
     if isinstance(value, (list, tuple)):
-        return ", ".join(_status_value(item) for item in value)
-    return str(value)
+        left, right = ("[", "]") if isinstance(value, list) else ("(", ")")
+        return left + ", ".join(_status_value(item) for item in value) + right
+    return str(value).replace("\r", " ").replace("\n", " ")
+
+
+def _status_sort_key(value: Any) -> tuple[str, str, str]:
+    return (_status_value(value), type(value).__name__, str(value))
 
 
 def _render_scan_status(scan: dict) -> str:
@@ -106,7 +116,7 @@ def _render_scan_status(scan: dict) -> str:
             '</section>'
         )
 
-    normalized = str(status).lower()
+    normalized = str(status).strip().lower()
     if normalized == "complete":
         return (
             '<section class="scan-status status-complete" aria-label="Scan status">'
@@ -131,18 +141,19 @@ def _render_scan_status(scan: dict) -> str:
     items = []
     for limitation in limitations:
         if isinstance(limitation, dict):
-            reason = limitation.get("reason") or "unspecified"
-            detail_keys = ["scope"] + sorted(
-                key for key in limitation if key not in {"reason", "scope"}
+            reason = _status_value(limitation.get("reason") or "unspecified")
+            detail_keys = (["scope"] if "scope" in limitation else []) + sorted(
+                (key for key in limitation if key not in {"reason", "scope"}),
+                key=_status_sort_key,
             )
             details = "".join(
-                f'<span><strong>{_esc(key.replace("_", " "))}:</strong> '
+                f'<span><strong>{_esc(_status_value(key).replace("_", " ").strip())}:</strong> '
                 f'{_esc(_status_value(limitation[key]))}</span>'
                 for key in detail_keys
                 if limitation.get(key) is not None
             )
         else:
-            reason = limitation
+            reason = _status_value(limitation)
             details = ""
         detail_html = f'<span class="status-limit-detail">{details}</span>' if details else ""
         items.append(
@@ -155,7 +166,10 @@ def _render_scan_status(scan: dict) -> str:
         if items else ""
     )
     status_class = normalized if normalized in {"partial", "failed"} else "legacy"
-    label = f"Scan {_esc(normalized)}" if normalized else "Scan status unavailable"
+    label = (
+        f"Scan {_esc(_status_value(normalized))}"
+        if normalized else "Scan status unavailable"
+    )
     return (
         f'<section class="scan-status status-{status_class}" aria-label="Scan status">'
         f'<h2>{label}</h2><p>{summary}</p>{list_html}</section>'
@@ -584,7 +598,10 @@ def write_html_report(scan: dict, out_path: str) -> None:
     input_dir = scan.get("input_dir", "")
     input_label = os.path.basename(os.path.normpath(input_dir)) or input_dir or "audit"
     raw_scan_status = scan.get("scan_status")
-    scan_status = str(raw_scan_status).lower() if raw_scan_status is not None else None
+    scan_status = (
+        str(raw_scan_status).strip().lower()
+        if raw_scan_status is not None else None
+    )
     status_html = _render_scan_status(scan)
     findings = _all_findings(scan)
     n_sheets = len({(it["file"], it["sheet"]) for it in findings if it["scope"] == "block"})
@@ -631,8 +648,13 @@ def write_html_report(scan: dict, out_path: str) -> None:
                 '<p class="empty">no findings recorded in this legacy scan; '
                 'detailed coverage is unavailable.</p>'
             )
-        else:
+        elif scan_status == "complete":
             sections = '<p class="empty">no findings — nothing flagged in this dataset.</p>'
+        else:
+            sections = (
+                '<p class="empty">no findings recorded; detailed coverage status '
+                'is unavailable for this scan.</p>'
+            )
 
     how_to_read = (
         '<div class="how-to-read">'

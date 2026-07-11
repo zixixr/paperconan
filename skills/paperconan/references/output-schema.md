@@ -65,11 +65,12 @@ be interpreted together with the amount of input that actually reached numeric
 scanning:
 
 - `complete`: at least one sheet reached numeric scanning and no coverage
-  limitation was recorded.
+  limitation was recorded. The CLI exits zero.
 - `partial`: some input reached numeric scanning, but one or more files, sheets,
-  detector paths, rows, blocks, or retained findings were limited.
-- `failed`: no sheet reached numeric scanning. The CLI still writes diagnostic
-  `scan.json` and requested HTML/Markdown reports, then exits nonzero.
+  detector paths, rows, blocks, or retained findings were limited. The CLI
+  exits zero.
+- `failed`: no sheet reached numeric scanning. The CLI first writes diagnostic
+  `scan.json` and requested HTML/Markdown outputs, then exits nonzero.
 
 Coverage counters are cumulative for the scan:
 

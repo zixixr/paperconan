@@ -8,9 +8,9 @@
 
 `report.html`（分诊工作台）：顶部摘要 + 扫描状态 + "如何阅读本报告"说明 + 左侧 severity/detector/文件/关键词过滤 + finding 卡片 + last-digit histogram + cross-sheet 专段。扫描状态在 findings 之前，含义如下：
 
-- **complete**：覆盖信息未记录限制；只有这种状态下，空 finding 列表才会显示为本次扫描未标记统计信号。
-- **partial**：保留并展示已完成部分的 findings，同时先列出文件、sheet、block、detector 或输出上限等 coverage limitations。
-- **failed**：没有输入表到达数值扫描；报告显示失败诊断，不会把空 finding 列表写成一次完整扫描的空结果。CLI 会先写出诊断产物，再以非零状态退出。
+- **complete**：覆盖信息未记录限制；只有这种状态下，空 finding 列表才会显示为本次扫描未标记统计信号。CLI 返回 `0`。
+- **partial**：保留并展示已完成部分的 findings，同时先列出文件、sheet、block、detector 或输出上限等 coverage limitations。CLI 返回 `0`。
+- **failed**：没有输入表到达数值扫描；报告显示失败诊断，不会把空 finding 列表写成一次完整扫描的空结果。CLI 会先写出诊断 `scan.json` 和用户请求的 HTML/Markdown 输出，再返回非零状态。
 - **legacy**：旧 `scan.json` 没有 `scan_status` / `coverage`；HTML 和 Markdown 仍可渲染，但明确提示详细覆盖状态不可用。
 
 `REPORT.md` 使用同样的 complete / partial / failed / legacy 语义，并按确定顺序列出 coverage limitations。
