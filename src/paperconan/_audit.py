@@ -25,6 +25,7 @@ import csv as _csv
 import ctypes
 import datetime
 import glob
+import hashlib
 import json
 import math
 import os
@@ -43,6 +44,12 @@ from ._input import InputLimitation, TableLoadResult, inspect_ooxml_formula_cach
 from ._numeric import integer_shift_close, relation_close
 from ._profiles import apply_profile_to_findings, normalize_profile
 from ._sheet import Sheet, _MAX_EXACT_FLOAT_INT
+from ._summaries import (
+    ColumnFingerprint,
+    CrossSheetSummary,
+    RecurringRowIndex,
+    SparseLabelContext,
+)
 from .schema import PaperconanInputError
 
 # Canonical list of the per-block finding-group keys emitted into every
@@ -1855,7 +1862,12 @@ def detect_equal_pairs(sheet, r0, r1, c0, c1, header):
 # ---------- driver ----------
 
 def _grid_from_rows(
-    sheet, min_decimal_places=3, max_rows=200, *, with_coverage=False
+    sheet,
+    min_decimal_places=3,
+    max_rows=200,
+    max_cells=None,
+    *,
+    with_coverage=False,
 ):
     """Build {(r, c): rounded_value} of decimal-bearing numeric cells from a Sheet.
     Only keeps non-integer values with >= min_decimal_places decimals in a sane range —
@@ -1863,6 +1875,8 @@ def _grid_from_rows(
     grid = {}
     nm = sheet.numeric
     rmax = min(sheet.nrows, max_rows)
+    cell_limit = None if max_cells is None else max(0, int(max_cells))
+    cell_limited = False
     for ri in range(rmax):
         for ci in range(sheet.ncols):
             fv = nm[ri, ci]
@@ -1873,12 +1887,22 @@ def _grid_from_rows(
                 if "." in s and "e" not in s.lower():
                     frac = s.split(".", 1)[1]
                     if len(frac) >= min_decimal_places:
+                        if cell_limit is not None and len(grid) >= cell_limit:
+                            cell_limited = True
+                            break
                         grid[(ri, ci)] = round(fv, 9)
+        if cell_limited:
+            break
     meta = {
         "rows_total": sheet.nrows,
         "rows_used": rmax,
         "row_limited": sheet.nrows > rmax,
     }
+    if cell_limit is not None:
+        meta.update({
+            "cells_used": len(grid),
+            "cell_limited": cell_limited,
+        })
     return (grid, meta) if with_coverage else grid
 
 
@@ -2609,6 +2633,166 @@ def _column_axis_like(a):
     return False
 
 
+def _numeric_ratio(value):
+    if isinstance(value, int):
+        return value, 1
+    return float(value).as_integer_ratio()
+
+
+def _fingerprint_values(values):
+    digest = hashlib.blake2b(digest_size=20)
+    for value in values:
+        numerator, denominator = _numeric_ratio(value)
+        token = f"{numerator}/{denominator};".encode("ascii")
+        digest.update(token)
+    return digest.hexdigest()
+
+
+def _fingerprint_example_value(value):
+    if isinstance(value, int) and abs(value) > _MAX_EXACT_FLOAT_INT:
+        return value
+    return float(value)
+
+
+def _exact_column_axis_like(exact_values):
+    if len(set(exact_values)) <= 1:
+        return True
+    fractions = [
+        Fraction(numerator, denominator)
+        for numerator, denominator in exact_values
+    ]
+    differences = [
+        fractions[idx + 1] - fractions[idx]
+        for idx in range(len(fractions) - 1)
+    ]
+    if differences and differences[0] != 0 and all(
+        value == differences[0] for value in differences
+    ):
+        return True
+    if all(value != 0 for value in fractions):
+        ratios = [
+            fractions[idx + 1] / fractions[idx]
+            for idx in range(len(fractions) - 1)
+        ]
+        if ratios and ratios[0] != 1 and all(
+            value == ratios[0] for value in ratios
+        ):
+            return True
+    return False
+
+
+def _column_fingerprints(file, sheet, source, blocks, min_column_length):
+    best = {}
+    for r0, r1, c0, c1 in blocks:
+        header = header_for(source, r0, c0, c1)
+        for col_idx in range(c0, c1):
+            values = [
+                source.exact_numeric(row_idx, col_idx)
+                for row_idx in range(r0, r1)
+            ]
+            values = [value for value in values if value is not None]
+            if len(values) < min_column_length:
+                continue
+            exact_values = [_numeric_ratio(value) for value in values]
+            try:
+                qualified = np.asarray(
+                    [float(value) for value in values],
+                    dtype=float,
+                )
+                axis_like = _column_axis_like(qualified)
+                rounded_distinct = len({
+                    round(float(value), 9)
+                    for value in values
+                })
+            except OverflowError:
+                axis_like = _exact_column_axis_like(exact_values)
+                rounded_distinct = len(set(exact_values))
+            if axis_like:
+                continue
+            if rounded_distinct < max(6, len(values) // 2):
+                continue
+            fingerprint = ColumnFingerprint(
+                file=file,
+                sheet=sheet,
+                col_idx=col_idx,
+                label=header[col_idx - c0],
+                length=len(values),
+                digest=_fingerprint_values(values),
+                all_int=all(denominator == 1 for _numerator, denominator in exact_values),
+                distinct=len(set(exact_values)),
+                sample=tuple(values[:5]),
+            )
+            current = best.get(col_idx)
+            if current is None or fingerprint.length > current.length:
+                best[col_idx] = fingerprint
+    return tuple(best[col_idx] for col_idx in sorted(best))
+
+
+def build_cross_sheet_summary(
+    file,
+    sheet,
+    source,
+    *,
+    blocks=None,
+    collision_max_rows=200,
+    collision_max_cells=200000,
+    min_column_length=12,
+) -> tuple[CrossSheetSummary, list[InputLimitation]]:
+    if blocks is None:
+        blocks = find_numeric_blocks(source)
+    grid, grid_meta = _grid_from_rows(
+        source,
+        max_rows=collision_max_rows,
+        max_cells=collision_max_cells,
+        with_coverage=True,
+    )
+    label_row_limit = min(source.nrows, collision_max_rows + 3)
+    labels = SparseLabelContext(
+        nrows=source.nrows,
+        ncols=source.ncols,
+        text={
+            (row_idx, col_idx): value
+            for (row_idx, col_idx), value in source._text.items()
+            if row_idx < label_row_limit and isinstance(value, str)
+        },
+    )
+    summary = CrossSheetSummary(
+        file=file,
+        sheet=sheet,
+        grid=grid,
+        labels=labels,
+        columns=_column_fingerprints(
+            file,
+            sheet,
+            source,
+            blocks,
+            min_column_length,
+        ),
+    )
+    limitations = []
+    if grid_meta["row_limited"]:
+        limitations.append(InputLimitation(
+            scope="sheet",
+            reason="collision_row_limit",
+            sheet=sheet,
+            details={
+                "rows_total": grid_meta["rows_total"],
+                "rows_used": grid_meta["rows_used"],
+            },
+        ))
+    if grid_meta["cell_limited"]:
+        limitations.append(InputLimitation(
+            scope="sheet",
+            reason="collision_cell_limit",
+            sheet=sheet,
+            details={
+                "cells_used": grid_meta["cells_used"],
+                "max_cells": max(0, int(collision_max_cells)),
+            },
+        ))
+    return summary, limitations
+
+
 def detect_cross_sheet_column_duplicates(grid_sheets, profile="review", min_len=12):
     """B1 — full-column duplication ACROSS different (file, sheet) panels, including the
     integer / 1-decimal columns that `detect_collisions` misses (it grids only >=3-decimal
@@ -2618,44 +2802,47 @@ def detect_cross_sheet_column_duplicates(grid_sheets, profile="review", min_len=
     (a combined plot and its per-replicate breakdown legitimately share a column)."""
     if len(grid_sheets) < 2:
         return []                                     # a cross-panel duplicate needs >=2 panels
-    # 1) collect candidate columns, deduped to the longest per (file, sheet, col_idx)
-    best = {}
-    for (fname, sname), sheet in grid_sheets.items():
-        for (r0, r1, c0, c1) in find_numeric_blocks(sheet):
-            header = header_for(sheet, r0, c0, c1)
-            for c in range(c0, c1):
-                a = col_array(sheet, r0, r1, c)
-                a = a[~np.isnan(a)]
-                if len(a) < min_len or _column_axis_like(a):
-                    continue
-                if len({round(float(v), 9) for v in a}) < max(6, len(a) // 2):
-                    continue                          # low-cardinality column recurs benignly
-                key = (fname, sname, c)
-                if key not in best or len(a) > len(best[key][3]):
-                    best[key] = (fname, sname, header[c - c0], a)
+    if hasattr(grid_sheets, "items"):
+        summaries = [
+            build_cross_sheet_summary(
+                file,
+                sheet,
+                source,
+                min_column_length=min_len,
+            )[0]
+            for (file, sheet), source in grid_sheets.items()
+        ]
+    else:
+        summaries = list(grid_sheets)
 
-    # 2) bucket by exact rounded value-sequence; a bucket with >=2 distinct panels is a dup
     buckets = {}
-    for (fname, sname, c), (_f, _s, label, a) in best.items():
-        sig = tuple(round(float(v), 6) for v in a)
-        buckets.setdefault(sig, []).append((fname, sname, c, label, a))
+    for summary in summaries:
+        for column in summary.columns:
+            if column.length >= min_len:
+                key = (column.length, column.digest)
+                buckets.setdefault(key, []).append(column)
 
     findings = []
-    for sig, group in buckets.items():
-        panels = {(g[0], g[1]) for g in group}
+    for group in buckets.values():
+        panels = {(column.file, column.sheet) for column in group}
         if len(panels) < 2:
             continue                                  # same-panel identical cols are identical_column's job
-        a = group[0][4]
-        n = len(a)
-        all_int = all(abs(float(v) - round(float(v))) < 1e-9 for v in a)
+        first = group[0]
+        n = first.length
+        all_int = first.all_int
         # all-integer sequences recur far more benignly (counts, indices) → require length + variety
-        if all_int and (n < 25 or len({round(float(v), 9) for v in a}) < max(12, int(0.7 * n))):
+        if all_int and (
+            n < 25
+            or first.distinct < max(12, int(0.7 * n))
+        ):
             continue
         emitted = 0
         for i in range(len(group)):
             for j in range(i + 1, len(group)):
-                fa, sa_name, _ca, la, _a = group[i]
-                fb, sb_name, _cb, lb, _b = group[j]
+                left = group[i]
+                right = group[j]
+                fa, sa_name, la = left.file, left.sheet, left.label
+                fb, sb_name, lb = right.file, right.sheet, right.label
                 if (fa, sa_name) == (fb, sb_name):
                     continue                          # different columns, same sheet → identical_column
                 fig_a, fig_b = figure_key(sa_name), figure_key(sb_name)
@@ -2674,7 +2861,10 @@ def detect_cross_sheet_column_duplicates(grid_sheets, profile="review", min_len=
                     fraction_of_smaller=1.0,
                     figure_a=fig_a, figure_b=fig_b, same_figure=same_figure,
                     delta={"pattern": "column_duplicate"},
-                    examples=[{"value": float(v)} for v in a[:5]],
+                    examples=[
+                        {"value": _fingerprint_example_value(value)}
+                        for value in first.sample
+                    ],
                     severity=sev,
                     rule=(f"column '{la}' ({sa_name}) and column '{lb}' ({sb_name}) match to 6 decimal "
                           f"places over all {n} values across 2 {scope}"),
@@ -2719,90 +2909,22 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
     # sheets whose figure_key is None).
     if len({figure_key(s) for (_f, s) in grid_sheets if figure_key(s) is not None}) < 2:
         return []
-    occ = {}   # rounded tuple -> list of (file, sheet, figure_key, row, start_col)
-    budget = 3_000_000   # bound worst-case work on genome-scale papers (linear, but many blocks)
+    index = RecurringRowIndex()
     for (fname, sname), sheet in grid_sheets.items():
-        fk = figure_key(sname)
-        for (r0, r1, c0, c1) in find_numeric_blocks(sheet):
-            for r in range(r0, min(r1, r0 + max_rows)):
-                row = []
-                for c in range(c0, c1):
-                    v = sheet.cell(r, c)
-                    row.append(float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None)
-                for start in range(len(row)):
-                    for k in range(min_k, max_k + 1):
-                        window = row[start:start + k]
-                        if len(window) < k or any(w is None for w in window):
-                            continue
-                        key = tuple(round(w, 6) for w in window)
-                        occ.setdefault(key, []).append((fname, sname, fk, r, c0 + start))
-                        budget -= 1
-                if budget <= 0:
-                    break
-            if budget <= 0:
-                break
-        if budget <= 0:
-            break
-
-    cands = []
-    for vec, places in occ.items():
-        if len(places) < 3 or _vector_is_patterned(list(vec)):
-            continue
-        namespaces = {p[2] for p in places if p[2] is not None}
-        if len(namespaces) < 2:
-            continue                                  # recurrence within one figure is expected
-        all_int = all(abs(v - round(v)) < 1e-9 for v in vec)
-        if all_int and (len(vec) < 5 or len({round(v, 6) for v in vec}) < 4):
-            continue
-        # distinct (sheet,row) occurrences so the same cells aren't counted twice
-        sites = {(p[0], p[1], p[3]) for p in places}
-        if len(sites) < 3:
-            continue
-        # cells physically covered by all occurrences (file, sheet, row, col) — used to merge the
-        # many overlapping windows that a single long recurring row-run produces. The file is part
-        # of the key so two files that share a sheet name ('Sheet1') are not conflated.
-        cells = {(p[0], p[1], p[3], p[4] + off) for p in places for off in range(len(vec))}
-        cands.append((vec, places, namespaces, sites, cells))
-
-    # Dedup by occurrence-cell overlap: a long recurring row-segment yields many overlapping
-    # windows (k=4..8, shifted) at the SAME cells. Keep the strongest (most occurrences, then
-    # longest) and drop any candidate whose covered cells overlap >=50% with a kept one, so one
-    # physical recurring run reports as one finding.
-    cands.sort(key=lambda x: (-len(x[3]), -len(x[0])))
-    kept = []
-    for c in cands:
-        cells = c[4]
-        if any(len(cells & k[4]) >= 0.5 * min(len(cells), len(k[4])) for k in kept):
-            continue
-        kept.append(c)
-
-    findings = []
-    for vec, places, namespaces, sites, _cells in kept:
-        sheets_hit = sorted({p[1] for p in places})
-        loc = "; ".join(sheets_hit[:6])
-        files_hit = sorted({p[0] for p in places})
-        findings.append(dict(
-            kind="recurring_row_vector",
-            file="; ".join(files_hit)[:120],
-            file_a=files_hit[0], file_b=files_hit[-1], same_file=len(files_hit) == 1,
-            sheet="; ".join(sheets_hit)[:120],
-            sheet_a=sheets_hit[0], sheet_b=sheets_hit[-1],
-            vector=[float(v) for v in vec],
-            size_a=len(sites), size_b=len(sites),
-            same_position_count=len(sites),
-            fraction_of_smaller=1.0,
-            n_occurrences=len(sites),
-            n_figures=len(namespaces),
-            same_figure=False,
-            delta={"pattern": "recurring_row_vector"},
-            pattern="recurring_row_vector",
-            examples=[{"value": float(v)} for v in vec],
-            severity="high" if (len(vec) >= 5 and len(sites) >= 3) else "medium",
-            rule=(f"the {len(vec)}-value vector {list(vec)} recurs at {len(sites)} places across "
-                  f"{len(namespaces)} figures ({loc})")))
-        if len(findings) >= max_findings:
-            break
-    apply_profile_to_findings(findings, profile)
+        index.add_sheet(
+            fname,
+            sname,
+            sheet,
+            blocks=find_numeric_blocks(sheet),
+            figure_id=figure_key(sname),
+            min_k=min_k,
+            max_k=max_k,
+            max_rows=max_rows,
+        )
+    findings, _meta = index.findings(
+        profile=profile,
+        max_findings=max_findings,
+    )
     return findings
 
 
@@ -2979,7 +3101,9 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     findings_kept_total = 0      # findings retained across all blocks (for the global backstop)
     per_sheet_numbers = {}
     grids = {}  # (file, sheet) -> decimal grid, for the unified collision pass
-    grid_sheets = {}  # (file, sheet) -> Sheet, for local cross-sheet label context
+    cross_sheet_summaries = []
+    recurring_rows = RecurringRowIndex()
+    within_sheet_fraction_findings = []
     scan_errors = []
     scan_stats = {"files": [], "sheets": []}
     scan_start = time.perf_counter()
@@ -3073,24 +3197,42 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 continue
             coverage.mark_sheet_succeeded()
             sheet = rows if isinstance(rows, Sheet) else Sheet.from_rows(rows)
-            grid, grid_meta = _grid_from_rows(sheet, with_coverage=True)
-            grids[(os.path.basename(f), sn)] = grid
-            if grid_meta["row_limited"]:
-                coverage.add_limitation(
-                    "sheet",
-                    "collision_row_limit",
-                    file=os.path.basename(f),
-                    sheet=sn,
-                    rows_total=grid_meta["rows_total"],
-                    rows_used=grid_meta["rows_used"],
-                )
-            grid_sheets[(os.path.basename(f), sn)] = sheet
-            sheet_nums = sheet.numeric_values()
-            per_sheet_numbers[(os.path.basename(f), sn)] = sheet_nums
+            file_name = os.path.basename(f)
             blocks = find_numeric_blocks(sheet)
+            summary, summary_limitations = build_cross_sheet_summary(
+                file_name,
+                sn,
+                sheet,
+                blocks=blocks,
+            )
+            cross_sheet_summaries.append(summary)
+            grids[(file_name, sn)] = summary.grid
+            for limitation in summary_limitations:
+                coverage.add_limitation(
+                    limitation.scope,
+                    limitation.reason,
+                    file=file_name,
+                    sheet=limitation.sheet,
+                    **limitation.details,
+                )
+            recurring_rows.add_sheet(
+                file_name,
+                sn,
+                sheet,
+                blocks=blocks,
+                figure_id=figure_key(sn),
+            )
+            within_sheet_fraction_findings.extend(
+                detect_within_sheet_fraction_reuse(
+                    {(file_name, sn): sheet},
+                    profile=profile,
+                )
+            )
+            sheet_nums = sheet.numeric_values()
+            per_sheet_numbers[(file_name, sn)] = sheet_nums
             max_cols = sheet.ncols
             scan_stats["sheets"].append({
-                "file": os.path.basename(f),
+                "file": file_name,
                 "sheet": sn,
                 "n_rows": sheet.nrows,
                 "n_cols": max_cols,
@@ -3242,14 +3384,26 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
 
     # Unified collision pass: every (file, sheet) grid against every other —
     # covers both intra-workbook sheet pairs and cross-file duplicates.
-    cross_sheet_findings = detect_collisions(grids, profile=profile, sheets=grid_sheets)
+    label_contexts = {
+        (summary.file, summary.sheet): summary.labels
+        for summary in cross_sheet_summaries
+    }
+    cross_sheet_findings = detect_collisions(
+        grids,
+        profile=profile,
+        sheets=label_contexts,
+    )
     # B1: full-column duplication across panels, incl. the integer / 1-decimal columns the
     # >=3-decimal collision grids miss.
-    cross_sheet_findings += detect_cross_sheet_column_duplicates(grid_sheets, profile=profile)
+    cross_sheet_findings += detect_cross_sheet_column_duplicates(
+        cross_sheet_summaries,
+        profile=profile,
+    )
     # B3: matrix-to-matrix decimal-fraction reuse between two blocks of the same sheet.
-    cross_sheet_findings += detect_within_sheet_fraction_reuse(grid_sheets, profile=profile)
+    cross_sheet_findings += within_sheet_fraction_findings
     # B2: a fixed high-information row-vector recurring across >=2 figures.
-    cross_sheet_findings += detect_recurring_row_vectors(grid_sheets, profile=profile)
+    recurring_findings, _recurring_meta = recurring_rows.findings(profile=profile)
+    cross_sheet_findings += recurring_findings
     _attach_benign(cross_sheet_findings)
 
     digit_reports, decimal_reports = [], []

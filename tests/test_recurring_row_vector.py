@@ -3,7 +3,13 @@ contiguous row-slice across >=3 places spanning >=2 figure namespaces. Includes 
 oracle and the FP guards (patterned/ladder tuples, single-figure recurrence, too few occurrences)."""
 from __future__ import annotations
 
-from paperconan._audit import Sheet, detect_recurring_row_vectors, figure_key
+from paperconan._audit import (
+    Sheet,
+    detect_recurring_row_vectors,
+    figure_key,
+    find_numeric_blocks,
+)
+from paperconan._summaries import RecurringRowIndex
 
 _W = 9   # uniform row width so a numeric block covers the full vector
 
@@ -143,3 +149,49 @@ def test_b2_same_sheet_name_across_files_not_conflated():
     f = detect_recurring_row_vectors({k: _sheet(v) for k, v in panels.items()})
     vecs = {tuple(x["vector"]) for x in f if x["severity"] == "high"}
     assert tuple(v1) in vecs and tuple(v2) in vecs, f"both distinct vectors must survive: {vecs}"
+
+
+def test_b2_incremental_index_matches_compatibility_wrapper():
+    panels = {
+        ("M1.xls", "Figure 1e"): _panel(VEC, 10),
+        ("M2.xls", "Figure 4b"): _panel(VEC, 40),
+        ("M3.xls", "Extended Data Fig. 2a"): _panel(VEC, 70),
+    }
+    sheets = {key: _sheet(rows) for key, rows in panels.items()}
+    index = RecurringRowIndex()
+    for (file, name), source in sheets.items():
+        index.add_sheet(
+            file,
+            name,
+            source,
+            blocks=find_numeric_blocks(source),
+            figure_id=figure_key(name),
+        )
+
+    compact, meta = index.findings()
+
+    assert compact == detect_recurring_row_vectors(sheets)
+    assert meta == {"findings_omitted": 0}
+
+
+def test_b2_site_count_survives_bounded_site_evidence():
+    panels = {
+        (f"M{i:02d}.xls", f"Figure {i + 1}a"): _panel(VEC, i * 10 + 1)
+        for i in range(20)
+    }
+    index = RecurringRowIndex()
+    for (file, name), rows in panels.items():
+        source = _sheet(rows)
+        index.add_sheet(
+            file,
+            name,
+            source,
+            blocks=find_numeric_blocks(source),
+            figure_id=figure_key(name),
+        )
+
+    findings, meta = index.findings()
+    match = next(finding for finding in findings if finding["vector"] == VEC)
+
+    assert match["n_occurrences"] == 20
+    assert meta == {"findings_omitted": 0}

@@ -5,7 +5,12 @@ so we can exercise severity/context logic without round-tripping through xlsx.
 """
 from __future__ import annotations
 
-from paperconan._audit import Sheet, detect_collisions
+from paperconan._audit import (
+    Sheet,
+    _grid_from_rows,
+    build_cross_sheet_summary,
+    detect_collisions,
+)
 
 
 def _grid_from_sheet(sheet):
@@ -99,6 +104,44 @@ def test_cross_sheet_context_marks_time_axis_from_local_labels():
 
     assert cf["shared_context"]["shared_axis_or_coordinate"] is True
     assert cf["delta"]["pattern"] != "perfect_dup"
+
+
+def test_compact_label_context_matches_sheet_compatibility_path():
+    rows_a = [
+        ["condition", "control", "treated"],
+        ["rep1", 1.2345, 9.1111],
+        ["rep2", 1.4567, 9.3131],
+        ["rep3", 1.6789, 9.5151],
+        ["rep4", 1.8901, 9.7171],
+        ["rep5", 2.0123, 9.9191],
+        ["rep6", 2.2345, 10.1111],
+    ]
+    rows_b = [
+        ["condition", "vehicle control", "drug B"],
+        ["rep1", 1.2345, 4.1111],
+        ["rep2", 1.4567, 4.3131],
+        ["rep3", 1.6789, 4.5151],
+        ["rep4", 1.8901, 4.7171],
+        ["rep5", 2.0123, 4.9191],
+        ["rep6", 2.2345, 5.1111],
+    ]
+    sheets = {
+        ("a.xlsx", "Fig. 1 control"): Sheet.from_rows(rows_a),
+        ("b.xlsx", "Fig. 2 control"): Sheet.from_rows(rows_b),
+    }
+    summaries = {
+        key: build_cross_sheet_summary(*key, source)[0]
+        for key, source in sheets.items()
+    }
+    grids = {key: _grid_from_rows(source) for key, source in sheets.items()}
+
+    direct = detect_collisions(grids, sheets=sheets)
+    compact = detect_collisions(
+        {key: summary.grid for key, summary in summaries.items()},
+        sheets={key: summary.labels for key, summary in summaries.items()},
+    )
+
+    assert compact == direct
 
 
 # ---------- Issue 1: context-aware severity ----------
