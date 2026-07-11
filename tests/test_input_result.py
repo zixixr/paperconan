@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+import paperconan._audit as audit
 from paperconan._audit import load_table, load_table_result
 from paperconan._input import (
     ExtractedTableResult,
@@ -8,6 +9,22 @@ from paperconan._input import (
     TableLoadResult,
 )
 from paperconan._sheet import Sheet
+
+
+def _scan_with_limitation(tmp_path, monkeypatch, limitation):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "source.csv").write_text("a\n1\n", encoding="utf-8")
+    result = TableLoadResult(
+        sheets={"Stats": Sheet.from_rows([["a"], [1], [2], [3]])},
+        limitations=[limitation],
+    )
+    monkeypatch.setattr(audit, "load_table_result", lambda _path: result)
+    return audit.scan_dir(
+        str(data),
+        str(tmp_path / "out"),
+        write_html=False,
+    )
 
 
 def test_table_load_result_keeps_compatibility_dict(tmp_path):
@@ -65,6 +82,48 @@ def test_input_limitation_rejects_reserved_detail_keys(reserved):
             sheet="S",
             details={reserved: "replacement"},
         )
+
+
+@pytest.mark.parametrize("reserved", ["scope", "reason", "sheet"])
+def test_scan_revalidates_mutated_reserved_limitation_details(
+    tmp_path, monkeypatch, reserved
+):
+    limitation = InputLimitation(
+        scope="sheet",
+        reason="formula_cache_missing",
+        sheet="Stats",
+        details={"count": 1, "cells": ["A3"]},
+    )
+    limitation.details[reserved] = "replacement"
+
+    with pytest.raises(
+        ValueError,
+        match=f"details contains reserved key: {reserved}",
+    ):
+        _scan_with_limitation(tmp_path, monkeypatch, limitation)
+
+
+def test_scan_uses_actual_source_filename_for_input_limitation(
+    tmp_path, monkeypatch
+):
+    limitation = InputLimitation(
+        scope="sheet",
+        reason="formula_cache_missing",
+        sheet="Stats",
+        details={"count": 1, "cells": ["A3"]},
+    )
+    limitation.details["file"] = "replacement.xlsx"
+
+    scan = _scan_with_limitation(tmp_path, monkeypatch, limitation)
+
+    assert scan["coverage"]["limitations"] == [{
+        "scope": "sheet",
+        "reason": "formula_cache_missing",
+        "sheet": "Stats",
+        "cells": ["A3"],
+        "count": 1,
+        "file": "source.csv",
+    }]
 
 
 def test_extracted_table_result_defaults_to_no_limitations():

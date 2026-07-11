@@ -2943,13 +2943,14 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             continue
         coverage.mark_file_succeeded()
         for limitation in load_result.limitations:
-            details = {"file": os.path.basename(f)}
-            if limitation.sheet is not None:
-                details["sheet"] = limitation.sheet
-            details.update(limitation.details)
+            details = limitation.to_dict()
+            scope = details.pop("scope")
+            reason = details.pop("reason")
+            details.pop("file", None)
             coverage.add_limitation(
-                limitation.scope,
-                limitation.reason,
+                scope,
+                reason,
+                file=os.path.basename(f),
                 **details,
             )
         sheets = load_result.sheets
