@@ -65,7 +65,8 @@ def test_tiny_nonzero_pure_scaling_is_detected():
 
 def test_high_baseline_near_values_are_not_many_equal_pairs():
     x = [1_000_000_000.0 + i for i in range(8)]
-    y = [v + 0.5 for v in x]
+    y = [v + (0.5 if i < 6 else 2_000.0) for i, v in enumerate(x)]
+    assert not any(left == right for left, right in zip(x, y))
     sheet = _sheet([x, y])
     assert detect_equal_pairs(sheet, 1, 9, 0, 2, ["x", "y"]) == []
 ```
@@ -142,9 +143,11 @@ Append to `tests/test_fraction_reuse.py`:
 
 ```python
 def test_b3_no_flag_when_high_baseline_differences_are_not_integers():
-    a = [[1_000_000_000.125 + r * 10 + c for c in range(5)]
-         for r in range(5)]
-    b = [[v + 0.5 + ((r + c) % 3) * 0.125 for c, v in enumerate(row)]
+    fractions = [0.12345, 0.23456, 0.34567, 0.45678, 0.56789]
+    offsets = [1.25, 2.25, 3.25]
+    a = [[1_000_000_000 + r * 10 + c + fractions[(r + c) % len(fractions)]
+          for c in range(5)] for r in range(5)]
+    b = [[v + offsets[(r + c) % len(offsets)] for c, v in enumerate(row)]
          for r, row in enumerate(a)]
     findings = detect_within_sheet_fraction_reuse(
         _grid_sheets_two_blocks(a, b)
@@ -166,8 +169,11 @@ Run:
   tests/test_fraction_reuse.py -q
 ```
 
-Expected: failures for high-baseline identity/equality, tiny ratio, wide integer
-round-trip/mask, ragged block discovery, and high-baseline fraction reuse.
+Expected: failures for high-baseline identity, mixed-row many-equal-pair
+exactness (`6/8` rows pass the old loose comparison despite zero exact source
+matches), tiny ratio, wide integer round-trip/mask, ragged block discovery, and
+high-baseline fraction reuse (`25/25` positions pass the old magnitude-scaled
+integer-shift check despite non-integer offsets).
 
 - [ ] **Step 6: Commit the regression tests**
 

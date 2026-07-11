@@ -215,7 +215,8 @@ def test_tiny_nonzero_pure_scaling_is_detected():
 
 def test_high_baseline_near_values_are_not_many_equal_pairs():
     x = [1_000_000_000.0 + i for i in range(8)]
-    y = [v + 0.5 for v in x]
+    y = [v + (0.5 if i < 6 else 2_000.0) for i, v in enumerate(x)]
+    assert not any(left == right for left, right in zip(x, y))
     sheet = _sheet([x, y])
     assert detect_equal_pairs(sheet, 1, 9, 0, 2, ["x", "y"]) == []
 
