@@ -2,8 +2,23 @@ import paperconan._audit as audit
 from paperconan._sheet import Sheet
 
 
-def _reasons(scan):
-    return {item["reason"] for item in scan["coverage"]["limitations"]}
+def _limitations(scan, reason):
+    return [
+        item
+        for item in scan["coverage"]["limitations"]
+        if item["reason"] == reason
+    ]
+
+
+def _qualifying_row_pair_rows():
+    header = [f"c{col}" for col in range(12)]
+    base = [100 + col + (col + 1) / 100 for col in range(12)]
+    return [
+        header,
+        base,
+        [value + 10 for value in base],
+        [value + 20 for value in base],
+    ]
 
 
 def test_wide_block_detector_skip_is_disclosed(tmp_path, monkeypatch):
@@ -15,9 +30,19 @@ def test_wide_block_detector_skip_is_disclosed(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     scan = audit.scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+
     assert scan["scan_status"] == "partial"
     assert scan["coverage"]["blocks_skipped"] == 0
-    assert "wide_block_detector_limit" in _reasons(scan)
+    assert _limitations(scan, "wide_block_detector_limit") == [{
+        "scope": "block",
+        "reason": "wide_block_detector_limit",
+        "file": "wide.csv",
+        "sheet": "wide",
+        "rows": "2-5",
+        "cols": "1-3",
+        "detectors": ["relations", "equal_pairs", "row_pairs"],
+        "max_cols": 2,
+    }]
 
 
 def test_row_pair_dimension_skip_is_disclosed(tmp_path, monkeypatch):
@@ -29,39 +54,79 @@ def test_row_pair_dimension_skip_is_disclosed(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     scan = audit.scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+
+    assert scan["scan_status"] == "partial"
     assert scan["coverage"]["blocks_skipped"] == 0
-    assert "row_pair_dimension_limit" in _reasons(scan)
+    assert _limitations(scan, "row_pair_dimension_limit") == [{
+        "scope": "block",
+        "reason": "row_pair_dimension_limit",
+        "file": "rows.csv",
+        "sheet": "rows",
+        "rows": 4,
+        "cols": 2,
+        "max_rows": 3,
+        "max_cols": 200,
+    }]
 
 
 def test_row_pair_finding_cap_is_disclosed(tmp_path, monkeypatch):
-    original = audit.detect_row_pair_digit_coupling
+    rows = _qualifying_row_pair_rows()
+    sheet = Sheet.from_rows(rows)
+    all_findings = audit.detect_row_pair_digit_coupling(
+        sheet, 1, 4, 0, 12, rows[0]
+    )
+    assert len(all_findings) == 3
 
-    def capped(*args, **kwargs):
-        if kwargs.get("with_coverage"):
-            return (
-                [{
-                    "kind": "row_pair_digit_coupling",
-                    "severity": "high",
-                    "rule": "synthetic capped row pair",
-                    "n": 3,
-                    "row_a_idx": 1,
-                    "row_b_idx": 2,
-                    "example_cells": [],
-                }],
-                {"findings_omitted": 3},
-            )
-        return original(*args, **kwargs)
+    monkeypatch.setattr(audit, "_ROW_PAIR_MAX_FINDINGS_PER_BLOCK", 1)
+    kept, meta = audit.detect_row_pair_digit_coupling(
+        sheet, 1, 4, 0, 12, rows[0], with_coverage=True
+    )
+    assert kept == all_findings[:1]
+    assert meta == {"findings_omitted": 2}
 
-    monkeypatch.setattr(audit, "detect_row_pair_digit_coupling", capped)
     data = tmp_path / "data"
     data.mkdir()
     (data / "rows.csv").write_text(
-        "a,b,c\n1.1,2.1,3.1\n2.2,3.2,4.2\n3.3,4.3,5.3\n",
+        "\n".join(",".join(str(value) for value in row) for row in rows) + "\n",
         encoding="utf-8",
     )
     scan = audit.scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+
+    row_pair_findings = [
+        finding
+        for block in scan["relations_blocks"]
+        for finding in block["row_pairs"]
+    ]
+    assert scan["scan_status"] == "partial"
     assert scan["coverage"]["blocks_skipped"] == 0
-    assert "row_pair_finding_limit" in _reasons(scan)
+    assert len(row_pair_findings) == 1
+    assert [
+        (
+            finding["kind"],
+            finding["row_a_idx"],
+            finding["row_b_idx"],
+            finding["rule"],
+        )
+        for finding in row_pair_findings
+    ] == [
+        (
+            finding["kind"],
+            finding["row_a_idx"],
+            finding["row_b_idx"],
+            finding["rule"],
+        )
+        for finding in kept
+    ]
+    assert _limitations(scan, "row_pair_finding_limit") == [{
+        "scope": "block",
+        "reason": "row_pair_finding_limit",
+        "file": "rows.csv",
+        "sheet": "rows",
+        "rows": "2-4",
+        "cols": "1-12",
+        "limit": 1,
+        "omitted_findings": 2,
+    }]
 
 
 def test_collision_row_limit_is_disclosed(tmp_path):
@@ -72,12 +137,8 @@ def test_collision_row_limit_is_disclosed(tmp_path):
 
     scan = audit.scan_dir(str(data), str(tmp_path / "out"), write_html=False)
 
-    limits = [
-        item for item in scan["coverage"]["limitations"]
-        if item["reason"] == "collision_row_limit"
-    ]
     assert scan["coverage"]["blocks_skipped"] == 0
-    assert limits == [{
+    assert _limitations(scan, "collision_row_limit") == [{
         "scope": "sheet",
         "reason": "collision_row_limit",
         "file": "rows.csv",

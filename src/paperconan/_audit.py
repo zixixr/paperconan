@@ -2979,9 +2979,9 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                     break   # global finding budget spent; stop collecting (subsequent sheets short-circuit here too)
                 coverage.mark_block_analyzed()
                 header = header_for(sheet, r0, c0, c1)
-                # On very wide blocks (dense correlation matrices) the O(col²) relation and
-                # equal-pair detectors explode in compute + output, so skip just those two; the
-                # column-wise detectors below still run. (_MAX_BLOCK_COLS=0 disables the skip.)
+                # On very wide blocks (dense correlation matrices), skip the relation and
+                # equal-pair O(col²) paths plus row-pair coupling; the column-wise detectors
+                # below still run. (_MAX_BLOCK_COLS=0 disables the skip.)
                 wide = _MAX_BLOCK_COLS and (c1 - c0) > _MAX_BLOCK_COLS
                 if wide:
                     coverage.add_limitation(
