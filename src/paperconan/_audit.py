@@ -38,6 +38,7 @@ import numpy as np
 from scipy import stats
 
 from ._coverage import ScanCoverage
+from ._input import InputLimitation, TableLoadResult, inspect_ooxml_formula_cache
 from ._numeric import integer_shift_close, relation_close
 from ._profiles import apply_profile_to_findings, normalize_profile
 from ._sheet import Sheet, _MAX_EXACT_FLOAT_INT
@@ -530,7 +531,7 @@ def load_csv_rows(path, delimiter):
     return {stem: Sheet.from_rows(rows)}
 
 
-def load_table(path):
+def _load_table_sheets(path):
     """Dispatch by extension to a {sheet_name: Sheet|None} loader."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".tsv":
@@ -544,6 +545,24 @@ def load_table(path):
         from ._extract import load_docx_tables
         return {k: (None if v is None else Sheet.from_rows(v)) for k, v in load_docx_tables(path).items()}
     return load_workbook_rows(path)
+
+
+def load_table_result(path) -> TableLoadResult:
+    sheets = _load_table_sheets(path)
+    limitations = []
+    for sheet, gap in inspect_ooxml_formula_cache(path).items():
+        limitations.append(InputLimitation(
+            scope="sheet",
+            reason="formula_cache_missing",
+            sheet=sheet,
+            details={"count": gap["count"], "cells": gap["cells"]},
+        ))
+    return TableLoadResult(sheets=sheets, limitations=limitations)
+
+
+def load_table(path) -> dict[str, Sheet | None]:
+    """Dispatch by extension to a {sheet_name: Sheet|None} loader."""
+    return load_table_result(path).sheets
 
 
 def find_numeric_blocks(sheet, min_rows=3, min_cols=1):
@@ -2913,7 +2932,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             scan_stats["files"].append(file_stat)
             continue
         try:
-            sheets = load_table(f)
+            load_result = load_table_result(f)
         except Exception as e:
             print(f"  failed to read {os.path.basename(f)}: {e}", file=sys.stderr)
             scan_errors.append({"file": os.path.basename(f), "error": str(e)})
@@ -2923,6 +2942,17 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             scan_stats["files"].append(file_stat)
             continue
         coverage.mark_file_succeeded()
+        for limitation in load_result.limitations:
+            details = {"file": os.path.basename(f)}
+            if limitation.sheet is not None:
+                details["sheet"] = limitation.sheet
+            details.update(limitation.details)
+            coverage.add_limitation(
+                limitation.scope,
+                limitation.reason,
+                **details,
+            )
+        sheets = load_result.sheets
         file_stat["n_sheets"] = len(sheets)
         file_stat["elapsed_ms"] = round((time.perf_counter() - file_start) * 1000, 3)
         scan_stats["files"].append(file_stat)
