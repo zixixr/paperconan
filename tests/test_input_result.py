@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from paperconan._audit import load_table, load_table_result
 from paperconan._input import (
@@ -50,6 +51,20 @@ def test_input_limitation_serializes_deterministically():
         "cells": 12,
         "max_cells": 10,
     }
+
+
+@pytest.mark.parametrize("reserved", ["scope", "reason", "sheet"])
+def test_input_limitation_rejects_reserved_detail_keys(reserved):
+    with pytest.raises(
+        ValueError,
+        match=f"details contains reserved key: {reserved}",
+    ):
+        InputLimitation(
+            scope="sheet",
+            reason="cell_limit",
+            sheet="S",
+            details={reserved: "replacement"},
+        )
 
 
 def test_extracted_table_result_defaults_to_no_limitations():

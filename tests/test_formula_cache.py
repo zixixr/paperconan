@@ -5,12 +5,22 @@ from xml.etree import ElementTree as ET
 import openpyxl
 import pytest
 
-from paperconan._audit import scan_dir
+from paperconan._audit import (
+    _load_table_sheets,
+    load_table,
+    load_table_result,
+    scan_dir,
+)
+import paperconan._input as input_module
 from paperconan._input import inspect_ooxml_formula_cache
+from paperconan._sheet import Sheet
 
 
 _MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_ROW_TAG = f"{{{_MAIN_NS}}}row"
+_CELL_TAG = f"{{{_MAIN_NS}}}c"
+_SHEET_DATA_TAG = f"{{{_MAIN_NS}}}sheetData"
 
 
 def _write_formula_book(path):
@@ -148,6 +158,58 @@ def test_formula_gap_examples_can_be_disabled(tmp_path):
     assert gaps == {"Stats": {"count": 1, "cells": []}}
 
 
+def test_formula_cache_parser_detaches_processed_rows_and_cells(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "streaming.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Stats"
+    for row in range(1, 51):
+        ws.cell(row, 1, f"={row}+1")
+    wb.save(path)
+
+    real_iterparse = ET.iterparse
+    detached_cells = []
+    detached_rows = []
+
+    def probing_iterparse(source, events):
+        requested = set(events)
+        current_row = None
+        sheet_data = None
+        for event, elem in real_iterparse(
+            source, events=("start", "end")
+        ):
+            if event == "start":
+                if elem.tag == _SHEET_DATA_TAG:
+                    sheet_data = elem
+                elif elem.tag == _ROW_TAG:
+                    current_row = elem
+            if event not in requested:
+                continue
+            yield event, elem
+            if event == "end" and elem.tag == _CELL_TAG:
+                assert current_row is not None
+                detached_cells.append(elem not in current_row)
+            elif event == "end" and elem.tag == _ROW_TAG:
+                assert sheet_data is not None
+                detached_rows.append(elem not in sheet_data)
+                current_row = None
+
+    monkeypatch.setattr(input_module.ET, "iterparse", probing_iterparse)
+
+    gaps = inspect_ooxml_formula_cache(str(path))
+
+    assert gaps == {
+        "Stats": {
+            "count": 50,
+            "cells": [f"A{row}" for row in range(1, 21)],
+        }
+    }
+    assert detached_cells == [True] * 50
+    assert detached_rows == [True] * 50
+
+
 def test_formula_gap_order_follows_workbook_and_cell_order(tmp_path):
     path = tmp_path / "ordered.xlsx"
     wb = openpyxl.Workbook()
@@ -198,3 +260,48 @@ def test_non_ooxml_input_has_no_formula_cache_gaps(tmp_path):
     path.write_text("a\n1\n", encoding="utf-8")
 
     assert inspect_ooxml_formula_cache(Path(path)) == {}
+
+
+@pytest.mark.parametrize(
+    ("cached", "expected_values", "expected_limitations"),
+    [
+        (
+            False,
+            [2, 3],
+            [{
+                "scope": "sheet",
+                "reason": "formula_cache_missing",
+                "sheet": "Stats",
+                "cells": ["A3"],
+                "count": 1,
+            }],
+        ),
+        (True, [2, 3, 5], []),
+    ],
+    ids=["uncached-formula", "cached-formula"],
+)
+def test_ooxml_result_preserves_legacy_sheet_content(
+    tmp_path, cached, expected_values, expected_limitations
+):
+    path = tmp_path / "formula.xlsx"
+    _write_formula_book(path)
+    if cached:
+        _set_formula_cache(path, "5")
+
+    baseline = _load_table_sheets(str(path))
+    legacy = load_table(str(path))
+    result = load_table_result(str(path))
+
+    for sheets in (baseline, legacy, result.sheets):
+        assert list(sheets) == ["Stats"]
+        sheet = sheets["Stats"]
+        assert isinstance(sheet, Sheet)
+        assert (sheet.nrows, sheet.ncols) == (len(expected_values), 1)
+        assert [
+            sheet.cell(row, 0)
+            for row in range(sheet.nrows)
+        ] == expected_values
+    assert [
+        limitation.to_dict()
+        for limitation in result.limitations
+    ] == expected_limitations

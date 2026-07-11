@@ -10,6 +10,9 @@ if TYPE_CHECKING:
     from ._sheet import Sheet
 
 
+_RESERVED_LIMITATION_KEYS = ("scope", "reason", "sheet")
+
+
 @dataclass(frozen=True)
 class InputLimitation:
     scope: str
@@ -17,7 +20,16 @@ class InputLimitation:
     sheet: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self._validate_details()
+
+    def _validate_details(self) -> None:
+        for key in _RESERVED_LIMITATION_KEYS:
+            if key in self.details:
+                raise ValueError(f"details contains reserved key: {key}")
+
     def to_dict(self) -> dict[str, Any]:
+        self._validate_details()
         out = {"scope": self.scope, "reason": self.reason}
         if self.sheet is not None:
             out["sheet"] = self.sheet
@@ -41,6 +53,7 @@ class ExtractedTableResult:
 _MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_CELL_TAG = f"{{{_MAIN_NS}}}c"
 
 
 def _worksheet_paths(zf) -> list[tuple[str, str]]:
@@ -86,23 +99,35 @@ def inspect_ooxml_formula_cache(
             count = 0
             cells = []
             with zf.open(member) as stream:
-                for _event, elem in ET.iterparse(stream, events=("end",)):
-                    if elem.tag != f"{{{_MAIN_NS}}}c":
+                stack = []
+                for event, elem in ET.iterparse(
+                    stream, events=("start", "end")
+                ):
+                    if event == "start":
+                        stack.append(elem)
                         continue
-                    formula = elem.find(f"{{{_MAIN_NS}}}f")
-                    value = elem.find(f"{{{_MAIN_NS}}}v")
-                    if (
-                        formula is not None
-                        and (
-                            value is None
-                            or value.text is None
-                            or not value.text.strip()
-                        )
-                    ):
-                        count += 1
-                        if len(cells) < example_limit:
-                            cells.append(elem.attrib.get("r", "?"))
-                    elem.clear()
+                    parent = stack[-2] if len(stack) > 1 else None
+                    if elem.tag == _CELL_TAG:
+                        formula = elem.find(f"{{{_MAIN_NS}}}f")
+                        value = elem.find(f"{{{_MAIN_NS}}}v")
+                        if (
+                            formula is not None
+                            and (
+                                value is None
+                                or value.text is None
+                                or not value.text.strip()
+                            )
+                        ):
+                            count += 1
+                            if len(cells) < example_limit:
+                                cells.append(elem.attrib.get("r", "?"))
+
+                    # Keep cell children until the cell end event so formula and
+                    # cached-value nodes remain available for inspection.
+                    if parent is not None and parent.tag != _CELL_TAG:
+                        parent.remove(elem)
+                        elem.clear()
+                    stack.pop()
             if count:
                 gaps[sheet_name] = {"count": count, "cells": cells}
     return gaps
