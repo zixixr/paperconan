@@ -68,6 +68,74 @@ def test_forensic_profile_keeps_original_boundary_value_high(tmp_path):
     assert any(f["severity"] == "high" for f in dupes)
 
 
+def test_scan_dir_forensic_preserves_reused_progression(tmp_path):
+    data = tmp_path / "d"
+    data.mkdir()
+    rows = [
+        "sample,measure,signal",
+        "a,9.1,1.25",
+        "b,2.4,1.75",
+        "c,7.8,2.25",
+        "d,3.3,2.75",
+        "e,8.6,3.25",
+        "f,4.7,3.75",
+    ]
+    content = _csv(rows)
+    (data / "panel_a.csv").write_text(content, encoding="utf-8")
+    (data / "panel_b.csv").write_text(content, encoding="utf-8")
+
+    review = scan_dir(
+        str(data), str(tmp_path / "review"), write_html=False, profile="review"
+    )
+    forensic = scan_dir(
+        str(data), str(tmp_path / "forensic"), write_html=False, profile="forensic"
+    )
+    review_progressions = [
+        f for f in _all_block_findings(review)
+        if f["kind"] == "arithmetic_progression" and f.get("col") == "signal"
+    ]
+    forensic_progressions = [
+        f for f in _all_block_findings(forensic)
+        if f["kind"] == "arithmetic_progression" and f.get("col") == "signal"
+    ]
+
+    assert len(review_progressions) == 2
+    assert all(f["severity"] == "low" for f in review_progressions)
+    assert all(f["profile_action"] == "kept" for f in review_progressions)
+    assert all(f.get("prefilter") == "drop" for f in review_progressions)
+    assert all(f.get("reused_progression") is True for f in review_progressions)
+
+    assert len(forensic_progressions) == 2
+    assert all(f["severity"] == "high" for f in forensic_progressions)
+    assert all(f["profile_action"] == "kept" for f in forensic_progressions)
+    assert all(f.get("prefilter") != "drop" for f in forensic_progressions)
+    assert all(f.get("reused_progression") is not True for f in forensic_progressions)
+
+
+def test_forensic_within_column_flood_remains_kept():
+    import paperconan._audit as audit
+
+    findings = [
+        {
+            "kind": "within_col_value_duplication",
+            "severity": "high",
+            "profile_action": "kept",
+        }
+        for _ in range(audit.WITHIN_COL_SHEET_CAP + 1)
+    ]
+    blocks = [{
+        "file": "f.csv",
+        "sheet": "S",
+        "relations": [],
+        "equal_pairs": [],
+        "within_col": findings,
+    }]
+    audit._demote_dense_sheets(blocks, profile="forensic")
+    assert all(f["severity"] == "high" for f in findings)
+    assert all(f["profile_action"] == "kept" for f in findings)
+    assert all(f.get("prefilter") != "drop" for f in findings)
+
+
 def test_review_profile_demotes_unit_conversion_relation(tmp_path):
     data = tmp_path / "d"
     data.mkdir()

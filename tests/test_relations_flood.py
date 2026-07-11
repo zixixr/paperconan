@@ -49,6 +49,33 @@ def test_flood_demoted_across_blocks_of_one_sheet():
     assert all(r["severity"] == "low" and r.get("dense_block") for r in flat)
 
 
+def test_forensic_dense_sheet_keeps_original_high_severity():
+    half = RELATION_FLOOD_CAP // 2 + 5
+
+    def relations():
+        return [
+            {
+                "kind": "identical_column",
+                "severity": "high",
+                "rule": f"synthetic relation {i}",
+            }
+            for i in range(half)
+        ]
+
+    blocks = [
+        {"file": "f.xlsx", "sheet": "S1",
+         "relations": relations(), "equal_pairs": [],
+         "within_col": []},
+        {"file": "f.xlsx", "sheet": "S1",
+         "relations": relations(), "equal_pairs": [],
+         "within_col": []},
+    ]
+    _demote_dense_sheets(blocks, profile="forensic")
+    findings = [f for block in blocks for f in block["relations"]]
+    assert all(f["severity"] == "high" for f in findings)
+    assert all(f.get("dense_block") is not True for f in findings)
+
+
 def test_separate_sheets_each_below_cap_keep_high():
     """Two different sheets, each with a handful of relations, must NOT be demoted just
     because their combined total would exceed the cap."""

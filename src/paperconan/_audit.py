@@ -1327,10 +1327,15 @@ def _demote_dense_relations(relations, cap=RELATION_FLOOD_CAP):
     return relations
 
 
-def _demote_dense_sheets(report_blocks, cap=RELATION_FLOOD_CAP):
+def _demote_dense_sheets(
+    report_blocks, cap=RELATION_FLOOD_CAP, profile="review"
+):
     """Apply the dense-flood demotion per (file, sheet), not per block: a dense matrix
     is split into many numeric blocks, each holding only part of the column relations,
     so the flood must be judged by the SHEET total. Mutates findings in place."""
+    if normalize_profile(profile) == "forensic":
+        return report_blocks
+
     by_sheet = {}
     for b in report_blocks:
         key = (b["file"], b["sheet"])
@@ -1345,7 +1350,7 @@ def _demote_dense_sheets(report_blocks, cap=RELATION_FLOOD_CAP):
     return report_blocks
 
 
-def _demote_reused_progressions(report_blocks):
+def _demote_reused_progressions(report_blocks, profile="review"):
     """A perfect arithmetic progression that is REUSED — the identical (step, n, first)
     appears in >=2 numeric blocks/sheets — is an independent-variable axis re-plotted across
     panels (magnetic-field / 2-theta / time / dose / wavelength sweep), not fabricated data.
@@ -1354,6 +1359,9 @@ def _demote_reused_progressions(report_blocks):
     forensic). A ONE-OFF perfect progression keeps its severity — that is the genuinely
     suspicious linear-fill case (and matches the golden fixture's single ap_col). Mutates in
     place and returns report_blocks."""
+    if normalize_profile(profile) == "forensic":
+        return report_blocks
+
     sig_count = {}
     progs = []
     for b in report_blocks:
@@ -3097,8 +3105,8 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
 
     # Down-weight dense/correlated sheets: judged by per-sheet relation totals, so a
     # wide matrix's expected identical/linear columns don't flood high-severity output.
-    _demote_dense_sheets(report_blocks)
-    _demote_reused_progressions(report_blocks)   # reused perfect progression = re-plotted axis
+    _demote_dense_sheets(report_blocks, profile=profile)
+    _demote_reused_progressions(report_blocks, profile=profile)
 
     # Unified collision pass: every (file, sheet) grid against every other —
     # covers both intra-workbook sheet pairs and cross-file duplicates.

@@ -28,6 +28,17 @@ def test_reused_axis_progression_demoted_out_of_high():
     assert "axis" in (benign_reason(blocks[0]["progressions"][0]) or "")
 
 
+def test_forensic_reused_progression_remains_kept():
+    blocks = [_block(f"Fig {i}", [_prog(0.5, 30, 1.25)]) for i in range(2)]
+    for block in blocks:
+        block["progressions"][0]["profile_action"] = "kept"
+    _demote_reused_progressions(blocks, profile="forensic")
+    findings = [block["progressions"][0] for block in blocks]
+    assert all(f["severity"] == "high" for f in findings)
+    assert all(f["profile_action"] == "kept" for f in findings)
+    assert all(f.get("prefilter") != "drop" for f in findings)
+
+
 def test_one_off_non_integer_progression_keeps_high():
     # a single non-integer progression (possible linear-fill fabrication) stays HIGH
     blocks = [_block("Fig 1", [_prog(2.5, 6, 2.5, sev="high")])]
