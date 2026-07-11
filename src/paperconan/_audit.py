@@ -3175,7 +3175,10 @@ def _markdown_status_value(value):
         return left + ", ".join(
             _markdown_status_value(item) for item in value
         ) + right
-    return str(value).replace("`", "'").replace("\r", " ").replace("\n", " ")
+    text = str(value)
+    if text == "":
+        return '""'
+    return text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
 
 
 def _markdown_status_sort_key(value):
@@ -3184,6 +3187,21 @@ def _markdown_status_sort_key(value):
         type(value).__name__,
         str(value),
     )
+
+
+def _markdown_inline_code(value):
+    text = _markdown_status_value(value)
+    longest_run = 0
+    current_run = 0
+    for char in text:
+        if char == "`":
+            current_run += 1
+            longest_run = max(longest_run, current_run)
+        else:
+            current_run = 0
+    fence = "`" * (longest_run + 1)
+    pad = " " if text.startswith(("`", " ")) or text.endswith(("`", " ")) else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
 
 
 def _markdown_scan_status(out):
@@ -3216,7 +3234,7 @@ def _markdown_scan_status(out):
         )
     else:
         lines.append(
-            f"**Scan status: {_markdown_status_value(normalized)}.** "
+            f"**Scan status:** {_markdown_inline_code(normalized)}. "
             "Detailed coverage status is unavailable for this scan.\n"
         )
 
@@ -3224,9 +3242,10 @@ def _markdown_scan_status(out):
         lines.append("### Coverage limitations\n")
         for limitation in limitations:
             if isinstance(limitation, dict):
-                reason = _markdown_status_value(
-                    limitation.get("reason") or "unspecified"
-                )
+                reason_value = limitation.get("reason")
+                if "reason" not in limitation or reason_value is None:
+                    reason_value = "unspecified"
+                reason = _markdown_inline_code(reason_value)
                 detail_keys = (
                     ["scope"] if "scope" in limitation else []
                 ) + sorted(
@@ -3234,16 +3253,16 @@ def _markdown_scan_status(out):
                     key=_markdown_status_sort_key,
                 )
                 details = " · ".join(
-                    f"{_markdown_status_value(key).replace('_', ' ').strip()}: "
-                    f"`{_markdown_status_value(limitation[key])}`"
+                    f"{_markdown_inline_code(_markdown_status_value(key).replace('_', ' ').strip())}: "
+                    f"{_markdown_inline_code(limitation[key])}"
                     for key in detail_keys
                     if limitation.get(key) is not None
                 )
             else:
-                reason = _markdown_status_value(limitation)
+                reason = _markdown_inline_code(limitation)
                 details = ""
             suffix = f" · {details}" if details else ""
-            lines.append(f"- `{reason}`{suffix}")
+            lines.append(f"- {reason}{suffix}")
         lines.append("")
     return lines
 

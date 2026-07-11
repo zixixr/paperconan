@@ -96,7 +96,10 @@ def _status_value(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         left, right = ("[", "]") if isinstance(value, list) else ("(", ")")
         return left + ", ".join(_status_value(item) for item in value) + right
-    return str(value).replace("\r", " ").replace("\n", " ")
+    text = str(value)
+    if text == "":
+        return '""'
+    return text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
 
 
 def _status_sort_key(value: Any) -> tuple[str, str, str]:
@@ -141,7 +144,10 @@ def _render_scan_status(scan: dict) -> str:
     items = []
     for limitation in limitations:
         if isinstance(limitation, dict):
-            reason = _status_value(limitation.get("reason") or "unspecified")
+            reason_value = limitation.get("reason")
+            if "reason" not in limitation or reason_value is None:
+                reason_value = "unspecified"
+            reason = _status_value(reason_value)
             detail_keys = (["scope"] if "scope" in limitation else []) + sorted(
                 (key for key in limitation if key not in {"reason", "scope"}),
                 key=_status_sort_key,

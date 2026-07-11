@@ -4,6 +4,9 @@ from paperconan._audit import write_markdown_report
 from paperconan._html import write_html_report
 
 
+_MISSING = object()
+
+
 def _scan(status, limitations=None):
     return {
         "tool": "paperconan",
@@ -284,14 +287,13 @@ def test_nested_limitations_render_canonically_and_sanitize_markdown(tmp_path):
 
     assert first_md == reordered_md
     assert limitations.strip().splitlines() == [
-        "- `{a: alpha, z: [reason'one, "
-        "{a: first, line key: <value>, line key: other}]}` "
-        "· scope: `block` · meta'key: `{a: <tag>, outer: [{a: line value, z: last}]}`",
-        "- `[second, {a: 1, b: 2}]` · scope: `file` "
-        "· detail: `{x: [one, {a: None, b: False}], y: two}`",
+        "- ``{a: alpha, z: [reason`one, "
+        "{a: first, line key: <value>, line key: other}]}`` "
+        "· `scope`: `block` · ``meta`key``: "
+        "`{a: <tag>, outer: [{a: line value, z: last}]}`",
+        "- `[second, {a: 1, b: 2}]` · `scope`: `file` "
+        "· `detail`: `{x: [one, {a: None, b: False}], y: two}`",
     ]
-    assert "reason`one" not in limitations
-    assert "meta`key" not in limitations
     assert "line\nkey" not in limitations
 
 
@@ -324,7 +326,94 @@ def test_unknown_html_status_never_uses_completed_empty_claim(tmp_path):
 def test_unknown_markdown_status_never_uses_completed_empty_claim(tmp_path):
     markdown = _render_markdown(tmp_path, _scan("cancelled"))
 
-    assert "scan status: cancelled" in markdown.lower()
+    assert "**scan status:** `cancelled`." in markdown.lower()
     assert "detailed coverage status is unavailable" in markdown.lower()
     assert "nothing flagged in this dataset" not in markdown.lower()
     assert "no findings were recorded" in markdown.lower()
+
+
+def test_hostile_markdown_status_and_limitations_stay_in_code_spans(tmp_path):
+    status = (
+        "BROKEN <details open><script>*em*[link](x)`tick`\r\nnext"
+    )
+    hostile_key = (
+        "<details open><script>*label*[link](x)`key`\r\nnext"
+    )
+    hostile_value = (
+        "<details open><script>*value*[link](x)`value`\r\nnext"
+    )
+    limitation = {
+        hostile_key: hostile_value,
+        "scope": "file",
+        "reason": (
+            "<details open><script>*reason*[link](x)`reason`\r\nnext"
+        ),
+    }
+    reordered = {
+        "reason": limitation["reason"],
+        "scope": "file",
+        hostile_key: hostile_value,
+    }
+
+    first = _render_markdown(
+        tmp_path,
+        _scan(status, [limitation]),
+        "hostile-first.md",
+    )
+    second = _render_markdown(
+        tmp_path,
+        _scan(status, [reordered]),
+        "hostile-reordered.md",
+    )
+    status_line = next(
+        line for line in first.splitlines() if line.startswith("**Scan status:**")
+    )
+    limitation_line = next(
+        line for line in first.splitlines() if line.startswith("- ")
+    )
+
+    assert first == second
+    assert status_line == (
+        "**Scan status:** ``broken <details open><script>*em*[link](x)"
+        "`tick` next``. Detailed coverage status is unavailable for this scan."
+    )
+    assert limitation_line == (
+        "- ``<details open><script>*reason*[link](x)`reason` next`` "
+        "· `scope`: `file` "
+        "· ``<details open><script>*label*[link](x)`key` next``: "
+        "``<details open><script>*value*[link](x)`value` next``"
+    )
+    assert not any(
+        line.startswith(("<details", "<script>", "*em*", "[link]"))
+        for line in first.splitlines()
+    )
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_html", "expected_markdown"),
+    [
+        pytest.param(_MISSING, "unspecified", "unspecified", id="absent"),
+        pytest.param(None, "unspecified", "unspecified", id="none"),
+        pytest.param({}, "{}", "{}", id="empty-dict"),
+        pytest.param([], "[]", "[]", id="empty-list"),
+        pytest.param(False, "False", "False", id="false"),
+        pytest.param(0, "0", "0", id="zero"),
+        pytest.param("", "&quot;&quot;", '""', id="empty-string"),
+    ],
+)
+def test_falsey_reason_values_are_preserved(
+    tmp_path, reason, expected_html, expected_markdown
+):
+    limitation = {"scope": "file"}
+    if reason is not _MISSING:
+        limitation["reason"] = reason
+    scan = _scan("partial", [limitation])
+
+    html = _render_html(tmp_path, scan)
+    markdown = _render_markdown(tmp_path, scan)
+
+    assert f"<li><code>{expected_html}</code>" in html
+    assert f"- `{expected_markdown}` · `scope`: `file`" in markdown
+    if expected_markdown != "unspecified":
+        assert "unspecified" not in html
+        assert "unspecified" not in markdown
