@@ -37,6 +37,7 @@ import openpyxl
 import numpy as np
 from scipy import stats
 
+from ._numeric import integer_shift_close, relation_close
 from ._profiles import apply_profile_to_findings, normalize_profile
 from ._sheet import Sheet
 from .schema import PaperconanInputError
@@ -608,26 +609,11 @@ def _attach_evidence(findings, sheet, r0, r1, c0, c1, header):
 
 # ---------- detectors ----------
 
-def _isclose_rowwise(actual, expected, rtol=1e-9):
-    """Return row-wise closeness at each row's own numeric scale.
-
-    A single coordinate/metadata row can be orders of magnitude larger than
-    the measurement rows. A block-wide absolute tolerance lets those small
-    measurement rows drift substantially while still passing a relation check.
-    """
-    actual = np.asarray(actual, dtype=float)
-    expected = np.asarray(expected, dtype=float)
-    row_scale = np.maximum.reduce([
-        np.abs(actual),
-        np.abs(expected),
-        np.full_like(actual, 1e-300, dtype=float),
-    ])
-    typical_scale = max(float(np.median(row_scale)), 1e-300)
-    tol = rtol * row_scale + (np.finfo(float).eps * typical_scale * 64)
-    return np.abs(actual - expected) <= tol
+def _isclose_rowwise(actual, expected, rtol=1e-10):
+    return relation_close(actual, expected, rtol=rtol)
 
 
-def _allclose_rowwise(actual, expected, rtol=1e-9):
+def _allclose_rowwise(actual, expected, rtol=1e-10):
     return bool(np.all(_isclose_rowwise(actual, expected, rtol=rtol)))
 
 
@@ -656,14 +642,11 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
             x, y = ai[mask], aj[mask]
             # Compact value peek for downstream LLM triage (bounded <=8 each, ~tiny).
             sa, sb = _sample(x), _sample(y)
-            # Scale-relative tolerance. A fixed absolute atol (1e-9) misfires on tiny-magnitude
-            # data: e.g. MEG fields ~1e-14 T are all within 1e-9 of each other, so every column
-            # pair falsely reads as identical/linear. Tie the tolerance to the data magnitude so
-            # these are tests of RELATIVE precision at any scale (and large-magnitude columns
-            # aren't held to an unreasonably tight absolute bound either).
+            # B4 retains its existing scale-relative run policy. Whole-column identity,
+            # transforms, and integer shifts use their dedicated policies below.
             tol = 1e-9 * max(float(np.max(np.abs(x))), float(np.max(np.abs(y))), 1e-300)
             # identical
-            if _allclose_rowwise(x, y):
+            if np.array_equal(x, y):
                 findings.append(dict(kind="identical_column", col_a=header[ci - c0], col_b=header[cj - c0],
                                      col_a_idx=ci, col_b_idx=cj, n=n, severity="high",
                                      col_a_sample=sa, col_b_sample=sb,
@@ -672,7 +655,7 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
             # constant offset
             diff = y - x
             mean_diff = float(np.mean(diff))
-            if abs(mean_diff) > tol and _allclose_rowwise(y, x + mean_diff):
+            if mean_diff != 0 and np.all(relation_close(y, x + mean_diff)):
                 findings.append(dict(kind="constant_offset", col_a=header[ci - c0], col_b=header[cj - c0],
                                      col_a_idx=ci, col_b_idx=cj, n=n, offset=mean_diff,
                                      severity="high",
@@ -681,7 +664,7 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                 continue
             # constant ratio
             ratio_emitted = False
-            if np.all(np.abs(x) > 1e-12):
+            if np.all(x != 0):
                 ratio = y / x
                 mean_ratio = float(np.mean(ratio))
                 ratio_tol = 1e-9 * max(abs(mean_ratio), 1e-300)
@@ -689,7 +672,7 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                     np.std(ratio) < ratio_tol
                     and abs(mean_ratio - 1) > 1e-9
                     and abs(mean_ratio) > 1e-9
-                    and _allclose_rowwise(y, mean_ratio * x)
+                    and np.all(relation_close(y, mean_ratio * x))
                 ):
                     findings.append(dict(kind="constant_ratio", col_a=header[ci - c0], col_b=header[cj - c0],
                                          col_a_idx=ci, col_b_idx=cj, n=n, ratio=mean_ratio,
@@ -699,22 +682,29 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                     ratio_emitted = True
             # mirror: x + y == constant
             csum = x + y
-            if n >= 5 and np.std(csum) < tol:
+            if n >= 5:
                 K = float(np.mean(csum))
-                if abs(K) > tol:
+                if K != 0 and np.all(relation_close(csum, np.full_like(csum, K))):
                     findings.append(dict(kind="sum_constant", col_a=header[ci - c0], col_b=header[cj - c0],
                                          col_a_idx=ci, col_b_idx=cj, n=n, sum=K,
                                          severity="high",
                                          col_a_sample=sa, col_b_sample=sb,
                                          rule=f"col[{ci}] + col[{cj}] = {K:.6g}"))
             # exact linear (non-identical)
-            if n >= 5 and np.ptp(x) > 1e-12:
+            if n >= 5 and np.ptp(x) > 0:
+                lo = int(np.argmin(x))
+                hi = int(np.argmax(x))
+                dx = x[hi] - x[lo]
                 try:
-                    slope, intercept, r, _p, _se = stats.linregress(x, y)
+                    _fit_slope, _fit_intercept, r, _p, _se = stats.linregress(x, y)
                 except ValueError:
                     continue
+                if dx == 0:
+                    continue
+                slope = (y[hi] - y[lo]) / dx
+                intercept = y[lo] - slope * x[lo]
                 fitted = slope * x + intercept
-                if np.std(y) > 0 and _allclose_rowwise(y, fitted, rtol=1e-7) and abs(r) > 0.99:
+                if np.std(y) > 0 and np.all(relation_close(y, fitted, rtol=1e-7)) and abs(r) > 0.99:
                     # A scale-relatively zero intercept means the fit is y = slope*x: the
                     # identity (slope~=1, caught by identical_column) or a pure scaling. When a
                     # constant_ratio already captured that scaling, a second exact_linear finding
@@ -782,8 +772,7 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                 # placeholder like a 1e99 fold-change for a zero-denominator row) must not inflate
                 # the tolerance so that every row's diff reads as a whole number — that produced
                 # spurious whole-sheet integer_diff_shared_fraction findings (M2-1).
-                diff_tol = 1e-9 * np.maximum(np.maximum(np.abs(x), np.abs(y)), 1e-300)
-                diff_is_int = np.abs(diff - np.round(diff)) < diff_tol
+                diff_is_int = integer_shift_close(x, y)
                 frac_x = x - np.round(x)                       # signed distance to nearest integer
                 hp_rows = diff_is_int & (np.abs(frac_x) > 1e-6)
                 hp_fracs = [float(v) for v in frac_x[hp_rows] if _sig_frac_digits(v) >= 4]
@@ -1490,10 +1479,8 @@ def detect_equal_pairs(sheet, r0, r1, c0, c1, header):
             if n < 6:
                 continue
             am, bm = a[mask], b[mask]
-            # scale-relative tolerances, applied per row so one large metadata
-            # coordinate does not make small measurement rows look equal.
-            eq = int(_isclose_rowwise(am, bm, rtol=1e-6).sum())
-            if eq >= max(6, n // 2) and eq / n >= 0.5 and not _allclose_rowwise(am, bm, rtol=1e-9):
+            eq = int(np.equal(am, bm).sum())
+            if eq >= max(6, n // 2) and eq / n >= 0.5 and not np.array_equal(am, bm):
                 findings.append(dict(kind="many_equal_pairs", col_a=header[i], col_b=header[j],
                                      col_a_idx=c0 + i, col_b_idx=c0 + j, n=n, equal=eq,
                                      severity="medium" if eq < n else "high",
@@ -2480,17 +2467,13 @@ def detect_within_sheet_fraction_reuse(grid_sheets, profile="review", min_cells=
                 fracs, diffset = set(), set()
                 for k in common:
                     x, y = ca[k], cb[k]
-                    d = y - x
-                    # Per-cell tolerance at THIS cell's magnitude, not the block-wide max. A single
-                    # extreme value (a huge integer coordinate like distanceToTSS ~3.6e6, or a
-                    # placeholder) must not inflate the tolerance so that every cell reads as an
-                    # integer difference — that produced spurious whole-block fraction_reuse (M2-1).
-                    tol = 1e-6 * max(abs(x), abs(y), 1.0)
-                    if abs(d - round(d)) < tol:                 # integer difference => same fraction
+                    same_fraction = bool(integer_shift_close([x], [y])[0])
+                    if same_fraction:
                         shared += 1
-                        if abs(round(d)) >= 1:
+                        rounded_diff = round(y - x)
+                        if abs(rounded_diff) >= 1:
                             int_diffs += 1
-                            diffset.add(round(d))
+                            diffset.add(rounded_diff)
                         if _sig_frac_digits(x) >= 3:
                             hp += 1
                             fracs.add(round(x - round(x), 6))
