@@ -603,8 +603,27 @@ def _load_table_sheets(path):
 
 
 def load_table_result(path) -> TableLoadResult:
-    sheets = _load_table_sheets(path)
-    limitations = []
+    ext = os.path.splitext(path)[1].lower()
+    if ext in {".pdf", ".docx"}:
+        if ext == ".pdf":
+            from ._extract import load_pdf_tables
+            loader = load_pdf_tables
+        else:
+            from ._extract import load_docx_tables
+            loader = load_docx_tables
+        extracted = loader(
+            path,
+            max_cells=_MAX_CELLS,
+            with_metadata=True,
+        )
+        sheets = {
+            name: None if rows is None else Sheet.from_rows(rows)
+            for name, rows in extracted.tables.items()
+        }
+        limitations = list(extracted.limitations)
+    else:
+        sheets = _load_table_sheets(path)
+        limitations = []
     for sheet, gap in inspect_ooxml_formula_cache(path).items():
         limitations.append(InputLimitation(
             scope="sheet",
@@ -2997,18 +3016,35 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             scan_stats["files"].append(file_stat)
             continue
         coverage.mark_file_succeeded()
+        sheets = load_result.sheets
+        deferred_cell_limits = {}
         for limitation in load_result.limitations:
             details = limitation.to_dict()
             scope = details.pop("scope")
             reason = details.pop("reason")
             details.pop("file", None)
+            sheet = details.get("sheet")
+            if (
+                scope == "sheet"
+                and reason == "cell_limit"
+                and sheet in sheets
+                and sheets[sheet] is None
+            ):
+                deferred_cell_limits.setdefault(
+                    sheet,
+                    {
+                        key: value
+                        for key, value in details.items()
+                        if key != "sheet"
+                    },
+                )
+                continue
             coverage.add_limitation(
                 scope,
                 reason,
                 file=os.path.basename(f),
                 **details,
             )
-        sheets = load_result.sheets
         file_stat["n_sheets"] = len(sheets)
         file_stat["elapsed_ms"] = round((time.perf_counter() - file_start) * 1000, 3)
         scan_stats["files"].append(file_stat)
@@ -3018,8 +3054,16 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 msg = (f"oversized sheet exceeds {_MAX_CELLS} cells "
                        f"(set PAPERCONAN_MAX_CELLS to raise) — skipped to bound memory")
                 scan_errors.append({"file": os.path.basename(f), "sheet": sn, "error": msg})
+                limitation_details = deferred_cell_limits.pop(sn, None)
                 coverage.mark_sheet_skipped(
-                    os.path.basename(f), sn, "cell_limit", max_cells=_MAX_CELLS
+                    os.path.basename(f),
+                    sn,
+                    "cell_limit",
+                    **(
+                        limitation_details
+                        if limitation_details is not None
+                        else {"max_cells": _MAX_CELLS}
+                    ),
                 )
                 scan_stats["sheets"].append({
                     "file": os.path.basename(f), "sheet": sn, "oversized": True,
