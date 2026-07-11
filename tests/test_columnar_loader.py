@@ -1,6 +1,7 @@
 import numpy as np
 import openpyxl
 import pytest
+from zipfile import ZIP_DEFLATED, ZipFile
 from paperconan._audit import load_workbook_rows
 from paperconan._sheet import Sheet
 
@@ -10,6 +11,20 @@ def _write_xlsx(path, rows, sheet_name="S1"):
     for row in rows:
         ws.append(row)
     wb.save(path)
+
+
+def _write_xlsx_with_exact_adjacent_wide_integers(path):
+    _write_xlsx(path, [["a", "b"], [2**53, 2**53]])
+    with ZipFile(path) as src:
+        members = [(info, src.read(info.filename)) for info in src.infolist()]
+    old = b'<c r="B2" t="n"><v>9007199254740992</v></c>'
+    new = b'<c r="B2" t="n"><v>9007199254740993</v></c>'
+    with ZipFile(path, "w", ZIP_DEFLATED) as dst:
+        for info, data in members:
+            if info.filename == "xl/worksheets/sheet1.xml":
+                assert old in data
+                data = data.replace(old, new, 1)
+            dst.writestr(info, data)
 
 
 def test_load_returns_sheets(tmp_path):
@@ -123,8 +138,69 @@ def test_streaming_loader_preserves_adjacent_wide_integers(tmp_path):
     import paperconan._audit as audit
 
     p = tmp_path / "wide.xlsx"
-    _write_xlsx(p, [["a", "b"], [2**53, 2**53 + 1]])
+    _write_xlsx_with_exact_adjacent_wide_integers(p)
     sheet = audit._load_workbook_openpyxl(str(p))["S1"]
     assert sheet.cell(1, 0) == 2**53
     assert sheet.cell(1, 1) == 2**53 + 1
     assert sheet.cell(1, 0) != sheet.cell(1, 1)
+
+
+def test_default_loader_falls_back_to_openpyxl_for_wide_ooxml_integers(
+    tmp_path, monkeypatch
+):
+    import paperconan._audit as audit
+
+    p = tmp_path / "wide.xlsx"
+    _write_xlsx_with_exact_adjacent_wide_integers(p)
+    openpyxl_load = audit._load_workbook_openpyxl
+    calls = []
+
+    def spy(path):
+        calls.append(path)
+        return openpyxl_load(path)
+
+    monkeypatch.setattr(audit, "_load_workbook_openpyxl", spy)
+
+    sheet = audit.load_workbook_rows(str(p))["S1"]
+
+    assert calls == [str(p)]
+    assert sheet.cell(1, 0) == 2**53
+    assert sheet.cell(1, 1) == 2**53 + 1
+    assert sheet.cell(1, 0) != sheet.cell(1, 1)
+
+
+@pytest.mark.parametrize("suffix", [".xls", ".xlsb"])
+def test_legacy_workbooks_do_not_use_wide_integer_openpyxl_fallback(
+    tmp_path, monkeypatch, suffix
+):
+    import paperconan._audit as audit
+    import python_calamine
+
+    class FakeSheet:
+        height = 1
+        width = 1
+
+        def to_python(self, skip_empty_area=False):
+            return [[float(2**53)]]
+
+    class FakeWorkbook:
+        sheet_names = ["S1"]
+
+        def get_sheet_by_name(self, name):
+            assert name == "S1"
+            return FakeSheet()
+
+    class FakeCalamineWorkbook:
+        @staticmethod
+        def from_path(path):
+            return FakeWorkbook()
+
+    def forbidden(path):
+        raise AssertionError("legacy workbook must stay on the Calamine path")
+
+    monkeypatch.setattr(python_calamine, "CalamineWorkbook", FakeCalamineWorkbook)
+    monkeypatch.setattr(audit, "_load_workbook_openpyxl", forbidden)
+
+    sheet = audit.load_workbook_rows(str(tmp_path / f"wide{suffix}"))["S1"]
+
+    assert sheet.cell(0, 0) == 2**53

@@ -357,6 +357,7 @@ git commit -m "fix: separate numeric comparison semantics"
 - Modify: `src/paperconan/_sheet.py`
 - Modify: `src/paperconan/_audit.py`
 - Test: `tests/test_sheet.py`
+- Test: `tests/test_numeric_blocks.py`
 - Test: `tests/test_relations_tolerance.py`
 - Test: `tests/test_columnar_loader.py`
 
@@ -365,6 +366,11 @@ git commit -m "fix: separate numeric comparison semantics"
 - `Sheet.exact_numeric(r, c) -> int | float | None`
 - `Sheet.numeric_values() -> list[int | float]`
 - `Sheet.__init__(nrows, ncols, numeric, text, ints, wide_ints=None)`
+
+The RED set must include the public/default `load_workbook_rows` path as well
+as `_load_workbook_openpyxl`. Build the `.xlsx` fixture with distinct serialized
+worksheet decimals for `2**53` and `2**53 + 1`; openpyxl's writer converts the
+latter before serialization and cannot create this regression fixture directly.
 
 - [ ] **Step 1: Store wide integers sparsely**
 
@@ -449,7 +455,40 @@ return Sheet(
 ), cells
 ```
 
-- [ ] **Step 2: Make block discovery use the numeric mask**
+- [ ] **Step 2: Reload wide OOXML numeric streams through openpyxl**
+
+python-calamine 0.7.0 returns serialized `2**53` and `2**53 + 1` cells from an
+`.xlsx` as the same float `9007199254740992.0` before `Sheet` construction. For
+OOXML `.xlsx` / `.xlsm` only, inspect the raw Calamine rows before
+`_calamine_cell` normalization. If any raw value is a finite integral float with
+`abs(value) >= 2**53`, conservatively discard the Calamine result and reload the
+whole workbook through `_load_workbook_openpyxl(path)`:
+
+```python
+is_ooxml = os.path.splitext(path)[1].lower() in {".xlsx", ".xlsm"}
+if is_ooxml and any(
+    isinstance(value, float)
+    and math.isfinite(value)
+    and value.is_integer()
+    and abs(value) >= _MAX_EXACT_FLOAT_INT
+    for row in rows
+    for value in row
+):
+    return _load_workbook_openpyxl(path)
+```
+
+The `>=` threshold intentionally permits a conservative fallback for an exact
+`2**53` cell because the Calamine float cannot reveal whether the serialized
+decimal was `2**53` or `2**53 + 1`. Do not apply this fallback to legacy `.xls`
+or `.xlsb`; their native numeric representation does not preserve a distinct
+larger integer beyond binary floating precision.
+
+Add a public-loader regression that spies on `_load_workbook_openpyxl`, asserts
+one whole-workbook reload for the exact OOXML fixture, and verifies both integer
+cells remain distinct. Add a `.xls` / `.xlsb` guard proving the same Calamine
+float stays on the legacy reader path.
+
+- [ ] **Step 3: Make block discovery use the numeric mask**
 
 In `find_numeric_blocks`, replace:
 
@@ -471,7 +510,7 @@ if (i1 - i0) >= min_rows and (j1 - j) >= min_cols:
     blocks.append((i0, i1, j, j1))
 ```
 
-- [ ] **Step 3: Add exact relation extraction**
+- [ ] **Step 4: Add exact relation extraction**
 
 Add to `_audit.py`:
 
@@ -546,7 +585,7 @@ if all(isinstance(v, int) for v in exact_x + exact_y):
 Only rows whose values are representable in the dense float arrays participate
 in remaining float-based transform checks.
 
-- [ ] **Step 4: Make many-equal-pairs exact**
+- [ ] **Step 5: Make many-equal-pairs exact**
 
 Rewrite `detect_equal_pairs` to count source-value equality through
 `Sheet.exact_numeric`:
@@ -563,7 +602,7 @@ Preserve existing sample, severity, and minimum-count behavior. Do not emit
 `many_equal_pairs` when every row is equal because `identical_column` owns that
 case.
 
-- [ ] **Step 5: Run focused tests**
+- [ ] **Step 6: Run focused tests**
 
 Run:
 
@@ -578,12 +617,13 @@ Run:
 
 Expected: all pass.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/paperconan/_sheet.py src/paperconan/_audit.py \
   tests/test_sheet.py tests/test_numeric_blocks.py \
-  tests/test_relations_tolerance.py
+  tests/test_relations_tolerance.py tests/test_columnar_loader.py \
+  docs/superpowers/plans/2026-07-11-numeric-correctness.md
 git commit -m "fix: preserve exact wide integers"
 ```
 

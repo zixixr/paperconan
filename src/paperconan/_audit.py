@@ -39,7 +39,7 @@ from scipy import stats
 
 from ._numeric import integer_shift_close, relation_close
 from ._profiles import apply_profile_to_findings, normalize_profile
-from ._sheet import Sheet
+from ._sheet import Sheet, _MAX_EXACT_FLOAT_INT
 from .schema import PaperconanInputError
 
 # Canonical list of the per-block finding-group keys emitted into every
@@ -179,6 +179,7 @@ def _fill_sheet_from_rows(rows_iter, mr, mc, loaded):
     numeric = np.full((mr, mc), np.nan, dtype=float) if (mr and mc) else np.empty((0, 0))
     text = {}
     ints = set()
+    wide_ints = {}
     r = 0                                        # rows consumed (== final nrows)
     cells = 0
     max_w = 0                                    # max row width seen (== final ncols)
@@ -193,9 +194,12 @@ def _fill_sheet_from_rows(rows_iter, mr, mc, loaded):
             numeric = np.hstack([numeric, pad]) if numeric.shape[1] else pad
         for c, v in enumerate(row):
             if is_num(v):
-                numeric[r, c] = float(v)
-                if isinstance(v, int) and not isinstance(v, bool):
-                    ints.add((r, c))
+                if isinstance(v, int) and abs(v) > _MAX_EXACT_FLOAT_INT:
+                    wide_ints[(r, c)] = v
+                else:
+                    numeric[r, c] = float(v)
+                    if isinstance(v, int) and not isinstance(v, bool):
+                        ints.add((r, c))
             elif v is not None:
                 text[(r, c)] = v
         if width > max_w:
@@ -217,7 +221,16 @@ def _fill_sheet_from_rows(rows_iter, mr, mc, loaded):
     text = {(rr, cc): val for (rr, cc), val in text.items()
             if rr < n_rows and cc < n_cols}
     ints = {(rr, cc) for (rr, cc) in ints if rr < n_rows and cc < n_cols}
-    return Sheet(numeric.shape[0], numeric.shape[1], numeric, text, ints), cells
+    wide_ints = {(rr, cc): val for (rr, cc), val in wide_ints.items()
+                 if rr < n_rows and cc < n_cols}
+    return Sheet(
+        numeric.shape[0],
+        numeric.shape[1],
+        numeric,
+        text,
+        ints,
+        wide_ints,
+    ), cells
 
 
 def _load_workbook_openpyxl(path):
@@ -275,6 +288,7 @@ def _load_workbook_calamine(path):
     wb = python_calamine.CalamineWorkbook.from_path(path)
     out = {}
     loaded = 0                                       # cumulative cells across this file's sheets
+    is_ooxml = os.path.splitext(path)[1].lower() in {".xlsx", ".xlsm"}
     for name in wb.sheet_names:
         sh = wb.get_sheet_by_name(name)
         # Reject from the cheap DECLARED dimensions BEFORE to_python materializes the
@@ -286,6 +300,15 @@ def _load_workbook_calamine(path):
             out[name] = None
             continue
         rows = sh.to_python(skip_empty_area=False)
+        if is_ooxml and any(
+            isinstance(value, float)
+            and math.isfinite(value)
+            and value.is_integer()
+            and abs(value) >= _MAX_EXACT_FLOAT_INT
+            for row in rows
+            for value in row
+        ):
+            return _load_workbook_openpyxl(path)
         mr = len(rows)
         mc = max((len(row) for row in rows), default=0)
         if loaded >= _MAX_CELLS or (mr and mc and mr * mc > _MAX_CELLS):
@@ -381,7 +404,7 @@ def find_numeric_blocks(sheet, min_rows=3, min_cols=1):
     R, C = sheet.nrows, sheet.ncols
     if R == 0 or C == 0:
         return []
-    num = ~np.isnan(sheet.numeric)
+    num = sheet.numeric_mask()
     blocks = []
     visited = np.zeros_like(num)
     for j in range(C):
@@ -399,8 +422,8 @@ def find_numeric_blocks(sheet, min_rows=3, min_cols=1):
                         j1 += 1
                     else:
                         break
-                visited[i0:i1, j:j1] = True
                 if (i1 - i0) >= min_rows and (j1 - j) >= min_cols:
+                    visited[i0:i1, j:j1] = True
                     blocks.append((i0, i1, j, j1))
             else:
                 i += 1
@@ -617,6 +640,26 @@ def _allclose_rowwise(actual, expected, rtol=1e-10):
     return bool(np.all(_isclose_rowwise(actual, expected, rtol=rtol)))
 
 
+def _numeric_pairs(sheet, r0, r1, ca, cb):
+    pairs = []
+    for row in range(r0, r1):
+        left = sheet.exact_numeric(row, ca)
+        right = sheet.exact_numeric(row, cb)
+        if left is not None and right is not None:
+            pairs.append((row, left, right))
+    return pairs
+
+
+def _sample_exact(values, k=8):
+    out = []
+    for value in values[:k]:
+        if isinstance(value, int):
+            out.append(value)
+        else:
+            out.append(round(float(value), 6))
+    return out
+
+
 _GRIM_MEAN_RE = re.compile(r"\b(mean|average|avg)\b|均值|平均", re.I)
 _GRIM_SD_RE = re.compile(r"\b(s\.?d\.?|std)\b|标准差", re.I)
 _GRIM_N_RE = re.compile(r"\bn\b|sample.?size|样本量|例数", re.I)
@@ -635,6 +678,43 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
         for j in range(i + 1, len(cols)):
             ci, ai = cols[i]
             cj, aj = cols[j]
+            pairs = _numeric_pairs(sheet, r0, r1, ci, cj)
+            if len(pairs) < 4:
+                continue
+            exact_x = [pair[1] for pair in pairs]
+            exact_y = [pair[2] for pair in pairs]
+            if all(a == b for a, b in zip(exact_x, exact_y)):
+                findings.append(dict(
+                    kind="identical_column",
+                    col_a=header[ci - c0],
+                    col_b=header[cj - c0],
+                    col_a_idx=ci,
+                    col_b_idx=cj,
+                    n=len(pairs),
+                    severity="high",
+                    col_a_sample=_sample_exact(exact_x),
+                    col_b_sample=_sample_exact(exact_y),
+                    rule=f"col[{cj}] == col[{ci}]",
+                ))
+                continue
+            if all(isinstance(value, int) for value in exact_x + exact_y):
+                offsets = {b - a for a, b in zip(exact_x, exact_y)}
+                if len(offsets) == 1 and next(iter(offsets)) != 0:
+                    offset = next(iter(offsets))
+                    findings.append(dict(
+                        kind="constant_offset",
+                        col_a=header[ci - c0],
+                        col_b=header[cj - c0],
+                        col_a_idx=ci,
+                        col_b_idx=cj,
+                        n=len(pairs),
+                        offset=offset,
+                        severity="high",
+                        col_a_sample=_sample_exact(exact_x),
+                        col_b_sample=_sample_exact(exact_y),
+                        rule=f"col[{cj}] = col[{ci}] + {offset}",
+                    ))
+                    continue
             mask = ~np.isnan(ai) & ~np.isnan(aj)
             n = int(mask.sum())
             if n < 4:
@@ -645,13 +725,6 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
             # B4 retains its existing scale-relative run policy. Whole-column identity,
             # transforms, and integer shifts use their dedicated policies below.
             tol = 1e-9 * max(float(np.max(np.abs(x))), float(np.max(np.abs(y))), 1e-300)
-            # identical
-            if np.array_equal(x, y):
-                findings.append(dict(kind="identical_column", col_a=header[ci - c0], col_b=header[cj - c0],
-                                     col_a_idx=ci, col_b_idx=cj, n=n, severity="high",
-                                     col_a_sample=sa, col_b_sample=sb,
-                                     rule=f"col[{cj}] == col[{ci}]"))
-                continue
             # constant offset
             diff = y - x
             mean_diff = float(np.mean(diff))
@@ -1470,21 +1543,23 @@ def detect_equal_pairs(sheet, r0, r1, c0, c1, header):
     """Detect column pairs where many rows have identical values
     (e.g. tumor length == tumor width)."""
     findings = []
-    A = sheet.block(r0, r1, c0, c1)
     for i in range(c1 - c0):
         for j in range(i + 1, c1 - c0):
-            a, b = A[:, i], A[:, j]
-            mask = ~np.isnan(a) & ~np.isnan(b)
-            n = int(mask.sum())
+            pairs = _numeric_pairs(sheet, r0, r1, c0 + i, c0 + j)
+            n = len(pairs)
             if n < 6:
                 continue
-            am, bm = a[mask], b[mask]
-            eq = int(np.equal(am, bm).sum())
-            if eq >= max(6, n // 2) and eq / n >= 0.5 and not np.array_equal(am, bm):
+            exact_a = [pair[1] for pair in pairs]
+            exact_b = [pair[2] for pair in pairs]
+            equal_rows = [row for row, left, right in pairs if left == right]
+            eq = len(equal_rows)
+            all_equal = eq == n
+            if eq >= max(6, n // 2) and eq / n >= 0.5 and not all_equal:
                 findings.append(dict(kind="many_equal_pairs", col_a=header[i], col_b=header[j],
                                      col_a_idx=c0 + i, col_b_idx=c0 + j, n=n, equal=eq,
                                      severity="medium" if eq < n else "high",
-                                     col_a_sample=_sample(am), col_b_sample=_sample(bm),
+                                     col_a_sample=_sample_exact(exact_a),
+                                     col_b_sample=_sample_exact(exact_b),
                                      rule=f"col[{c0+i}] == col[{c0+j}] in {eq}/{n} rows"))
     return findings
 

@@ -1,15 +1,18 @@
 """Columnar substrate for the audit engine.
 
 A Sheet replaces the legacy {sheet: list[list]} representation. Numeric cells
-live in a dense float64 array (NaN = empty-or-non-numeric); non-numeric cells
-(text, dates, bools) live in a sparse dict; integer-typed cells are tracked in a
-sparse set so evidence keeps int-vs-float fidelity. The reconstruction rule in
-`cell()` reproduces the original value exactly for every accessor and the
-evidence builder.
+representable as float64 live in a dense array (NaN = empty-or-non-numeric);
+wide integers and non-numeric cells live in sparse mappings. Integer-typed
+dense cells are tracked in a sparse set so evidence keeps int-vs-float
+fidelity. The reconstruction rule in `cell()` reproduces the original value
+exactly for every accessor and the evidence builder.
 """
 from __future__ import annotations
 import math
 import numpy as np
+
+
+_MAX_EXACT_FLOAT_INT = 2**53
 
 
 def _is_num(x):
@@ -23,14 +26,15 @@ def _is_num(x):
 
 
 class Sheet:
-    __slots__ = ("nrows", "ncols", "numeric", "_text", "_ints")
+    __slots__ = ("nrows", "ncols", "numeric", "_text", "_ints", "_wide_ints")
 
-    def __init__(self, nrows, ncols, numeric, text, ints):
+    def __init__(self, nrows, ncols, numeric, text, ints, wide_ints=None):
         self.nrows = nrows
         self.ncols = ncols
         self.numeric = numeric
         self._text = text
         self._ints = ints
+        self._wide_ints = wide_ints or {}
 
     @classmethod
     def from_rows(cls, rows):
@@ -40,19 +44,25 @@ class Sheet:
         numeric = np.full((nrows, ncols), np.nan, dtype=float)
         text = {}
         ints = set()
+        wide_ints = {}
         for r, row in enumerate(rows):
             for c, v in enumerate(row):
                 if _is_num(v):
-                    numeric[r, c] = float(v)
-                    if isinstance(v, int):
-                        ints.add((r, c))
+                    if isinstance(v, int) and abs(v) > _MAX_EXACT_FLOAT_INT:
+                        wide_ints[(r, c)] = v
+                    else:
+                        numeric[r, c] = float(v)
+                        if isinstance(v, int):
+                            ints.add((r, c))
                 elif v is not None:
                     text[(r, c)] = v
-        return cls(nrows, ncols, numeric, text, ints)
+        return cls(nrows, ncols, numeric, text, ints, wide_ints)
 
     def cell(self, r, c):
         """Original value at (r, c): number (int/float fidelity), text/date/bool, or None."""
         if 0 <= r < self.nrows and 0 <= c < self.ncols:
+            if (r, c) in self._wide_ints:
+                return self._wide_ints[(r, c)]
             v = self.numeric[r, c]
             if not math.isnan(v):
                 # Return built-in int/float, never numpy scalars: evidence cells
@@ -66,7 +76,24 @@ class Sheet:
         """float64 sub-array (NaN for non-numeric) — the equal-pairs block matrix."""
         return self.numeric[r0:r1, c0:c1].copy()
 
+    def numeric_mask(self):
+        mask = ~np.isnan(self.numeric)
+        for r, c in self._wide_ints:
+            mask[r, c] = True
+        return mask
+
+    def exact_numeric(self, r, c):
+        if (r, c) in self._wide_ints:
+            return self._wide_ints[(r, c)]
+        value = self.cell(r, c)
+        return value if _is_num(value) else None
+
     def numeric_values(self):
-        """Flat list of all numeric cell values (order unspecified)."""
-        col = self.numeric[~np.isnan(self.numeric)]
-        return col.tolist()
+        """Row-major list of all numeric cell values with exact integer fidelity."""
+        values = []
+        for r in range(self.nrows):
+            for c in range(self.ncols):
+                value = self.exact_numeric(r, c)
+                if value is not None:
+                    values.append(value)
+        return values

@@ -241,8 +241,27 @@ def test_adjacent_wide_integer_columns_are_not_identical_or_equal_pairs():
     sheet = _sheet([x, y])
     findings = detect_relations(sheet, 1, 9, 0, 2, ["x", "y"])
     assert not any(f["kind"] == "identical_column" for f in findings)
-    assert any(f["kind"] == "constant_offset" for f in findings)
+    offsets = [f for f in findings if f["kind"] == "constant_offset"]
+    assert len(offsets) == 1
+    assert offsets[0]["offset"] == 1
+    assert isinstance(offsets[0]["offset"], int)
+    assert offsets[0]["col_a_sample"] == x
+    assert offsets[0]["col_b_sample"] == y
     assert detect_equal_pairs(sheet, 1, 9, 0, 2, ["x", "y"]) == []
+
+
+def test_wide_integer_many_equal_pairs_counts_exact_source_values():
+    x = [2**53 + i * 4 for i in range(8)]
+    y = x[:6] + [x[6] + 1, x[7] + 1]
+    sheet = _sheet([x, y])
+
+    findings = detect_equal_pairs(sheet, 1, 9, 0, 2, ["x", "y"])
+
+    assert len(findings) == 1
+    assert findings[0]["kind"] == "many_equal_pairs"
+    assert findings[0]["equal"] == 6
+    assert findings[0]["col_a_sample"] == x
+    assert findings[0]["col_b_sample"] == y
 
 
 # ---------------------------------------------------------------------------
