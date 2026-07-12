@@ -16,25 +16,25 @@ def fixture():
     return load_fixture
 
 
-def make_fake_get_json(routes):
+def make_stub_get_json(routes):
     """routes: list of (url_substring, fixture_object). First match wins."""
-    def _fake(url, params=None, headers=None, timeout=15):
+    def _stub(url, params=None, headers=None, timeout=15):
         for sub, obj in routes:
             if sub in url:
                 return obj
-        raise AssertionError(f"no fake route for GET {url}")
-    return _fake
+        raise AssertionError(f"no stub route for GET {url}")
+    return _stub
 
 
-def make_fake_post_json(routes):
-    def _fake(url, payload, headers=None, timeout=15):
+def make_stub_post_json(routes):
+    def _stub(url, payload, headers=None, timeout=15):
         for sub, obj in routes:
             if sub in url:
                 return obj
-        raise AssertionError(f"no fake route for POST {url}")
-    return _fake
+        raise AssertionError(f"no stub route for POST {url}")
+    return _stub
 
 
 @pytest.fixture
-def fake_http():
-    return {"get": make_fake_get_json, "post": make_fake_post_json}
+def stub_http():
+    return {"get": make_stub_get_json, "post": make_stub_post_json}

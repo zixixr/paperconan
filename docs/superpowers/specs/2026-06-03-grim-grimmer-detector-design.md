@@ -8,8 +8,8 @@
 
 paperconan's existing detectors all operate on *raw-ish* data columns —
 relations between columns, within-column repetition, cross-sheet collisions.
-None of them validate **reported summary statistics**. But a large fraction of
-fabricated supplementary tables are summary tables of the form
+None of them validate **reported summary statistics**. But supplementary tables
+with data inconsistencies are often summary tables of the form
 `group → mean ± SD (n)`, with no raw values to cross-check.
 
 GRIM (Granularity-Related Inconsistency of Means, Brown & Heathers 2017) and
@@ -18,7 +18,7 @@ well-validated forensic tests that catch impossible mean/SD values in exactly
 this kind of table. They fit paperconan's engine style (per-block, pure
 numeric, zero external deps) and fill a genuine capability gap.
 
-Borrowed conceptually from the `geng-academic-fraud-detector` skill's second
+Borrowed conceptually from an academic-integrity review skill's second
 "form" ("能否反推出三个合理的原始值?"), but implemented as deterministic code,
 not LLM reasoning.
 

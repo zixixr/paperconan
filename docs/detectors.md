@@ -19,7 +19,7 @@ paperconan 跑一组数值取证检测器，把"值得人工复核的位置"找�
 | `many_equal_pairs` | 两个本该独立的列里大量 byte-identical | 9/10 一致，只手改一格 |
 | `row_pair_digit_coupling` | 两行之间高位改变但小数/个位异常保留 | `197.2 → 167.2`、`165.5 → 155.5` 成串出现 |
 | `cross_sheet_position_identical` | 两张 sheet 同位置数值完全一样 | 同一份样本被复制到另一张表 |
-| `cross_sheet_value_overlap` | 两张表共享大量小数值（不要求同位置） | 池化后重新洗牌伪造独立实验 |
+| `cross_sheet_value_overlap` | 两张表共享大量小数值（不要求同位置） | 池化后重新洗牌、呈现为独立实验的数据不一致 |
 | `cross_sheet_decimal_tail_reuse` | 跨 sheet 多个值保留长小数尾、只改前导数字 | `14.70300997 → 6.70300997` 成串出现 |
 | `cross_sheet_column_duplicate` | 跨 sheet / 跨文件**整列逐值重复**（含 `cross_sheet_*` 位置检测漏掉的整数 / 一位小数列） | 一张图的"No IR"基线列在另一张图里 60 个值全同 |
 | `within_table_fraction_reuse` | 同一 sheet 两个矩阵块**逐格共享小数位**、只差整数 | 两个剂量-反应矩阵 48/49 格小数位相同 |

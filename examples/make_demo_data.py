@@ -1,6 +1,6 @@
 """Generate the synthetic demo dataset for examples/demo_paper/.
 
-This is a *fabricated* paper's source data — every suspicious pattern below was
+This is a *synthetic* paper's source data — every statistical-signal pattern below was
 planted on purpose so the generated report shows what paperconan can find. No
 real paper or person is involved.
 

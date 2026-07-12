@@ -1,12 +1,12 @@
 # paperconan: how to talk about findings
 
-paperconan 输出的是 **统计异常**，不是 **学术不端结论**。本文件只管用户回复的措辞和红线；具体 detector 判读见 [detectors.md](detectors.md)，finding 分级见 [judgment-rubric.md](judgment-rubric.md) 和 [adjudication-tiers.md](adjudication-tiers.md)，正式报告模板见 [report-templates.md](report-templates.md)。
+paperconan 输出的是 **统计异常**，不是 **研究完整性审查结论**。本文件只管用户回复的措辞和红线；具体 detector 判读见 [detectors.md](detectors.md)，finding 分级见 [judgment-rubric.md](judgment-rubric.md) 和 [adjudication-tiers.md](adjudication-tiers.md)，正式报告模板见 [report-templates.md](report-templates.md)。
 
 ## Severity Is Not Verdict
 
 | Severity | 可说的含义 | 不可说的含义 |
 |---|---|---|
-| `high` | 算法认为模式非常反常，值得核对原表和论文说明 | 造假概率高 |
+| `high` | 算法认为模式非常反常，值得核对原表和论文说明 | 研究完整性问题概率高 |
 | `medium` | 有可疑模式，但常见良性解释更多 | 不严重、可以忽略 |
 | `low` | 弱信号，或被 profile/prefilter 降级后的信号 | 已经排除问题 |
 
@@ -14,7 +14,7 @@ paperconan 输出的是 **统计异常**，不是 **学术不端结论**。本�
 
 Tier labels, when used, are also not verdicts. `Tier 1/2/3` means review
 priority and difficulty of innocent explanation after context review; it does
-not mean probability of misconduct.
+not mean probability of a research-integrity issue.
 
 ## Before Saying A Finding Matters
 
@@ -28,7 +28,7 @@ not mean probability of misconduct.
 
 ## Red Lines
 
-- 不说"这篇论文造假了"、"作者编了数据"、"fake/fraud/fabricated data"。
+- 只描述文件、sheet、列、行和数值模式，不对论文或作者意图作定性。
 - 不点名作者为作假者；只描述文件、sheet、列、行和数值模式。
 - 不建议微博 / Twitter / 知乎 / 小红书 / 抖音曝光。
 - 不用"实锤"。
@@ -37,7 +37,7 @@ not mean probability of misconduct.
 ## Normal Scan Summary Template
 
 ```text
-我扫了 <N> 个文件；<M> 个文件解析失败/全部解析成功。下面这些是统计异常信号，不是造假结论。
+我扫了 <N> 个文件；<M> 个文件解析失败/全部解析成功。下面这些是统计异常信号，不是研究完整性审查结论。
 
 优先核对：
 1. <file> :: <sheet> — <kind>, <rule>, n=<n>
@@ -62,13 +62,13 @@ not mean probability of misconduct.
 避免结论式：
 
 - "这说明数据是编的。"
-- "作者造假。"
+- "作者存在研究完整性问题。"
 - "已经实锤。"
 
-## If The User Asks "Is This Fraud?"
+## If The User Asks For A Definitive Research-Integrity Verdict
 
 ```text
-我不能这样定性，paperconan 也不能。它只能指出统计上反常、值得复核的模式；是否存在学术不端需要作者解释、同行或编辑部复核，必要时由研究诚信办公室调查。现在能做的是把具体文件、sheet、列、规则和样本值整理成可复核的问题。
+我不能这样定性，paperconan 也不能。它只能指出统计上反常、值得复核的模式；是否需要进入研究完整性审查，需要作者解释、同行或编辑部复核，必要时由研究诚信办公室调查。现在能做的是把具体文件、sheet、列、规则和样本值整理成可复核的问题。
 ```
 
 ## If The User Wants Social-Media Exposure

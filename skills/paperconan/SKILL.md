@@ -1,18 +1,18 @@
 ---
 name: paperconan
 version: 0.8.2
-description: Use when auditing paper source-data tables for numerical integrity signals, interpreting paperconan scan.json/report.html, preparing cautious PubPeer or research-integrity notes, or finding open supplementary data from a DOI/title. Trigger on 论文数据检查, source data audit, paper data audit, suspicious numeric tables, fabrication red flags, PubPeer prep, research integrity, DOI/title data fetch. Covers .xlsx/.csv/.tsv and tables in .pdf/.docx; not image forensics or chart digitization.
+description: Use when auditing paper source-data tables for numerical integrity signals, interpreting paperconan scan.json/report.html, preparing cautious PubPeer or research-integrity notes, or finding open supplementary data from a DOI/title. Trigger on 论文数据检查, source data audit, paper data audit, suspicious numeric tables, statistical-signal patterns, PubPeer prep, research integrity, DOI/title data fetch. Covers .xlsx/.csv/.tsv and tables in .pdf/.docx; not image forensics or chart digitization.
 ---
 
 # paperconan
 
-paperconan scans paper source-data tables for numerical anomaly signals. Treat every hit as **signal, not verdict**: report locations and patterns, never intent or misconduct.
+paperconan scans paper source-data tables for numerical anomaly signals. Treat every hit as **signal, not verdict**: report locations and patterns, never intent or a research-integrity conclusion.
 
 Tool repository: https://github.com/zixixr/paperconan
 
 ## Core Workflow
 
-0. Ensure the CLI is available before scanning: run `paperconan --version`. If it is missing and pip works, install once with `pip install "paperconan[all]"` (ask first if a virtualenv or non-global install is preferred). If Python/pip is unavailable, ask the user to install and run locally — never fabricate output.
+0. Ensure the CLI is available before scanning: run `paperconan --version`. If it is missing and pip works, install once with `pip install "paperconan[all]"` (ask first if a virtualenv or non-global install is preferred). If Python/pip is unavailable, ask the user to install and run locally — never synthesize output.
 1. Confirm what the user supplied:
    - Local source-data directory: run `paperconan <input-dir>`.
    - DOI or title: run `paperconan fetch "<DOI or title>"`, choose a matched tabular dataset, download it, then scan the downloaded directory.
@@ -34,7 +34,7 @@ Choose the lightest mode that satisfies the user request:
   load [references/adjudication-tiers.md](references/adjudication-tiers.md) and
   [references/report-templates.md](references/report-templates.md). Use Tier
   labels only as review priority / innocent-explanation difficulty, never as
-  misconduct probability.
+  research-integrity probability.
 - **Batch review**: use [references/batch-workflow.md](references/batch-workflow.md).
   Keep deterministic paperconan output separate from agent judgment. Preserve
   DROP reasons because repeated false positives can guide future filters.
@@ -134,13 +134,13 @@ Load references only when needed:
 
 ## Judgment Discipline
 
-- Never convert `severity` into a misconduct conclusion. Severity means anomaly strength after the active profile, not author intent.
-- Never convert `Tier 1/2/3` into a misconduct probability. Tier means follow-up priority and difficulty of innocent explanation after context review.
+- Never convert `severity` into a research-integrity conclusion. Severity means anomaly strength after the active profile, not author intent.
+- Never convert `Tier 1/2/3` into a research-integrity probability. Tier means follow-up priority and difficulty of innocent explanation after context review.
 - Inspect cross-sheet reuse and cross-column transforms before weaker single-column patterns.
 - Prefer benign structural explanations first: shared controls, re-plots, unit conversions, formulas, indices, ratios, normalized values, model outputs, detection floors, and bounded scoring scales.
 - Treat `within_col_*` findings as false-positive-heavy by default. Do not strongly report `n < 10`, categorical/index labels, derived columns, fixed-denominator ratios, rounded grids, floors/ceilings, or repeated fill values.
 - Use "needs human context" when you cannot confirm row independence, raw measurement status, formula generation, Methods/legend meaning, or original-table provenance.
-- For PubPeer-style writing, provide concrete file/sheet/column evidence and questions for the authors; do not say "fake", "fraud", "fabricated", "实锤", or name authors as wrongdoers.
+- For PubPeer-style writing, provide concrete file/sheet/column evidence and questions for the authors; use only neutral statistical-signal, data-inconsistency, and clarification wording, without assigning intent to authors.
 - Do not use real papers as public calibration examples unless the user has
   explicitly asked to prepare a specific public note and the evidence has been
   checked against source data and paper context.
@@ -172,4 +172,4 @@ confuse this with the default deterministic `audit/report.html`; the
 adjudicated report is only as reliable as the human/AI verdict and source
 context behind it.
 
-If the user asks "is this fraud?", answer that paperconan cannot determine that. The next step is to verify the original data and, if concerns remain, ask for clarification through PubPeer, the journal, or a research integrity office.
+If the user asks for a definitive research-integrity conclusion, answer that paperconan cannot determine that. The next step is to verify the original data and, if concerns remain, ask for clarification through PubPeer, the journal, or a research integrity office.

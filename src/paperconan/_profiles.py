@@ -274,6 +274,6 @@ def apply_profile_to_findings(findings: Iterable[dict], profile: str | None,
                 ctx,
                 f"within_col prefilter matched {reason}; this column pattern is usually "
                 "categorical/integer-coded, an axis/index, a normalized or derived column, "
-                "or a large-matrix flood rather than a fabricated measurement repeat",
+                "or a large-matrix flood rather than an unexplained measurement repeat",
             )
             _demote_or_hide(f, profile_name)

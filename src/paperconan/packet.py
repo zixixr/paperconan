@@ -35,7 +35,7 @@ def _distill_cross_sheet(scan: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         n = int(f.get("same_position_count") or f.get("size_a") or 0)
         # Preserve the decimal-tail-reuse identity: a long fractional tail shared across
-        # sheets is a near-zero-chance fabrication fingerprint, distinct from a generic
+        # sheets is a near-zero-chance statistical-signal pattern, distinct from a generic
         # value_tweaked partial overlap — it must not be relabeled away (or the judge sees
         # only "a small partial overlap" and dismisses it as benign).
         if f.get("kind") == "cross_sheet_decimal_tail_reuse":

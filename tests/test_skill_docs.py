@@ -41,8 +41,8 @@ def test_new_judgment_docs_keep_signal_not_verdict_boundary() -> None:
     text = "\n".join(path.read_text(encoding="utf-8") for path in docs)
 
     assert "signal-not-verdict" in text
-    assert re.search(r"misconduct probabilit(?:y|ies)", text)
-    assert "not a misconduct accusation" in text
+    assert re.search(r"not\s+research-integrity probabilities", text)
+    assert "does not establish a research-integrity finding" in text
 
 
 def test_case_patterns_do_not_publish_real_paper_identifiers() -> None:
@@ -67,4 +67,4 @@ def test_readme_points_to_public_adjudication_docs() -> None:
     ]:
         assert f"skills/paperconan/references/{name}" in readme
 
-    assert "不是造假概率" in readme
+    assert "不是研究完整性问题概率" in readme

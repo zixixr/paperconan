@@ -14,7 +14,7 @@ Use this for normal interactive audits.
 
 ```text
 I scanned <input>. <N> files were read; <M> files failed to parse.
-These are numerical signals, not misconduct conclusions.
+These are numerical signals, not research-integrity conclusions.
 
 Highest-priority finding:
 - Location: <file> :: <sheet>, rows <range>, columns <labels>
@@ -103,7 +103,7 @@ List reproducibility details:
 Close with:
 
 ```text
-以上是可复核的数据模式问题，不构成对作者意图或学术不端的判断。
+以上是可复核的数据模式问题，不构成对作者意图或研究完整性问题的判断。
 ```
 
 ## Batch Verdict Record

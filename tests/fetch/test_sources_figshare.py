@@ -2,12 +2,12 @@
 from paperconan.fetch import _sources, _http
 
 
-def test_search_figshare_fetches_article_files(monkeypatch, fixture, fake_http):
+def test_search_figshare_fetches_article_files(monkeypatch, fixture, stub_http):
     monkeypatch.setattr(_http, "post_json",
-                        fake_http["post"]([("api.figshare.com/v2/articles/search",
+                        stub_http["post"]([("api.figshare.com/v2/articles/search",
                                             fixture("figshare_search.json"))]))
     monkeypatch.setattr(_http, "get_json",
-                        fake_http["get"]([("api.figshare.com/v2/articles/32340066",
+                        stub_http["get"]([("api.figshare.com/v2/articles/32340066",
                                            fixture("figshare_article.json"))]))
 
     cands = _sources.search_figshare("thrombocytopenia", size=5)

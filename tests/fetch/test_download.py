@@ -58,12 +58,12 @@ def test_download_file_auth_required_message(monkeypatch, tmp_path):
 def test_download_candidate_tabular_only(monkeypatch, tmp_path):
     saved = []
 
-    def fake_dl(url, dest, **kw):
+    def stub_dl(url, dest, **kw):
         Path(dest).write_bytes(b"x")
         saved.append(dest)
         return {"ok": True, "path": dest}
 
-    monkeypatch.setattr(_download, "download_file", fake_dl)
+    monkeypatch.setattr(_download, "download_file", stub_dl)
     cand = {"cand_id": "zenodo:1", "tabular_files": [
         {"name": "a.csv", "ext": "csv", "size": 5, "download_url": "https://x/a.csv"}]}
     summary = _download.download_candidate(cand, str(tmp_path))
@@ -98,15 +98,15 @@ def test_download_candidate_extracts_tabular_from_supplementary_zip(monkeypatch,
     import io, os, zipfile
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:
-        z.writestr("nested/dir/table.xlsx", b"PK-fake-xlsx-bytes")
+        z.writestr("nested/dir/table.xlsx", b"PK-stub-xlsx-bytes")
         z.writestr("figure.csv", b"a,b\n1,2\n")
         z.writestr("readme.txt", b"not data")
     zbytes = buf.getvalue()
 
-    def fake_dl(url, dest, **kw):
+    def stub_dl(url, dest, **kw):
         Path(dest).write_bytes(zbytes)
         return {"ok": True, "path": dest}
-    monkeypatch.setattr(_download, "download_file", fake_dl)
+    monkeypatch.setattr(_download, "download_file", stub_dl)
 
     cand = {"cand_id": "europepmc:PMC1", "source": "europepmc", "doi": "10.1038/x",
             "title": "T", "tabular_files": [],
@@ -133,11 +133,11 @@ def test_supplementary_archive_downloads_with_larger_cap_than_per_file(monkeypat
     zbytes = buf.getvalue()
     calls = []
 
-    def fake_dl(url, dest, **kw):
+    def stub_dl(url, dest, **kw):
         calls.append({"url": url, "max_bytes": kw.get("max_bytes")})
         Path(dest).write_bytes(zbytes)
         return {"ok": True, "path": dest}
-    monkeypatch.setattr(_download, "download_file", fake_dl)
+    monkeypatch.setattr(_download, "download_file", stub_dl)
     cand = {"cand_id": "europepmc:PMC1", "source": "europepmc", "tabular_files": [],
             "supplementary_archive": {"url": "https://ebi/PMC1/supplementaryFiles",
                                       "name": "PMC1.zip"}}

@@ -150,7 +150,7 @@ def test_detector_integer_keyword_must_be_in_mean_header():
 
 def test_detector_mean_header_with_n_token_uses_real_n_column():
     # The mean header contains a standalone 'n' token ("n per group"). The real
-    # n column must still supply n — not the mean column (which would fabricate a
+    # n column must still supply n — not the mean column (which would infer a
     # tiny n and produce spurious GRIM findings).
     rows = [
         ["group", "score mean (n per group)", "sd", "n"],

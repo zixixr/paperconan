@@ -50,7 +50,7 @@ paperconan fetch "<DOI>" --auto --out runs/<paper-id>/data/
 
 子 agent 的报告汇总后定级：
 
-- **Tier 1**：最高复核优先级；无辜解释很难，但仍不是学术不端结论
+- **Tier 1**：最高复核优先级；无辜解释很难，但仍不是研究完整性审查结论
 - **Tier 2 / Tier 3**：信号真实但影响范围、上下文或良性解释空间不同
 - **NEEDS_HUMAN**：必须有领域专家、原始数据、figure legend 或 Methods 才能判
 - **DROP**：经判定为良性 / 误报（要写明良性理由，便于回归）

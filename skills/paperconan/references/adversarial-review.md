@@ -5,7 +5,7 @@ the first reviewer wants to escalate a paperconan signal. The goal is to avoid
 one-directional confirmation bias. The adversarial reviewer must try to refute
 the concern before it is reported.
 
-Adversarial review does not decide misconduct. It decides whether the proposed
+Adversarial review does not decide a research-integrity conclusion. It decides whether the proposed
 data-integrity question is concrete enough to keep, downgrade, or drop.
 
 ## Roles

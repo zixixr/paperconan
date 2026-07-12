@@ -1,10 +1,10 @@
 # paperconan example — a worked walkthrough
 
 This folder is a complete, runnable example: a **synthetic** paper's source data
-with fabrication-style patterns planted on purpose, plus the report paperconan
+with statistical-signal patterns planted on purpose, plus the report paperconan
 produces from it.
 
-> ⚠️ The data in [`demo_paper/`](demo_paper/) is fabricated for demonstration.
+> ⚠️ The data in [`demo_paper/`](demo_paper/) is synthetic and for demonstration.
 > No real paper, dataset, or person is involved.
 
 ---
@@ -105,7 +105,7 @@ because `rel_expr` looks like a normalized / fold-change column; rerun with
 The `day` column (0, 3, 6, … 21) is flagged as an arithmetic progression — but it's a
 **legitimate time axis**, a textbook false positive. `tumor_length == tumor_width` is
 suspicious but could happen if both are read off the same caliper image. This is exactly
-why paperconan severity is **not** a misconduct verdict: a `high` can be benign (shared
+why paperconan severity is **not** a research-integrity verdict: a `high` can be benign (shared
 control) and a `medium` can be the real tell. You still have to read the paper.
 
 ---

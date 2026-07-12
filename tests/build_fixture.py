@@ -50,7 +50,7 @@ def build(out_dir: str) -> str:
     ws2 = wb.create_sheet("Sheet2")
     ws2.append(["mass(kg)", "vol(mL)", "copy_of_mass", "ap_col"])
     # Same mass / copy_of_mass / vol as Sheet1 (triggers cross_sheet_position_identical),
-    # except vol on row 8 (one byte-level tweak — common fabrication fingerprint),
+    # except vol on row 8 (one byte-level tweak — common data-inconsistency pattern),
     # and a different ap_col series so it isn't simply Sheet1 reused.
     for i, r in enumerate(_ROWS):
         mass, vol, copy_, _ = r

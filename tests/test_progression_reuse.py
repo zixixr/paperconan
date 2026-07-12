@@ -1,6 +1,6 @@
 """M2-2: a perfect arithmetic progression that is REUSED — the identical (step, n, first)
 appears in >=2 numeric blocks/sheets — is an independent-variable axis re-plotted across panels
-(magnetic-field / 2-theta / time / dose sweep), not fabricated data. Real measured data is never
+(magnetic-field / 2-theta / time / dose sweep), not a data inconsistency. Real measured data is never
 a perfect progression, so a reused one is an axis and must not flood the high-severity output.
 A ONE-OFF perfect progression keeps its severity (that is the genuinely-suspicious linear-fill)."""
 from copy import deepcopy
@@ -64,7 +64,7 @@ def test_forensic_reused_progression_remains_kept():
 
 
 def test_one_off_non_integer_progression_keeps_high():
-    # a single non-integer progression (possible linear-fill fabrication) stays HIGH
+    # a single non-integer progression (possible linear-fill statistical signal) stays HIGH
     blocks = [_block("Fig 1", [_prog(2.5, 6, 2.5, sev="high")])]
     _demote_reused_progressions(blocks)
     f = blocks[0]["progressions"][0]

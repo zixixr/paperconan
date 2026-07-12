@@ -106,7 +106,7 @@ def test_extract_tabular_tar(tmp_path):
             ("PMC1/data1.xlsx", b"x"),
             ("PMC1/t.csv", b"a,b\n1,2\n"),
             ("PMC1/fig.pdf", b"%PDF"),
-            ("PMC1/tables.docx", b"PK-fake-docx-bytes"),
+            ("PMC1/tables.docx", b"PK-stub-docx-bytes"),
             ("PMC1/notes.txt", b"notes"),
         ]:
             data = body
@@ -130,10 +130,10 @@ def test_download_candidate_extracts_oa_package(tmp_path, monkeypatch):
         info = tarfile.TarInfo("PMC1/sd.csv"); info.size = len(data)
         tf.addfile(info, io.BytesIO(data))
     # make download_file just copy our local tar into the out_dir
-    def fake_dl(url, dest, **k):
+    def stub_dl(url, dest, **k):
         import shutil; shutil.copy(tar_path, dest)
         return {"ok": True, "path": dest, "size": tar_path.stat().st_size}
-    monkeypatch.setattr(dl, "download_file", fake_dl)
+    monkeypatch.setattr(dl, "download_file", stub_dl)
     cand = {"cand_id": "europepmc:PMC1", "source": "europepmc", "tabular_files": [],
             "oa_package": {"url": "https://ftp.ncbi.nlm.nih.gov/x/PMC1.tar.gz", "name": "PMC1.tar.gz"}}
     res = dl.download_candidate(cand, str(tmp_path / "out"))

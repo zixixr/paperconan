@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "paperconan"
 version = "0.8.2"
-description = "Numeric forensics for paper supplementary source-data: surfaces fabrication-style patterns (signal, not verdict)."
+description = "Numeric forensics for paper supplementary source-data: surfaces statistical-signal patterns (signal, not verdict)."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
     { name = "Xiaotong" },
 ]
-keywords = ["research-integrity", "data-forensics", "pubpeer", "scientific-fraud", "xlsx", "audit"]
+keywords = ["research-integrity", "data-forensics", "pubpeer", "scientific-integrity", "xlsx", "audit"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",

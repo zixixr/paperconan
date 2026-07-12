@@ -13,13 +13,13 @@ from paperconan._audit import (_demote_dense_relations, _demote_dense_sheets,
                                RELATION_FLOOD_CAP)
 
 
-def _fake_relations(n):
+def _stub_relations(n):
     return [dict(kind="identical_column", col_a=f"c{i}", col_b=f"c{i+1}",
                  n=10, severity="high", rule=f"col[{i}] == col[{i+1}]") for i in range(n)]
 
 
 def test_flood_of_relations_demoted_to_low():
-    rels = _fake_relations(RELATION_FLOOD_CAP + 10)
+    rels = _stub_relations(RELATION_FLOOD_CAP + 10)
     out = _demote_dense_relations(rels)
     assert all(r["severity"] == "low" for r in out)
     assert all(r.get("dense_block") for r in out)
@@ -28,7 +28,7 @@ def test_flood_of_relations_demoted_to_low():
 
 
 def test_handful_of_relations_keep_high():
-    rels = _fake_relations(3)
+    rels = _stub_relations(3)
     out = _demote_dense_relations(rels)
     assert all(r["severity"] == "high" for r in out)
     assert not any(r.get("dense_block") for r in out)
@@ -43,8 +43,8 @@ def test_flood_demoted_across_blocks_of_one_sheet():
     but together over it — the per-SHEET total must trigger demotion."""
     half = RELATION_FLOOD_CAP // 2 + 5
     blocks = [
-        {"file": "f.xlsx", "sheet": "S1", "relations": _fake_relations(half), "equal_pairs": []},
-        {"file": "f.xlsx", "sheet": "S1", "relations": _fake_relations(half), "equal_pairs": []},
+        {"file": "f.xlsx", "sheet": "S1", "relations": _stub_relations(half), "equal_pairs": []},
+        {"file": "f.xlsx", "sheet": "S1", "relations": _stub_relations(half), "equal_pairs": []},
     ]
     _demote_dense_sheets(blocks)
     flat = [r for b in blocks for r in b["relations"]]
@@ -104,8 +104,8 @@ def test_separate_sheets_each_below_cap_keep_high():
     """Two different sheets, each with a handful of relations, must NOT be demoted just
     because their combined total would exceed the cap."""
     blocks = [
-        {"file": "f.xlsx", "sheet": "S1", "relations": _fake_relations(3), "equal_pairs": []},
-        {"file": "f.xlsx", "sheet": "S2", "relations": _fake_relations(3), "equal_pairs": []},
+        {"file": "f.xlsx", "sheet": "S1", "relations": _stub_relations(3), "equal_pairs": []},
+        {"file": "f.xlsx", "sheet": "S2", "relations": _stub_relations(3), "equal_pairs": []},
     ]
     _demote_dense_sheets(blocks, cap=4)
     flat = [r for b in blocks for r in b["relations"]]

@@ -2,9 +2,9 @@
 from paperconan.fetch import _sources, _http
 
 
-def test_search_zenodo_normalizes_candidate(monkeypatch, fixture, fake_http):
+def test_search_zenodo_normalizes_candidate(monkeypatch, fixture, stub_http):
     routes = [("zenodo.org/api/records", fixture("zenodo_search.json"))]
-    monkeypatch.setattr(_http, "get_json", fake_http["get"](routes))
+    monkeypatch.setattr(_http, "get_json", stub_http["get"](routes))
 
     cands = _sources.search_zenodo("10.15761/JTS.1000455", size=5)
     assert len(cands) == 1

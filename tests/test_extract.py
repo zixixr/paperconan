@@ -293,14 +293,14 @@ def test_load_table_result_calls_extractor_once_with_metadata(
     path.write_bytes(b"placeholder")
     calls = []
 
-    def fake_loader(called_path, *, max_cells, with_metadata):
+    def stub_loader(called_path, *, max_cells, with_metadata):
         calls.append((called_path, max_cells, with_metadata))
         return ExtractedTableResult(
             tables={sheet_name: [["value"], [1]]}
         )
 
     monkeypatch.setattr(audit, "_MAX_CELLS", 7)
-    monkeypatch.setattr(extract, loader_name, fake_loader)
+    monkeypatch.setattr(extract, loader_name, stub_loader)
 
     result = audit.load_table_result(str(path))
 
@@ -317,7 +317,7 @@ def test_scan_counts_extracted_cell_limit_once(tmp_path, monkeypatch):
     path.write_bytes(b"placeholder")
     calls = []
 
-    def fake_loader(called_path, *, max_cells, with_metadata):
+    def stub_loader(called_path, *, max_cells, with_metadata):
         calls.append((called_path, max_cells, with_metadata))
         return ExtractedTableResult(
             tables={
@@ -335,7 +335,7 @@ def test_scan_counts_extracted_cell_limit_once(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(audit, "_MAX_CELLS", 6)
-    monkeypatch.setattr(extract, "load_pdf_tables", fake_loader)
+    monkeypatch.setattr(extract, "load_pdf_tables", stub_loader)
 
     scan = audit.scan_dir(
         str(data), str(tmp_path / "out"), write_html=False

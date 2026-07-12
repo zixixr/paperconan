@@ -2,7 +2,7 @@
 
 Use this reference when a user asks for ranking, batch review, a KEEP/DROP
 decision, or a formal report. These tiers are **review priority labels**, not
-misconduct probabilities. They describe how hard it is to explain a numerical
+research-integrity probabilities. They describe how hard it is to explain a numerical
 signal innocently after checking the source table, labels, figure legend, and
 Methods.
 
@@ -14,8 +14,8 @@ Public wording:
 - `NEEDS_HUMAN`: key context is missing.
 - `DROP`: likely benign or not meaningful after context review.
 
-Do not say `fraud`, `fake`, `fabricated`, `造假`, or `实锤`. Say "data
-inconsistency", "unexplained numerical pattern", or "needs clarification".
+Use "data inconsistency", "unexplained numerical pattern", or "needs
+clarification", without assigning intent to authors.
 
 ## Before Assigning Any Tier
 
@@ -56,7 +56,7 @@ Typical Tier 1 patterns:
 - Multiple independent anomalies in one paper point to separate data-integrity
   questions, not one obvious duplicated upload.
 
-Tier 1 is still not a misconduct accusation. It means the case is a high
+Tier 1 still does not establish a research-integrity finding. It means the case is a high
 priority for author clarification or formal human review.
 
 ## Tier 2

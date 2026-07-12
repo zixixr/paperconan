@@ -54,7 +54,7 @@
 - Modify `src/paperconan/_audit.py` — `main()` dispatches the `fetch` subcommand.
 - Modify `src/paperconan/__init__.py` — bump `__version__` to `0.4.0`.
 - Modify `pyproject.toml` — version `0.4.0`.
-- Create `tests/fetch/__init__.py`, `tests/fetch/conftest.py` (fixture loader + fake HTTP), `tests/fetch/fixtures/*.json`, and one test module per source/unit.
+- Create `tests/fetch/__init__.py`, `tests/fetch/conftest.py` (fixture loader + stub HTTP), `tests/fetch/fixtures/*.json`, and one test module per source/unit.
 - Modify `skills/paperconan/SKILL.md` + `references/` — fetch-then-audit workflow + honesty rules.
 - Modify `README.md` — document `paperconan fetch`.
 
@@ -162,7 +162,7 @@ import pytest
 from paperconan.fetch import _http
 
 
-class _FakeResp(io.BytesIO):
+class _StubResp(io.BytesIO):
     def __enter__(self): return self
     def __exit__(self, *a): self.close()
 
@@ -170,12 +170,12 @@ class _FakeResp(io.BytesIO):
 def test_get_json_builds_query_and_parses(monkeypatch):
     seen = {}
 
-    def fake_urlopen(req, timeout=None):
+    def stub_urlopen(req, timeout=None):
         seen["url"] = req.full_url
         seen["headers"] = {k.lower(): v for k, v in req.header_items()}
-        return _FakeResp(json.dumps({"ok": True}).encode())
+        return _StubResp(json.dumps({"ok": True}).encode())
 
-    monkeypatch.setattr(_http.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(_http.urllib.request, "urlopen", stub_urlopen)
     out = _http.get_json("https://api.example.org/x", params={"q": "a b", "size": 3})
     assert out == {"ok": True}
     assert seen["url"].startswith("https://api.example.org/x?")
@@ -186,12 +186,12 @@ def test_get_json_builds_query_and_parses(monkeypatch):
 def test_post_json_sends_body(monkeypatch):
     seen = {}
 
-    def fake_urlopen(req, timeout=None):
+    def stub_urlopen(req, timeout=None):
         seen["data"] = req.data
         seen["method"] = req.get_method()
-        return _FakeResp(json.dumps([{"id": 1}]).encode())
+        return _StubResp(json.dumps([{"id": 1}]).encode())
 
-    monkeypatch.setattr(_http.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(_http.urllib.request, "urlopen", stub_urlopen)
     out = _http.post_json("https://api.example.org/search", {"search_for": "x"})
     assert out == [{"id": 1}]
     assert seen["method"] == "POST"
@@ -251,7 +251,7 @@ git commit -m "feat(fetch): stdlib JSON HTTP helpers"
 
 ---
 
-### Task 3: Test fixtures + fake-HTTP conftest
+### Task 3: Test fixtures + stub-HTTP conftest
 
 **Files:**
 - Create: `tests/fetch/conftest.py`
@@ -262,7 +262,7 @@ git commit -m "feat(fetch): stdlib JSON HTTP helpers"
 - Create: `tests/fetch/fixtures/dryad_versions.json`
 - Create: `tests/fetch/fixtures/dryad_files.json`
 
-These fixtures mirror the real API shapes verified on 2026-05-28. `fake_http` lets a test map URL substrings to fixture objects.
+These fixtures mirror the real API shapes verified on 2026-05-28. `stub_http` lets a test map URL substrings to fixture objects.
 
 - [ ] **Step 1: Create the fixture files**
 
@@ -327,7 +327,7 @@ These fixtures mirror the real API shapes verified on 2026-05-28. `fake_http` le
 ]}}
 ```
 
-- [ ] **Step 2: Create conftest with fixture loader + fake HTTP**
+- [ ] **Step 2: Create conftest with fixture loader + stub HTTP**
 
 ```python
 # tests/fetch/conftest.py
@@ -348,28 +348,28 @@ def fixture():
     return load_fixture
 
 
-def make_fake_get_json(routes):
+def make_stub_get_json(routes):
     """routes: list of (url_substring, fixture_object). First match wins."""
-    def _fake(url, params=None, headers=None, timeout=15):
+    def _stub(url, params=None, headers=None, timeout=15):
         for sub, obj in routes:
             if sub in url:
                 return obj
-        raise AssertionError(f"no fake route for GET {url}")
-    return _fake
+        raise AssertionError(f"no stub route for GET {url}")
+    return _stub
 
 
-def make_fake_post_json(routes):
-    def _fake(url, payload, headers=None, timeout=15):
+def make_stub_post_json(routes):
+    def _stub(url, payload, headers=None, timeout=15):
         for sub, obj in routes:
             if sub in url:
                 return obj
-        raise AssertionError(f"no fake route for POST {url}")
-    return _fake
+        raise AssertionError(f"no stub route for POST {url}")
+    return _stub
 
 
 @pytest.fixture
-def fake_http():
-    return {"get": make_fake_get_json, "post": make_fake_post_json}
+def stub_http():
+    return {"get": make_stub_get_json, "post": make_stub_post_json}
 ```
 
 - [ ] **Step 3: Verify fixtures load**
@@ -381,7 +381,7 @@ Expected: PASS (existing tests still pass; no new test yet — this confirms con
 
 ```bash
 git add tests/fetch/conftest.py tests/fetch/fixtures/
-git commit -m "test(fetch): real-shape API fixtures and fake-HTTP harness"
+git commit -m "test(fetch): real-shape API fixtures and stub-HTTP harness"
 ```
 
 ---
@@ -399,9 +399,9 @@ git commit -m "test(fetch): real-shape API fixtures and fake-HTTP harness"
 from paperconan.fetch import _sources, _http
 
 
-def test_search_zenodo_normalizes_candidate(monkeypatch, fixture, fake_http):
+def test_search_zenodo_normalizes_candidate(monkeypatch, fixture, stub_http):
     routes = [("zenodo.org/api/records", fixture("zenodo_search.json"))]
-    monkeypatch.setattr(_http, "get_json", fake_http["get"](routes))
+    monkeypatch.setattr(_http, "get_json", stub_http["get"](routes))
 
     cands = _sources.search_zenodo("10.15761/JTS.1000455", size=5)
     assert len(cands) == 1
@@ -491,12 +491,12 @@ Figshare search returns articles without files; fetch each article for its files
 from paperconan.fetch import _sources, _http
 
 
-def test_search_figshare_fetches_article_files(monkeypatch, fixture, fake_http):
+def test_search_figshare_fetches_article_files(monkeypatch, fixture, stub_http):
     monkeypatch.setattr(_http, "post_json",
-                        fake_http["post"]([("api.figshare.com/v2/articles/search",
+                        stub_http["post"]([("api.figshare.com/v2/articles/search",
                                             fixture("figshare_search.json"))]))
     monkeypatch.setattr(_http, "get_json",
-                        fake_http["get"]([("api.figshare.com/v2/articles/32340066",
+                        stub_http["get"]([("api.figshare.com/v2/articles/32340066",
                                            fixture("figshare_article.json"))]))
 
     cands = _sources.search_figshare("thrombocytopenia", size=5)
@@ -565,12 +565,12 @@ test the per-dataset normalization via `_dryad_candidate(doi)` which the search 
 from paperconan.fetch import _sources, _http
 
 
-def test_dryad_candidate_follows_version_chain(monkeypatch, fixture, fake_http):
+def test_dryad_candidate_follows_version_chain(monkeypatch, fixture, stub_http):
     routes = [
         ("/api/v2/datasets/doi%3A10.5061%2Fdryad.7rh4625", fixture("dryad_dataset.json")),
         ("/api/v2/versions/124910/files", fixture("dryad_files.json")),
     ]
-    monkeypatch.setattr(_http, "get_json", fake_http["get"](routes))
+    monkeypatch.setattr(_http, "get_json", stub_http["get"](routes))
 
     c = _sources._dryad_candidate("doi:10.5061/dryad.7rh4625")
     assert c["cand_id"] == "dryad:10.5061/dryad.7rh4625"
@@ -809,9 +809,9 @@ def test_download_file_saves_bytes(monkeypatch, tmp_path):
 
 def test_download_candidate_tabular_only(monkeypatch, tmp_path):
     saved = []
-    def fake_dl(url, dest, **kw):
+    def stub_dl(url, dest, **kw):
         open(dest, "wb").write(b"x"); saved.append(dest); return {"ok": True, "path": dest}
-    monkeypatch.setattr(_download, "download_file", fake_dl)
+    monkeypatch.setattr(_download, "download_file", stub_dl)
     cand = {"cand_id": "zenodo:1", "tabular_files": [
         {"name": "a.csv", "ext": "csv", "size": 5, "download_url": "https://x/a.csv"}]}
     summary = _download.download_candidate(cand, str(tmp_path))
@@ -1118,7 +1118,7 @@ Replace the first two lines of `main()` (the `ap = argparse.ArgumentParser(...)`
 
 ```python
 def main():
-    ap = argparse.ArgumentParser(description="Scan a paper's source-data xlsx files for fabrication red flags")
+    ap = argparse.ArgumentParser(description="Scan a paper's source-data xlsx files for statistical-signal patterns")
 ```
 
 Insert the dispatch immediately inside `main()`, before that line:
@@ -1128,7 +1128,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "fetch":
         from .fetch._cli import fetch_main
         sys.exit(fetch_main(sys.argv[2:]))
-    ap = argparse.ArgumentParser(description="Scan a paper's source-data xlsx files for fabrication red flags")
+    ap = argparse.ArgumentParser(description="Scan a paper's source-data xlsx files for statistical-signal patterns")
 ```
 
 - [ ] **Step 5: Run tests to verify they pass**

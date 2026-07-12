@@ -95,7 +95,7 @@ run there.
 
 ## Non-goals
 
-- No fabricated/eyeballed results passed off as real tool output.
+- No synthetic or eyeballed results passed off as real tool output.
 - No repo-root or pre-made-zip upload; no bypassing the binary rules.
 - No auto-submit without the user's explicit go.
 - Not bundling Python deps (impossible under the binary ban anyway).

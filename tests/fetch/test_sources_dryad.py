@@ -2,12 +2,12 @@
 from paperconan.fetch import _sources, _http
 
 
-def test_dryad_candidate_follows_version_chain(monkeypatch, fixture, fake_http):
+def test_dryad_candidate_follows_version_chain(monkeypatch, fixture, stub_http):
     routes = [
         ("/api/v2/datasets/doi%3A10.5061%2Fdryad.7rh4625", fixture("dryad_dataset.json")),
         ("/api/v2/versions/124910/files", fixture("dryad_files.json")),
     ]
-    monkeypatch.setattr(_http, "get_json", fake_http["get"](routes))
+    monkeypatch.setattr(_http, "get_json", stub_http["get"](routes))
 
     c = _sources._dryad_candidate("doi:10.5061/dryad.7rh4625")
     assert c["cand_id"] == "dryad:10.5061/dryad.7rh4625"

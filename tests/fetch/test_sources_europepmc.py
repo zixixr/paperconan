@@ -5,9 +5,9 @@ don't carry journal-hosted source data."""
 from paperconan.fetch import _sources, _http
 
 
-def test_search_europepmc_builds_supplementary_candidate(monkeypatch, fixture, fake_http):
+def test_search_europepmc_builds_supplementary_candidate(monkeypatch, fixture, stub_http):
     routes = [("europepmc/webservices/rest/search", fixture("europepmc_search.json"))]
-    monkeypatch.setattr(_http, "get_json", fake_http["get"](routes))
+    monkeypatch.setattr(_http, "get_json", stub_http["get"](routes))
 
     cands = _sources.search_europepmc("10.1038/s41467-021-22125-z", size=5)
     assert len(cands) == 1
@@ -20,17 +20,17 @@ def test_search_europepmc_builds_supplementary_candidate(monkeypatch, fixture, f
     assert arch["name"].endswith(".zip")
 
 
-def test_search_europepmc_skips_when_no_supplementary(monkeypatch, fixture, fake_http):
+def test_search_europepmc_skips_when_no_supplementary(monkeypatch, fixture, stub_http):
     data = fixture("europepmc_search.json")
     data["resultList"]["result"][0]["hasSuppl"] = "N"
     routes = [("europepmc/webservices/rest/search", data)]
-    monkeypatch.setattr(_http, "get_json", fake_http["get"](routes))
+    monkeypatch.setattr(_http, "get_json", stub_http["get"](routes))
     assert _sources.search_europepmc("10.1038/x", size=5) == []
 
 
-def test_search_europepmc_skips_when_no_pmcid(monkeypatch, fixture, fake_http):
+def test_search_europepmc_skips_when_no_pmcid(monkeypatch, fixture, stub_http):
     data = fixture("europepmc_search.json")
     data["resultList"]["result"][0].pop("pmcid")
     routes = [("europepmc/webservices/rest/search", data)]
-    monkeypatch.setattr(_http, "get_json", fake_http["get"](routes))
+    monkeypatch.setattr(_http, "get_json", stub_http["get"](routes))
     assert _sources.search_europepmc("10.1038/x", size=5) == []

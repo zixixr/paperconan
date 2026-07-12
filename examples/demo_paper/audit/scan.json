@@ -1,7 +1,20 @@
 {
+  "schema_version": 2,
+  "scan_status": "complete",
+  "coverage": {
+    "files_discovered": 2,
+    "files_succeeded": 2,
+    "files_failed": 0,
+    "sheets_succeeded": 3,
+    "sheets_skipped": 0,
+    "blocks_analyzed": 3,
+    "blocks_skipped": 0,
+    "truncated": false,
+    "limitations": []
+  },
   "tool": "paperconan",
   "tool_version": "0.8.2",
-  "scanned_at": "2026-07-07T02:48:43+00:00",
+  "scanned_at": null,
   "profile": "review",
   "input_dir": "examples/demo_paper",
   "paper": null,
@@ -13,15 +26,15 @@
     "files": [
       {
         "file": "ED_Fig2_tumor_volume.xlsx",
-        "path": "examples/demo_paper/ED_Fig2_tumor_volume.xlsx",
+        "path": "ED_Fig2_tumor_volume.xlsx",
         "n_sheets": 1,
-        "elapsed_ms": 7.945
+        "elapsed_ms": null
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
-        "path": "examples/demo_paper/ED_Fig4_qPCR.xlsx",
+        "path": "ED_Fig4_qPCR.xlsx",
         "n_sheets": 2,
-        "elapsed_ms": 0.338
+        "elapsed_ms": null
       }
     ],
     "sheets": [
@@ -32,7 +45,7 @@
         "n_cols": 6,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.128
+        "elapsed_ms": null
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
@@ -41,7 +54,7 @@
         "n_cols": 5,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.08
+        "elapsed_ms": null
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
@@ -50,10 +63,10 @@
         "n_cols": 5,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.08
+        "elapsed_ms": null
       }
     ],
-    "elapsed_ms": 16.435
+    "elapsed_ms": null
   },
   "relations_blocks": [
     {
@@ -1209,7 +1222,7 @@
           ],
           "prefilter": "drop",
           "prefilter_reason": "normalized_or_fold_change",
-          "likely_benign": "within_col prefilter matched normalized_or_fold_change; this column pattern is usually categorical/integer-coded, an axis/index, a normalized or derived column, or a large-matrix flood rather than a fabricated measurement repeat"
+          "likely_benign": "within_col prefilter matched normalized_or_fold_change; this column pattern is usually categorical/integer-coded, an axis/index, a normalized or derived column, or a large-matrix flood rather than an unexplained measurement repeat"
         },
         {
           "kind": "within_col_decimal_repetition",
@@ -1587,11 +1600,6 @@
             ],
             "col_offset": 1,
             "highlight_cols": [
-              3,
-              3,
-              3,
-              3,
-              3,
               3
             ],
             "highlight_rows": [
@@ -1812,10 +1820,6 @@
             ],
             "col_offset": 1,
             "highlight_cols": [
-              3,
-              3,
-              3,
-              3,
               3,
               1
             ],
