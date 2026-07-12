@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import sys
 
 import pytest
 
@@ -18,8 +17,6 @@ import paperconan._extract as extract
 from paperconan._extract import tables_to_sheets
 from paperconan._input import ExtractedTableResult, InputLimitation
 from paperconan._sheet import Sheet
-
-sys.path.insert(0, os.path.dirname(__file__))
 
 _POLICY_TOKEN_HEX_BY_ID = (
     ("T1", "6672617564"),
