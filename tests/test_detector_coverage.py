@@ -183,10 +183,81 @@ def test_column_fingerprint_distinct_limit_is_disclosed_exactly(
         "file": "large.csv",
         "sheet": "large",
         "detector": "cross_sheet_column_duplicate",
-        "column": 1,
-        "rows": "2-41",
-        "numeric_cells": 40,
+        "affected_columns": 1,
+        "examples": [{
+            "column": 1,
+            "rows": "2-41",
+            "numeric_cells": 40,
+        }],
         "limit": 7,
+    }]
+    assert scan["coverage"]["truncated"] is True
+
+
+def test_column_fingerprint_column_limit_is_disclosed_exactly(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        audit,
+        "_COLUMN_FINGERPRINT_MAX_COLUMNS",
+        3,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        audit,
+        "_COLUMN_FINGERPRINT_DISTINCT_LIMIT",
+        25,
+    )
+    data = tmp_path / "data"
+    data.mkdir()
+    rows = [",".join(f"c{column}" for column in range(8))]
+    rows.extend(
+        ",".join(
+            str(row * row + 3 * row + column / 1000)
+            for column in range(8)
+        )
+        for row in range(40)
+    )
+    (data / "wide.csv").write_text(
+        "\n".join(rows) + "\n",
+        encoding="utf-8",
+    )
+
+    scan = audit.scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    assert _limitations(
+        scan, "column_fingerprint_distinct_limit"
+    ) == [{
+        "scope": "sheet",
+        "reason": "column_fingerprint_distinct_limit",
+        "file": "wide.csv",
+        "sheet": "wide",
+        "detector": "cross_sheet_column_duplicate",
+        "affected_columns": 3,
+        "examples": [
+            {
+                "column": column,
+                "rows": "2-41",
+                "numeric_cells": 40,
+            }
+            for column in range(1, 4)
+        ],
+        "limit": 25,
+    }]
+    assert _limitations(
+        scan, "column_fingerprint_column_limit"
+    ) == [{
+        "scope": "sheet",
+        "reason": "column_fingerprint_column_limit",
+        "file": "wide.csv",
+        "sheet": "wide",
+        "detector": "cross_sheet_column_duplicate",
+        "columns_total": 8,
+        "columns_used": 3,
+        "columns_skipped": 5,
+        "limit": 3,
     }]
     assert scan["coverage"]["truncated"] is True
 

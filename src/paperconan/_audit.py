@@ -21,6 +21,7 @@ Dependencies: openpyxl, numpy, scipy
 """
 from __future__ import annotations
 import argparse
+from bisect import bisect_left
 import csv as _csv
 import ctypes
 import datetime
@@ -3092,6 +3093,54 @@ def _stream_column_fingerprint(
     ), None
 
 
+def _iter_column_intervals_in_order(blocks):
+    previous_start = None
+    ordered = True
+    for _, _, start, stop in blocks:
+        if stop <= start:
+            continue
+        if previous_start is not None and start < previous_start:
+            ordered = False
+            break
+        previous_start = start
+    if ordered:
+        for _, _, start, stop in blocks:
+            if stop > start:
+                yield start, stop
+        return
+
+    previous_key = None
+    while True:
+        next_key = None
+        for block_index, (_, _, start, stop) in enumerate(blocks):
+            if stop <= start:
+                continue
+            key = (start, stop, block_index)
+            if previous_key is not None and key <= previous_key:
+                continue
+            if next_key is None or key < next_key:
+                next_key = key
+        if next_key is None:
+            return
+        previous_key = next_key
+        yield next_key[0], next_key[1]
+
+
+def _iter_merged_column_intervals(blocks):
+    merged_start = None
+    merged_stop = None
+    for start, stop in _iter_column_intervals_in_order(blocks):
+        if merged_start is None:
+            merged_start, merged_stop = start, stop
+        elif start <= merged_stop:
+            merged_stop = max(merged_stop, stop)
+        else:
+            yield merged_start, merged_stop
+            merged_start, merged_stop = start, stop
+    if merged_start is not None:
+        yield merged_start, merged_stop
+
+
 def _column_fingerprints(
     file,
     sheet,
@@ -3099,14 +3148,59 @@ def _column_fingerprints(
     blocks,
     min_column_length,
     distinct_limit=None,
+    column_limit=None,
 ):
     if distinct_limit is None:
         distinct_limit = _COLUMN_FINGERPRINT_DISTINCT_LIMIT
+    if column_limit is None:
+        column_limit = _COLUMN_FINGERPRINT_MAX_COLUMNS
+    column_limit = max(0, int(column_limit))
+    selected_columns = []
+    columns_total = 0
+    for start, stop in _iter_merged_column_intervals(blocks):
+        interval_size = stop - start
+        remaining = column_limit - len(selected_columns)
+        if remaining > 0:
+            take = min(interval_size, remaining)
+            selected_columns.extend(range(start, start + take))
+        columns_total += interval_size
+    selected_columns = tuple(selected_columns)
+    columns_used = len(selected_columns)
+
     best = {}
-    limitations = []
+    distinct_overflows = {}
     for r0, r1, c0, c1 in blocks:
-        header = header_for(source, r0, c0, c1)
-        for col_idx in range(c0, c1):
+        selected_start = bisect_left(selected_columns, c0)
+        selected_stop = bisect_left(selected_columns, c1)
+        if selected_start == selected_stop:
+            continue
+        header_row = None
+        for row_idx in range(r0 - 1, max(-1, r0 - 5), -1):
+            if row_idx < 0:
+                continue
+            if any(
+                (
+                    (value := source.cell(
+                        row_idx,
+                        selected_columns[column_pos],
+                    ))
+                    is not None
+                    and not is_num(value)
+                )
+                for column_pos in range(
+                    selected_start,
+                    selected_stop,
+                )
+            ):
+                header_row = row_idx
+                break
+        for column_pos in range(selected_start, selected_stop):
+            col_idx = selected_columns[column_pos]
+            label_value = (
+                source.cell(header_row, col_idx)
+                if header_row is not None
+                else None
+            )
             fingerprint, limitation = _stream_column_fingerprint(
                 file=file,
                 sheet=sheet,
@@ -3114,17 +3208,72 @@ def _column_fingerprints(
                 r0=r0,
                 r1=r1,
                 col_idx=col_idx,
-                label=header[col_idx - c0],
+                label=(
+                    str(label_value).strip()
+                    if label_value is not None
+                    else ""
+                ),
                 min_column_length=min_column_length,
                 distinct_limit=distinct_limit,
             )
             if limitation is not None:
-                limitations.append(limitation)
+                example = {
+                    "column": limitation.details["column"],
+                    "rows": limitation.details["rows"],
+                    "numeric_cells": limitation.details[
+                        "numeric_cells"
+                    ],
+                }
+                current = distinct_overflows.get(col_idx)
+                example_key = (
+                    example["rows"],
+                    example["numeric_cells"],
+                )
+                if (
+                    current is None
+                    or example_key
+                    < (current["rows"], current["numeric_cells"])
+                ):
+                    distinct_overflows[col_idx] = example
             if fingerprint is None:
                 continue
             current = best.get(col_idx)
             if current is None or fingerprint.length > current.length:
                 best[col_idx] = fingerprint
+
+    limitations = []
+    if distinct_overflows:
+        examples = [
+            distinct_overflows[col_idx]
+            for col_idx in sorted(distinct_overflows)[
+                :_COLUMN_FINGERPRINT_EXAMPLE_LIMIT
+            ]
+        ]
+        limitations.append(InputLimitation(
+            scope="sheet",
+            reason="column_fingerprint_distinct_limit",
+            sheet=sheet,
+            details={
+                "detector": "cross_sheet_column_duplicate",
+                "affected_columns": len(distinct_overflows),
+                "examples": examples,
+                "limit": max(0, int(distinct_limit)),
+            },
+        ))
+    columns_skipped = columns_total - columns_used
+    if columns_skipped:
+        limitations.append(InputLimitation(
+            scope="sheet",
+            reason="column_fingerprint_column_limit",
+            sheet=sheet,
+            details={
+                "detector": "cross_sheet_column_duplicate",
+                "columns_total": columns_total,
+                "columns_used": columns_used,
+                "columns_skipped": columns_skipped,
+                "limit": column_limit,
+            },
+        ))
     return (
         tuple(best[col_idx] for col_idx in sorted(best)),
         limitations,
@@ -3474,6 +3623,15 @@ _COLUMN_FINGERPRINT_DISTINCT_LIMIT = int(
         "50000",
     )
 )
+# At most this many physical columns per sheet are fingerprinted, selected in
+# ascending column order. Wider sheets receive exact structured coverage.
+_COLUMN_FINGERPRINT_MAX_COLUMNS = int(
+    os.environ.get(
+        "PAPERCONAN_COLUMN_FINGERPRINT_MAX_COLUMNS",
+        "512",
+    )
+)
+_COLUMN_FINGERPRINT_EXAMPLE_LIMIT = 5
 # Wide blocks (dense correlation matrices) can make relation, equal-pair, and row-pair
 # coupling detector paths expensive in compute time and output size. Skip those three paths
 # above this width while the column-wise detectors still run. 0 disables the skip.

@@ -202,12 +202,109 @@ def test_column_fingerprint_distinct_aggregation_is_bounded_and_disclosed(
         sheet="Figure 1",
         details={
             "detector": "cross_sheet_column_duplicate",
-            "column": 1,
-            "rows": "2-41",
-            "numeric_cells": 40,
+            "affected_columns": 1,
+            "examples": [{
+                "column": 1,
+                "rows": "2-41",
+                "numeric_cells": 40,
+            }],
             "limit": limit,
         },
     )]
+
+
+def test_column_fingerprint_sheet_budget_is_fixed_exact_and_deterministic(
+    monkeypatch,
+):
+    row_count = 40
+    column_count = 250_000
+    column_limit = 7
+    distinct_limit = 25
+
+    class VirtualWideSource:
+        nrows = row_count
+        ncols = column_count
+        _text = {}
+
+        def __init__(self):
+            self.exact_numeric_calls = 0
+
+        def cell(self, row, col):
+            return self.exact_numeric(row, col)
+
+        def exact_numeric(self, row, col):
+            self.exact_numeric_calls += 1
+            if col < 3:
+                return float((row * 7) % 20) + col / 1000
+            return float(row * row + 3 * row) + col / 1000
+
+    monkeypatch.setattr(
+        audit,
+        "_COLUMN_FINGERPRINT_MAX_COLUMNS",
+        column_limit,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        audit,
+        "_COLUMN_FINGERPRINT_DISTINCT_LIMIT",
+        distinct_limit,
+    )
+    source = VirtualWideSource()
+    blocks = [(0, row_count, 0, column_count)]
+
+    first = audit._column_fingerprints(
+        "wide.csv",
+        "Figure 1",
+        source,
+        blocks,
+        min_column_length=12,
+    )
+    second = audit._column_fingerprints(
+        "wide.csv",
+        "Figure 1",
+        source,
+        blocks,
+        min_column_length=12,
+    )
+
+    assert first == second
+    columns, limitations = first
+    assert [column.col_idx for column in columns] == [0, 1, 2]
+    assert len(columns) <= column_limit
+    assert len(limitations) == 2
+    assert limitations == [
+        InputLimitation(
+            scope="sheet",
+            reason="column_fingerprint_distinct_limit",
+            sheet="Figure 1",
+            details={
+                "detector": "cross_sheet_column_duplicate",
+                "affected_columns": 4,
+                "examples": [
+                    {
+                        "column": column,
+                        "rows": "1-40",
+                        "numeric_cells": 40,
+                    }
+                    for column in range(4, 8)
+                ],
+                "limit": distinct_limit,
+            },
+        ),
+        InputLimitation(
+            scope="sheet",
+            reason="column_fingerprint_column_limit",
+            sheet="Figure 1",
+            details={
+                "detector": "cross_sheet_column_duplicate",
+                "columns_total": column_count,
+                "columns_used": column_limit,
+                "columns_skipped": column_count - column_limit,
+                "limit": column_limit,
+            },
+        ),
+    ]
+    assert source.exact_numeric_calls == 2 * row_count * column_limit
 
 
 def test_float_convertible_wide_integers_use_exact_qualification():

@@ -167,12 +167,76 @@ def test_large_single_column_sheet_keeps_retained_state_bounded(
         "file": "large.csv",
         "sheet": "large",
         "detector": "cross_sheet_column_duplicate",
-        "column": 1,
-        "rows": f"1-{row_count}",
-        "numeric_cells": row_count,
+        "affected_columns": 1,
+        "examples": [{
+            "column": 1,
+            "rows": f"1-{row_count}",
+            "numeric_cells": row_count,
+        }],
         "limit": 16,
     }]
     _assert_compact(result, state)
+
+
+def test_very_wide_column_fingerprints_touch_only_fixed_budget(
+    monkeypatch,
+):
+    row_count = 40
+    column_count = 1_000_000
+    column_limit = 6
+
+    class VirtualWideSource:
+        nrows = row_count
+        ncols = column_count
+
+        def __init__(self):
+            self.exact_numeric_calls = 0
+
+        def cell(self, row, col):
+            return None
+
+        def exact_numeric(self, row, col):
+            self.exact_numeric_calls += 1
+            return float(row * row + 3 * row) + col / 1000
+
+    monkeypatch.setattr(
+        audit,
+        "_COLUMN_FINGERPRINT_MAX_COLUMNS",
+        column_limit,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        audit,
+        "_COLUMN_FINGERPRINT_DISTINCT_LIMIT",
+        100,
+    )
+    source = VirtualWideSource()
+
+    columns, limitations = audit._column_fingerprints(
+        "wide.csv",
+        "wide",
+        source,
+        [(0, row_count, 0, column_count)],
+        min_column_length=12,
+    )
+
+    assert len(columns) == column_limit
+    assert source.exact_numeric_calls == row_count * column_limit
+    assert limitations == [
+        audit.InputLimitation(
+            scope="sheet",
+            reason="column_fingerprint_column_limit",
+            sheet="wide",
+            details={
+                "detector": "cross_sheet_column_duplicate",
+                "columns_total": column_count,
+                "columns_used": column_limit,
+                "columns_skipped": column_count - column_limit,
+                "limit": column_limit,
+            },
+        )
+    ]
+    _assert_compact(columns, limitations)
 
 
 def test_deferred_reload_releases_each_source_before_next_load(
