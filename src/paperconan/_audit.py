@@ -2657,6 +2657,27 @@ def detect_within_sheet_fraction_reuse(grid_sheets, profile="review", min_cells=
     return findings
 
 
+def _longest_identical_run(a, b, c0, c1):
+    """Longest contiguous column run where a[c] == b[c] (bit-identical to a tight
+    relative tolerance). `a`, `b` are full row slices (may contain NaN); a NaN in
+    either breaks the run. Returns (run_length, x_values_in_run) or None."""
+    best_len, best_start = 0, 0
+    cur_len, cur_start = 0, 0
+    for idx in range(c1 - c0):
+        av, bv = a[idx], b[idx]
+        if math.isnan(av) or math.isnan(bv) or abs(av - bv) > 1e-9 * max(abs(av), abs(bv), 1e-300):
+            cur_len = 0
+            continue
+        if cur_len == 0:
+            cur_start = idx
+        cur_len += 1
+        if cur_len > best_len:
+            best_len, best_start = cur_len, cur_start
+    if best_len == 0:
+        return None
+    return best_len, a[best_start:best_start + best_len].astype(float)
+
+
 def _row_bands(sheet):
     """Maximal runs of consecutive DATA rows (>= _ROW_REL_MIN_COLS finite cells),
     split by header/blank rows. A 'band' is one cohort/condition block laid out with
@@ -2703,14 +2724,18 @@ def _scaled_row_candidates(grid_sheets):
 def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
                             max_findings=40):
     """Two DATA ROWS in DIFFERENT blocks (cross-block within a sheet) or different
-    sheets that hold `row_B == row_A * k` (k != 1) over a long contiguous run of
-    positionally-aligned columns.
+    sheets that hold `row_B == row_A * k` over a long contiguous run of positionally-
+    aligned columns — the scalar-multiple case (k != 1, `scaled_row_reuse`) and its
+    k == 1 special case, a bit-identical data group reappearing under another cohort
+    (`identical_row_reuse`).
 
     The Extended Data Fig. 5B pattern: the same condition measured under two
     treatments, where one cohort's row is an exact scalar multiple of the other's
     across ~200 cells. detect_row_relations only compares rows inside ONE block, so
-    this cross-block scaling has no other detector. A whole power-of-ten ratio is a
-    unit/percentage restatement (benign); an arbitrary constant is unexplained.
+    this cross-block reuse has no other detector. A whole power-of-ten ratio is a
+    unit/percentage restatement (benign); an arbitrary constant is unexplained. An
+    identical row across cohorts/figures may be a disclosed shared control — confirm
+    against the legend.
     """
     cands = _scaled_row_candidates(grid_sheets)
     truncated = len(cands) > max_candidates
@@ -2729,11 +2754,17 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
             budget -= m
             if budget <= 0:
                 break
-            run = _longest_constant_ratio_run(a[:m], b[:m], 0, m)
-            if run is None:
-                continue
-            k, run_len, x_run = run
-            if run_len < _ROW_REL_MIN_COLS or len(np.unique(x_run)) < 6:
+            # Prefer the identical run (k==1) when it is at least as long as the best
+            # scaling run — an exact duplicate is a cleaner statement than a ratio.
+            ident = _longest_identical_run(a[:m], b[:m], 0, m)
+            ratio = _longest_constant_ratio_run(a[:m], b[:m], 0, m)
+            ident_ok = ident is not None and ident[0] >= _ROW_REL_MIN_COLS and len(np.unique(ident[1])) >= 6
+            ratio_ok = ratio is not None and ratio[1] >= _ROW_REL_MIN_COLS and len(np.unique(ratio[2])) >= 6
+            if ident_ok and (not ratio_ok or ident[0] >= ratio[1]):
+                kind, k, run_len, x_run = "identical_row_reuse", 1.0, ident[0], ident[1]
+            elif ratio_ok:
+                kind, k, run_len, x_run = "scaled_row_reuse", ratio[0], ratio[1], ratio[2]
+            else:
                 continue
             fa, fb = A["file"], B["file"]
             sa_name, sb_name = A["sheet"], B["sheet"]
@@ -2741,8 +2772,10 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
             same_file = fa == fb
             same_sheet = same_file and sa_name == sb_name
             scope = "blocks" if same_sheet else ("sheets" if same_file else "files")
+            rel = (f"== row '{B['label']}'" if kind == "identical_row_reuse"
+                   else f"= row '{B['label']}' ({sb_name}) * {k:.6g}")
             findings.append(dict(
-                kind="scaled_row_reuse",
+                kind=kind,
                 file=fa if same_file else f"{fa} + {fb}",
                 file_a=fa, file_b=fb, same_file=same_file,
                 sheet_a=sa_name, sheet_b=sb_name,
@@ -2753,15 +2786,14 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
                 ratio=k, run_length=run_len,
                 figure_a=fig_a, figure_b=fig_b,
                 same_figure=(fig_a is not None and fig_a == fig_b),
-                delta={"pattern": "scaled_row"},
+                delta={"pattern": "identical_row" if kind == "identical_row_reuse" else "scaled_row"},
                 block_a=f"rows {A['rows'][0] + 1}-{A['rows'][1]}",
                 block_b=f"rows {B['rows'][0] + 1}-{B['rows'][1]}",
                 examples=[{"row": A["label"], "col": None, "value": float(v)}
                           for v in x_run[:5]],
                 severity="high",
-                rule=(f"row '{A['label']}' ({sa_name}) = row '{B['label']}' ({sb_name}) "
-                      f"* {k:.6g} over a run of {run_len} positionally-aligned columns "
-                      f"across 2 {scope}")))
+                rule=(f"row '{A['label']}' ({sa_name}) {rel} over a run of {run_len} "
+                      f"positionally-aligned columns across 2 {scope}")))
             if len(findings) >= max_findings:
                 break
         if budget <= 0 or len(findings) >= max_findings:

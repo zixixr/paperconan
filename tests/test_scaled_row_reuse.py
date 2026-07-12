@@ -51,6 +51,34 @@ def test_detects_scaled_row_across_blocks_in_same_sheet():
     assert "shUSP15-2+pPARP1" in (f["row_a"], f["row_b"])
 
 
+def test_detects_identical_row_across_blocks_in_same_sheet():
+    # ratio == 1 special case: the SAME data group reappears under a different cohort.
+    vals = _distinct_highprec(60, 31, 7)
+    sheet = _two_band_sheet(vals, list(vals), 60)
+    findings = detect_scaled_row_reuse({("MOESM22.xlsx", "Extended Data Fig. 3G"): sheet})
+
+    ident = [f for f in findings if f["kind"] == "identical_row_reuse"]
+    assert len(ident) == 1, f"expected one identical-row finding, got {findings}"
+    assert ident[0]["run_length"] == 60
+    assert ident[0]["same_file"] is True
+    # the same pair must NOT also be reported as a (ratio) scaled row
+    pair = {ident[0]["row_a"], ident[0]["row_b"]}
+    assert not [f for f in findings
+                if f["kind"] == "scaled_row_reuse" and {f["row_a"], f["row_b"]} == pair]
+
+
+def test_identical_row_across_two_sheets():
+    vals = _distinct_highprec(40, 31, 7)
+    sa = Sheet.from_rows([["c", *[f"m{i}" for i in range(40)]],
+                          ["ctrl", *_distinct_highprec(40, 53, 17)], ["x", *vals]])
+    sb = Sheet.from_rows([["c", *[f"m{i}" for i in range(40)]],
+                          ["ctrl", *_distinct_highprec(40, 71, 41)], ["y", *list(vals)]])
+    findings = detect_scaled_row_reuse({("A.xlsx", "Fig. 1"): sa, ("B.xlsx", "Fig. 2"): sb})
+    ident = [f for f in findings if f["kind"] == "identical_row_reuse"]
+    assert len(ident) == 1
+    assert ident[0]["same_file"] is False
+
+
 def test_no_false_positive_on_independent_bands():
     sheet = _two_band_sheet(_distinct_highprec(60, 31, 7),
                             _distinct_highprec(60, 200, 3), 60)
