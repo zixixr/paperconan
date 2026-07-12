@@ -225,6 +225,38 @@ def test_explicit_empty_selector_is_unmatched():
     assert html.count('class="finding-card"') == 0
 
 
+def test_primary_non_dict_selector_is_visible_and_unmatched():
+    verdict = {
+        "verdict": "KEEP",
+        "findings": [{
+            "title": "x",
+            "finding_ref": "Alpha selector",
+            "report_md": "x",
+        }],
+    }
+    html = render_adjudicated_report(_scan_two_findings(), verdict)
+    assert "unmatched" in html.lower()
+    assert "Alpha selector" in html
+    assert html.count('class="finding-card"') == 0
+    assert "constant_offset" not in html
+
+
+def test_unmatched_selector_output_escapes_html_sensitive_text():
+    selector = "<b>Missing & selector</b>"
+    verdict = {
+        "verdict": "KEEP",
+        "findings": [{
+            "title": "x",
+            "finding_ref": {"sheet": selector},
+            "report_md": "x",
+        }],
+    }
+    html = render_adjudicated_report(_scan_two_findings(), verdict)
+    assert selector not in html
+    assert "&lt;b&gt;Missing &amp; selector&lt;/b&gt;" in html
+    assert html.count('class="finding-card"') == 0
+
+
 def test_null_primary_selector_uses_labeled_automatic_selection():
     verdict = {
         "verdict": "KEEP",
@@ -255,6 +287,22 @@ def test_unmatched_extra_reference_is_visible_without_fallback():
     assert "constant_ratio" in html
 
 
+def test_additional_legacy_null_selector_labels_automatic_selection():
+    verdict = {
+        "verdict": "KEEP",
+        "report_md": "## t",
+        "finding_refs": [
+            {"sheet": "Alpha", "kind": "constant_offset"},
+            None,
+        ],
+    }
+    html = render_adjudicated_report(_scan_two_findings(), verdict)
+    assert html.lower().count("automatic evidence selection") == 1
+    assert "additional finding_ref was null" in html
+    assert html.count('class="finding-card"') == 2
+    assert html.count("constant_offset") == 2
+
+
 def test_explicit_empty_primary_findings_do_not_synthesize_legacy_finding():
     verdict = {
         "verdict": "KEEP",
@@ -267,6 +315,53 @@ def test_explicit_empty_primary_findings_do_not_synthesize_legacy_finding():
     assert html.count('class="finding-card"') == 0
     assert "legacy report must not render" not in html
     assert "constant_offset" not in html
+
+
+def test_findings_index_and_blocks_share_binding_state():
+    verdict = {
+        "title": "Paper X",
+        "verdict": "KEEP",
+        "findings": [
+            {
+                "title": "Matched finding",
+                "finding_ref": {"sheet": "Alpha", "kind": "constant_offset"},
+            },
+            {
+                "title": "Omitted finding",
+            },
+            {
+                "title": "Unmatched finding",
+                "finding_ref": {"sheet": "Missing", "kind": "constant_ratio"},
+            },
+        ],
+    }
+    html = render_adjudicated_report(_scan_two_findings(), verdict)
+    index = html.split('<table class="findings-index">', 1)[1].split("</table>", 1)[0]
+    assert index.count("Alpha 5-39") == 2
+    assert index.count("constant_offset") == 2
+    assert "Missing" in index
+    assert "constant_ratio" in index
+    assert "Beta" not in index
+    assert "within_col_value_duplication" not in index
+
+    matched, omitted, unmatched = html.split('<section class="finding-block">')[1:]
+    assert 'class="finding-card"' in matched
+    assert "Alpha" in matched
+    assert "constant_offset" in matched
+    assert "automatic evidence selection" not in matched.lower()
+
+    assert 'class="finding-card"' in omitted
+    assert "Alpha" in omitted
+    assert "constant_offset" in omitted
+    assert "automatic evidence selection" in omitted.lower()
+
+    assert 'class="finding-card"' not in unmatched
+    assert "Missing" in unmatched
+    assert "constant_ratio" in unmatched
+    assert "Alpha" not in unmatched
+    assert "constant_offset" not in unmatched
+    assert "Beta" not in unmatched
+    assert "within_col_value_duplication" not in unmatched
 
 
 def _multi_finding_verdict() -> dict:
