@@ -1258,6 +1258,68 @@ def test_journal_failed_restore_remains_retryable_and_continues(
     assert not list(tmp_path.glob(".paperconan-output-rollback-*"))
 
 
+@pytest.mark.parametrize("persistent", [False, True])
+def test_journal_empty_backup_directory_cleanup_remains_retryable(
+    tmp_path, monkeypatch, persistent
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    output = out_dir / "table.csv"
+    output.write_bytes(b"old-output")
+    journal = _download._ManagedOutputJournal(str(out_dir))
+    journal.prepare(output)
+    output.write_bytes(b"new-output")
+    backup_dir = Path(journal._backup_dir)
+    real_rmdir = _download.os.rmdir
+    failures = []
+
+    def fail_cleanup(path):
+        is_backup_dir = (
+            os.path.abspath(path) == os.path.abspath(backup_dir)
+        )
+        if is_backup_dir and (persistent or not failures):
+            failures.append(os.fspath(path))
+            raise PermissionError(
+                "injected rollback directory cleanup failure"
+            )
+        return real_rmdir(path)
+
+    monkeypatch.setattr(_download.os, "rmdir", fail_cleanup)
+
+    with pytest.raises(
+        _download._ManagedOutputRollbackError,
+        match="could not remove managed-output rollback directory",
+    ) as first:
+        journal.rollback()
+
+    assert first.value.failures == ()
+    assert first.value.cleanup_failure[0] == str(backup_dir)
+    assert output.read_bytes() == b"old-output"
+    assert journal._entries == {}
+    assert journal._backup_dir == str(backup_dir)
+    assert backup_dir.is_dir()
+    assert list(backup_dir.iterdir()) == []
+
+    if persistent:
+        with pytest.raises(
+            _download._ManagedOutputRollbackError,
+            match="could not remove managed-output rollback directory",
+        ) as second:
+            journal.rollback()
+        assert second.value.failures == ()
+        assert second.value.cleanup_failure[0] == str(backup_dir)
+        assert len(failures) == 2
+        assert journal._backup_dir == str(backup_dir)
+        assert backup_dir.is_dir()
+    else:
+        assert journal.rollback() == set()
+        assert len(failures) == 1
+        assert journal._backup_dir is None
+        assert not backup_dir.exists()
+    assert output.read_bytes() == b"old-output"
+    assert journal._entries == {}
+
+
 @pytest.mark.parametrize("channel", ["direct", "zip", "tar"])
 @pytest.mark.parametrize("destination_state", ["new", "replacement"])
 @pytest.mark.parametrize("persistent", [False, True])

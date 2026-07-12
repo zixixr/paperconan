@@ -119,17 +119,34 @@ def _remaining_final_size_allowance(
 
 
 class _ManagedOutputRollbackError(RuntimeError):
-    def __init__(self, failures):
+    def __init__(self, failures, cleanup_failure=None):
         self.failures = tuple(failures)
-        count = len(self.failures)
-        noun = "output" if count == 1 else "outputs"
-        details = "; ".join(
-            f"{dest_path}: {type(error).__name__}: {error}"
-            for dest_path, error in self.failures
-        )
-        super().__init__(
-            f"could not restore {count} managed {noun}: {details}"
-        )
+        self.cleanup_failure = cleanup_failure
+        messages = []
+        if self.failures:
+            count = len(self.failures)
+            noun = "output" if count == 1 else "outputs"
+            details = "; ".join(
+                f"{dest_path}: {type(error).__name__}: {error}"
+                for dest_path, error in self.failures
+            )
+            messages.append(
+                f"could not restore {count} managed {noun}: {details}"
+            )
+        if cleanup_failure is not None:
+            backup_dir, error = cleanup_failure
+            messages.append(
+                "could not remove managed-output rollback directory "
+                f"{backup_dir}: {type(error).__name__}: {error}"
+            )
+        super().__init__("; ".join(messages))
+
+
+class _ManagedOutputDirectoryCleanupError(OSError):
+    def __init__(self, backup_dir, error):
+        self.backup_dir = backup_dir
+        self.error = error
+        super().__init__(str(error))
 
 
 class _ManagedOutputRestoreFailure(RuntimeError):
@@ -162,7 +179,7 @@ class _ManagedOutputJournal:
             os.replace(dest_path, backup_path)
         self._entries[dest_path] = backup_path
 
-    def restore(self, dest_path):
+    def restore(self, dest_path, *, cleanup=True):
         dest_path = os.path.abspath(dest_path)
         if dest_path not in self._entries:
             return
@@ -175,7 +192,8 @@ class _ManagedOutputJournal:
         else:
             os.replace(backup_path, dest_path)
         self._entries.pop(dest_path)
-        self._cleanup_backup_dir()
+        if cleanup:
+            self._cleanup_backup_dir()
 
     def discard(self, dest_path):
         dest_path = os.path.abspath(dest_path)
@@ -194,11 +212,20 @@ class _ManagedOutputJournal:
         failures = []
         for dest_path in reversed(tuple(self._entries)):
             try:
-                self.restore(dest_path)
+                self.restore(dest_path, cleanup=False)
             except OSError as error:
                 failures.append((dest_path, error))
-        if failures:
-            raise _ManagedOutputRollbackError(failures)
+        cleanup_failure = None
+        if not self._entries:
+            try:
+                self._cleanup_backup_dir()
+            except _ManagedOutputDirectoryCleanupError as error:
+                cleanup_failure = (error.backup_dir, error.error)
+        if failures or cleanup_failure is not None:
+            raise _ManagedOutputRollbackError(
+                failures,
+                cleanup_failure=cleanup_failure,
+            )
         return paths
 
     def commit(self):
@@ -219,10 +246,16 @@ class _ManagedOutputJournal:
     def _cleanup_backup_dir(self):
         if self._entries or self._backup_dir is None:
             return
+        backup_dir = self._backup_dir
         try:
-            os.rmdir(self._backup_dir)
+            os.rmdir(backup_dir)
         except FileNotFoundError:
             pass
+        except OSError as error:
+            raise _ManagedOutputDirectoryCleanupError(
+                backup_dir,
+                error,
+            ) from error
         self._backup_dir = None
 
 
@@ -233,6 +266,20 @@ def _restore_managed_output(
 ):
     try:
         output_journal.restore(dest_path)
+    except _ManagedOutputDirectoryCleanupError as cleanup_error:
+        rollback_error = _ManagedOutputRollbackError(
+            [],
+            cleanup_failure=(
+                cleanup_error.backup_dir,
+                cleanup_error.error,
+            ),
+        )
+        if operation_error is None:
+            raise rollback_error from cleanup_error
+        raise _ManagedOutputRestoreFailure(
+            operation_error,
+            rollback_error,
+        ) from cleanup_error
     except OSError as restore_error:
         rollback_error = _ManagedOutputRollbackError(
             [(os.path.abspath(dest_path), restore_error)]
