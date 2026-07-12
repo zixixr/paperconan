@@ -3065,6 +3065,28 @@ class FileScanResult:
     errors: list[dict]
 
 
+@dataclass
+class _SheetScanResult:
+    report_blocks: list[dict]
+    digit_reports: list[dict]
+    decimal_reports: list[dict]
+    summaries: list[CrossSheetSummary]
+    within_sheet_findings: list[dict]
+    stats: dict
+
+
+def _empty_file_scan_result(file_stat, errors):
+    return FileScanResult(
+        report_blocks=[],
+        digit_reports=[],
+        decimal_reports=[],
+        summaries=[],
+        within_sheet_findings=[],
+        stats={"files": [file_stat], "sheets": []},
+        errors=errors,
+    )
+
+
 def _cap_block_findings(groups, cap):
     """Trim a block's findings to at most `cap`, keeping the highest-severity ones.
 
@@ -3092,7 +3114,304 @@ def _cap_block_findings(groups, cap):
     return omitted
 
 
+def _analyze_numeric_blocks(
+    sheet, *, file_name, sheet_name, blocks, state
+):
+    report_blocks = []
+    for block_index, (r0, r1, c0, c1) in enumerate(blocks):
+        if state.report_blocks_kept >= _MAX_REPORT_BLOCKS:
+            state.coverage.mark_blocks_skipped(
+                len(blocks) - block_index,
+                scope="sheet",
+                reason="report_block_limit",
+                file=file_name,
+                sheet=sheet_name,
+            )
+            break
+        if (
+            _MAX_TOTAL_FINDINGS > 0
+            and state.findings_kept >= _MAX_TOTAL_FINDINGS
+        ):
+            state.coverage.mark_blocks_skipped(
+                len(blocks) - block_index,
+                scope="sheet",
+                reason="finding_limit",
+                file=file_name,
+                sheet=sheet_name,
+            )
+            break
+        state.coverage.mark_block_analyzed()
+        header = header_for(sheet, r0, c0, c1)
+        wide = _MAX_BLOCK_COLS and (c1 - c0) > _MAX_BLOCK_COLS
+        if wide:
+            state.coverage.add_limitation(
+                "block",
+                "wide_block_detector_limit",
+                file=file_name,
+                sheet=sheet_name,
+                rows=f"{r0 + 1}-{r1}",
+                cols=f"{c0 + 1}-{c1}",
+                detectors=["relations", "equal_pairs", "row_pairs"],
+                max_cols=_MAX_BLOCK_COLS,
+            )
+        row_pair_dimension_limited = (
+            not wide
+            and (
+                (r1 - r0) > _ROW_PAIR_MAX_ROWS
+                or (c1 - c0) > _ROW_PAIR_MAX_COLS
+            )
+        )
+        if row_pair_dimension_limited:
+            state.coverage.add_limitation(
+                "block",
+                "row_pair_dimension_limit",
+                file=file_name,
+                sheet=sheet_name,
+                rows=r1 - r0,
+                cols=c1 - c0,
+                max_rows=_ROW_PAIR_MAX_ROWS,
+                max_cols=_ROW_PAIR_MAX_COLS,
+            )
+        rel = [] if wide else detect_relations(
+            sheet, r0, r1, c0, c1, header
+        )
+        ap = detect_arithmetic_progression(
+            sheet, r0, r1, c0, c1, header
+        )
+        eq = [] if wide else detect_equal_pairs(
+            sheet, r0, r1, c0, c1, header
+        )
+        row_pair_meta = {"findings_omitted": 0}
+        if wide or row_pair_dimension_limited:
+            rp = []
+        else:
+            row_pair_result = detect_row_pair_digit_coupling(
+                sheet,
+                r0,
+                r1,
+                c0,
+                c1,
+                header,
+                with_coverage=True,
+            )
+            if isinstance(row_pair_result, tuple):
+                rp, row_pair_meta = row_pair_result
+            else:
+                rp = row_pair_result
+        if row_pair_meta["findings_omitted"] > 0:
+            state.coverage.add_limitation(
+                "block",
+                "row_pair_finding_limit",
+                file=file_name,
+                sheet=sheet_name,
+                rows=f"{r0 + 1}-{r1}",
+                cols=f"{c0 + 1}-{c1}",
+                limit=_ROW_PAIR_MAX_FINDINGS_PER_BLOCK,
+                omitted_findings=row_pair_meta["findings_omitted"],
+            )
+        wc = detect_within_column_patterns(
+            sheet, r0, r1, c0, c1, header
+        )
+        wc += detect_dispersed_repeats(
+            sheet, r0, r1, c0, c1, header
+        )
+        iar = detect_identical_after_rounding(
+            sheet, r0, r1, c0, c1, header
+        )
+        gg = detect_grim_grimmer(
+            sheet, r0, r1, c0, c1, header
+        )
+        if not (rel or ap or eq or rp or wc or iar or gg):
+            continue
+
+        sheet_context = " ".join([
+            file_name,
+            sheet_name,
+            *[str(value) for value in header],
+        ])
+        groups = {
+            "relations": rel,
+            "progressions": ap,
+            "equal_pairs": eq,
+            "row_pairs": rp,
+            "within_col": wc,
+            "identical_after_rounding": iar,
+            "grim": gg,
+        }
+        per_block = (
+            _MAX_FINDINGS_PER_BLOCK
+            if _MAX_FINDINGS_PER_BLOCK > 0
+            else None
+        )
+        if _MAX_TOTAL_FINDINGS > 0:
+            remaining = max(
+                0, _MAX_TOTAL_FINDINGS - state.findings_kept
+            )
+            block_cap = (
+                remaining
+                if per_block is None
+                else min(per_block, remaining)
+            )
+        else:
+            block_cap = per_block
+        omitted = _cap_block_findings(groups, block_cap)
+        state.findings_omitted += omitted
+        if omitted:
+            state.coverage.add_limitation(
+                "block",
+                "finding_limit",
+                file=file_name,
+                sheet=sheet_name,
+                rows=f"{r0 + 1}-{r1}",
+                cols=f"{c0 + 1}-{c1}",
+                omitted_findings=omitted,
+                limit=block_cap,
+            )
+        state.findings_kept += sum(
+            len(group) for group in groups.values()
+        )
+        for group in groups.values():
+            if state.evidence:
+                _attach_evidence(
+                    group, sheet, r0, r1, c0, c1, header
+                )
+            _attach_benign(group)
+            apply_profile_to_findings(
+                group,
+                state.profile,
+                sheet_context=sheet_context,
+            )
+        report_blocks.append({
+            "file": file_name,
+            "sheet": sheet_name,
+            "block": {
+                "rows": f"{r0 + 1}-{r1}",
+                "cols": f"{c0 + 1}-{c1}",
+                "header": header,
+            },
+            "relations": groups["relations"],
+            "progressions": groups["progressions"],
+            "equal_pairs": groups["equal_pairs"],
+            "row_pairs": groups["row_pairs"],
+            "within_col": groups["within_col"],
+            "identical_after_rounding": groups[
+                "identical_after_rounding"
+            ],
+            "grim": groups["grim"],
+            "findings_omitted": omitted,
+        })
+        state.report_blocks_kept += 1
+    return report_blocks
+
+
+def _process_loaded_sheet(
+    sheet, *, file_name, sheet_name, sheet_start, state
+):
+    blocks = find_numeric_blocks(sheet)
+    block_analysis_start = time.perf_counter()
+    report_blocks = _analyze_numeric_blocks(
+        sheet,
+        file_name=file_name,
+        sheet_name=sheet_name,
+        blocks=blocks,
+        state=state,
+    )
+    block_analysis_elapsed = (
+        time.perf_counter() - block_analysis_start
+    )
+
+    within_sheet_findings = detect_within_sheet_fraction_reuse(
+        {(file_name, sheet_name): sheet},
+        profile=state.profile,
+    )
+
+    sheet_numbers = sheet.numeric_values()
+    label = f"{file_name}::{sheet_name}"
+    digit_reports = []
+    digit_report = detect_last_digit(sheet_numbers, label=label)
+    if digit_report:
+        digit_reports.append(digit_report)
+    decimal_reports = []
+    decimal_report = detect_repeated_decimals(
+        sheet_numbers, label=label
+    )
+    if decimal_report:
+        decimal_reports.append(decimal_report)
+
+    recurring_meta = state.recurring_index.add_sheet(
+        file_name,
+        sheet_name,
+        sheet,
+        blocks=blocks,
+        figure_id=figure_key(sheet_name),
+    )
+    if recurring_meta["windows_skipped"] > 0:
+        state.coverage.add_limitation(
+            "sheet",
+            "recurring_row_vector_budget",
+            file=file_name,
+            sheet=sheet_name,
+            windows_skipped=recurring_meta["windows_skipped"],
+            limit=state.recurring_index.initial_budget,
+        )
+
+    summary, summary_limitations = build_cross_sheet_summary(
+        file_name,
+        sheet_name,
+        sheet,
+        blocks=blocks,
+    )
+    for limitation in summary_limitations:
+        reason = (
+            "collision_grid_cell_limit"
+            if limitation.reason == "collision_cell_limit"
+            else limitation.reason
+        )
+        state.coverage.add_limitation(
+            limitation.scope,
+            reason,
+            file=file_name,
+            sheet=limitation.sheet,
+            **limitation.details,
+        )
+
+    stats = {
+        "file": file_name,
+        "sheet": sheet_name,
+        "n_rows": sheet.nrows,
+        "n_cols": sheet.ncols,
+        "numeric_cells": len(sheet_numbers),
+        "n_blocks": len(blocks),
+        "elapsed_ms": round(
+            max(
+                0.0,
+                (
+                    time.perf_counter()
+                    - sheet_start
+                    - block_analysis_elapsed
+                ),
+            )
+            * 1000,
+            3,
+        ),
+    }
+    del sheet_numbers
+    return _SheetScanResult(
+        report_blocks=report_blocks,
+        digit_reports=digit_reports,
+        decimal_reports=decimal_reports,
+        summaries=[summary],
+        within_sheet_findings=within_sheet_findings,
+        stats=stats,
+    )
+
+
 def _process_file(path, *, input_dir, state) -> FileScanResult:
+    """Process one source file.
+
+    `input_dir` is reserved for stable file-relative orchestration and
+    provenance without changing this plan-mandated interface.
+    """
     report_blocks = []
     digit_reports = []
     decimal_reports = []
@@ -3121,15 +3440,7 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
         file_stat["elapsed_ms"] = round(
             (time.perf_counter() - file_start) * 1000, 3
         )
-        return FileScanResult(
-            report_blocks=report_blocks,
-            digit_reports=digit_reports,
-            decimal_reports=decimal_reports,
-            summaries=summaries,
-            within_sheet_findings=within_sheet_findings,
-            stats={"files": [file_stat], "sheets": sheet_stats},
-            errors=errors,
-        )
+        return _empty_file_scan_result(file_stat, errors)
 
     try:
         load_result = load_table_result(path)
@@ -3141,15 +3452,7 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
         file_stat["elapsed_ms"] = round(
             (time.perf_counter() - file_start) * 1000, 3
         )
-        return FileScanResult(
-            report_blocks=report_blocks,
-            digit_reports=digit_reports,
-            decimal_reports=decimal_reports,
-            summaries=summaries,
-            within_sheet_findings=within_sheet_findings,
-            stats={"files": [file_stat], "sheets": sheet_stats},
-            errors=errors,
-        )
+        return _empty_file_scan_result(file_stat, errors)
 
     state.coverage.mark_file_succeeded()
     sheets = load_result.sheets
@@ -3223,260 +3526,22 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
             if isinstance(loaded_sheet, Sheet)
             else Sheet.from_rows(loaded_sheet)
         )
-        blocks = find_numeric_blocks(sheet)
-
-        for block_index, (r0, r1, c0, c1) in enumerate(blocks):
-            if state.report_blocks_kept >= _MAX_REPORT_BLOCKS:
-                state.coverage.mark_blocks_skipped(
-                    len(blocks) - block_index,
-                    scope="sheet",
-                    reason="report_block_limit",
-                    file=file_name,
-                    sheet=sheet_name,
-                )
-                break
-            if (
-                _MAX_TOTAL_FINDINGS > 0
-                and state.findings_kept >= _MAX_TOTAL_FINDINGS
-            ):
-                state.coverage.mark_blocks_skipped(
-                    len(blocks) - block_index,
-                    scope="sheet",
-                    reason="finding_limit",
-                    file=file_name,
-                    sheet=sheet_name,
-                )
-                break
-            state.coverage.mark_block_analyzed()
-            header = header_for(sheet, r0, c0, c1)
-            wide = _MAX_BLOCK_COLS and (c1 - c0) > _MAX_BLOCK_COLS
-            if wide:
-                state.coverage.add_limitation(
-                    "block",
-                    "wide_block_detector_limit",
-                    file=file_name,
-                    sheet=sheet_name,
-                    rows=f"{r0 + 1}-{r1}",
-                    cols=f"{c0 + 1}-{c1}",
-                    detectors=["relations", "equal_pairs", "row_pairs"],
-                    max_cols=_MAX_BLOCK_COLS,
-                )
-            row_pair_dimension_limited = (
-                not wide
-                and (
-                    (r1 - r0) > _ROW_PAIR_MAX_ROWS
-                    or (c1 - c0) > _ROW_PAIR_MAX_COLS
-                )
-            )
-            if row_pair_dimension_limited:
-                state.coverage.add_limitation(
-                    "block",
-                    "row_pair_dimension_limit",
-                    file=file_name,
-                    sheet=sheet_name,
-                    rows=r1 - r0,
-                    cols=c1 - c0,
-                    max_rows=_ROW_PAIR_MAX_ROWS,
-                    max_cols=_ROW_PAIR_MAX_COLS,
-                )
-            rel = [] if wide else detect_relations(
-                sheet, r0, r1, c0, c1, header
-            )
-            ap = detect_arithmetic_progression(
-                sheet, r0, r1, c0, c1, header
-            )
-            eq = [] if wide else detect_equal_pairs(
-                sheet, r0, r1, c0, c1, header
-            )
-            row_pair_meta = {"findings_omitted": 0}
-            if wide or row_pair_dimension_limited:
-                rp = []
-            else:
-                row_pair_result = detect_row_pair_digit_coupling(
-                    sheet,
-                    r0,
-                    r1,
-                    c0,
-                    c1,
-                    header,
-                    with_coverage=True,
-                )
-                if isinstance(row_pair_result, tuple):
-                    rp, row_pair_meta = row_pair_result
-                else:
-                    rp = row_pair_result
-            if row_pair_meta["findings_omitted"] > 0:
-                state.coverage.add_limitation(
-                    "block",
-                    "row_pair_finding_limit",
-                    file=file_name,
-                    sheet=sheet_name,
-                    rows=f"{r0 + 1}-{r1}",
-                    cols=f"{c0 + 1}-{c1}",
-                    limit=_ROW_PAIR_MAX_FINDINGS_PER_BLOCK,
-                    omitted_findings=row_pair_meta["findings_omitted"],
-                )
-            wc = detect_within_column_patterns(
-                sheet, r0, r1, c0, c1, header
-            )
-            wc += detect_dispersed_repeats(
-                sheet, r0, r1, c0, c1, header
-            )
-            iar = detect_identical_after_rounding(
-                sheet, r0, r1, c0, c1, header
-            )
-            gg = detect_grim_grimmer(
-                sheet, r0, r1, c0, c1, header
-            )
-            if not (rel or ap or eq or rp or wc or iar or gg):
-                continue
-
-            sheet_context = " ".join([
-                file_name,
-                sheet_name,
-                *[str(value) for value in header],
-            ])
-            groups = {
-                "relations": rel,
-                "progressions": ap,
-                "equal_pairs": eq,
-                "row_pairs": rp,
-                "within_col": wc,
-                "identical_after_rounding": iar,
-                "grim": gg,
-            }
-            per_block = (
-                _MAX_FINDINGS_PER_BLOCK
-                if _MAX_FINDINGS_PER_BLOCK > 0
-                else None
-            )
-            if _MAX_TOTAL_FINDINGS > 0:
-                remaining = max(
-                    0, _MAX_TOTAL_FINDINGS - state.findings_kept
-                )
-                block_cap = (
-                    remaining
-                    if per_block is None
-                    else min(per_block, remaining)
-                )
-            else:
-                block_cap = per_block
-            omitted = _cap_block_findings(groups, block_cap)
-            state.findings_omitted += omitted
-            if omitted:
-                state.coverage.add_limitation(
-                    "block",
-                    "finding_limit",
-                    file=file_name,
-                    sheet=sheet_name,
-                    rows=f"{r0 + 1}-{r1}",
-                    cols=f"{c0 + 1}-{c1}",
-                    omitted_findings=omitted,
-                    limit=block_cap,
-                )
-            state.findings_kept += sum(
-                len(group) for group in groups.values()
-            )
-            for group in groups.values():
-                if state.evidence:
-                    _attach_evidence(
-                        group, sheet, r0, r1, c0, c1, header
-                    )
-                _attach_benign(group)
-                apply_profile_to_findings(
-                    group,
-                    state.profile,
-                    sheet_context=sheet_context,
-                )
-            report_blocks.append({
-                "file": file_name,
-                "sheet": sheet_name,
-                "block": {
-                    "rows": f"{r0 + 1}-{r1}",
-                    "cols": f"{c0 + 1}-{c1}",
-                    "header": header,
-                },
-                "relations": groups["relations"],
-                "progressions": groups["progressions"],
-                "equal_pairs": groups["equal_pairs"],
-                "row_pairs": groups["row_pairs"],
-                "within_col": groups["within_col"],
-                "identical_after_rounding": groups[
-                    "identical_after_rounding"
-                ],
-                "grim": groups["grim"],
-                "findings_omitted": omitted,
-            })
-            state.report_blocks_kept += 1
-
+        sheet_result = _process_loaded_sheet(
+            sheet,
+            file_name=file_name,
+            sheet_name=sheet_name,
+            sheet_start=sheet_start,
+            state=state,
+        )
+        report_blocks.extend(sheet_result.report_blocks)
+        digit_reports.extend(sheet_result.digit_reports)
+        decimal_reports.extend(sheet_result.decimal_reports)
+        summaries.extend(sheet_result.summaries)
         within_sheet_findings.extend(
-            detect_within_sheet_fraction_reuse(
-                {(file_name, sheet_name): sheet},
-                profile=state.profile,
-            )
+            sheet_result.within_sheet_findings
         )
-
-        sheet_numbers = sheet.numeric_values()
-        label = f"{file_name}::{sheet_name}"
-        digit_report = detect_last_digit(sheet_numbers, label=label)
-        if digit_report:
-            digit_reports.append(digit_report)
-        decimal_report = detect_repeated_decimals(
-            sheet_numbers, label=label
-        )
-        if decimal_report:
-            decimal_reports.append(decimal_report)
-
-        recurring_meta = state.recurring_index.add_sheet(
-            file_name,
-            sheet_name,
-            sheet,
-            blocks=blocks,
-            figure_id=figure_key(sheet_name),
-        )
-        if recurring_meta["windows_skipped"] > 0:
-            state.coverage.add_limitation(
-                "sheet",
-                "recurring_row_vector_budget",
-                file=file_name,
-                sheet=sheet_name,
-                windows_skipped=recurring_meta["windows_skipped"],
-                limit=_RECURRING_ROW_VECTOR_BUDGET,
-            )
-
-        summary, summary_limitations = build_cross_sheet_summary(
-            file_name,
-            sheet_name,
-            sheet,
-            blocks=blocks,
-        )
-        summaries.append(summary)
-        for limitation in summary_limitations:
-            reason = (
-                "collision_grid_cell_limit"
-                if limitation.reason == "collision_cell_limit"
-                else limitation.reason
-            )
-            state.coverage.add_limitation(
-                limitation.scope,
-                reason,
-                file=file_name,
-                sheet=limitation.sheet,
-                **limitation.details,
-            )
-
-        sheet_stats.append({
-            "file": file_name,
-            "sheet": sheet_name,
-            "n_rows": sheet.nrows,
-            "n_cols": sheet.ncols,
-            "numeric_cells": len(sheet_numbers),
-            "n_blocks": len(blocks),
-            "elapsed_ms": round(
-                (time.perf_counter() - sheet_start) * 1000, 3
-            ),
-        })
-        del sheet_numbers
+        sheet_stats.append(sheet_result.stats)
+        del sheet_result
 
     return FileScanResult(
         report_blocks=report_blocks,

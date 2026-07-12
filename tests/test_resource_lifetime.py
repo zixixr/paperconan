@@ -1,35 +1,24 @@
 import gc
+import types
 import weakref
+from collections.abc import Mapping, Sequence, Set
 from dataclasses import fields, is_dataclass
 
 import numpy as np
 import paperconan._audit as audit
+import pytest
 from paperconan._coverage import ScanCoverage
 from paperconan._input import TableLoadResult
 from paperconan._sheet import Sheet
 from paperconan._summaries import RecurringRowIndex
 
 
-def test_previous_file_sheet_is_released_before_next_load(tmp_path, monkeypatch):
-    data = tmp_path / "data"
-    data.mkdir()
-    (data / "a.csv").write_text("x\n1\n2\n3\n", encoding="utf-8")
-    (data / "b.csv").write_text("x\n4\n5\n6\n", encoding="utf-8")
-    refs = []
+class _WeakNumericList(list):
+    pass
 
-    def stub_load(path):
-        if refs:
-            gc.collect()
-            assert refs[-1]() is None
-        sheet = Sheet.from_rows([["x"], [1.1], [2.2], [3.3]])
-        refs.append(weakref.ref(sheet.numeric))
-        return TableLoadResult({path: sheet})
 
-    monkeypatch.setattr(audit, "load_table_result", stub_load)
-    scan = audit.scan_dir(
-        str(data), str(tmp_path / "out"), write_html=False
-    )
-    assert scan["coverage"]["files_succeeded"] == 2
+class _WeakSheet(Sheet):
+    pass
 
 
 def _walk(value, seen=None):
@@ -39,16 +28,108 @@ def _walk(value, seen=None):
         return
     seen.add(id(value))
     yield value
+    if isinstance(value, types.ModuleType) or isinstance(value, type):
+        return
     if is_dataclass(value):
         for field in fields(value):
             yield from _walk(getattr(value, field.name), seen)
-    elif isinstance(value, dict):
+    if isinstance(value, Mapping):
         for key, item in value.items():
             yield from _walk(key, seen)
             yield from _walk(item, seen)
-    elif isinstance(value, (list, tuple, set, frozenset)):
+    if isinstance(value, (Sequence, Set)) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
         for item in value:
             yield from _walk(item, seen)
+    attributes = getattr(value, "__dict__", None)
+    if isinstance(attributes, dict):
+        yield from _walk(attributes, seen)
+    if callable(value):
+        for cell in getattr(value, "__closure__", None) or ():
+            try:
+                retained = cell.cell_contents
+            except ValueError:
+                continue
+            yield from _walk(retained, seen)
+
+
+def _assert_compact(*roots):
+    retained = list(_walk(roots))
+    disallowed = [
+        value
+        for value in retained
+        if isinstance(value, (Sheet, np.ndarray, _WeakNumericList))
+    ]
+    assert not disallowed, [
+        type(value).__name__
+        for value in disallowed
+    ]
+    return retained
+
+
+def test_previous_file_sheet_is_released_before_next_load(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "a.csv").write_text("x\n1\n2\n3\n", encoding="utf-8")
+    (data / "b.csv").write_text("x\n4\n5\n6\n", encoding="utf-8")
+    records = []
+    records_by_sheet_id = {}
+    original_numeric_values = Sheet.numeric_values
+
+    def tracked_numeric_values(sheet):
+        values = _WeakNumericList(original_numeric_values(sheet))
+        records_by_sheet_id[id(sheet)]["values"] = weakref.ref(values)
+        return values
+
+    def stub_load(path):
+        if records:
+            gc.collect()
+            prior = records[-1]
+            assert prior["sheet"]() is None
+            assert prior["numeric"]() is None
+            assert prior["values"] is not None
+            assert prior["values"]() is None
+        sheet = _WeakSheet.from_rows([["x"], [1.1], [2.2], [3.3]])
+        record = {
+            "sheet": weakref.ref(sheet),
+            "numeric": weakref.ref(sheet.numeric),
+            "values": None,
+        }
+        records.append(record)
+        records_by_sheet_id[id(sheet)] = record
+        return TableLoadResult({path: sheet})
+
+    monkeypatch.setattr(Sheet, "numeric_values", tracked_numeric_values)
+    monkeypatch.setattr(audit, "load_table_result", stub_load)
+    scan = audit.scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+    assert scan["coverage"]["files_succeeded"] == 2
+
+
+def test_compactness_walker_detects_attribute_closure_and_list_retention():
+    class Holder:
+        pass
+
+    holder = Holder()
+    sheet = Sheet.from_rows([["x"], [1.25]])
+    numeric = sheet.numeric
+    values = _WeakNumericList([1.25])
+    holder.sheet = sheet
+    holder.values = values
+
+    def retained_numeric():
+        return numeric
+
+    holder.callback = retained_numeric
+
+    walked = list(_walk(holder))
+    assert any(value is sheet for value in walked)
+    assert any(value is numeric for value in walked)
+    assert any(value is values for value in walked)
+    with pytest.raises(AssertionError):
+        _assert_compact(holder)
 
 
 def test_file_scan_result_contains_only_compact_state(tmp_path):
@@ -72,9 +153,152 @@ def test_file_scan_result_contains_only_compact_state(tmp_path):
         10.875,
     ]
     path.write_text(
-        "value\n" + "\n".join(str(value) for value in values) + "\n",
+        "left,right\n"
+        + "\n".join(f"{value},{value}" for value in values)
+        + "\n",
         encoding="utf-8",
     )
+    state = audit.ScanBudgetState(
+        coverage=ScanCoverage(files_discovered=1),
+        recurring_index=RecurringRowIndex(),
+        profile="review",
+        evidence=True,
+    )
+
+    result = audit._process_file(
+        str(path),
+        input_dir=str(data),
+        state=state,
+    )
+
+    assert result.report_blocks
+    findings = [
+        finding
+        for block in result.report_blocks
+        for group in audit.BLOCK_FINDING_GROUPS
+        for finding in block[group]
+    ]
+    assert findings
+    assert all("evidence" in finding for finding in findings)
+    walked = _assert_compact(result, state)
+    numeric_sequences = {
+        tuple(sequence)
+        for sequence in walked
+        if isinstance(sequence, (list, tuple))
+        and sequence
+        and all(
+            isinstance(item, (int, float)) and not isinstance(item, bool)
+            for item in sequence
+        )
+    }
+    complete_values = tuple(
+        item
+        for value in values
+        for item in (value, value)
+    )
+    assert complete_values not in numeric_sequences
+
+
+def test_loaded_sheet_helper_returns_compact_state_without_closures():
+    sheet = Sheet.from_rows([
+        ["left", "right"],
+        [1.125, 1.125],
+        [2.375, 2.375],
+        [3.625, 3.625],
+    ])
+    state = audit.ScanBudgetState(
+        coverage=ScanCoverage(files_discovered=1),
+        recurring_index=RecurringRowIndex(),
+        profile="review",
+        evidence=True,
+    )
+
+    result = audit._process_loaded_sheet(
+        sheet,
+        file_name="source.csv",
+        sheet_name="source",
+        sheet_start=audit.time.perf_counter(),
+        state=state,
+    )
+
+    _assert_compact(result, state)
+    assert audit._analyze_numeric_blocks.__closure__ is None
+    assert audit._process_loaded_sheet.__closure__ is None
+    assert audit._process_file.__closure__ is None
+
+
+def test_process_file_reports_actual_custom_recurring_budget(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    path = data / "Figure 1.csv"
+    path.write_text(
+        "a,b,c,d,e\n"
+        "11.25,7.5,19.75,3.125,14.5\n"
+        "21.25,17.5,29.75,13.125,24.5\n"
+        "31.25,27.5,39.75,23.125,34.5\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(audit, "_RECURRING_ROW_VECTOR_BUDGET", 999)
+    state = audit.ScanBudgetState(
+        coverage=ScanCoverage(files_discovered=1),
+        recurring_index=RecurringRowIndex(budget=1),
+        profile="review",
+        evidence=False,
+    )
+
+    audit._process_file(
+        str(path),
+        input_dir=str(data),
+        state=state,
+    )
+
+    limitation = next(
+        item
+        for item in state.coverage.limitations
+        if item["reason"] == "recurring_row_vector_budget"
+    )
+    assert limitation["limit"] == 1
+
+
+def test_recurring_index_initial_budget_is_read_only():
+    index = RecurringRowIndex(budget=7)
+
+    assert index.initial_budget == 7
+    with pytest.raises(AttributeError):
+        index.initial_budget = 9
+
+
+def test_sheet_elapsed_excludes_numeric_block_analysis_time(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    path = data / "timing.csv"
+    path.write_text(
+        "a,b\n"
+        "1.125,7.375\n"
+        "2.625,4.875\n"
+        "5.375,3.125\n",
+        encoding="utf-8",
+    )
+    now = [0.0]
+
+    def perf_counter():
+        return now[0]
+
+    def block_detector(*_args, **_kwargs):
+        now[0] += 5.0
+        return []
+
+    def digit_report(*_args, **_kwargs):
+        now[0] += 2.0
+        return None
+
+    monkeypatch.setattr(audit.time, "perf_counter", perf_counter)
+    monkeypatch.setattr(audit, "detect_relations", block_detector)
+    monkeypatch.setattr(audit, "detect_last_digit", digit_report)
     state = audit.ScanBudgetState(
         coverage=ScanCoverage(files_discovered=1),
         recurring_index=RecurringRowIndex(),
@@ -88,19 +312,7 @@ def test_file_scan_result_contains_only_compact_state(tmp_path):
         state=state,
     )
 
-    walked = list(_walk(result))
-    assert not any(isinstance(value, (Sheet, np.ndarray)) for value in walked)
-    numeric_sequences = {
-        tuple(sequence)
-        for sequence in walked
-        if isinstance(sequence, (list, tuple))
-        and sequence
-        and all(
-            isinstance(item, (int, float)) and not isinstance(item, bool)
-            for item in sequence
-        )
-    }
-    assert tuple(values) not in numeric_sequences
+    assert result.stats["sheets"][0]["elapsed_ms"] == 2000.0
 
 
 def test_scan_maps_collision_grid_cell_limit_with_counts(

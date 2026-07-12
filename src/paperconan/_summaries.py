@@ -131,8 +131,13 @@ def _location_names(record, prefix):
 
 class RecurringRowIndex:
     def __init__(self, budget=3_000_000):
-        self._budget = max(0, int(budget))
+        self._initial_budget = max(0, int(budget))
+        self._budget = self._initial_budget
         self._vectors: dict[tuple[float, ...], dict[str, Any]] = {}
+
+    @property
+    def initial_budget(self):
+        return self._initial_budget
 
     def add_sheet(
         self,
