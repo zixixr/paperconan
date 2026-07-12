@@ -5,6 +5,7 @@ from collections import Counter
 import json
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -87,36 +88,6 @@ EXPECTED_CI_PYTEST_STEPS = [
     {"run": "uv sync --frozen"},
     {"run": "uv run --frozen pytest -q"},
 ]
-EXPECTED_CI_SDIST_STEPS = [
-    {"uses": "actions/checkout@v4"},
-    {
-        "uses": "astral-sh/setup-uv@v6",
-        "with": {
-            "python-version": "3.14",
-        },
-    },
-    {"run": "uv build --sdist"},
-    {
-        "run": (
-            "archive=$(find dist -maxdepth 1 -type f "
-            "-name 'paperconan-*.tar.gz' -print -quit); "
-            'test -n "$archive"; mkdir sdist-root; '
-            'tar -xzf "$archive" -C sdist-root --strip-components=1'
-        ),
-    },
-    {
-        "working-directory": "sdist-root",
-        "run": "uv venv --python 3.14 .venv",
-    },
-    {
-        "working-directory": "sdist-root",
-        "run": 'uv pip install --python .venv/bin/python ".[test]"',
-    },
-    {
-        "working-directory": "sdist-root",
-        "run": ".venv/bin/python -m pytest -q",
-    },
-]
 INLINE_MATRIX_JOB = """
 pytest:
   strategy:
@@ -145,6 +116,66 @@ pytest:
     - name: Test
       run: uv run --frozen pytest -q
 """
+SDIST_CHECKOUT_STEP = """\
+    - name: Checkout source
+      uses: actions/checkout@v4
+"""
+SDIST_SETUP_STEP = """\
+    - name: Configure uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        python-version: "3.14"
+"""
+SDIST_BUILD_STEP = """\
+    - name: Build source distribution
+      run: |
+        uv   build   --sdist
+"""
+SDIST_EXTRACT_STEP = """\
+    - name: Extract source distribution
+      run: >
+        archive=$(find dist -maxdepth 1 -type f
+        -name 'paperconan-*.tar.gz' -print -quit);
+        test -n "$archive";
+        mkdir sdist-root;
+        tar -xzf "$archive" -C sdist-root --strip-components=1
+"""
+SDIST_VENV_STEP = """\
+    - name: Create isolated environment
+      working-directory: sdist-root
+      run: |
+        uv venv --python 3.14 .venv
+"""
+SDIST_INSTALL_STEP = """\
+    - name: Install unpacked tests
+      run: >
+        uv pip install --python .venv/bin/python
+        ".[test]"
+      working-directory: sdist-root
+"""
+SDIST_TEST_STEP = """\
+    - name: Test unpacked source
+      working-directory: sdist-root
+      run: |
+        .venv/bin/python    -m pytest -q
+"""
+SDIST_POST_TEST_STEP = """\
+    - name: Publish summary
+      run: echo "sdist verification complete"
+"""
+EQUIVALENT_SDIST_JOB = (
+    "sdist:\n"
+    "  runs-on: ubuntu-latest\n"
+    "  steps:\n"
+    + SDIST_CHECKOUT_STEP
+    + SDIST_SETUP_STEP
+    + SDIST_BUILD_STEP
+    + SDIST_EXTRACT_STEP
+    + SDIST_VENV_STEP
+    + SDIST_INSTALL_STEP
+    + SDIST_TEST_STEP
+    + SDIST_POST_TEST_STEP
+)
 
 
 def _load_toml(relative_path):
@@ -247,6 +278,11 @@ def _tracked_public_files(root=ROOT):
     }
 
 
+def _replace_sdist_job(old, new=""):
+    assert old in EQUIVALENT_SDIST_JOB
+    return EQUIVALENT_SDIST_JOB.replace(old, new, 1)
+
+
 def _workflow_job(workflow, job_name):
     lines = workflow.splitlines()
     jobs_index = next(
@@ -298,30 +334,232 @@ def _workflow_steps(job):
     if current:
         blocks.append(current)
 
-    steps = []
-    for block in blocks:
-        list_indent = len(block[0]) - len(block[0].lstrip())
-        first_key, first_value = block[0].lstrip()[2:].split(":", 1)
-        step = {first_key: _yaml_scalar(first_value.strip())}
-        section = None
-        for line in block[1:]:
-            if not line.strip():
-                continue
-            indent = len(line) - len(line.lstrip())
+    return [_workflow_step(block) for block in blocks]
+
+
+def _workflow_step(block):
+    list_indent = len(block[0]) - len(block[0].lstrip())
+    key_indent = list_indent + 2
+    lines = [
+        (" " * key_indent) + block[0].lstrip()[2:],
+        *block[1:],
+    ]
+    step = {}
+    section = None
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip():
+            index += 1
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == key_indent:
             key, value = line.strip().split(":", 1)
             value = value.strip()
-            if indent == list_indent + 2:
-                if value:
-                    step[key] = _yaml_scalar(value)
-                    section = None
-                else:
-                    step[key] = {}
-                    section = key
-            elif indent == list_indent + 4 and section is not None:
-                step[section][key] = _yaml_scalar(value)
-        step.pop("name", None)
-        steps.append(step)
-    return steps
+            if re.fullmatch(r"[|>][+-]?", value):
+                step[key], index = _workflow_block_scalar(
+                    lines,
+                    index + 1,
+                    key_indent,
+                    value,
+                )
+                section = None
+                continue
+            if value:
+                step[key] = _yaml_scalar(value)
+                section = None
+            else:
+                step[key] = {}
+                section = key
+            index += 1
+            continue
+        if indent == key_indent + 2 and section is not None:
+            key, value = line.strip().split(":", 1)
+            step[section][key] = _yaml_scalar(value.strip())
+            index += 1
+            continue
+        raise AssertionError("unsupported workflow step presentation")
+
+    step.pop("name", None)
+    return step
+
+
+def _workflow_block_scalar(lines, index, parent_indent, style):
+    content = []
+    content_indent = None
+
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip():
+            content.append("")
+            index += 1
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= parent_indent:
+            break
+        if content_indent is None:
+            content_indent = indent
+        assert indent >= content_indent
+        content.append(line[content_indent:])
+        index += 1
+
+    if style.startswith(">"):
+        value = " ".join(item.strip() for item in content if item.strip())
+    else:
+        value = "\n".join(content).strip()
+    return value, index
+
+
+def _normalize_shell(command):
+    lines = [
+        " ".join(line.split())
+        for line in command.splitlines()
+        if line.strip()
+    ]
+    return " ; ".join(lines)
+
+
+def _shell_tokens(command):
+    try:
+        return shlex.split(command)
+    except ValueError as exc:
+        raise AssertionError(f"invalid shell command: {command}") from exc
+
+
+def _without_option(tokens, option, expected_value):
+    tokens = list(tokens)
+    assert tokens.count(option) == 1
+    index = tokens.index(option)
+    assert index + 1 < len(tokens)
+    assert tokens[index + 1] == expected_value
+    del tokens[index:index + 2]
+    return tokens
+
+
+def _assert_safe_pretest_command(command):
+    assert not re.search(
+        r"(^|[;&|]\s*)(?:sudo\s+)?(?:cp|rsync)\s",
+        command,
+    ), "checkout-copy command before pytest"
+    forbidden_sources = (
+        "../",
+        "$GITHUB_WORKSPACE",
+        "${{ github.workspace }}",
+        "/github/workspace",
+    )
+    assert not any(source in command for source in forbidden_sources), (
+        "parent or workspace source before pytest"
+    )
+
+
+def _sdist_run_operation(step):
+    assert set(step) <= {"run", "working-directory"}
+    command = _normalize_shell(step["run"])
+    working_directory = step.get("working-directory")
+    _assert_safe_pretest_command(command)
+    tokens = _shell_tokens(command)
+
+    if tokens[:2] == ["uv", "build"]:
+        assert working_directory in (None, ".")
+        assert tokens[2:] == ["--sdist"]
+        return "build"
+
+    if command.startswith("archive=$("):
+        assert working_directory in (None, ".")
+        segments = [
+            segment.strip()
+            for segment in re.split(r"\s*(?:;|&&)\s*", command)
+            if segment.strip()
+        ]
+        assert len(segments) == 4
+        assert segments[0].startswith("archive=$(find dist ")
+        assert "paperconan-*.tar.gz" in segments[0]
+        assert "-print -quit)" in segments[0]
+        assert _shell_tokens(segments[1]) == ["test", "-n", "$archive"]
+        assert _shell_tokens(segments[2]) in (
+            ["mkdir", "sdist-root"],
+            ["mkdir", "-p", "sdist-root"],
+        )
+        tar_tokens = _shell_tokens(segments[3])
+        assert tar_tokens[:5] == [
+            "tar",
+            "-xzf",
+            "$archive",
+            "-C",
+            "sdist-root",
+        ]
+        assert tar_tokens[5:] in (
+            ["--strip-components=1"],
+            ["--strip-components", "1"],
+        )
+        return "extract"
+
+    if tokens[:2] == ["uv", "venv"]:
+        assert working_directory == "sdist-root"
+        remaining = _without_option(tokens[2:], "--python", "3.14")
+        assert remaining == [".venv"]
+        return "venv"
+
+    if tokens[:3] == ["uv", "pip", "install"]:
+        assert working_directory == "sdist-root"
+        remaining = _without_option(
+            tokens[3:],
+            "--python",
+            ".venv/bin/python",
+        )
+        assert remaining == [".[test]"]
+        return "install"
+
+    if "pytest" in tokens:
+        assert working_directory == "sdist-root"
+        assert tokens == [".venv/bin/python", "-m", "pytest", "-q"]
+        return "test"
+
+    return None
+
+
+def _assert_sdist_job_invariants(job):
+    operations = {}
+    test_complete = False
+
+    for index, step in enumerate(_workflow_steps(job)):
+        if test_complete:
+            continue
+
+        action = step.get("uses")
+        if action is not None:
+            assert set(step) <= {"uses", "with"}
+            if action == "actions/checkout@v4":
+                operation = "checkout"
+            elif action == "astral-sh/setup-uv@v6":
+                operation = "setup"
+            else:
+                raise AssertionError("unknown action before pytest")
+        else:
+            assert "run" in step, "unknown step before pytest"
+            operation = _sdist_run_operation(step)
+            assert operation is not None, "unknown command before pytest"
+
+        assert operation not in operations, f"duplicate {operation}"
+        operations[operation] = index
+        if operation == "test":
+            test_complete = True
+
+    required = (
+        "checkout",
+        "setup",
+        "build",
+        "extract",
+        "venv",
+        "install",
+        "test",
+    )
+    assert set(required) <= operations.keys()
+    assert [operations[name] for name in required] == sorted(
+        operations[name]
+        for name in required
+    )
 
 
 def _yaml_scalar(value):
@@ -680,7 +918,123 @@ def test_ci_sdist_steps_build_and_test_only_from_unpacked_root():
         workflow = fh.read()
 
     sdist_job = _workflow_job(workflow, "sdist")
-    assert _workflow_steps(sdist_job) == EXPECTED_CI_SDIST_STEPS
+    _assert_sdist_job_invariants(sdist_job)
+
+
+def test_sdist_job_invariants_accept_equivalent_block_commands():
+    _assert_sdist_job_invariants(EQUIVALENT_SDIST_JOB)
+
+
+@pytest.mark.parametrize(
+    ("case", "job"),
+    [
+        ("missing checkout", _replace_sdist_job(SDIST_CHECKOUT_STEP)),
+        ("missing setup", _replace_sdist_job(SDIST_SETUP_STEP)),
+        ("missing build", _replace_sdist_job(SDIST_BUILD_STEP)),
+        ("missing extraction", _replace_sdist_job(SDIST_EXTRACT_STEP)),
+        ("missing venv", _replace_sdist_job(SDIST_VENV_STEP)),
+        ("missing install", _replace_sdist_job(SDIST_INSTALL_STEP)),
+        ("missing test", _replace_sdist_job(SDIST_TEST_STEP)),
+        (
+            "install outside root",
+            _replace_sdist_job(
+                SDIST_INSTALL_STEP,
+                SDIST_INSTALL_STEP.replace(
+                    "      working-directory: sdist-root\n",
+                    "",
+                ),
+            ),
+        ),
+        (
+            "pytest outside root",
+            _replace_sdist_job(
+                SDIST_TEST_STEP,
+                SDIST_TEST_STEP.replace(
+                    "working-directory: sdist-root",
+                    "working-directory: .",
+                ),
+            ),
+        ),
+        (
+            "install from parent",
+            _replace_sdist_job('        ".[test]"\n', '        "../.[test]"\n'),
+        ),
+        (
+            "copy checkout into root",
+            _replace_sdist_job(
+                SDIST_TEST_STEP,
+                (
+                    "    - name: Copy checkout file\n"
+                    "      run: cp README.md sdist-root/README.md\n"
+                    + SDIST_TEST_STEP
+                ),
+            ),
+        ),
+        (
+            "wrong test extra",
+            _replace_sdist_job('        ".[test]"\n', '        ".[dev]"\n'),
+        ),
+        (
+            "wrong install interpreter",
+            _replace_sdist_job(
+                SDIST_INSTALL_STEP,
+                SDIST_INSTALL_STEP.replace(
+                    ".venv/bin/python",
+                    ".venv/bin/python3",
+                ),
+            ),
+        ),
+        (
+            "wrong pytest interpreter",
+            _replace_sdist_job(
+                SDIST_TEST_STEP,
+                SDIST_TEST_STEP.replace(
+                    ".venv/bin/python",
+                    "python",
+                ),
+            ),
+        ),
+        (
+            "unknown pre-test command",
+            _replace_sdist_job(
+                SDIST_TEST_STEP,
+                (
+                    "    - name: Unverified preparation\n"
+                    "      run: echo preparing\n"
+                    + SDIST_TEST_STEP
+                ),
+            ),
+        ),
+        (
+            "operations out of order",
+            _replace_sdist_job(
+                SDIST_VENV_STEP + SDIST_INSTALL_STEP,
+                SDIST_INSTALL_STEP + SDIST_VENV_STEP,
+            ),
+        ),
+    ],
+    ids=[
+        "missing-checkout",
+        "missing-setup",
+        "missing-build",
+        "missing-extraction",
+        "missing-venv",
+        "missing-install",
+        "missing-test",
+        "install-outside-root",
+        "pytest-outside-root",
+        "install-from-parent",
+        "copy-checkout-into-root",
+        "wrong-test-extra",
+        "wrong-install-interpreter",
+        "wrong-pytest-interpreter",
+        "unknown-pre-test-command",
+        "operations-out-of-order",
+    ],
+)
+def test_sdist_job_invariants_reject_contract_mutations(case, job):
+    with pytest.raises(AssertionError, match="."):
+        _assert_sdist_job_invariants(job)
 
 
 def test_tracked_public_files_requires_exact_repository_root():
