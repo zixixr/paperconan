@@ -1661,25 +1661,36 @@ _TAIL_CLUSTER_SHARE = float(os.environ.get("PAPERCONAN_TAIL_CLUSTER_SHARE", "0.4
 
 def detect_decimal_tail_clustering(values, label, top_k=6):
     """A few multi-digit fractional TAILS recurring far above chance across many
-    DIFFERENT high-precision values — a fingerprint of numbers drawn from a small set
+    INDEPENDENT high-precision values — a fingerprint of numbers drawn from a small set
     of fractional parts (copied/derived) rather than independently measured.
 
     Distinct from detect_last_digit (a single last digit), detect_repeated_decimals
     (2-digit endings, no concentration test) and within_col_value_duplication (repeated
-    whole VALUES, not shared tails). Gated hard: only values with >=3 significant
-    fractional digits count; needs >=_TAIL_CLUSTER_MIN_N of them; and the top-`top_k`
-    3-digit tails must cover >=_TAIL_CLUSTER_SHARE of them — far above both the ~uniform
-    tails of genuine measured data and the chance concentration at this N."""
-    tails = []
+    whole VALUES, not shared tails). Gated hard: only values with >=3 fractional digits
+    (at read precision) count; needs >=_TAIL_CLUSTER_MIN_N of them; the top-`top_k`
+    3-digit tails must cover >=_TAIL_CLUSTER_SHARE of them; AND the full fractional parts
+    must be MOSTLY DISTINCT — otherwise a quantized / common-denominator column (values
+    like k/7 or eighths) trivially shares tails and would false-positive. Large-magnitude
+    values (>=1e7) are skipped: read-precision noise there reaches the captured digits."""
+    tails, full = [], []
     for v in values:
-        s = f"{abs(float(v)):.10f}".rstrip("0")
+        av = abs(float(v))
+        if av >= 1e7:
+            continue
+        s = f"{av:.10f}".rstrip("0")
         if "." not in s:
             continue
         frac = s.split(".")[1]
         if len(frac) >= 3:
             tails.append(frac[-3:])
+            full.append(frac)
     n = len(tails)
     if n < _TAIL_CLUSTER_MIN_N:
+        return None
+    # Quantized / common-denominator data (few distinct fractions) shares tails trivially.
+    # The genuine fingerprint is MANY independent values that nonetheless collide on a few
+    # tails, so require the full fractional parts to be mostly distinct.
+    if len(set(full)) < max(50, n // 2):
         return None
     counts = Counter(tails)
     top = counts.most_common(top_k)
@@ -1690,12 +1701,13 @@ def detect_decimal_tail_clustering(values, label, top_k=6):
     top_tails = [t for t, _ in top]
     # complementary pairs (t + t' = 1000) among the dominant tails — a stronger sub-signal
     comp = sum(1 for t in top_tails if int(t) < 500 and f"{1000 - int(t):03d}" in top_tails)
-    return dict(label=label, n=n, n_unique=len(counts),
+    return dict(label=label, n=n, n_unique=len(counts), n_distinct_fraction=len(set(full)),
                 top=[[t, c] for t, c in top], top_share=round(share, 4),
                 complementary_pairs=comp, severity="high",
                 rule=(f"the {top_k} most common 3-digit fractional tails cover "
-                      f"{top_sum}/{n} ({share:.0%}) of high-precision values "
-                      f"(uniform expectation ~{100 * top_k / 1000:.1f}%)"))
+                      f"{top_sum}/{n} ({share:.0%}) of the high-precision values "
+                      f"(uniform expectation ~{100 * top_k / 1000:.1f}%), which have "
+                      f"{len(set(full))} distinct fractional parts"))
 
 
 def benjamini_hochberg(pvals, alpha=0.05):

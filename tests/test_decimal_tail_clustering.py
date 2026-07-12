@@ -59,6 +59,48 @@ def test_small_n_does_not_fire():
     assert detect_decimal_tail_clustering(vals, "Fig S") is None
 
 
+def test_common_denominator_column_is_not_flagged():
+    # values = integer + k/7 : all DIFFERENT numbers, but only ~7 distinct fractional parts.
+    # This shares 3-digit tails trivially and must NOT fire (H1 regression).
+    vals = [10 + i + (i % 7) / 7 for i in range(300)]
+    assert detect_decimal_tail_clustering(vals, "Fig /7") is None
+
+
+def test_eighths_column_is_not_flagged():
+    vals = [5 + i + (i % 8) / 8 for i in range(300)]
+    assert detect_decimal_tail_clustering(vals, "Fig /8") is None
+
+
+def test_large_magnitude_values_are_skipped():
+    # tails above ~1e7 are read-precision noise; a clustered column there must not fire
+    vals = _clustered(160, ["714", "286", "572", "428", "143", "857"])
+    vals = [v + 1e8 for v in vals]
+    assert detect_decimal_tail_clustering(vals, "Fig big") is None
+
+
+def test_negative_values_counted_by_magnitude():
+    vals = [-v for v in _clustered(160, ["714", "286", "572", "428", "143", "857"])]
+    r = detect_decimal_tail_clustering(vals, "Fig neg")
+    assert r is not None and r["top_share"] >= 0.9
+
+
+def test_min_n_boundary():
+    tails = ["714", "286", "572", "428", "143", "857"]
+    assert detect_decimal_tail_clustering(_clustered(99, tails), "a") is None
+    assert detect_decimal_tail_clustering(_clustered(100, tails), "b") is not None
+
+
+def test_tail_cluster_flows_into_review_packet(tmp_path):
+    from paperconan.packet import distill_findings_for_review
+    vals = _clustered(160, ["714", "286", "572", "428", "143", "857"])
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "s.csv").write_text("\n".join(["m"] + [f"{v:.6f}" for v in vals]) + "\n", encoding="utf-8")
+    scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+    distilled = distill_findings_for_review(scan)
+    assert any(d.get("kind") == "decimal_tail_clustering" for d in distilled)
+
+
 def test_scan_dir_surfaces_tail_clustering_and_html(tmp_path):
     vals = _clustered(160, ["714", "286", "572", "428", "143", "857"])
     data = tmp_path / "data"

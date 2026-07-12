@@ -185,6 +185,38 @@ def _distill_block_findings(scan: dict[str, Any]) -> list[dict[str, Any]]:
     return findings
 
 
+def _distill_tail_clusters(scan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Distill high-severity `decimal_tail_clusters` (a top-level per-sheet field, not a
+    per-block group) so the signal reaches the review packet instead of being visible
+    only in the HTML report."""
+    out = []
+    for d in scan.get("decimal_tail_clusters", []) or []:
+        if str(d.get("severity")).lower() != "high":
+            continue
+        label = d.get("label") or ""
+        file, _, sheet = label.partition("::")
+        n = int(d.get("n") or 0)
+        top = d.get("top") or []
+        out.append({
+            "kind": "decimal_tail_clustering",
+            "col_a": sheet or label,
+            "col_b": None,
+            "n": n,
+            "rule": d.get("rule"),
+            "top5_a": [t for t, _ in top[:5]],
+            "top5_b": [],
+            "high_precision": True,
+            "mass": bool(n >= 200),
+            "evidence_confidence": evidence_confidence(n, 1.0, True),
+            "prefilter": "keep",
+            "prefilter_reason": None,
+            "sheet": sheet or None,
+            "file": file or None,
+            "figure_label": None,
+        })
+    return out
+
+
 def distill_findings_for_review(scan: dict[str, Any], *,
                                 within_col_drop_budget: int = 100) -> list[dict[str, Any]]:
     """Return compact, prefiltered review findings from a full PaperConan scan.
@@ -202,6 +234,7 @@ def distill_findings_for_review(scan: dict[str, Any], *,
     findings.extend(_distill_relations(scan))
     findings.extend(_distill_within_col(scan, within_col_drop_budget))
     findings.extend(_distill_block_findings(scan))
+    findings.extend(_distill_tail_clusters(scan))
     return findings
 
 
