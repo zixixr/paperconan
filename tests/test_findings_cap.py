@@ -303,6 +303,56 @@ def test_directory_budget_selects_by_severity_across_finding_families(
     }]
 
 
+def test_directory_budget_materializes_evidence_only_for_retained_findings(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_budget_csv(data / "values.csv")
+    _patch_scan_finding_sources(
+        monkeypatch,
+        block_findings=[
+            {
+                "kind": "block_low",
+                "severity": "low",
+                "rule": "low block",
+            },
+            {
+                "kind": "block_medium",
+                "severity": "medium",
+                "rule": "medium block",
+            },
+        ],
+        cross_findings=[{
+            "kind": "cross_high",
+            "severity": "high",
+            "rule": "high cross-sheet",
+        }],
+    )
+    monkeypatch.setattr(A, "_MAX_FINDINGS_PER_BLOCK", 0)
+    monkeypatch.setattr(A, "_MAX_TOTAL_FINDINGS", 2)
+    materialized = []
+    original = A._block_evidence
+
+    def record_materialization(*args, **kwargs):
+        materialized.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(A, "_block_evidence", record_materialization)
+
+    scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+
+    assert [
+        finding["kind"] for finding in _retained_findings(scan)
+    ] == ["block_medium", "cross_high"]
+    assert len(materialized) == 1
+    retained_block_finding = (
+        scan["relations_blocks"][0]["relations"][0]
+    )
+    assert retained_block_finding["kind"] == "block_medium"
+    assert retained_block_finding["evidence"]["rows"]
+
+
 def test_directory_budget_caps_cross_sheet_only_output_deterministically(
     tmp_path, monkeypatch
 ):

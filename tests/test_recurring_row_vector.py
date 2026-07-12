@@ -9,7 +9,7 @@ from paperconan._audit import (
     figure_key,
     find_numeric_blocks,
 )
-from paperconan._summaries import RecurringRowIndex
+from paperconan._summaries import RecurringRowIndex, _materialize_window
 
 _W = 9   # uniform row width so a numeric block covers the full vector
 
@@ -63,6 +63,22 @@ WIDE_VEC = [
         (4, 8),
         (7, 14),
     )
+]
+MIXED_WIDE_NON_PATTERN = [
+    2**53,
+    float(2**53 + 2),
+    2**53 + 3,
+    2**53 + 5,
+    float(2**53 + 6),
+    2**53 + 7,
+]
+MIXED_WIDE_PATTERN = [
+    2**53,
+    float(2**53 + 2),
+    2**53 + 4,
+    float(2**53 + 6),
+    2**53 + 8,
+    float(2**53 + 10),
 ]
 
 
@@ -332,3 +348,55 @@ def test_distinct_wide_integer_vectors_do_not_collapse_into_recurrence():
     })
 
     assert findings == []
+
+
+def test_materialized_windows_canonicalize_integral_floats_before_patterns():
+    materialized = _materialize_window(
+        [2**53 + 3, float(2**53 + 6), 1.23456789],
+        0,
+        3,
+    )
+
+    assert materialized == (2**53 + 3, 2**53 + 6, 1.234568)
+    assert all(
+        isinstance(value, int) for value in materialized[:2]
+    )
+
+
+def test_mixed_wide_integral_types_keep_non_pattern_recurrence():
+    panels = {
+        ("M1.xlsx", "Figure 1a"): _panel(MIXED_WIDE_NON_PATTERN, 10),
+        ("M2.xlsx", "Figure 2a"): _panel(MIXED_WIDE_NON_PATTERN, 40),
+        ("M3.xlsx", "Figure 3a"): _panel(MIXED_WIDE_NON_PATTERN, 70),
+    }
+
+    findings = detect_recurring_row_vectors({
+        key: _sheet(rows) for key, rows in panels.items()
+    })
+    match = next(
+        finding for finding in findings
+        if finding["vector"] == [
+            int(value) for value in MIXED_WIDE_NON_PATTERN
+        ]
+    )
+
+    assert all(isinstance(value, int) for value in match["vector"])
+
+
+def test_mixed_wide_integral_types_still_exclude_genuine_pattern():
+    panels = {
+        ("M1.xlsx", "Figure 1a"): _panel(MIXED_WIDE_PATTERN, 10),
+        ("M2.xlsx", "Figure 2a"): _panel(MIXED_WIDE_PATTERN, 40),
+        ("M3.xlsx", "Figure 3a"): _panel(MIXED_WIDE_PATTERN, 70),
+    }
+
+    findings = detect_recurring_row_vectors({
+        key: _sheet(rows) for key, rows in panels.items()
+    })
+
+    assert not any(
+        finding["vector"] == [
+            int(value) for value in MIXED_WIDE_PATTERN
+        ]
+        for finding in findings
+    )

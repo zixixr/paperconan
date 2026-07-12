@@ -301,6 +301,49 @@ def test_raw_html_evidence_keeps_tiny_nonzero_float_signs(tmp_path):
     assert ">0<" in html
 
 
+def test_raw_html_renders_all_truncated_evidence_windows(tmp_path):
+    scan = _scan("partial", [{
+        "scope": "block",
+        "reason": "evidence_limit",
+    }])
+    _add_finding(scan)
+    scan["relations_blocks"][0]["relations"][0]["evidence"] = {
+        "truncated": True,
+        "windows": [
+            {
+                "headers": ["first"],
+                "col_offset": 0,
+                "col_indices": [0],
+                "highlight_cols": [0],
+                "highlight_rows": [1],
+                "rows": [{
+                    "row_idx": 1,
+                    "is_context": False,
+                    "values": ["window-one"],
+                }],
+            },
+            {
+                "headers": ["last"],
+                "col_offset": 9,
+                "col_indices": [9],
+                "highlight_cols": [9],
+                "highlight_rows": [10],
+                "rows": [{
+                    "row_idx": 10,
+                    "is_context": False,
+                    "values": ["window-two"],
+                }],
+            },
+        ],
+    }
+
+    html = _render_html(tmp_path, scan)
+
+    assert html.count('<table class="ev">') == 2
+    assert "window-one" in html
+    assert "window-two" in html
+
+
 def test_legacy_html_reports_unknown_detailed_coverage(tmp_path):
     scan = _scan("complete")
     scan.pop("scan_status")

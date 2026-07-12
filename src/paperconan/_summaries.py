@@ -42,7 +42,17 @@ class CrossSheetSummary:
     columns: tuple[ColumnFingerprint, ...]
 
 
+def _canonical_vector_value(value):
+    if isinstance(value, int):
+        return value
+    numeric = float(value)
+    if math.isfinite(numeric) and numeric.is_integer():
+        return int(numeric)
+    return round(numeric, 6)
+
+
 def _vector_is_patterned(vec):
+    vec = tuple(_canonical_vector_value(value) for value in vec)
     if len(set(vec)) < 3:
         return True
     differences = [vec[i + 1] - vec[i] for i in range(len(vec) - 1)]
@@ -120,7 +130,7 @@ def _iter_valid_window_specs(run_lengths, min_k, max_k, limit):
 
 def _materialize_window(row, start, width):
     return tuple(
-        value if isinstance(value, int) else round(float(value), 6)
+        _canonical_vector_value(value)
         for value in row[start:start + width]
     )
 

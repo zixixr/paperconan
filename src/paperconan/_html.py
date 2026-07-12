@@ -227,6 +227,15 @@ def _render_omission_warning(scan: dict, omitted: int) -> str:
 # ---------- evidence table rendering ----------
 
 def _render_evidence_table(ev: dict | None) -> str:
+    windows = ev.get("windows") if ev else None
+    if isinstance(windows, list):
+        rendered = [
+            _render_evidence_table(window)
+            for window in windows
+            if isinstance(window, dict)
+        ]
+        if rendered:
+            return '<div class="ev-windows">' + "".join(rendered) + "</div>"
     if not ev or not ev.get("rows"):
         return '<p class="no-evidence">no evidence table</p>'
     headers = ev.get("headers") or []

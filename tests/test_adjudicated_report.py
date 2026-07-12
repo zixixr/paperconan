@@ -209,6 +209,47 @@ def test_adjudicated_evidence_keeps_tiny_nonzero_float_signs():
     assert ">0<" in html
 
 
+def test_adjudicated_report_renders_all_truncated_evidence_windows():
+    scan = _scan_two_findings()
+    scan["relations_blocks"][0]["relations"][0]["evidence"] = {
+        "truncated": True,
+        "windows": [
+            {
+                "headers": ["first"],
+                "col_offset": 0,
+                "col_indices": [0],
+                "highlight_cols": [0],
+                "highlight_rows": [5],
+                "rows": [{
+                    "row_idx": 5,
+                    "values": ["adjudicated-one"],
+                }],
+            },
+            {
+                "headers": ["last"],
+                "col_offset": 9,
+                "col_indices": [9],
+                "highlight_cols": [9],
+                "highlight_rows": [39],
+                "rows": [{
+                    "row_idx": 39,
+                    "values": ["adjudicated-two"],
+                }],
+            },
+        ],
+    }
+    verdict = {
+        "report_md": "## Review\n\nNeutral review.",
+        "finding_refs": [{"sheet": "Alpha", "kind": "constant_offset"}],
+    }
+
+    html = render_adjudicated_report(scan, verdict)
+
+    assert html.count('<table class="ev">') == 2
+    assert "adjudicated-one" in html
+    assert "adjudicated-two" in html
+
+
 def test_omitted_reference_uses_labeled_automatic_selection():
     html = render_adjudicated_report(
         _scan_two_findings(),

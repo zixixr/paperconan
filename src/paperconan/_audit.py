@@ -739,81 +739,246 @@ def _bounded_evidence_indices(start, end, highlights, limit):
     all_indices = list(range(start, end))
     if len(all_indices) <= limit:
         return all_indices
+    if limit <= 0:
+        return []
     selected = sorted({
         index for index in highlights
         if start <= index < end
-    })
-    target = max(limit, len(selected))
+    })[:limit]
     for index in all_indices:
-        if len(selected) >= target:
+        if len(selected) >= limit:
             break
         if index not in selected:
             selected.append(index)
     return sorted(selected)
 
 
-def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_rows=None):
-    """Slice a numeric block (with 1 row of context above/below if available) into a
-    JSON-friendly evidence dict that the HTML renderer can show as a table.
-
-    The emitted snippet uses deterministic row and column selections bounded by
-    _MAX_EV_ROWS × _MAX_EV_COLS unless the highlighted cells themselves exceed
-    those bounds. This stops a dense block from being copied whole into every
-    finding while preserving every retained highlight. Small blocks are emitted
-    whole and stay byte-identical (no `truncated` key)."""
-    truncated = False
-
-    # --- column selection ----------------------------------------------------
-    col_indices = list(range(c0, c1))
-    if len(col_indices) > _MAX_EV_COLS:
-        truncated = True
-        col_indices = _bounded_evidence_indices(
-            c0,
-            c1,
-            highlight_cols,
-            max(0, _MAX_EV_COLS),
-        )
-
-    # --- row selection -------------------------------------------------------
-    r_start = max(0, r0 - 1)
-    r_end = min(sheet.nrows, r1 + 1)
-    row_indices = list(range(r_start, r_end))
-    if len(row_indices) > _MAX_EV_ROWS:
-        truncated = True
-        row_indices = _bounded_evidence_indices(
-            r_start,
-            r_end,
-            [
-                row_number - 1
-                for row_number in (highlight_rows or [])
-            ],
-            max(0, _MAX_EV_ROWS),
-        )
-
+def _evidence_window(
+    sheet,
+    r0,
+    r1,
+    c0,
+    header,
+    row_indices,
+    col_indices,
+    highlight_cols,
+    highlight_rows,
+):
     data_rows = []
-    for r in row_indices:
-        vals = [
-            _cell_value(sheet.cell(r, c))
-            for c in col_indices
-        ]
+    for row_index in row_indices:
         data_rows.append({
-            "row_idx": r + 1,
-            "is_context": r < r0 or r >= r1,
-            "values": vals,
+            "row_idx": row_index + 1,
+            "is_context": row_index < r0 or row_index >= r1,
+            "values": [
+                _cell_value(sheet.cell(row_index, col_index))
+                for col_index in col_indices
+            ],
         })
-    out = {
+    return {
         "headers": [
-            header[c - c0]
-            for c in col_indices
+            header[col_index - c0]
+            for col_index in col_indices
         ],
         "col_offset": col_indices[0] if col_indices else c0,
         "highlight_cols": list(highlight_cols),
-        "highlight_rows": list(highlight_rows) if highlight_rows else [],
+        "highlight_rows": list(highlight_rows),
         "rows": data_rows,
+        "col_indices": list(col_indices),
     }
-    if truncated:
-        out["truncated"] = True
-        out["col_indices"] = col_indices
+
+
+def _block_evidence(
+    sheet,
+    r0,
+    r1,
+    c0,
+    c1,
+    header,
+    highlight_cols,
+    highlight_rows=None,
+    highlight_cells=None,
+):
+    """Slice a numeric block (with 1 row of context above/below if available) into a
+    JSON-friendly evidence dict that the HTML renderer can show as a table.
+
+    Each truncated window remains within _MAX_EV_ROWS × _MAX_EV_COLS.
+    Additional deterministic windows cover highlights that do not fit in the
+    first window without materializing the full highlighted-row by
+    highlighted-column cross-product. Small blocks retain the legacy shape."""
+    r_start = max(0, r0 - 1)
+    r_end = min(sheet.nrows, r1 + 1)
+    all_rows = list(range(r_start, r_end))
+    all_cols = list(range(c0, c1))
+    highlight_rows = list(highlight_rows or [])
+    normalized_rows = sorted({
+        row_number - 1
+        for row_number in highlight_rows
+        if r_start <= row_number - 1 < r_end
+    })
+    normalized_cols = sorted({
+        col_index
+        for col_index in highlight_cols
+        if c0 <= col_index < c1
+    })
+    normalized_cells = sorted({
+        (row_index, col_index)
+        for row_index, col_index in (highlight_cells or [])
+        if (
+            r_start <= row_index < r_end
+            and c0 <= col_index < c1
+        )
+    })
+    row_limit = max(0, _MAX_EV_ROWS)
+    col_limit = max(0, _MAX_EV_COLS)
+    truncated = (
+        len(all_rows) > row_limit
+        or len(all_cols) > col_limit
+    )
+
+    if not truncated:
+        out = _evidence_window(
+            sheet,
+            r0,
+            r1,
+            c0,
+            header,
+            all_rows,
+            all_cols,
+            highlight_cols,
+            highlight_rows,
+        )
+        out.pop("col_indices")
+        return out
+
+    windows = []
+    seen_windows = set()
+
+    def add_window(selected_rows, selected_cols):
+        selected_rows = tuple(sorted(selected_rows))
+        selected_cols = tuple(sorted(selected_cols))
+        key = (selected_rows, selected_cols)
+        if (
+            not selected_rows
+            or not selected_cols
+            or key in seen_windows
+        ):
+            return
+        seen_windows.add(key)
+        windows.append(_evidence_window(
+            sheet,
+            r0,
+            r1,
+            c0,
+            header,
+            selected_rows,
+            selected_cols,
+            highlight_cols,
+            highlight_rows,
+        ))
+
+    base_rows = _bounded_evidence_indices(
+        r_start, r_end, normalized_rows, row_limit
+    )
+    base_cols = _bounded_evidence_indices(
+        c0, c1, normalized_cols, col_limit
+    )
+    add_window(base_rows, base_cols)
+
+    def cell_is_covered(cell):
+        row_index, col_index = cell
+        return any(
+            row_index in {
+                row["row_idx"] - 1 for row in window["rows"]
+            }
+            and col_index in window["col_indices"]
+            for window in windows
+        )
+
+    pending_cells = [
+        cell for cell in normalized_cells
+        if not cell_is_covered(cell)
+    ]
+    while pending_cells and row_limit > 0 and col_limit > 0:
+        selected_rows = set()
+        selected_cols = set()
+        selected_cells = []
+        for row_index, col_index in pending_cells:
+            next_rows = selected_rows | {row_index}
+            next_cols = selected_cols | {col_index}
+            if (
+                len(next_rows) <= row_limit
+                and len(next_cols) <= col_limit
+            ):
+                selected_rows = next_rows
+                selected_cols = next_cols
+                selected_cells.append((row_index, col_index))
+        if not selected_cells:
+            break
+        add_window(
+            _bounded_evidence_indices(
+                r_start, r_end, selected_rows, row_limit
+            ),
+            _bounded_evidence_indices(
+                c0, c1, selected_cols, col_limit
+            ),
+        )
+        selected_cell_set = set(selected_cells)
+        pending_cells = [
+            cell for cell in pending_cells
+            if cell not in selected_cell_set
+        ]
+
+    covered_rows = {
+        row["row_idx"] - 1
+        for window in windows
+        for row in window["rows"]
+    }
+    uncovered_rows = [
+        row_index for row_index in normalized_rows
+        if row_index not in covered_rows
+    ]
+    for start in range(0, len(uncovered_rows), max(1, row_limit)):
+        selected_rows = uncovered_rows[start:start + max(1, row_limit)]
+        add_window(
+            _bounded_evidence_indices(
+                r_start, r_end, selected_rows, row_limit
+            ),
+            base_cols,
+        )
+
+    covered_cols = {
+        col_index
+        for window in windows
+        for col_index in window["col_indices"]
+    }
+    uncovered_cols = [
+        col_index for col_index in normalized_cols
+        if col_index not in covered_cols
+    ]
+    for start in range(0, len(uncovered_cols), max(1, col_limit)):
+        selected_cols = uncovered_cols[start:start + max(1, col_limit)]
+        add_window(
+            base_rows,
+            _bounded_evidence_indices(
+                c0, c1, selected_cols, col_limit
+            ),
+        )
+
+    if not windows:
+        windows.append(_evidence_window(
+            sheet,
+            r0,
+            r1,
+            c0,
+            header,
+            [],
+            [],
+            highlight_cols,
+            highlight_rows,
+        ))
+    out = dict(windows[0])
+    out["truncated"] = True
+    out["windows"] = windows
     return out
 
 
@@ -878,16 +1043,26 @@ def _attach_evidence(findings, sheet, r0, r1, c0, c1, header):
                 hi_rows.append(f[k] + 1)
         # identical_after_rounding / within_col_dispersed_repeats list specific
         # (row, col) example cells (1-based).
+        hi_cells = []
+        if (
+            isinstance(f.get("row_idx"), int)
+            and isinstance(f.get("col_idx"), int)
+        ):
+            hi_cells.append((f["row_idx"], f["col_idx"]))
         for ex in f.get("example_cells", []) or []:
             try:
-                hi_rows.append(int(ex[0]))
-                hi_cols.append(int(ex[1]) - 1)
+                row_index = int(ex[0]) - 1
+                col_index = int(ex[1]) - 1
+                hi_rows.append(row_index + 1)
+                hi_cols.append(col_index)
+                hi_cells.append((row_index, col_index))
             except (TypeError, ValueError, IndexError):
                 pass
         # De-duplicate (order-preserving): a column/row referenced by both an *_idx
         # field and one or more example_cells should highlight once, not N times.
         hi_cols = list(dict.fromkeys(hi_cols))
         hi_rows = list(dict.fromkeys(hi_rows))
+        hi_cells = list(dict.fromkeys(hi_cells))
         evidence = _block_evidence(
             sheet,
             r0,
@@ -897,6 +1072,7 @@ def _attach_evidence(findings, sheet, r0, r1, c0, c1, header):
             header,
             highlight_cols=hi_cols,
             highlight_rows=hi_rows,
+            highlight_cells=hi_cells,
         )
         f["evidence"] = evidence
         truncated = truncated or bool(evidence.get("truncated"))
@@ -3086,6 +3262,7 @@ class ScanBudgetState:
     findings_omitted: int = 0
     report_blocks_kept: int = 0
     include_runtime: bool = True
+    defer_evidence: bool = False
 
 
 @dataclass
@@ -3210,6 +3387,58 @@ def _apply_global_finding_budget(report_blocks, cross_sheet_findings, cap):
         entry_index += 1
     cross_sheet_findings[:] = kept_cross_sheet
     return len(entries) - cap
+
+
+def _attach_deferred_evidence(report_blocks, coverage):
+    blocks_by_path = {}
+    for block in report_blocks:
+        path = block.get("_evidence_path")
+        if path is not None:
+            blocks_by_path.setdefault(path, []).append(block)
+
+    try:
+        for path, path_blocks in blocks_by_path.items():
+            retained_blocks = [
+                block for block in path_blocks
+                if any(block.get(group) for group in BLOCK_FINDING_GROUPS)
+            ]
+            if not retained_blocks:
+                continue
+            sheets = _load_table_sheets(path)
+            for block in retained_blocks:
+                sheet = sheets.get(block["sheet"])
+                if sheet is None:
+                    continue
+                if not isinstance(sheet, Sheet):
+                    sheet = Sheet.from_rows(sheet)
+                r0, r1, c0, c1 = block["_evidence_context"]
+                header = block["block"]["header"]
+                evidence_truncated = False
+                for group_name in BLOCK_FINDING_GROUPS:
+                    evidence_truncated = _attach_evidence(
+                        block.get(group_name) or [],
+                        sheet,
+                        r0,
+                        r1,
+                        c0,
+                        c1,
+                        header,
+                    ) or evidence_truncated
+                if evidence_truncated:
+                    coverage.add_limitation(
+                        "block",
+                        "evidence_limit",
+                        file=block["file"],
+                        sheet=block["sheet"],
+                        rows=block["block"]["rows"],
+                        cols=block["block"]["cols"],
+                        max_rows=_MAX_EV_ROWS,
+                        max_cols=_MAX_EV_COLS,
+                    )
+    finally:
+        for block in report_blocks:
+            block.pop("_evidence_path", None)
+            block.pop("_evidence_context", None)
 
 
 def _analyze_numeric_blocks(
@@ -3348,7 +3577,7 @@ def _analyze_numeric_blocks(
         )
         evidence_truncated = False
         for group in groups.values():
-            if state.evidence:
+            if state.evidence and not state.defer_evidence:
                 evidence_truncated = _attach_evidence(
                     group, sheet, r0, r1, c0, c1, header
                 ) or evidence_truncated
@@ -3369,7 +3598,7 @@ def _analyze_numeric_blocks(
                 max_rows=_MAX_EV_ROWS,
                 max_cols=_MAX_EV_COLS,
             )
-        report_blocks.append({
+        report_block = {
             "file": file_name,
             "sheet": sheet_name,
             "block": {
@@ -3387,7 +3616,10 @@ def _analyze_numeric_blocks(
             ],
             "grim": groups["grim"],
             "findings_omitted": omitted,
-        })
+        }
+        if state.evidence and state.defer_evidence:
+            report_block["_evidence_context"] = (r0, r1, c0, c1)
+        report_blocks.append(report_block)
         state.report_blocks_kept += 1
     return report_blocks
 
@@ -3604,6 +3836,9 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
             sheet_start=sheet_start,
             state=state,
         )
+        if state.evidence and state.defer_evidence:
+            for report_block in sheet_result.report_blocks:
+                report_block["_evidence_path"] = path
         blocks_analyzed = (
             state.coverage.blocks_analyzed - blocks_before
         )
@@ -3668,6 +3903,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         profile=profile,
         evidence=evidence,
         include_runtime=include_runtime,
+        defer_evidence=evidence,
     )
     report_blocks = []
     digit_reports = []
@@ -3742,6 +3978,8 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 omitted_findings=global_omitted,
             )
             state.findings_omitted += global_omitted
+    if evidence:
+        _attach_deferred_evidence(report_blocks, coverage)
 
     if digit_reports:
         adj, sig = benjamini_hochberg([d["p"] for d in digit_reports], alpha=0.05)

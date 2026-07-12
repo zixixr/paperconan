@@ -68,6 +68,53 @@ def test_truncated_evidence_keeps_distant_highlighted_rows(monkeypatch):
     assert [row["row_idx"] for row in ev["rows"]] == [1, 2, 100]
 
 
+def test_many_highlighted_cells_use_bounded_windows_without_cross_product(
+    monkeypatch,
+):
+    monkeypatch.setattr(audit, "_MAX_EV_ROWS", 2)
+    monkeypatch.setattr(audit, "_MAX_EV_COLS", 2)
+    s = _grid(12, 12)
+    highlighted = [(index, index) for index in range(1, 8)]
+    findings = [{
+        "kind": "identical_after_rounding",
+        "severity": "medium",
+        "rule": "bounded highlighted cells",
+        "example_cells": highlighted,
+    }]
+
+    audit._attach_evidence(
+        findings,
+        s,
+        0,
+        s.nrows,
+        0,
+        s.ncols,
+        [f"h{index}" for index in range(s.ncols)],
+    )
+
+    evidence = findings[0]["evidence"]
+    windows = evidence["windows"]
+    assert windows
+    assert all(len(window["rows"]) <= 2 for window in windows)
+    assert all(
+        len(row["values"]) <= 2
+        for window in windows
+        for row in window["rows"]
+    )
+    represented = {
+        (row["row_idx"], col_index + 1)
+        for window in windows
+        for row in window["rows"]
+        for col_index in window["col_indices"]
+    }
+    assert set(highlighted) <= represented
+    assert sum(
+        len(row["values"])
+        for window in windows
+        for row in window["rows"]
+    ) <= len(highlighted) * 4
+
+
 def test_evidence_limit_is_recorded_once_per_affected_block(monkeypatch):
     monkeypatch.setattr(audit, "_MAX_EV_ROWS", 3)
     monkeypatch.setattr(audit, "_MAX_EV_COLS", 3)
