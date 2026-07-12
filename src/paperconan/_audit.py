@@ -447,9 +447,15 @@ def _load_workbook_openpyxl(path):
             out[s] = sheet
             if sheet is not None:
                 loaded += cells
-        return out
-    finally:
+    except BaseException:
+        try:
+            wb.close()
+        except BaseException:
+            pass
+        raise
+    else:
         wb.close()
+        return out
 
 
 def _calamine_cell(v):
@@ -750,11 +756,11 @@ def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_row
     """Slice a numeric block (with 1 row of context above/below if available) into a
     JSON-friendly evidence dict that the HTML renderer can show as a table.
 
-    The emitted snippet is bounded to a contiguous _MAX_EV_ROWS × _MAX_EV_COLS
-    sub-rectangle inside the block, always covering the highlighted columns (and rows
-    when given). This stops a dense block from being copied whole into every finding
-    (which balloons the scan dict / scan.json to GBs). Small blocks are emitted whole
-    and stay byte-identical (no `truncated` key)."""
+    The emitted snippet uses deterministic row and column selections bounded by
+    _MAX_EV_ROWS × _MAX_EV_COLS unless the highlighted cells themselves exceed
+    those bounds. This stops a dense block from being copied whole into every
+    finding while preserving every retained highlight. Small blocks are emitted
+    whole and stay byte-identical (no `truncated` key)."""
     truncated = False
 
     # --- column selection ----------------------------------------------------
@@ -3044,11 +3050,11 @@ _MAX_BLOCK_COLS = int(os.environ.get("PAPERCONAN_MAX_BLOCK_COLS", "120"))
 # Output cap: each finding embeds a table-snippet as evidence, so a paper with thousands of
 # findings balloons scan.json to many GB. Stop collecting blocks once this many have findings.
 _MAX_REPORT_BLOCKS = int(os.environ.get("PAPERCONAN_MAX_REPORT_BLOCKS", "2000"))
-# Per-finding evidence cap: each finding embeds a sub-rectangle of its block as evidence.
+# Per-finding evidence cap: each finding embeds selected rows and columns as evidence.
 # On a dense matrix a single block can be hundreds of rows × cols, and that copy is duplicated
 # across thousands of findings — ballooning the scan dict / scan.json to many GB and OOMing the
-# worker. Bound each evidence snippet to a contiguous window of this many rows × cols (always
-# including the highlighted cells). Small blocks are emitted whole and stay byte-identical.
+# worker. Bound each evidence snippet to this many rows × cols unless preserving every
+# highlighted cell requires more. Small blocks are emitted whole and stay byte-identical.
 _MAX_EV_ROWS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_ROWS", "50"))
 _MAX_EV_COLS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_COLS", "30"))
 # Per-block finding cap: the pairwise detectors are O(col²), so a single dense, highly
@@ -3058,8 +3064,8 @@ _MAX_EV_COLS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_COLS", "30"))
 # Keep at most this many findings per block, retaining the highest-severity ones, and record how
 # many were dropped in the block's `findings_omitted` field (never a silent truncation). 0 disables.
 _MAX_FINDINGS_PER_BLOCK = int(os.environ.get("PAPERCONAN_MAX_FINDINGS_PER_BLOCK", "150"))
-# Global backstop across all blocks: MAX_REPORT_BLOCKS × MAX_FINDINGS_PER_BLOCK could still be
-# large on a pathological corpus, so stop retaining findings once this many have been kept.
+# Directory-wide cap across block and cross-sheet finding families. When trimming is needed,
+# retain higher-severity findings first and preserve stable emission order within ties.
 _MAX_TOTAL_FINDINGS = int(os.environ.get("PAPERCONAN_MAX_TOTAL_FINDINGS", "5000"))
 # Directory-wide recurrence budgets. The vector budget preserves the historical
 # RecurringRowIndex default while giving scan orchestration a stable control point.

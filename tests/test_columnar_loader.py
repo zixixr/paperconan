@@ -326,6 +326,44 @@ def test_openpyxl_loader_closes_workbook_exactly_once(
     assert workbook.close_calls == 1
 
 
+def test_openpyxl_loader_preserves_processing_error_if_close_fails(
+    monkeypatch,
+):
+    import paperconan._audit as audit
+
+    processing_error = RuntimeError("row iteration failed")
+
+    class StubSheet:
+        max_row = 1
+        max_column = 1
+
+        def iter_rows(self, values_only=True):
+            assert values_only is True
+            raise processing_error
+            yield
+
+    class StubWorkbook:
+        sheetnames = ["S1"]
+
+        def __getitem__(self, name):
+            assert name == "S1"
+            return StubSheet()
+
+        def close(self):
+            raise OSError("close failed")
+
+    monkeypatch.setattr(
+        audit.openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: StubWorkbook(),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        audit._load_workbook_openpyxl("input.xlsx")
+
+    assert exc_info.value is processing_error
+
+
 @pytest.mark.parametrize("suffix", [".xlsx", ".xlsm"])
 def test_default_loader_falls_back_to_openpyxl_for_wide_ooxml_integers(
     tmp_path, monkeypatch, suffix
