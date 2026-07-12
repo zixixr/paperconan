@@ -1207,6 +1207,283 @@ def test_journal_cleanup_error_preserves_successful_sidecar_commit(
     assert not list(tmp_path.glob(".paperconan-output-rollback-*"))
 
 
+def test_journal_failed_restore_remains_retryable_and_continues(
+    tmp_path, monkeypatch
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    first = out_dir / "first.csv"
+    second = out_dir / "second.csv"
+    first.write_bytes(b"old-first")
+    second.write_bytes(b"old-second")
+    journal = _download._ManagedOutputJournal(str(out_dir))
+    journal.prepare(first)
+    journal.prepare(second)
+    first.write_bytes(b"new-first")
+    second.write_bytes(b"new-second")
+    second_dest = next(
+        dest for dest in journal._entries
+        if Path(dest).name == second.name
+    )
+    second_backup = Path(journal._entries[second_dest])
+    real_replace = _download.os.replace
+    failures = []
+
+    def fail_once(src, dest):
+        if (
+            os.path.abspath(src) == os.path.abspath(second_backup)
+            and not failures
+        ):
+            failures.append(os.fspath(src))
+            raise PermissionError("injected restore failure")
+        return real_replace(src, dest)
+
+    monkeypatch.setattr(_download.os, "replace", fail_once)
+
+    with pytest.raises(
+        _download._ManagedOutputRollbackError,
+        match="could not restore 1 managed output",
+    ):
+        journal.rollback()
+
+    assert len(failures) == 1
+    assert first.read_bytes() == b"old-first"
+    assert second.read_bytes() == b"new-second"
+    assert journal._entries == {second_dest: str(second_backup)}
+    assert second_backup.read_bytes() == b"old-second"
+
+    assert journal.rollback() == {second_dest}
+    assert second.read_bytes() == b"old-second"
+    assert journal._entries == {}
+    assert not list(tmp_path.glob(".paperconan-output-rollback-*"))
+
+
+@pytest.mark.parametrize("channel", ["direct", "zip", "tar"])
+@pytest.mark.parametrize("destination_state", ["new", "replacement"])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_restore_failure_preserves_operation_error_and_recovery_state(
+    tmp_path, monkeypatch, channel, destination_state, persistent
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    output = out_dir / "table.csv"
+    old_bytes = b"old-output"
+    managed_files = []
+    if destination_state == "replacement":
+        output.write_bytes(old_bytes)
+        managed_files.append(output.name)
+    _write_sidecar(out_dir, managed_files, doi="10.x/old")
+    sidecar = out_dir / _download.SOURCE_SIDECAR
+    original_sidecar = sidecar.read_bytes()
+    operation_error = OSError("source operation failed")
+
+    if channel == "direct":
+        cand = _candidate(output.name, "https://x/table.csv")
+
+        def source_download(url, dest, **kwargs):
+            Path(dest).write_bytes(b"partial-output")
+            raise operation_error
+
+        monkeypatch.setattr(
+            _download, "download_file", source_download
+        )
+    else:
+        payload = _archive_payload(
+            channel, [(f"nested/{output.name}", b"source-output")]
+        )
+        cand = {
+            "cand_id": "source:1",
+            "source": "source",
+            "tabular_files": [],
+            **_archive_fields(channel),
+        }
+
+        def archive_download(url, dest, **kwargs):
+            Path(dest).write_bytes(payload)
+            return {
+                "ok": True,
+                "path": dest,
+                "size": len(payload),
+            }
+
+        def fail_member_write(src, dest, max_bytes):
+            Path(dest).write_bytes(b"partial-output")
+            raise operation_error
+
+        monkeypatch.setattr(
+            _download, "download_file", archive_download
+        )
+        monkeypatch.setattr(
+            _download, "_atomic_stream_write", fail_member_write
+        )
+
+    failures = []
+    if destination_state == "replacement":
+        real_replace = _download.os.replace
+
+        def fail_restore(src, dest):
+            is_restore = (
+                Path(src).parent.name.startswith(
+                    ".paperconan-output-rollback-"
+                )
+                and os.path.abspath(dest) == os.path.abspath(output)
+            )
+            if is_restore and (persistent or not failures):
+                failures.append((os.fspath(src), os.fspath(dest)))
+                raise PermissionError("injected restore failure")
+            return real_replace(src, dest)
+
+        monkeypatch.setattr(_download.os, "replace", fail_restore)
+    else:
+        real_remove = _download.os.remove
+
+        def fail_restore(path):
+            is_restore = (
+                os.path.abspath(path) == os.path.abspath(output)
+            )
+            if is_restore and (persistent or not failures):
+                failures.append(os.fspath(path))
+                raise PermissionError("injected restore failure")
+            return real_remove(path)
+
+        monkeypatch.setattr(_download.os, "remove", fail_restore)
+
+    with pytest.raises(OSError, match="source operation failed") as caught:
+        _download.download_candidate(cand, str(out_dir))
+
+    assert caught.value is operation_error
+    assert caught.value.__cause__ is not None
+    assert sidecar.read_bytes() == original_sidecar
+    if persistent:
+        assert output.read_bytes() == b"partial-output"
+        if destination_state == "replacement":
+            rollback_dirs = list(
+                tmp_path.glob(".paperconan-output-rollback-*")
+            )
+            assert len(rollback_dirs) == 1
+            backups = list(rollback_dirs[0].iterdir())
+            assert len(backups) == 1
+            assert backups[0].read_bytes() == old_bytes
+    else:
+        assert not list(
+            tmp_path.glob(".paperconan-output-rollback-*")
+        )
+        if destination_state == "replacement":
+            assert output.read_bytes() == old_bytes
+        else:
+            assert not output.exists()
+
+
+@pytest.mark.parametrize("channel", ["direct", "zip", "tar"])
+@pytest.mark.parametrize("destination_state", ["new", "replacement"])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_sidecar_rollback_failure_is_actionable_and_preserves_recovery_state(
+    tmp_path, monkeypatch, channel, destination_state, persistent
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    output = out_dir / "table.csv"
+    old_bytes = b"old-output"
+    managed_files = []
+    if destination_state == "replacement":
+        output.write_bytes(old_bytes)
+        managed_files.append(output.name)
+    _write_sidecar(out_dir, managed_files, doi="10.x/old")
+    sidecar = out_dir / _download.SOURCE_SIDECAR
+    original_sidecar = sidecar.read_bytes()
+    body = b"new-output"
+
+    if channel == "direct":
+        cand = _candidate(output.name, "https://x/table.csv")
+
+        def source_download(url, dest, **kwargs):
+            Path(dest).write_bytes(body)
+            return {"ok": True, "path": dest, "size": len(body)}
+    else:
+        payload = _archive_payload(
+            channel, [(f"nested/{output.name}", body)]
+        )
+        cand = {
+            "cand_id": "source:1",
+            "source": "source",
+            "tabular_files": [],
+            **_archive_fields(channel),
+        }
+
+        def source_download(url, dest, **kwargs):
+            Path(dest).write_bytes(payload)
+            return {
+                "ok": True,
+                "path": dest,
+                "size": len(payload),
+            }
+
+    monkeypatch.setattr(_download, "download_file", source_download)
+    failures = []
+    real_replace = _download.os.replace
+    real_remove = _download.os.remove
+
+    def fail_replace(src, dest):
+        if Path(dest).name == _download.SOURCE_SIDECAR:
+            raise OSError("sidecar commit failed")
+        is_restore = (
+            Path(src).parent.name.startswith(
+                ".paperconan-output-rollback-"
+            )
+            and os.path.abspath(dest) == os.path.abspath(output)
+        )
+        if (
+            destination_state == "replacement"
+            and is_restore
+            and (persistent or not failures)
+        ):
+            failures.append((os.fspath(src), os.fspath(dest)))
+            raise PermissionError("injected restore failure")
+        return real_replace(src, dest)
+
+    def fail_remove(path):
+        is_restore = os.path.abspath(path) == os.path.abspath(output)
+        if (
+            destination_state == "new"
+            and is_restore
+            and (persistent or not failures)
+        ):
+            failures.append(os.fspath(path))
+            raise PermissionError("injected restore failure")
+        return real_remove(path)
+
+    monkeypatch.setattr(_download.os, "replace", fail_replace)
+    monkeypatch.setattr(_download.os, "remove", fail_remove)
+
+    with pytest.raises(
+        _download._ManagedOutputRollbackError,
+        match="could not restore 1 managed output",
+    ):
+        _download.download_candidate(cand, str(out_dir))
+
+    assert sidecar.read_bytes() == original_sidecar
+    if persistent:
+        assert len(failures) == 2
+        assert output.read_bytes() == body
+        if destination_state == "replacement":
+            rollback_dirs = list(
+                tmp_path.glob(".paperconan-output-rollback-*")
+            )
+            assert len(rollback_dirs) == 1
+            backups = list(rollback_dirs[0].iterdir())
+            assert len(backups) == 1
+            assert backups[0].read_bytes() == old_bytes
+    else:
+        assert len(failures) == 1
+        assert not list(
+            tmp_path.glob(".paperconan-output-rollback-*")
+        )
+        if destination_state == "replacement":
+            assert output.read_bytes() == old_bytes
+        else:
+            assert not output.exists()
+
+
 def test_later_download_error_rolls_back_earlier_accepted_output(
     tmp_path, monkeypatch
 ):

@@ -118,6 +118,27 @@ def _remaining_final_size_allowance(
     )
 
 
+class _ManagedOutputRollbackError(RuntimeError):
+    def __init__(self, failures):
+        self.failures = tuple(failures)
+        count = len(self.failures)
+        noun = "output" if count == 1 else "outputs"
+        details = "; ".join(
+            f"{dest_path}: {type(error).__name__}: {error}"
+            for dest_path, error in self.failures
+        )
+        super().__init__(
+            f"could not restore {count} managed {noun}: {details}"
+        )
+
+
+class _ManagedOutputRestoreFailure(RuntimeError):
+    def __init__(self, operation_error, rollback_error):
+        self.operation_error = operation_error
+        self.rollback_error = rollback_error
+        super().__init__(str(rollback_error))
+
+
 class _ManagedOutputJournal:
     def __init__(self, out_dir):
         self._parent = os.path.dirname(os.path.abspath(out_dir))
@@ -145,7 +166,7 @@ class _ManagedOutputJournal:
         dest_path = os.path.abspath(dest_path)
         if dest_path not in self._entries:
             return
-        backup_path = self._entries.pop(dest_path)
+        backup_path = self._entries[dest_path]
         if backup_path is None:
             try:
                 os.remove(dest_path)
@@ -153,6 +174,7 @@ class _ManagedOutputJournal:
                 pass
         else:
             os.replace(backup_path, dest_path)
+        self._entries.pop(dest_path)
         self._cleanup_backup_dir()
 
     def discard(self, dest_path):
@@ -169,8 +191,14 @@ class _ManagedOutputJournal:
 
     def rollback(self):
         paths = set(self._entries)
+        failures = []
         for dest_path in reversed(tuple(self._entries)):
-            self.restore(dest_path)
+            try:
+                self.restore(dest_path)
+            except OSError as error:
+                failures.append((dest_path, error))
+        if failures:
+            raise _ManagedOutputRollbackError(failures)
         return paths
 
     def commit(self):
@@ -196,6 +224,25 @@ class _ManagedOutputJournal:
         except FileNotFoundError:
             pass
         self._backup_dir = None
+
+
+def _restore_managed_output(
+    output_journal,
+    dest_path,
+    operation_error=None,
+):
+    try:
+        output_journal.restore(dest_path)
+    except OSError as restore_error:
+        rollback_error = _ManagedOutputRollbackError(
+            [(os.path.abspath(dest_path), restore_error)]
+        )
+        if operation_error is None:
+            raise rollback_error from restore_error
+        raise _ManagedOutputRestoreFailure(
+            operation_error,
+            rollback_error,
+        ) from restore_error
 
 
 def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
@@ -532,7 +579,7 @@ def _extract_archive_members(
                 committed = True
         except _SizeLimitExceeded:
             if output_journal is not None:
-                output_journal.restore(dest)
+                _restore_managed_output(output_journal, dest)
             if reuses_old and os.path.lexists(dest):
                 preserved.add(name)
             continue
@@ -550,7 +597,11 @@ def _extract_archive_members(
                 })
                 continue
             if output_journal is not None:
-                output_journal.restore(dest)
+                _restore_managed_output(
+                    output_journal,
+                    dest,
+                    operation_error=e,
+                )
             if reuses_old and os.path.lexists(dest):
                 preserved.add(name)
             skipped.append({
@@ -910,14 +961,18 @@ def _download_candidate(
                 dest,
                 max_bytes=download_limit,
             )
-        except BaseException:
-            output_journal.restore(dest)
+        except BaseException as error:
+            _restore_managed_output(
+                output_journal,
+                dest,
+                operation_error=error,
+            )
             raise
         if res.get("ok"):
             downloaded.append(res["path"])
             new_managed.add(output_name)
         else:
-            output_journal.restore(dest)
+            _restore_managed_output(output_journal, dest)
             if (
                 remaining < max_bytes
                 and "exceeds max_bytes"
@@ -1043,6 +1098,21 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
             archive_max=archive_max,
             output_journal=output_journal,
         )
-    except BaseException:
-        output_journal.rollback()
+    except _ManagedOutputRestoreFailure as failure:
+        try:
+            output_journal.rollback()
+        except _ManagedOutputRollbackError as rollback_error:
+            raise failure.operation_error from rollback_error
+        raise failure.operation_error from failure.rollback_error
+    except _ManagedOutputRollbackError as primary_error:
+        try:
+            output_journal.rollback()
+        except _ManagedOutputRollbackError as rollback_error:
+            raise primary_error from rollback_error
+        raise
+    except BaseException as operation_error:
+        try:
+            output_journal.rollback()
+        except _ManagedOutputRollbackError as rollback_error:
+            raise operation_error from rollback_error
         raise
