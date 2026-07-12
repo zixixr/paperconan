@@ -1,4 +1,5 @@
 import gc
+import os
 import types
 import weakref
 from collections.abc import Mapping, Sequence, Set
@@ -106,6 +107,63 @@ def test_previous_file_sheet_is_released_before_next_load(tmp_path, monkeypatch)
         str(data), str(tmp_path / "out"), write_html=False
     )
     assert scan["coverage"]["files_succeeded"] == 2
+
+
+def test_deferred_reload_releases_each_source_before_next_load(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    for name in ("a.csv", "b.csv"):
+        (data / name).write_text("placeholder", encoding="utf-8")
+    records = []
+    calls = []
+    values = [
+        11.125,
+        7.375,
+        19.625,
+        3.875,
+        14.125,
+        8.625,
+        17.375,
+        5.125,
+        13.875,
+        9.625,
+        16.125,
+        6.375,
+        12.625,
+        10.875,
+    ]
+
+    def stub_load(path):
+        if records:
+            gc.collect()
+            assert records[-1]() is None
+        sheet = _WeakSheet.from_rows(
+            [["left", "right"]]
+            + [[value, value] for value in values]
+        )
+        records.append(weakref.ref(sheet))
+        calls.append(path)
+        return TableLoadResult({
+            os.path.splitext(os.path.basename(path))[0]: sheet
+        })
+
+    monkeypatch.setattr(audit, "load_table_result", stub_load)
+
+    scan = audit.scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    assert calls == [
+        str(data / "a.csv"),
+        str(data / "b.csv"),
+        str(data / "a.csv"),
+        str(data / "b.csv"),
+    ]
+    assert scan["coverage"]["files_succeeded"] == 2
+    gc.collect()
+    assert all(record() is None for record in records)
 
 
 def test_compactness_walker_detects_attribute_closure_and_list_retention():

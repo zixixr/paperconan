@@ -6,6 +6,8 @@ import sys
 import paperconan._audit as audit
 from paperconan._audit import scan_dir, write_markdown_report
 from paperconan._html import write_html_report
+from paperconan._input import TableLoadResult
+from paperconan._sheet import Sheet
 
 
 def _data(tmp_path):
@@ -61,6 +63,108 @@ def test_runtime_metadata_is_opt_in(tmp_path):
         item["elapsed_ms"] >= 0
         for item in scan["scan_stats"]["sheets"]
     )
+
+
+def test_runtime_metadata_attributes_deferred_evidence_to_its_source(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    for name in ("a.csv", "b.csv"):
+        (data / name).write_text("placeholder", encoding="utf-8")
+    now = [0.0]
+    load_counts = {"a.csv": 0, "b.csv": 0}
+
+    def perf_counter():
+        return now[0]
+
+    def load_table(path):
+        name = os.path.basename(path)
+        load_counts[name] += 1
+        if name == "a.csv":
+            now[0] += 2.0 if load_counts[name] == 1 else 5.0
+            return TableLoadResult({
+                "affected": Sheet.from_rows([
+                    ["left", "right"],
+                    [1.125, 7.375],
+                    [2.625, 4.875],
+                    [5.375, 3.125],
+                ]),
+                "unaffected": Sheet.from_rows([
+                    ["label"],
+                    ["text"],
+                ]),
+            })
+        now[0] += 4.0
+        return TableLoadResult({
+            "other": Sheet.from_rows([
+                ["label"],
+                ["text"],
+            ])
+        })
+
+    def relation_finding(*_args, **_kwargs):
+        return [{
+            "kind": "constant_offset",
+            "severity": "medium",
+            "rule": "runtime attribution",
+        }]
+
+    for name in (
+        "detect_arithmetic_progression",
+        "detect_equal_pairs",
+        "detect_within_column_patterns",
+        "detect_dispersed_repeats",
+        "detect_identical_after_rounding",
+        "detect_grim_grimmer",
+    ):
+        monkeypatch.setattr(
+            audit, name, lambda *_args, **_kwargs: []
+        )
+    monkeypatch.setattr(audit, "detect_relations", relation_finding)
+    monkeypatch.setattr(
+        audit,
+        "detect_row_pair_digit_coupling",
+        lambda *_args, **_kwargs: ([], {"findings_omitted": 0}),
+    )
+    monkeypatch.setattr(
+        audit,
+        "apply_profile_to_findings",
+        lambda *_args, **_kwargs: None,
+    )
+    original_block_evidence = audit._block_evidence
+
+    def timed_block_evidence(*args, **kwargs):
+        now[0] += 3.0
+        return original_block_evidence(*args, **kwargs)
+
+    monkeypatch.setattr(audit.time, "perf_counter", perf_counter)
+    monkeypatch.setattr(audit, "load_table_result", load_table)
+    monkeypatch.setattr(
+        audit, "_block_evidence", timed_block_evidence
+    )
+
+    scan = scan_dir(
+        str(data),
+        str(tmp_path / "out"),
+        write_html=False,
+        include_runtime=True,
+    )
+
+    files = {
+        item["file"]: item for item in scan["scan_stats"]["files"]
+    }
+    sheets = {
+        (item["file"], item["sheet"]): item
+        for item in scan["scan_stats"]["sheets"]
+    }
+    assert load_counts == {"a.csv": 2, "b.csv": 1}
+    assert files["a.csv"]["elapsed_ms"] == 10000.0
+    assert files["b.csv"]["elapsed_ms"] == 4000.0
+    assert sheets[("a.csv", "affected")]["elapsed_ms"] == 3000.0
+    assert sheets[("a.csv", "unaffected")]["elapsed_ms"] == 0.0
+    assert sheets[("b.csv", "other")]["elapsed_ms"] == 0.0
+    assert scan["scan_stats"]["elapsed_ms"] == 14000.0
 
 
 def test_cli_runtime_metadata_switch(tmp_path):

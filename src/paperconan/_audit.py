@@ -3304,6 +3304,14 @@ def _elapsed_ms(start) -> float | None:
     return round((time.perf_counter() - start) * 1000, 3)
 
 
+def _add_elapsed_ms(stat, start):
+    if stat is None or start is None:
+        return
+    elapsed = _elapsed_ms(start)
+    current = stat.get("elapsed_ms")
+    stat["elapsed_ms"] = round((current or 0.0) + elapsed, 3)
+
+
 def _cap_block_findings(groups, cap):
     """Trim a block's findings to at most `cap`, keeping the highest-severity ones.
 
@@ -3389,7 +3397,9 @@ def _apply_global_finding_budget(report_blocks, cross_sheet_findings, cap):
     return len(entries) - cap
 
 
-def _attach_deferred_evidence(report_blocks, coverage):
+def _attach_deferred_evidence(
+    report_blocks, coverage, runtime_stats=None
+):
     blocks_by_path = {}
     for block in report_blocks:
         path = block.get("_evidence_path")
@@ -3404,37 +3414,79 @@ def _attach_deferred_evidence(report_blocks, coverage):
             ]
             if not retained_blocks:
                 continue
-            sheets = _load_table_sheets(path)
-            for block in retained_blocks:
-                sheet = sheets.get(block["sheet"])
-                if sheet is None:
-                    continue
-                if not isinstance(sheet, Sheet):
-                    sheet = Sheet.from_rows(sheet)
-                r0, r1, c0, c1 = block["_evidence_context"]
-                header = block["block"]["header"]
-                evidence_truncated = False
-                for group_name in BLOCK_FINDING_GROUPS:
-                    evidence_truncated = _attach_evidence(
-                        block.get(group_name) or [],
-                        sheet,
-                        r0,
-                        r1,
-                        c0,
-                        c1,
-                        header,
-                    ) or evidence_truncated
-                if evidence_truncated:
-                    coverage.add_limitation(
-                        "block",
-                        "evidence_limit",
-                        file=block["file"],
-                        sheet=block["sheet"],
-                        rows=block["block"]["rows"],
-                        cols=block["block"]["cols"],
-                        max_rows=_MAX_EV_ROWS,
-                        max_cols=_MAX_EV_COLS,
-                    )
+            path_runtime = (
+                runtime_stats.get(path)
+                if runtime_stats is not None
+                else None
+            )
+            file_start = (
+                time.perf_counter()
+                if path_runtime is not None
+                else None
+            )
+            try:
+                load_result = load_table_result(path)
+                sheets = load_result.sheets
+                try:
+                    for block in retained_blocks:
+                        sheet_name = block["sheet"]
+                        sheet_stat = (
+                            path_runtime["sheets"].get(sheet_name)
+                            if path_runtime is not None
+                            else None
+                        )
+                        sheet_start = (
+                            time.perf_counter()
+                            if sheet_stat is not None
+                            else None
+                        )
+                        sheet = sheets.get(sheet_name)
+                        try:
+                            if sheet is None:
+                                continue
+                            if not isinstance(sheet, Sheet):
+                                sheet = Sheet.from_rows(sheet)
+                            r0, r1, c0, c1 = (
+                                block["_evidence_context"]
+                            )
+                            header = block["block"]["header"]
+                            evidence_truncated = False
+                            for group_name in BLOCK_FINDING_GROUPS:
+                                evidence_truncated = _attach_evidence(
+                                    block.get(group_name) or [],
+                                    sheet,
+                                    r0,
+                                    r1,
+                                    c0,
+                                    c1,
+                                    header,
+                                ) or evidence_truncated
+                            if evidence_truncated:
+                                coverage.add_limitation(
+                                    "block",
+                                    "evidence_limit",
+                                    file=block["file"],
+                                    sheet=sheet_name,
+                                    rows=block["block"]["rows"],
+                                    cols=block["block"]["cols"],
+                                    max_rows=_MAX_EV_ROWS,
+                                    max_cols=_MAX_EV_COLS,
+                                )
+                        finally:
+                            _add_elapsed_ms(sheet_stat, sheet_start)
+                            del sheet
+                finally:
+                    del sheets
+                    del load_result
+            finally:
+                _add_elapsed_ms(
+                    (
+                        path_runtime["file"]
+                        if path_runtime is not None
+                        else None
+                    ),
+                    file_start,
+                )
     finally:
         for block in report_blocks:
             block.pop("_evidence_path", None)
@@ -3912,6 +3964,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     within_sheet_fraction_findings = []
     scan_errors = []
     scan_stats = {"files": [], "sheets": []}
+    deferred_runtime_stats = {} if include_runtime else None
     scan_start = time.perf_counter() if include_runtime else None
 
     for path in files:
@@ -3926,6 +3979,18 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         scan_errors.extend(result.errors)
         scan_stats["files"].extend(result.stats["files"])
         scan_stats["sheets"].extend(result.stats["sheets"])
+        if deferred_runtime_stats is not None:
+            deferred_runtime_stats[path] = {
+                "file": (
+                    result.stats["files"][0]
+                    if result.stats["files"]
+                    else None
+                ),
+                "sheets": {
+                    item["sheet"]: item
+                    for item in result.stats["sheets"]
+                },
+            }
         del result
 
     _demote_dense_sheets(report_blocks, profile=profile)
@@ -3979,7 +4044,11 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             )
             state.findings_omitted += global_omitted
     if evidence:
-        _attach_deferred_evidence(report_blocks, coverage)
+        _attach_deferred_evidence(
+            report_blocks,
+            coverage,
+            runtime_stats=deferred_runtime_stats,
+        )
 
     if digit_reports:
         adj, sig = benjamini_hochberg([d["p"] for d in digit_reports], alpha=0.05)

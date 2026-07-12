@@ -307,6 +307,70 @@ def test_load_table_result_calls_extractor_once_with_metadata(
     assert result.sheets[sheet_name].cell(1, 0) == 1
 
 
+@pytest.mark.parametrize(
+    ("suffix", "loader_name", "sheet_name"),
+    [
+        (".pdf", "load_pdf_tables", "tables!p1_t1"),
+        (".docx", "load_docx_tables", "tables!t1"),
+    ],
+)
+def test_deferred_evidence_reload_preserves_extraction_cell_cap(
+    tmp_path, monkeypatch, suffix, loader_name, sheet_name
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    path = data / f"tables{suffix}"
+    path.write_bytes(b"placeholder")
+    calls = []
+    values = [
+        11.125,
+        7.375,
+        19.625,
+        3.875,
+        14.125,
+        8.625,
+        17.375,
+        5.125,
+        13.875,
+        9.625,
+        16.125,
+        6.375,
+        12.625,
+        10.875,
+    ]
+    tables = {
+        sheet_name: [["left", "right"]]
+        + [[value, value] for value in values]
+    }
+
+    def stub_loader(
+        called_path, *, max_cells=None, with_metadata=False
+    ):
+        calls.append((called_path, max_cells, with_metadata))
+        if with_metadata:
+            return ExtractedTableResult(tables=tables)
+        return tables
+
+    monkeypatch.setattr(audit, "_MAX_CELLS", 11)
+    monkeypatch.setattr(extract, loader_name, stub_loader)
+
+    scan = audit.scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    assert scan["relations_blocks"]
+    assert any(
+        "evidence" in finding
+        for block in scan["relations_blocks"]
+        for group in audit.BLOCK_FINDING_GROUPS
+        for finding in block[group]
+    )
+    assert calls == [
+        (str(path), 11, True),
+        (str(path), 11, True),
+    ]
+
+
 def test_scan_counts_extracted_cell_limit_once(tmp_path, monkeypatch):
     data = tmp_path / "data"
     data.mkdir()
