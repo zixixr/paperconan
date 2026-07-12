@@ -101,12 +101,18 @@ def _remaining_final_size_allowance(
     current_size,
     dest_path,
     reuses_old,
+    sidecar_delta=0,
 ):
     replacement_credit = _existing_destination_size(
         dest_path, reuses_old
     )
     return (
-        _MAX_PAPER_BYTES - current_size + replacement_credit,
+        (
+            _MAX_PAPER_BYTES
+            - current_size
+            + replacement_credit
+            - sidecar_delta
+        ),
         replacement_credit,
     )
 
@@ -383,6 +389,8 @@ def _extract_archive_members(
     open_member,
     member_errors,
     transient_paths=(),
+    sidecar_delta_for_names=None,
+    cap_state=None,
 ):
     extracted = []
     preserved = set()
@@ -392,6 +400,7 @@ def _extract_archive_members(
         member_name(member) for member in members
     )
     reusable = set(_safe_managed_names(out_dir, reusable_names))
+    accepted_names = set()
     for member, preferred in zip(members, preferred_names):
         source_name = member_name(member)
         name = _managed_output_name(
@@ -400,11 +409,17 @@ def _extract_archive_members(
         reuses_old = name in reusable
         reusable.discard(name)
         dest = os.path.join(out_dir, name)
+        sidecar_delta = (
+            sidecar_delta_for_names(accepted_names | {name})
+            if sidecar_delta_for_names is not None
+            else 0
+        )
         remaining, replacement_credit = (
             _remaining_final_size_allowance(
                 written,
                 dest,
                 reuses_old,
+                sidecar_delta,
             )
         )
         write_limit = min(max_member_bytes, remaining)
@@ -412,6 +427,11 @@ def _extract_archive_members(
             write_limit <= 0
             or member_size(member) > write_limit
         ):
+            if (
+                cap_state is not None
+                and remaining < max_member_bytes
+            ):
+                cap_state["exceeded"] = True
             if reuses_old and os.path.lexists(dest):
                 preserved.add(name)
             continue
@@ -433,6 +453,7 @@ def _extract_archive_members(
             if committed:
                 written = written - replacement_credit + size
                 extracted.append(dest)
+                accepted_names.add(name)
                 skipped.append({
                     "name": source_name,
                     "reason": (
@@ -450,6 +471,7 @@ def _extract_archive_members(
             continue
         written = written - replacement_credit + size
         extracted.append(dest)
+        accepted_names.add(name)
     return extracted, preserved, skipped
 
 
@@ -478,6 +500,8 @@ def _extract_tabular_zip_managed(
     max_member_bytes,
     *,
     reusable_names,
+    sidecar_delta_for_names=None,
+    cap_state=None,
 ):
     with zipfile.ZipFile(zip_path) as zf:
         infos = [
@@ -499,6 +523,8 @@ def _extract_tabular_zip_managed(
                 zipfile.BadZipFile,
             ),
             transient_paths=(zip_path,),
+            sidecar_delta_for_names=sidecar_delta_for_names,
+            cap_state=cap_state,
         )
 
 
@@ -527,6 +553,8 @@ def _extract_tabular_tar_managed(
     max_member_bytes,
     *,
     reusable_names,
+    sidecar_delta_for_names=None,
+    cap_state=None,
 ):
     with tarfile.open(tar_path, "r:gz") as tf:
         members = [
@@ -547,6 +575,8 @@ def _extract_tabular_tar_managed(
                 tarfile.TarError,
             ),
             transient_paths=(tar_path,),
+            sidecar_delta_for_names=sidecar_delta_for_names,
+            cap_state=cap_state,
         )
 
 
@@ -568,6 +598,8 @@ def _download_oa_package(
     max_bytes,
     *,
     reusable_names=(),
+    sidecar_delta_for_names=None,
+    cap_state=None,
 ):
     """Download the static PMC OA tar.gz, extract its tabular members, drop the tarball."""
     tmp = _temporary_archive_path(out_dir, ".tar.gz")
@@ -586,6 +618,8 @@ def _download_oa_package(
                     out_dir,
                     max_bytes,
                     reusable_names=reusable_names,
+                    sidecar_delta_for_names=sidecar_delta_for_names,
+                    cap_state=cap_state,
                 )
             )
             skipped.extend(member_skipped)
@@ -606,7 +640,9 @@ def _download_oa_package(
 
 def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_bytes,
                                     archive_max=_ARCHIVE_MAX, *,
-                                    reusable_names=()):
+                                    reusable_names=(),
+                                    sidecar_delta_for_names=None,
+                                    cap_state=None):
     """Fetch a supplementary zip (Europe PMC), extract its tabular members, drop the zip.
 
     The archive downloads with the larger ``archive_max`` cap; each extracted table is
@@ -627,6 +663,8 @@ def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_byte
                     out_dir,
                     max_bytes,
                     reusable_names=reusable_names,
+                    sidecar_delta_for_names=sidecar_delta_for_names,
+                    cap_state=cap_state,
                 )
             )
             skipped.extend(member_skipped)
@@ -645,12 +683,41 @@ def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_byte
             pass
 
 
+def _source_sidecar_bytes(cand, out_dir, managed_files):
+    prov = {
+        "doi": cand.get("doi"),
+        "title": cand.get("title"),
+        "source": cand.get("source"),
+        "cand_id": cand.get("cand_id"),
+        "related_dois": cand.get("related_dois") or [],
+        "managed_files": _safe_managed_names(out_dir, managed_files),
+    }
+    return (
+        json.dumps(
+            prov,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _source_sidecar_replacement_delta(cand, out_dir, managed_files):
+    path = os.path.join(out_dir, SOURCE_SIDECAR)
+    try:
+        previous_size = os.path.getsize(path)
+    except OSError:
+        previous_size = 0
+    return (
+        len(_source_sidecar_bytes(cand, out_dir, managed_files))
+        - previous_size
+    )
+
+
 def _write_source_sidecar(cand, out_dir, managed_files):
     """Record which paper/dataset these downloads came from, for scan.json provenance."""
-    prov = {"doi": cand.get("doi"), "title": cand.get("title"),
-            "source": cand.get("source"), "cand_id": cand.get("cand_id"),
-            "related_dois": cand.get("related_dois") or [],
-            "managed_files": _safe_managed_names(out_dir, managed_files)}
+    payload = _source_sidecar_bytes(cand, out_dir, managed_files)
     fd = None
     temp_path = None
     try:
@@ -659,17 +726,10 @@ def _write_source_sidecar(cand, out_dir, managed_files):
             suffix=".part",
             dir=out_dir,
         )
-        stream = os.fdopen(fd, "w", encoding="utf-8")
+        stream = os.fdopen(fd, "wb")
         fd = None
         with stream as fh:
-            json.dump(
-                prov,
-                fh,
-                indent=2,
-                sort_keys=True,
-                default=str,
-            )
-            fh.write("\n")
+            fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(temp_path, os.path.join(out_dir, SOURCE_SIDECAR))
@@ -702,6 +762,7 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
     downloaded, skipped = [], []
     new_managed = set()
     preserved_managed = set()
+    cap_state = {"exceeded": False}
     for file_ref in files:
         requested_name = str(file_ref.get("name") or "").strip()
         source_url = str(file_ref.get("download_url") or "")
@@ -719,13 +780,19 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
         reuses_old = output_name in reusable_names
         reusable_names.discard(output_name)
         dest = os.path.join(out_dir, output_name)
+        potential_managed = old_managed | new_managed | {output_name}
+        sidecar_delta = _source_sidecar_replacement_delta(
+            cand, out_dir, potential_managed
+        )
         remaining, _ = _remaining_final_size_allowance(
             _dir_size(out_dir),
             dest,
             reuses_old,
+            sidecar_delta,
         )
         download_limit = min(max_bytes, remaining)
         if download_limit <= 0:
+            cap_state["exceeded"] = True
             skipped.append({
                 "name": requested_name,
                 "reason": "paper data exceeds per-paper cap",
@@ -742,6 +809,12 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
             downloaded.append(res["path"])
             new_managed.add(output_name)
         else:
+            if (
+                remaining < max_bytes
+                and "exceeds max_bytes"
+                in str(res.get("skipped_reason") or "")
+            ):
+                cap_state["exceeded"] = True
             skipped.append({
                 "name": requested_name,
                 "reason": res.get("skipped_reason"),
@@ -751,6 +824,15 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
     pkg = cand.get("oa_package")
     if pkg and pkg.get("url"):
         archive_start = len(downloaded)
+        archive_base_managed = old_managed | new_managed
+
+        def archive_sidecar_delta(names):
+            return _source_sidecar_replacement_delta(
+                cand,
+                out_dir,
+                archive_base_managed | set(names),
+            )
+
         archive_ok, archive_preserved = _download_oa_package(
             pkg,
             out_dir,
@@ -758,6 +840,8 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
             skipped,
             max_bytes,
             reusable_names=reusable_names,
+            sidecar_delta_for_names=archive_sidecar_delta,
+            cap_state=cap_state,
         )
         preserved_managed.update(archive_preserved)
         if not archive_ok:
@@ -767,6 +851,15 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
     arch = cand.get("supplementary_archive")
     if not downloaded and arch and arch.get("url"):
         archive_start = len(downloaded)
+        archive_base_managed = old_managed | new_managed
+
+        def archive_sidecar_delta(names):
+            return _source_sidecar_replacement_delta(
+                cand,
+                out_dir,
+                archive_base_managed | set(names),
+            )
+
         archive_ok, archive_preserved = _download_supplementary_archive(
             arch,
             out_dir,
@@ -775,6 +868,8 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
             max_bytes,
             archive_max=archive_max,
             reusable_names=reusable_names,
+            sidecar_delta_for_names=archive_sidecar_delta,
+            cap_state=cap_state,
         )
         preserved_managed.update(archive_preserved)
         if not archive_ok:
@@ -784,7 +879,22 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
     managed_files = new_managed | preserved_managed
     stale_managed = old_managed - managed_files
     committed_managed = managed_files | stale_managed
-    if _write_source_sidecar(cand, out_dir, committed_managed):
+    preserve_previous_refresh = (
+        cap_state["exceeded"]
+        and bool(old_managed)
+        and not new_managed
+    )
+    sidecar_delta = _source_sidecar_replacement_delta(
+        cand, out_dir, committed_managed
+    )
+    sidecar_fits = (
+        _dir_size(out_dir) + sidecar_delta <= _MAX_PAPER_BYTES
+    )
+    if (
+        not preserve_previous_refresh
+        and sidecar_fits
+        and _write_source_sidecar(cand, out_dir, committed_managed)
+    ):
         failed_removals = set(
             _remove_managed_files(out_dir, stale_managed)
         )

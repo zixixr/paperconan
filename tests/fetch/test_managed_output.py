@@ -1064,30 +1064,32 @@ def _bounded_download_stub(monkeypatch, payloads, calls):
         return {"ok": True, "path": dest, "size": size}
 
     monkeypatch.setattr(_download, "download_file", download)
-    monkeypatch.setattr(
-        _download, "_read_source_sidecar", lambda _out_dir: {}
+
+
+def _real_sidecar_size(tmp_path, cand, managed_files):
+    probe = tmp_path / "sidecar-probe"
+    probe.mkdir(exist_ok=True)
+    assert _download._write_source_sidecar(
+        cand, str(probe), managed_files
     )
-    monkeypatch.setattr(
-        _download,
-        "_write_source_sidecar",
-        lambda _cand, _out_dir, _managed_files: True,
-    )
+    return (probe / _download.SOURCE_SIDECAR).stat().st_size
 
 
 def test_direct_download_accepts_exact_fit_then_stops_at_paper_cap(
     tmp_path, monkeypatch
 ):
-    (tmp_path / "existing.bin").write_bytes(b"seed")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "existing.bin").write_bytes(b"seed")
     payloads = {
         "https://x/exact": b"123456",
         "https://x/overflow": b"x",
     }
     calls = []
     _bounded_download_stub(monkeypatch, payloads, calls)
-    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", 10)
-
-    result = _download.download_candidate({
+    cand = {
         "cand_id": "source:1",
+        "source": "source",
         "tabular_files": [
             {
                 "name": "exact.csv",
@@ -1098,35 +1100,52 @@ def test_direct_download_accepts_exact_fit_then_stops_at_paper_cap(
                 "download_url": "https://x/overflow",
             },
         ],
-    }, str(tmp_path))
+    }
+    cap = (
+        4
+        + 6
+        + _real_sidecar_size(tmp_path, cand, ["exact.csv"])
+    )
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", cap)
 
-    assert result["downloaded"] == [str(tmp_path / "exact.csv")]
+    result = _download.download_candidate(cand, str(out_dir))
+
+    assert result["downloaded"] == [str(out_dir / "exact.csv")]
     assert calls == [("https://x/exact", 6)]
-    assert _download._dir_size(tmp_path) == 10
-    assert not (tmp_path / "overflow.csv").exists()
+    assert _download._dir_size(out_dir) == cap
+    assert not (out_dir / "overflow.csv").exists()
 
 
 def test_direct_download_rejects_one_byte_paper_cap_overflow(
     tmp_path, monkeypatch
 ):
-    (tmp_path / "existing.bin").write_bytes(b"seed")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "existing.bin").write_bytes(b"seed")
     calls = []
     _bounded_download_stub(
         monkeypatch,
         {"https://x/overflow": b"1234567"},
         calls,
     )
-    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", 10)
+    cand = _candidate("overflow.csv", "https://x/overflow")
+    cap = (
+        4
+        + 6
+        + _real_sidecar_size(tmp_path, cand, ["overflow.csv"])
+    )
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", cap)
 
     result = _download.download_candidate(
-        _candidate("overflow.csv", "https://x/overflow"),
-        str(tmp_path),
+        cand,
+        str(out_dir),
     )
 
     assert result["downloaded"] == []
     assert calls == [("https://x/overflow", 6)]
-    assert _download._dir_size(tmp_path) == 4
-    assert not (tmp_path / "overflow.csv").exists()
+    assert _download._dir_size(out_dir) <= cap
+    assert not (out_dir / "overflow.csv").exists()
+    assert (out_dir / _download.SOURCE_SIDECAR).exists()
 
 
 @pytest.mark.parametrize(
@@ -1136,25 +1155,40 @@ def test_direct_download_rejects_one_byte_paper_cap_overflow(
 def test_direct_download_credits_managed_replacement_once(
     tmp_path, monkeypatch, replacement, accepted
 ):
-    old = tmp_path / "table.csv"
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    old = out_dir / "table.csv"
     old.write_bytes(b"123456")
-    (tmp_path / "existing.bin").write_bytes(b"seed")
+    (out_dir / "existing.bin").write_bytes(b"seed")
+    old_cand = {
+        "cand_id": "old",
+        "source": "source",
+        "tabular_files": [],
+    }
+    assert _download._write_source_sidecar(
+        old_cand, str(out_dir), ["table.csv"]
+    )
+    original_sidecar = (
+        out_dir / _download.SOURCE_SIDECAR
+    ).read_bytes()
     calls = []
     _bounded_download_stub(
         monkeypatch,
         {"https://x/table": replacement},
         calls,
     )
-    monkeypatch.setattr(
-        _download,
-        "_read_source_sidecar",
-        lambda _out_dir: {"managed_files": ["table.csv"]},
+    cand = _candidate("table.csv", "https://x/table")
+    cand["title"] = "replacement provenance that grows the sidecar"
+    cap = (
+        4
+        + 6
+        + _real_sidecar_size(tmp_path, cand, ["table.csv"])
     )
-    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", 10)
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", cap)
 
     result = _download.download_candidate(
-        _candidate("table.csv", "https://x/table"),
-        str(tmp_path),
+        cand,
+        str(out_dir),
     )
 
     assert calls == [("https://x/table", 6)]
@@ -1164,7 +1198,59 @@ def test_direct_download_credits_managed_replacement_once(
     assert old.read_bytes() == (
         replacement if accepted else b"123456"
     )
-    assert _download._dir_size(tmp_path) == 10
+    if accepted:
+        assert _download._dir_size(out_dir) == cap
+    else:
+        assert (
+            out_dir / _download.SOURCE_SIDECAR
+        ).read_bytes() == original_sidecar
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+@pytest.mark.parametrize(
+    ("member_body", "accepted"),
+    [(b"123456", True), (b"1234567", False)],
+)
+def test_candidate_archive_cap_includes_real_sidecar(
+    tmp_path, monkeypatch, archive_kind, member_body, accepted
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "existing.bin").write_bytes(b"seed")
+    payload = _archive_payload(
+        archive_kind,
+        [("nested/table.csv", member_body)],
+    )
+
+    def archive_download(url, dest, **kwargs):
+        Path(dest).write_bytes(payload)
+        return {"ok": True, "path": dest, "size": len(payload)}
+
+    monkeypatch.setattr(_download, "download_file", archive_download)
+    cand = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+        **_archive_fields(archive_kind),
+    }
+    cap = (
+        4
+        + 6
+        + _real_sidecar_size(tmp_path, cand, ["table.csv"])
+    )
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", cap)
+
+    result = _download.download_candidate(cand, str(out_dir))
+
+    table = out_dir / "table.csv"
+    assert result["downloaded"] == ([str(table)] if accepted else [])
+    assert table.exists() is accepted
+    assert _download._dir_size(out_dir) <= cap
+    sidecar = out_dir / _download.SOURCE_SIDECAR
+    assert sidecar.exists()
+    assert json.loads(sidecar.read_text(encoding="utf-8"))[
+        "managed_files"
+    ] == (["table.csv"] if accepted else [])
 
 
 def _write_archive(path, archive_kind, members):
