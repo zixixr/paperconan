@@ -176,7 +176,7 @@ open demo_paper/audit/report.html
 
 ## 路线图
 
-已完成：`.xlsx` / 旧版 `.xls` / `.xlsm` / `.csv` / `.tsv` 输入 · HTML 报告与 evidence 高亮 · PDF / Word 表格输入 · `paperconan fetch` 开放源检索下载 · Agent skill bundle · Columnar engine（calamine 快速读取，含旧版 Excel）+ 内存/输出保护 · `review` / `forensic` / `triage` profiles 与确定性 prefilter · 跨 sheet / 跨文件整列复用 + 矩阵小数位复用 + 连续段偏移 + 整数差共享小数 + 固定行向量跨图复发等重复/变换检测器。
+已完成：`.xlsx` / 旧版 `.xls` / `.xlsm` / `.csv` / `.tsv` 输入 · HTML 报告与 evidence 高亮 · PDF / Word 表格输入 · `paperconan fetch` 开放源检索下载 · Agent skill bundle · Columnar engine（calamine 快速读取，含旧版 Excel）+ 内存/输出保护 · `review` / `forensic` / `triage` profiles 与确定性 prefilter · 跨 sheet / 跨文件整列复用 + 矩阵小数位复用 + 连续段偏移 + 整数差共享小数 + 固定行向量跨图复发 + **行向比值/相同（含跨块缩放复用）+ 整十差保尾 + 高精度尾数聚集** 等重复/变换检测器。
 
 未完成：跨论文扫描（一个 lab / 作者组多篇一起看复用）· 图表像素数字化 · 图像取证（Western blot / 显微镜重复拼接）· 与 PubPeer Public API 联动。
 

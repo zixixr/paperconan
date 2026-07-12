@@ -48,6 +48,18 @@
 - **常见误报**：极少——要求高精度小数尾且 ≥3 种不同的高精度小数。单位换算 / 派生列若碰巧保留小数尾要人工确认。
 - **解读时**：`n_shared_fraction` 报的是**真正共享非零小数**的行数（不含整数对整数的行）；`n_high_precision` 是不同高精度小数的种类数。
 
+### `round_shift_shared_fraction`
+- **原理**：`integer_diff_shared_fraction` 的低精度版。两列逐行**共享相同小数尾**、整数部分差为**非零的 10 的整数倍**时触发。高精度版要求 ≥4 位小数，本条只要求"差全是 10 的倍数"作为额外结构约束，从而在 2–3 位小数的常见台式读数上也能抓。门槛：既是整十差又带真小数尾的行 ≥ max(5, 0.7n)、所有非零差都是 10 的倍数、且共享小数尾 ≥3 种。
+- **典型命中**：作者把一组数按整十"微调"成另一组、保留小数（两组逐行差 60, −10, −20, 20…全是 10 的倍数，`.34/.58/.86` 尾数全同）。
+- **常见误报**：整数列按整十平移（无真小数尾）已被排除；恒定的整十偏移会先命中 `constant_offset`。
+- **解读时**：`n_shared_fraction` 是共享真小数尾的行数；确认两列确是独立测量而非派生。
+
+### `constant_ratio_row` / `identical_row`
+- **原理**：**同一 block 内两行**（而非两列）在最长连续列段上成精确比值（`row_b = row_a × k`, k≠1）或逐值完全相同。针对"实验条件在行、逐格测量在列"的布局——这类关系不落在任何列对上，列向 `detect_relations` 完全看不到。比值容差 1e-3（吸收 2–6 位有效数字舍入），段长 ≥12 列，且段内 ≥6 个不同值。
+- **典型命中**：两条**不同实验条件**的行逐列恰好差一个固定比例（`shUSP15-2+shPARP1-2` = `shUSP15-2+pPARP1` × 1.14，78 列全中）；或不同标签下一整行数据完全相同。
+- **常见误报**：整十/整百等 power-of-ten 比值（单位换算/百分比互换）标 `likely_benign`；命名含单位/归一等派生词的行按 review 降权（`derived_or_unit_conversion`）。
+- **解读时**：看 `ratio`/`run_length`/`row_a`/`row_b`；确认两行确是独立条件而非派生/换算。
+
 ### `many_equal_pairs`
 - **原理**：两列 ≥ 50% 行 byte-identical，但不是完全相同（有少量手改痕迹）。
 - **典型命中**："9/10 完全一致只改 1 格" 的造假指纹。
@@ -116,6 +128,12 @@
 - **典型命中**：批量编造数字的指纹。
 - **常见误报**：单位换算 / 公式派生导致天然出现 `.00` / `.50`。
 
+### `decimal_tail_clustering`
+- **原理**：在大量**不同**高精度值里，少数几个**3 位小数尾数**高频集中——数值取自一小撮固定小数部分（拷贝/派生）而非独立测量的指纹，常见互补对（尾数相加 = 1000）。只取 ≥3 位小数的值、需 ≥100 个、top-6 尾数覆盖 ≥40%（远高于均匀分布的 ~0.6% 与该 N 下的偶然集中），**且完整小数部分需大多不同**——否则量化/公分母列（如 k/7、eighths）会平凡地共享尾数造成误报。|v|≥1e7 的值跳过（读精度噪声）。与 `within_col_value_duplication`（整值重复）、`repeated_two_decimal_endings`（2 位、无集中度检验）不同。
+- **典型命中**：一张 568 个数的表里,尾数 714 出现 86 次、286 出现 81 次…6 个尾数占 81%（互补对 714+286=1000）。
+- **常见误报**：量化 / 公分母数据（少数几个小数）已被"完整小数大多不同"闸门排除；仍要确认这批高精度值确是独立测量。
+- **解读时**：看 `top`（各尾数及次数）、`top_share`、`complementary_pairs`、`n_distinct_fraction`。
+
 ---
 
 ## 统计自洽性类 (summary-statistics consistency detectors)
@@ -166,6 +184,12 @@
 - **常见误报**：等差 / 等比 / round-number 阶梯（已排除）；**合法复用的标准曲线 / 参考向量跨图展示**（这是本类固有的误报面）；同一图内复发（预期的 replicate 结构，已要求跨 ≥2 图）。
 - **解读时**：看 `vector`、`n_occurrences`、`n_figures` 和各出现位置；因固有误报面较大，**优先确认这几张图之间是否有正当理由共享同一向量**，别当复用铁证那样直接下结论。
 
+### `scaled_row_reuse` / `identical_row_reuse`
+- **原理**：`constant_ratio_row` / `identical_row` 的**跨块 / 跨 sheet** 版。把每张表按连续数据行切成 band（cohort 块），比较**不同 band 或不同 sheet** 的行对（只比不同 band，避免与同块的 `constant_ratio_row` 重复），找 `row_b = row_a × k`（k≠1，`scaled`）或逐值完全相同（k=1，`identical`）的最长连续列段。带候选/预算上限，超限走 stderr、不静默截断。
+- **典型命中**：同一条件在两种处理下应独立，却是标量倍关系（DMSO 组 `shUSP15-2+pPARP1` = MMS 组同条件 × 1.05，逐列 204 格全中）；某队列的数据组原样出现在另一队列/图。
+- **常见误报**：power-of-ten 比值标 benign；**同图号 + 不同 sheet + 同名行**的 `identical_row_reuse` 视为跨面板共享对照（benign）；同 sheet 跨 block（如 DMSO↔MMS）和不同名行保持 HIGH。
+- **解读时**：看 `ratio`/`run_length`/`same_sheet`/`same_figure`/`block_a`/`block_b`；`same_sheet=true` 的跨块关系（两处理臂之间）最值得看。
+
 ---
 
 ## Profile 降级映射 (`false_positive_context` → 检测器)
@@ -176,7 +200,7 @@
 |---|---|---|---|
 | `axis_or_scan_column` | `arithmetic_progression` | step 是整数，或列名像 day/time/dose/index/2θ 等扫描轴 | 确认这列确实是自变量轴而非测量值 |
 | `censoring_or_boundary_value` | `within_col_value_duplication` | 重复值是 0/1/-1/100 等边界（或 p 值列里的 1） | 边界值天然重复（截断/饱和/缺失计数/校正 p），但若重复的是普通测量值则降级不成立 |
-| `derived_or_unit_conversion` | `constant_ratio` / `exact_linear` / `sum_constant` | 列名含单位/比例/均值/归一等派生词 | 派生列本就和源列严格相关，合理；但要确认它确实是派生而非两次"独立"测量 |
+| `derived_or_unit_conversion` | `constant_ratio` / `exact_linear` / `sum_constant` / `constant_ratio_row` / `scaled_row_reuse` | 列名（或行名）含单位/比例/均值/归一等派生词 | 派生列本就和源列严格相关，合理；但要确认它确实是派生而非两次"独立"测量 |
 | `same_data_replot_or_duplicate_upload` | `cross_sheet_position_identical` / `cross_sheet_value_overlap`（仅 `delta.pattern == perfect_dup`） | 同图号，或表名像 source data / 补充表 | 同一份数据多图重绘属预期；**注意只对 `perfect_dup` 生效——`value_tweaked` 不会被降级，那才是改一格指纹** |
 | `omics_or_large_matrix_boundary_flood` | `within_col_value_duplication` / `within_col_decimal_repetition` | sheet/列名像 gene/protein/padj/logFC 等大矩阵 | omics 大表里 0/1/padj/logFC 边界值海量重复属常态 |
 
