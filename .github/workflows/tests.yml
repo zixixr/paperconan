@@ -18,3 +18,19 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --frozen
       - run: uv run --frozen pytest -q
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
+      - run: uv build --sdist
+      - run: archive=$(find dist -maxdepth 1 -type f -name 'paperconan-*.tar.gz' -print -quit); test -n "$archive"; mkdir sdist-root; tar -xzf "$archive" -C sdist-root --strip-components=1
+      - run: uv venv --python 3.14 .venv
+        working-directory: sdist-root
+      - run: uv pip install --python .venv/bin/python ".[test]"
+        working-directory: sdist-root
+      - run: .venv/bin/python -m pytest -q
+        working-directory: sdist-root

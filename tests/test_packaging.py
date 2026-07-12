@@ -3,8 +3,11 @@ from __future__ import annotations
 import ast
 from collections import Counter
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
+import subprocess
+import sys
+import tarfile
 
 try:
     import tomllib
@@ -16,6 +19,13 @@ import pytest
 from paperconan import __version__
 
 ROOT = Path(__file__).resolve().parents[1]
+PUBLIC_ARCHIVE_ROOTS = (
+    ".github",
+    "tests",
+    "skills",
+    "examples",
+    "docs",
+)
 
 EXPECTED_DEV_GROUP = [
     "pytest>=8",
@@ -27,10 +37,19 @@ EXPECTED_DEV_GROUP = [
 ]
 EXPECTED_PIP_EXTRA = [
     "pytest>=8",
+    "build>=1.2",
     "pdfplumber>=0.11",
     "python-docx>=1.1",
     "xlwt>=1.3",
     "tomli>=2; python_version < '3.11'",
+]
+EXPECTED_LOCK_PIP_EXTRA_DEPENDENCIES = [
+    {"name": "build"},
+    {"name": "pdfplumber"},
+    {"name": "pytest"},
+    {"name": "python-docx"},
+    {"name": "tomli", "marker": "python_full_version < '3.11'"},
+    {"name": "xlwt"},
 ]
 EXPECTED_LOCK_DEV_DEPENDENCIES = [
     {"name": "build"},
@@ -67,6 +86,36 @@ EXPECTED_CI_PYTEST_STEPS = [
     },
     {"run": "uv sync --frozen"},
     {"run": "uv run --frozen pytest -q"},
+]
+EXPECTED_CI_SDIST_STEPS = [
+    {"uses": "actions/checkout@v4"},
+    {
+        "uses": "astral-sh/setup-uv@v6",
+        "with": {
+            "python-version": "3.14",
+        },
+    },
+    {"run": "uv build --sdist"},
+    {
+        "run": (
+            "archive=$(find dist -maxdepth 1 -type f "
+            "-name 'paperconan-*.tar.gz' -print -quit); "
+            'test -n "$archive"; mkdir sdist-root; '
+            'tar -xzf "$archive" -C sdist-root --strip-components=1'
+        ),
+    },
+    {
+        "working-directory": "sdist-root",
+        "run": "uv venv --python 3.14 .venv",
+    },
+    {
+        "working-directory": "sdist-root",
+        "run": 'uv pip install --python .venv/bin/python ".[test]"',
+    },
+    {
+        "working-directory": "sdist-root",
+        "run": ".venv/bin/python -m pytest -q",
+    },
 ]
 INLINE_MATRIX_JOB = """
 pytest:
@@ -130,6 +179,74 @@ def _assert_semantic_members(actual, expected):
     )
 
 
+def _expected_lock_optional_metadata(extra):
+    return [
+        {
+            "name": "build",
+            "marker": f"extra == '{extra}'",
+            "specifier": ">=1.2",
+        },
+        {
+            "name": "pdfplumber",
+            "marker": f"extra == '{extra}'",
+            "specifier": ">=0.11",
+        },
+        {
+            "name": "pytest",
+            "marker": f"extra == '{extra}'",
+            "specifier": ">=8",
+        },
+        {
+            "name": "python-docx",
+            "marker": f"extra == '{extra}'",
+            "specifier": ">=1.1",
+        },
+        {
+            "name": "tomli",
+            "marker": (
+                "python_full_version < '3.11' "
+                f"and extra == '{extra}'"
+            ),
+            "specifier": ">=2",
+        },
+        {
+            "name": "xlwt",
+            "marker": f"extra == '{extra}'",
+            "specifier": ">=1.3",
+        },
+    ]
+
+
+def _tracked_public_files(root=ROOT):
+    try:
+        repository = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            check=False,
+            capture_output=True,
+            cwd=root,
+            text=True,
+        )
+    except OSError:
+        return None
+    if repository.returncode != 0:
+        return None
+    if Path(repository.stdout.strip()).resolve() != root.resolve():
+        return None
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z", "--", *PUBLIC_ARCHIVE_ROOTS],
+        check=True,
+        capture_output=True,
+        cwd=root,
+        text=True,
+    )
+    return {
+        name
+        for name in tracked.stdout.split("\0")
+        if name
+    }
+
+
 def _workflow_job(workflow, job_name):
     lines = workflow.splitlines()
     jobs_index = next(
@@ -185,7 +302,7 @@ def _workflow_steps(job):
     for block in blocks:
         list_indent = len(block[0]) - len(block[0].lstrip())
         first_key, first_value = block[0].lstrip()[2:].split(":", 1)
-        step = {first_key: first_value.strip()}
+        step = {first_key: _yaml_scalar(first_value.strip())}
         section = None
         for line in block[1:]:
             if not line.strip():
@@ -195,13 +312,13 @@ def _workflow_steps(job):
             value = value.strip()
             if indent == list_indent + 2:
                 if value:
-                    step[key] = value
+                    step[key] = _yaml_scalar(value)
                     section = None
                 else:
                     step[key] = {}
                     section = key
             elif indent == list_indent + 4 and section is not None:
-                step[section][key] = value
+                step[section][key] = _yaml_scalar(value)
         step.pop("name", None)
         steps.append(step)
     return steps
@@ -501,6 +618,39 @@ def test_lock_dev_dependency_metadata_matches_pyproject():
     )
 
 
+@pytest.mark.parametrize("extra", ["test", "dev"])
+def test_lock_optional_extra_resolution_matches_pyproject(extra):
+    project = _project_lock_entry()
+
+    _assert_semantic_members(
+        project["optional-dependencies"][extra],
+        EXPECTED_LOCK_PIP_EXTRA_DEPENDENCIES,
+    )
+
+    lock = _load_toml("uv.lock")
+    locked_names = {package["name"] for package in lock["package"]}
+    assert {
+        dependency["name"]
+        for dependency in EXPECTED_LOCK_PIP_EXTRA_DEPENDENCIES
+    } <= locked_names
+
+
+@pytest.mark.parametrize("extra", ["test", "dev"])
+def test_lock_optional_extra_metadata_matches_pyproject(extra):
+    project = _project_lock_entry()
+    marker = f"extra == '{extra}'"
+    metadata = [
+        item
+        for item in project["metadata"]["requires-dist"]
+        if marker in item.get("marker", "")
+    ]
+
+    _assert_semantic_members(
+        metadata,
+        _expected_lock_optional_metadata(extra),
+    )
+
+
 def test_ci_python_matrix_is_exact():
     with (ROOT / ".github/workflows/tests.yml").open(encoding="utf-8") as fh:
         workflow = fh.read()
@@ -523,3 +673,73 @@ def test_ci_pytest_steps_are_exact():
 
     pytest_job = _workflow_job(workflow, "pytest")
     assert _workflow_steps(pytest_job) == EXPECTED_CI_PYTEST_STEPS
+
+
+def test_ci_sdist_steps_build_and_test_only_from_unpacked_root():
+    with (ROOT / ".github/workflows/tests.yml").open(encoding="utf-8") as fh:
+        workflow = fh.read()
+
+    sdist_job = _workflow_job(workflow, "sdist")
+    assert _workflow_steps(sdist_job) == EXPECTED_CI_SDIST_STEPS
+
+
+def test_tracked_public_files_requires_exact_repository_root():
+    assert _tracked_public_files(ROOT / "tests") is None
+
+
+def test_sdist_contains_test_and_skill_closure(tmp_path):
+    dist = tmp_path / "dist"
+    result = subprocess.run(
+        [sys.executable, "-m", "build", "--outdir", str(dist)],
+        check=True,
+        capture_output=True,
+        cwd=ROOT,
+        text=True,
+    )
+    warning_lines = [
+        line
+        for line in (*result.stdout.splitlines(), *result.stderr.splitlines())
+        if "warning:" in line.lower()
+    ]
+    assert not warning_lines, "\n".join(warning_lines)
+
+    archive = next(dist.glob("paperconan-*.tar.gz"))
+    with tarfile.open(archive, "r:gz") as tf:
+        names = {
+            name.split("/", 1)[1]
+            for name in tf.getnames()
+            if "/" in name
+        }
+    required = {
+        "docs/detectors.md",
+        "docs/faq.md",
+        "MANIFEST.in",
+        "tests/__init__.py",
+        "tests/build_fixture.py",
+        "tests/fetch/test_download.py",
+        "tests/fetch/fixtures/dryad_files.json",
+        "tests/fixtures/supp_table.pdf",
+        "tests/golden/tiny_paper.json",
+        "skills/paperconan/SKILL.md",
+        "examples/demo_paper/audit/scan.json",
+        "build_skill_zip.sh",
+        "uv.lock",
+        ".gitignore",
+    }
+    assert required <= names
+
+    tracked_public = _tracked_public_files()
+    if tracked_public is not None:
+        assert tracked_public <= names
+
+    forbidden = set()
+    for name in names:
+        parts = PurePosixPath(name).parts
+        if (
+            (parts and parts[0] in {"recheck", "batches", ".worktrees"})
+            or "__pycache__" in parts
+            or re.search(r"\.py[cod]$", name)
+            or (parts and parts[-1] == ".DS_Store")
+        ):
+            forbidden.add(name)
+    assert not forbidden

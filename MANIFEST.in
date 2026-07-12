@@ -1,0 +1,10 @@
+include LICENSE README.md pyproject.toml uv.lock .gitignore build_skill_zip.sh
+include MANIFEST.in
+
+# Include only tracked public artifact types. Private local roots and generated
+# caches are excluded by construction because no rule selects them.
+recursive-include .github *.yml
+recursive-include tests *.py *.json *.pdf
+recursive-include skills *.md
+recursive-include examples *.py *.png *.md *.xlsx *.json *.html
+recursive-include docs *.md *.png

@@ -625,6 +625,7 @@ all = [
     { name = "python-docx" },
 ]
 dev = [
+    { name = "build" },
     { name = "pdfplumber" },
     { name = "pytest" },
     { name = "python-docx" },
@@ -641,6 +642,7 @@ pdf = [
     { name = "pdfplumber" },
 ]
 test = [
+    { name = "build" },
     { name = "pdfplumber" },
     { name = "pytest" },
     { name = "python-docx" },
@@ -660,6 +662,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "build", marker = "extra == 'dev'", specifier = ">=1.2" },
+    { name = "build", marker = "extra == 'test'", specifier = ">=1.2" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "openpyxl", specifier = ">=3.1" },
     { name = "pdfplumber", marker = "extra == 'all'", specifier = ">=0.11" },
