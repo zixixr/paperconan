@@ -438,3 +438,61 @@ def test_global_omissions_do_not_double_count_detector_specific_caps(
         if item["reason"] in {"finding_limit", "global_finding_limit"}
     ]
     assert omissions == [1, 1]
+
+
+def test_row_pair_omissions_compose_with_block_and_global_caps_once(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_budget_csv(data / "values.csv")
+    _patch_scan_finding_sources(
+        monkeypatch,
+        block_findings=[],
+        cross_findings=[],
+    )
+    row_pair_findings = [
+        {
+            "kind": f"row_pair_{severity}",
+            "severity": severity,
+            "rule": severity,
+        }
+        for severity in ("high", "medium", "low")
+    ]
+    monkeypatch.setattr(
+        A,
+        "detect_row_pair_digit_coupling",
+        lambda *_args, **_kwargs: (
+            [dict(item) for item in row_pair_findings],
+            {"findings_omitted": 2},
+        ),
+    )
+    monkeypatch.setattr(A, "_MAX_FINDINGS_PER_BLOCK", 2)
+    monkeypatch.setattr(A, "_MAX_TOTAL_FINDINGS", 1)
+
+    scan = scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    assert [
+        finding["kind"] for finding in _retained_findings(scan)
+    ] == ["row_pair_high"]
+    assert len(scan["relations_blocks"]) == 1
+    assert scan["relations_blocks"][0]["findings_omitted"] == 4
+    assert scan["findings_omitted"] == 4
+    assert [
+        (
+            item["reason"],
+            item["omitted_findings"],
+        )
+        for item in scan["coverage"]["limitations"]
+        if item["reason"] in {
+            "row_pair_finding_limit",
+            "finding_limit",
+            "global_finding_limit",
+        }
+    ] == [
+        ("row_pair_finding_limit", 2),
+        ("finding_limit", 1),
+        ("global_finding_limit", 1),
+    ]

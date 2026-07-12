@@ -248,6 +248,15 @@ def test_partial_html_lists_escaped_limit_and_retains_findings(tmp_path):
             "PAPERCONAN_MAX_FINDINGS_PER_BLOCK",
             id="recurring",
         ),
+        pytest.param(
+            [{
+                "scope": "block",
+                "reason": "row_pair_finding_limit",
+            }],
+            "row_pair_finding_limit",
+            "PAPERCONAN_MAX_FINDINGS_PER_BLOCK",
+            id="row-pair-only",
+        ),
     ],
 )
 def test_omission_warning_uses_coverage_reason_and_neutral_severity(

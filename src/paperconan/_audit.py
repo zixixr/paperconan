@@ -3820,7 +3820,10 @@ def _analyze_numeric_blocks(
                 rp, row_pair_meta = row_pair_result
             else:
                 rp = row_pair_result
-        if row_pair_meta["findings_omitted"] > 0:
+        row_pair_omitted = int(
+            row_pair_meta["findings_omitted"]
+        )
+        if row_pair_omitted > 0:
             state.coverage.add_limitation(
                 "block",
                 "row_pair_finding_limit",
@@ -3829,8 +3832,9 @@ def _analyze_numeric_blocks(
                 rows=f"{r0 + 1}-{r1}",
                 cols=f"{c0 + 1}-{c1}",
                 limit=_ROW_PAIR_MAX_FINDINGS_PER_BLOCK,
-                omitted_findings=row_pair_meta["findings_omitted"],
+                omitted_findings=row_pair_omitted,
             )
+            state.findings_omitted += row_pair_omitted
         wc = detect_within_column_patterns(
             sheet, r0, r1, c0, c1, header
         )
@@ -3843,7 +3847,10 @@ def _analyze_numeric_blocks(
         gg = detect_grim_grimmer(
             sheet, r0, r1, c0, c1, header
         )
-        if not (rel or ap or eq or rp or wc or iar or gg):
+        if not (
+            rel or ap or eq or rp or wc or iar or gg
+            or row_pair_omitted
+        ):
             continue
 
         sheet_context = " ".join([
@@ -3866,9 +3873,9 @@ def _analyze_numeric_blocks(
             else None
         )
         block_cap = per_block
-        omitted = _cap_block_findings(groups, block_cap)
-        state.findings_omitted += omitted
-        if omitted:
+        block_cap_omitted = _cap_block_findings(groups, block_cap)
+        state.findings_omitted += block_cap_omitted
+        if block_cap_omitted:
             state.coverage.add_limitation(
                 "block",
                 "finding_limit",
@@ -3876,7 +3883,7 @@ def _analyze_numeric_blocks(
                 sheet=sheet_name,
                 rows=f"{r0 + 1}-{r1}",
                 cols=f"{c0 + 1}-{c1}",
-                omitted_findings=omitted,
+                omitted_findings=block_cap_omitted,
                 limit=block_cap,
             )
         state.findings_kept += sum(
@@ -3922,7 +3929,9 @@ def _analyze_numeric_blocks(
                 "identical_after_rounding"
             ],
             "grim": groups["grim"],
-            "findings_omitted": omitted,
+            "findings_omitted": (
+                row_pair_omitted + block_cap_omitted
+            ),
         }
         if state.evidence and state.defer_evidence:
             report_block["_evidence_context"] = (r0, r1, c0, c1)

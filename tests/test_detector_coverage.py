@@ -97,6 +97,9 @@ def test_row_pair_finding_cap_is_disclosed(tmp_path, monkeypatch):
         for block in scan["relations_blocks"]
         for finding in block["row_pairs"]
     ]
+    assert len(scan["relations_blocks"]) == 1
+    assert scan["relations_blocks"][0]["findings_omitted"] == 2
+    assert scan["findings_omitted"] == 2
     assert scan["scan_status"] == "partial"
     assert scan["coverage"]["blocks_skipped"] == 0
     assert len(row_pair_findings) == 1
