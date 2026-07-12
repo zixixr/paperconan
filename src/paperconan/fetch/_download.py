@@ -5,6 +5,7 @@ from collections import Counter
 import hashlib
 import json
 import os
+import shutil
 import tarfile
 import tempfile
 import time
@@ -173,8 +174,19 @@ class _ManagedOutputJournal:
         return paths
 
     def commit(self):
-        for dest_path in tuple(self._entries):
-            self.discard(dest_path)
+        backup_dir = self._backup_dir
+        backup_paths = tuple(self._entries.values())
+        self._entries.clear()
+        self._backup_dir = None
+        for backup_path in backup_paths:
+            if backup_path is None:
+                continue
+            try:
+                os.remove(backup_path)
+            except OSError:
+                pass
+        if backup_dir is not None:
+            shutil.rmtree(backup_dir, ignore_errors=True)
 
     def _cleanup_backup_dir(self):
         if self._entries or self._backup_dir is None:

@@ -1159,6 +1159,54 @@ def test_final_sidecar_failure_rolls_back_every_accepted_output(
     assert not list(out_dir.glob(".paperconan-archive-*"))
 
 
+def test_journal_cleanup_error_preserves_successful_sidecar_commit(
+    tmp_path, monkeypatch
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    output = out_dir / "table.csv"
+    output.write_bytes(b"old-output")
+    _write_sidecar(out_dir, ["table.csv"], doi="10.x/old")
+
+    def source_download(url, dest, **kwargs):
+        Path(dest).write_bytes(b"new-output")
+        return {"ok": True, "path": dest, "size": 10}
+
+    real_remove = _download.os.remove
+    failures = []
+
+    def fail_first_backup_remove(path):
+        parent_name = Path(path).parent.name
+        if (
+            parent_name.startswith(".paperconan-output-rollback-")
+            and not failures
+        ):
+            failures.append(os.fspath(path))
+            raise PermissionError("injected journal cleanup failure")
+        return real_remove(path)
+
+    monkeypatch.setattr(_download, "download_file", source_download)
+    monkeypatch.setattr(
+        _download.os, "remove", fail_first_backup_remove
+    )
+
+    result = _download.download_candidate(
+        _candidate("table.csv", "https://x/table.csv"),
+        str(out_dir),
+    )
+
+    assert len(failures) == 1
+    assert result["downloaded"] == [str(output)]
+    assert output.read_bytes() == b"new-output"
+    sidecar = json.loads(
+        (out_dir / _download.SOURCE_SIDECAR).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert sidecar["managed_files"] == ["table.csv"]
+    assert not list(tmp_path.glob(".paperconan-output-rollback-*"))
+
+
 def test_later_download_error_rolls_back_earlier_accepted_output(
     tmp_path, monkeypatch
 ):
