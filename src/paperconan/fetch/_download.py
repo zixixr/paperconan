@@ -5,6 +5,7 @@ import io
 import json
 import os
 import tarfile
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -39,6 +40,41 @@ def _dir_size(path):
     return total
 
 
+def _copy_limited(src, dest, max_bytes):
+    total = 0
+    while True:
+        chunk = src.read(65536)
+        if not chunk:
+            return total
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(f"file exceeds max_bytes ({max_bytes})")
+        dest.write(chunk)
+
+
+def _atomic_stream_write(src, dest_path, max_bytes):
+    directory = os.path.dirname(os.path.abspath(dest_path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(dest_path)}.",
+        suffix=".part",
+        dir=directory,
+    )
+    try:
+        with os.fdopen(fd, "wb") as dest:
+            size = _copy_limited(src, dest, max_bytes)
+            dest.flush()
+            os.fsync(dest.fileno())
+        os.replace(temp_path, dest_path)
+        return size
+    except BaseException:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise
+
+
 def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
                   retries=3, backoff=2.0):
     """Download to disk with redirects, size cap, HTML sniffing, and retry/backoff.
@@ -60,32 +96,23 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
                 if clen and clen.isdigit() and int(clen) > max_bytes:
                     return {"ok": False, "path": dest_path,
                             "skipped_reason": f"file exceeds max_bytes ({max_bytes})"}
-                os.makedirs(os.path.dirname(os.path.abspath(dest_path)) or ".", exist_ok=True)
-                total = 0
-                with open(dest_path, "wb") as fh:
-                    while True:
-                        chunk = resp.read(65536)
-                        if not chunk:
-                            break
-                        total += len(chunk)
-                        if total > max_bytes:
-                            fh.close()
-                            try:
-                                os.remove(dest_path)
-                            except OSError:
-                                pass
-                            return {"ok": False, "path": dest_path,
-                                    "skipped_reason": f"file exceeds max_bytes ({max_bytes})"}
-                        fh.write(chunk)
-                return {"ok": True, "path": dest_path, "size": total}
+                try:
+                    size = _atomic_stream_write(resp, dest_path, max_bytes)
+                except ValueError as e:
+                    return {"ok": False, "path": dest_path,
+                            "skipped_reason": str(e)}
+                return {"ok": True, "path": dest_path, "size": size}
         except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
-                return {"ok": False, "path": dest_path,
-                        "skipped_reason": (f"requires authentication (HTTP {e.code}); "
-                                           "download this file manually from the dataset page")}
-            last_reason = f"HTTP {e.code}: {e.reason}"
-            if not (500 <= e.code < 600):
-                return {"ok": False, "path": dest_path, "skipped_reason": last_reason}
+            try:
+                if e.code in (401, 403):
+                    return {"ok": False, "path": dest_path,
+                            "skipped_reason": (f"requires authentication (HTTP {e.code}); "
+                                               "download this file manually from the dataset page")}
+                last_reason = f"HTTP {e.code}: {e.reason}"
+                if not (500 <= e.code < 600):
+                    return {"ok": False, "path": dest_path, "skipped_reason": last_reason}
+            finally:
+                e.close()
         except Exception as e:
             last_reason = f"download error: {e}"
         if attempt < retries - 1:

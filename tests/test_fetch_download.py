@@ -22,39 +22,78 @@ class _Resp:
 
 def test_download_retries_then_succeeds(tmp_path, monkeypatch):
     calls = {"n": 0}
+    errors = []
+
     def flaky_urlopen(req, timeout=None):
         calls["n"] += 1
         if calls["n"] < 3:
-            raise urllib.error.HTTPError(req.full_url, 500, "err", {}, None)
+            error = urllib.error.HTTPError(req.full_url, 500, "err", {}, None)
+            errors.append(error)
+            raise error
         return _Resp()
+
     monkeypatch.setattr(dl.urllib.request, "urlopen", flaky_urlopen)
     monkeypatch.setattr(dl.time, "sleep", lambda *_: None)  # no real backoff wait
     dest = tmp_path / "t.csv"
     res = dl.download_file("https://x/t.csv", str(dest), retries=3, backoff=0.0)
     assert res["ok"] is True
     assert calls["n"] == 3
+    assert all(error.closed for error in errors)
     assert dest.read_bytes() == b"col1,col2\n1,2\n"   # streamed to disk correctly
 
 
 def test_download_gives_up_after_retries(tmp_path, monkeypatch):
+    errors = []
+
     def always_500(req, timeout=None):
-        raise urllib.error.HTTPError(req.full_url, 500, "err", {}, None)
+        error = urllib.error.HTTPError(req.full_url, 500, "err", {}, None)
+        errors.append(error)
+        raise error
+
     monkeypatch.setattr(dl.urllib.request, "urlopen", always_500)
     monkeypatch.setattr(dl.time, "sleep", lambda *_: None)
     res = dl.download_file("https://x/t.csv", str(tmp_path / "t.csv"), retries=2, backoff=0.0)
     assert res["ok"] is False
     assert "HTTP 500" in res["skipped_reason"]
+    assert all(error.closed for error in errors)
 
 
 def test_download_does_not_retry_on_403(tmp_path, monkeypatch):
     calls = {"n": 0}
+    errors = []
+
     def auth_fail(req, timeout=None):
         calls["n"] += 1
-        raise urllib.error.HTTPError(req.full_url, 403, "forbidden", {}, None)
+        error = urllib.error.HTTPError(
+            req.full_url, 403, "forbidden", {}, None
+        )
+        errors.append(error)
+        raise error
+
     monkeypatch.setattr(dl.urllib.request, "urlopen", auth_fail)
     monkeypatch.setattr(dl.time, "sleep", lambda *_: None)
     res = dl.download_file("https://x/t.csv", str(tmp_path / "t.csv"), retries=3, backoff=0.0)
     assert res["ok"] is False and calls["n"] == 1   # auth errors are terminal, no retry
+    assert all(error.closed for error in errors)
+
+
+def test_download_closes_terminal_http_error(tmp_path, monkeypatch):
+    errors = []
+
+    def not_found(req, timeout=None):
+        error = urllib.error.HTTPError(
+            req.full_url, 404, "not found", {}, None
+        )
+        errors.append(error)
+        raise error
+
+    monkeypatch.setattr(dl.urllib.request, "urlopen", not_found)
+    res = dl.download_file(
+        "https://x/t.csv", str(tmp_path / "t.csv"), retries=3, backoff=0.0
+    )
+    assert res["ok"] is False
+    assert res["skipped_reason"] == "HTTP 404: not found"
+    assert all(error.closed for error in errors)
 
 
 def test_extract_tabular_tar(tmp_path):
