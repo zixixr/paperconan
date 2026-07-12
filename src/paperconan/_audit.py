@@ -429,23 +429,27 @@ def _load_workbook_openpyxl(path):
     directly into the Sheet's columnar arrays — the full list-of-lists is never
     materialized."""
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
-    out = {}
-    loaded = 0                                       # cumulative cells across this file's sheets
-    for s in wb.sheetnames:
-        ws = wb[s]
-        mr, mc = ws.max_row or 0, ws.max_column or 0
-        declared = _dense_cells(mr, mc)
-        # Skip a sheet that is too big on its own, OR once this file's cumulative cell budget is
-        # spent (a many-sheet workbook materialized at once OOMs even if each sheet is under cap).
-        if loaded >= _MAX_CELLS or loaded + declared > _MAX_CELLS:
-            out[s] = None
-            continue
-        sheet, cells = _fill_sheet_from_rows(ws.iter_rows(values_only=True), mr, mc, loaded)
-        out[s] = sheet
-        if sheet is not None:
-            loaded += cells
-    wb.close()
-    return out
+    try:
+        out = {}
+        loaded = 0                                   # cumulative cells across this file's sheets
+        for s in wb.sheetnames:
+            ws = wb[s]
+            mr, mc = ws.max_row or 0, ws.max_column or 0
+            declared = _dense_cells(mr, mc)
+            # Skip a sheet that is too big on its own, OR once this file's cumulative cell budget is
+            # spent (a many-sheet workbook materialized at once OOMs even if each sheet is under cap).
+            if loaded >= _MAX_CELLS or loaded + declared > _MAX_CELLS:
+                out[s] = None
+                continue
+            sheet, cells = _fill_sheet_from_rows(
+                ws.iter_rows(values_only=True), mr, mc, loaded
+            )
+            out[s] = sheet
+            if sheet is not None:
+                loaded += cells
+        return out
+    finally:
+        wb.close()
 
 
 def _calamine_cell(v):
@@ -725,6 +729,23 @@ def _cell_value(v):
     return str(v)
 
 
+def _bounded_evidence_indices(start, end, highlights, limit):
+    all_indices = list(range(start, end))
+    if len(all_indices) <= limit:
+        return all_indices
+    selected = sorted({
+        index for index in highlights
+        if start <= index < end
+    })
+    target = max(limit, len(selected))
+    for index in all_indices:
+        if len(selected) >= target:
+            break
+        if index not in selected:
+            selected.append(index)
+    return sorted(selected)
+
+
 def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_rows=None):
     """Slice a numeric block (with 1 row of context above/below if available) into a
     JSON-friendly evidence dict that the HTML renderer can show as a table.
@@ -736,72 +757,57 @@ def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_row
     and stay byte-identical (no `truncated` key)."""
     truncated = False
 
-    # --- column window -------------------------------------------------------
-    ec0, ec1 = c0, c1
-    if (c1 - c0) > _MAX_EV_COLS:
+    # --- column selection ----------------------------------------------------
+    col_indices = list(range(c0, c1))
+    if len(col_indices) > _MAX_EV_COLS:
         truncated = True
-        if highlight_cols:
-            lo = min(highlight_cols)
-            hi = max(highlight_cols)
-        else:
-            lo = hi = c0
-        if hi - lo + 1 > _MAX_EV_COLS:
-            ec0 = lo
-            ec1 = lo + _MAX_EV_COLS
-        else:
-            # Center a _MAX_EV_COLS-wide window on [lo, hi], then clamp into [c0, c1).
-            pad = (_MAX_EV_COLS - (hi - lo + 1)) // 2
-            ec0 = lo - pad
-            ec1 = ec0 + _MAX_EV_COLS
-            if ec0 < c0:
-                ec0, ec1 = c0, c0 + _MAX_EV_COLS
-            if ec1 > c1:
-                ec1 = c1
-                ec0 = ec1 - _MAX_EV_COLS
-            if ec0 < c0:
-                ec0 = c0
+        col_indices = _bounded_evidence_indices(
+            c0,
+            c1,
+            highlight_cols,
+            max(0, _MAX_EV_COLS),
+        )
 
-    # --- row window ----------------------------------------------------------
+    # --- row selection -------------------------------------------------------
     r_start = max(0, r0 - 1)
     r_end = min(sheet.nrows, r1 + 1)
-    if (r_end - r_start) > _MAX_EV_ROWS:
+    row_indices = list(range(r_start, r_end))
+    if len(row_indices) > _MAX_EV_ROWS:
         truncated = True
-        if highlight_rows:
-            # highlight_rows are 1-based row numbers; center the window on them.
-            rlo = min(highlight_rows) - 1
-            rhi = max(highlight_rows) - 1
-            if rhi - rlo + 1 >= _MAX_EV_ROWS:
-                wr0 = rlo
-            else:
-                pad = (_MAX_EV_ROWS - (rhi - rlo + 1)) // 2
-                wr0 = rlo - pad
-        else:
-            wr0 = r_start
-        if wr0 < r_start:
-            wr0 = r_start
-        wr1 = wr0 + _MAX_EV_ROWS
-        if wr1 > r_end:
-            wr1 = r_end
-            wr0 = max(r_start, wr1 - _MAX_EV_ROWS)
-        r_start, r_end = wr0, wr1
+        row_indices = _bounded_evidence_indices(
+            r_start,
+            r_end,
+            [
+                row_number - 1
+                for row_number in (highlight_rows or [])
+            ],
+            max(0, _MAX_EV_ROWS),
+        )
 
     data_rows = []
-    for r in range(r_start, r_end):
-        vals = [_cell_value(sheet.cell(r, c)) for c in range(ec0, ec1)]
+    for r in row_indices:
+        vals = [
+            _cell_value(sheet.cell(r, c))
+            for c in col_indices
+        ]
         data_rows.append({
             "row_idx": r + 1,
             "is_context": r < r0 or r >= r1,
             "values": vals,
         })
     out = {
-        "headers": list(header[ec0 - c0:ec1 - c0]),
-        "col_offset": ec0,
+        "headers": [
+            header[c - c0]
+            for c in col_indices
+        ],
+        "col_offset": col_indices[0] if col_indices else c0,
         "highlight_cols": list(highlight_cols),
         "highlight_rows": list(highlight_rows) if highlight_rows else [],
         "rows": data_rows,
     }
     if truncated:
         out["truncated"] = True
+        out["col_indices"] = col_indices
     return out
 
 
@@ -854,6 +860,7 @@ def _attach_evidence(findings, sheet, r0, r1, c0, c1, header):
     """Mutate each finding in-place to add an `evidence` field, derived from the same
     block coordinates the detector was scanning. Highlight columns come from the
     finding's own col_*_idx / col_idx fields."""
+    truncated = False
     for f in findings:
         hi_cols = []
         for k in ("col_a_idx", "col_b_idx", "col_idx"):
@@ -875,10 +882,19 @@ def _attach_evidence(findings, sheet, r0, r1, c0, c1, header):
         # field and one or more example_cells should highlight once, not N times.
         hi_cols = list(dict.fromkeys(hi_cols))
         hi_rows = list(dict.fromkeys(hi_rows))
-        f["evidence"] = _block_evidence(sheet, r0, r1, c0, c1, header,
-                                        highlight_cols=hi_cols,
-                                        highlight_rows=hi_rows)
-    return findings
+        evidence = _block_evidence(
+            sheet,
+            r0,
+            r1,
+            c0,
+            c1,
+            header,
+            highlight_cols=hi_cols,
+            highlight_rows=hi_rows,
+        )
+        f["evidence"] = evidence
+        truncated = truncated or bool(evidence.get("truncated"))
+    return truncated
 
 
 # ---------- detectors ----------
@@ -3132,6 +3148,64 @@ def _cap_block_findings(groups, cap):
     return omitted
 
 
+def _apply_global_finding_budget(report_blocks, cross_sheet_findings, cap):
+    if cap <= 0:
+        return 0
+
+    entries = []
+    for block in report_blocks:
+        for group_name in BLOCK_FINDING_GROUPS:
+            for finding_index, finding in enumerate(
+                block.get(group_name) or []
+            ):
+                entries.append(
+                    ("block", block, group_name, finding_index, finding)
+                )
+    for finding_index, finding in enumerate(cross_sheet_findings):
+        entries.append(
+            ("cross_sheet", None, None, finding_index, finding)
+        )
+
+    if len(entries) <= cap:
+        return 0
+
+    ranked = sorted(
+        range(len(entries)),
+        key=lambda index: _SEVERITY_RANK.get(
+            str(entries[index][4].get("severity") or "low").lower(),
+            3,
+        ),
+    )
+    kept_entry_indices = set(ranked[:cap])
+
+    entry_index = 0
+    for block in report_blocks:
+        omitted_from_block = 0
+        for group_name in BLOCK_FINDING_GROUPS:
+            group = block.get(group_name) or []
+            kept_group = []
+            for finding in group:
+                if entry_index in kept_entry_indices:
+                    kept_group.append(finding)
+                else:
+                    omitted_from_block += 1
+                entry_index += 1
+            group[:] = kept_group
+        if omitted_from_block:
+            block["findings_omitted"] = (
+                int(block.get("findings_omitted") or 0)
+                + omitted_from_block
+            )
+
+    kept_cross_sheet = []
+    for finding in cross_sheet_findings:
+        if entry_index in kept_entry_indices:
+            kept_cross_sheet.append(finding)
+        entry_index += 1
+    cross_sheet_findings[:] = kept_cross_sheet
+    return len(entries) - cap
+
+
 def _analyze_numeric_blocks(
     sheet, *, file_name, sheet_name, blocks, state
 ):
@@ -3142,18 +3216,6 @@ def _analyze_numeric_blocks(
                 len(blocks) - block_index,
                 scope="sheet",
                 reason="report_block_limit",
-                file=file_name,
-                sheet=sheet_name,
-            )
-            break
-        if (
-            _MAX_TOTAL_FINDINGS > 0
-            and state.findings_kept >= _MAX_TOTAL_FINDINGS
-        ):
-            state.coverage.mark_blocks_skipped(
-                len(blocks) - block_index,
-                scope="sheet",
-                reason="finding_limit",
                 file=file_name,
                 sheet=sheet_name,
             )
@@ -3261,17 +3323,7 @@ def _analyze_numeric_blocks(
             if _MAX_FINDINGS_PER_BLOCK > 0
             else None
         )
-        if _MAX_TOTAL_FINDINGS > 0:
-            remaining = max(
-                0, _MAX_TOTAL_FINDINGS - state.findings_kept
-            )
-            block_cap = (
-                remaining
-                if per_block is None
-                else min(per_block, remaining)
-            )
-        else:
-            block_cap = per_block
+        block_cap = per_block
         omitted = _cap_block_findings(groups, block_cap)
         state.findings_omitted += omitted
         if omitted:
@@ -3288,16 +3340,28 @@ def _analyze_numeric_blocks(
         state.findings_kept += sum(
             len(group) for group in groups.values()
         )
+        evidence_truncated = False
         for group in groups.values():
             if state.evidence:
-                _attach_evidence(
+                evidence_truncated = _attach_evidence(
                     group, sheet, r0, r1, c0, c1, header
-                )
+                ) or evidence_truncated
             _attach_benign(group)
             apply_profile_to_findings(
                 group,
                 state.profile,
                 sheet_context=sheet_context,
+            )
+        if evidence_truncated:
+            state.coverage.add_limitation(
+                "block",
+                "evidence_limit",
+                file=file_name,
+                sheet=sheet_name,
+                rows=f"{r0 + 1}-{r1}",
+                cols=f"{c0 + 1}-{c1}",
+                max_rows=_MAX_EV_ROWS,
+                max_cols=_MAX_EV_COLS,
             )
         report_blocks.append({
             "file": file_name,
@@ -3326,20 +3390,12 @@ def _process_loaded_sheet(
     sheet, *, file_name, sheet_name, sheet_start, state
 ):
     blocks = find_numeric_blocks(sheet)
-    block_analysis_start = (
-        time.perf_counter() if sheet_start is not None else None
-    )
     report_blocks = _analyze_numeric_blocks(
         sheet,
         file_name=file_name,
         sheet_name=sheet_name,
         blocks=blocks,
         state=state,
-    )
-    block_analysis_elapsed = (
-        time.perf_counter() - block_analysis_start
-        if block_analysis_start is not None
-        else 0.0
     )
 
     within_sheet_findings = detect_within_sheet_fraction_reuse(
@@ -3404,11 +3460,7 @@ def _process_loaded_sheet(
         "n_cols": sheet.ncols,
         "numeric_cells": len(sheet_numbers),
         "n_blocks": len(blocks),
-        "elapsed_ms": _elapsed_ms(
-            None
-            if sheet_start is None
-            else sheet_start + block_analysis_elapsed
-        ),
+        "elapsed_ms": _elapsed_ms(sheet_start),
     }
     del sheet_numbers
     return _SheetScanResult(
@@ -3501,7 +3553,6 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
             **details,
         )
     file_stat["n_sheets"] = len(sheets)
-    file_stat["elapsed_ms"] = _elapsed_ms(file_start)
 
     for sheet_name, loaded_sheet in sheets.items():
         sheet_start = (
@@ -3534,12 +3585,12 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
             })
             continue
 
-        state.coverage.mark_sheet_succeeded()
         sheet = (
             loaded_sheet
             if isinstance(loaded_sheet, Sheet)
             else Sheet.from_rows(loaded_sheet)
         )
+        blocks_before = state.coverage.blocks_analyzed
         sheet_result = _process_loaded_sheet(
             sheet,
             file_name=file_name,
@@ -3547,6 +3598,25 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
             sheet_start=sheet_start,
             state=state,
         )
+        blocks_analyzed = (
+            state.coverage.blocks_analyzed - blocks_before
+        )
+        if blocks_analyzed:
+            state.coverage.mark_sheet_succeeded()
+        elif sheet_result.stats["numeric_cells"] == 0:
+            state.coverage.mark_sheet_skipped(
+                file_name,
+                sheet_name,
+                "no_numeric_data",
+            )
+        elif sheet_result.stats["n_blocks"] == 0:
+            state.coverage.mark_sheet_skipped(
+                file_name,
+                sheet_name,
+                "no_qualifying_numeric_block",
+            )
+        else:
+            state.coverage.mark_sheet_unanalyzed()
         report_blocks.extend(sheet_result.report_blocks)
         digit_reports.extend(sheet_result.digit_reports)
         decimal_reports.extend(sheet_result.decimal_reports)
@@ -3557,6 +3627,7 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
         sheet_stats.append(sheet_result.stats)
         del sheet_result
 
+    file_stat["elapsed_ms"] = _elapsed_ms(file_start)
     return FileScanResult(
         report_blocks=report_blocks,
         digit_reports=digit_reports,
@@ -3651,6 +3722,20 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         state.findings_omitted += recurring_omitted
     cross_sheet_findings += recurring_findings
     _attach_benign(cross_sheet_findings)
+    if _MAX_TOTAL_FINDINGS > 0:
+        global_omitted = _apply_global_finding_budget(
+            report_blocks,
+            cross_sheet_findings,
+            _MAX_TOTAL_FINDINGS,
+        )
+        if global_omitted:
+            coverage.add_limitation(
+                "scan",
+                "global_finding_limit",
+                limit=_MAX_TOTAL_FINDINGS,
+                omitted_findings=global_omitted,
+            )
+            state.findings_omitted += global_omitted
 
     if digit_reports:
         adj, sig = benjamini_hochberg([d["p"] for d in digit_reports], alpha=0.05)

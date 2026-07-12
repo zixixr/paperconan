@@ -14,6 +14,7 @@ def test_partial_coverage_requires_some_success_and_a_limitation():
     coverage = ScanCoverage(files_discovered=2)
     coverage.mark_file_succeeded()
     coverage.mark_sheet_succeeded()
+    coverage.mark_block_analyzed()
     coverage.mark_file_failed("bad.xlsx", "parse_error")
     assert coverage.status == "partial"
     out = coverage.to_dict()
@@ -27,10 +28,19 @@ def test_failed_coverage_has_no_successful_sheet():
     assert coverage.status == "failed"
 
 
+def test_coverage_requires_an_analyzed_block_for_success():
+    coverage = ScanCoverage(files_discovered=1)
+    coverage.mark_file_succeeded()
+    coverage.mark_sheet_succeeded()
+
+    assert coverage.status == "failed"
+
+
 def test_skipped_blocks_are_counted_and_mark_truncation():
     coverage = ScanCoverage(files_discovered=1)
     coverage.mark_file_succeeded()
     coverage.mark_sheet_succeeded()
+    coverage.mark_block_analyzed()
     coverage.mark_blocks_skipped(
         4, scope="sheet", reason="report_block_limit", file="a.csv", sheet="S"
     )
@@ -43,6 +53,7 @@ def test_skipped_blocks_are_counted_and_mark_truncation():
 def test_skipped_sheet_records_location_and_makes_coverage_partial():
     coverage = ScanCoverage(files_discovered=1)
     coverage.mark_sheet_succeeded()
+    coverage.mark_block_analyzed()
     coverage.mark_sheet_skipped("a.xlsx", "Summary", "unsupported_layout")
 
     assert coverage.sheets_skipped == 1

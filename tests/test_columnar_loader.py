@@ -271,6 +271,61 @@ def test_streaming_loader_preserves_adjacent_wide_integers(tmp_path):
     assert sheet.cell(1, 0) != sheet.cell(1, 1)
 
 
+@pytest.mark.parametrize("mode", ["success", "row_iteration", "conversion"])
+def test_openpyxl_loader_closes_workbook_exactly_once(
+    monkeypatch, mode
+):
+    import paperconan._audit as audit
+
+    expected = RuntimeError(f"{mode} failed")
+
+    class StubSheet:
+        max_row = 2
+        max_column = 1
+
+        def iter_rows(self, values_only=True):
+            assert values_only is True
+            yield [1]
+            if mode == "row_iteration":
+                raise expected
+            yield [2]
+
+    class StubWorkbook:
+        sheetnames = ["S1"]
+
+        def __init__(self):
+            self.close_calls = 0
+
+        def __getitem__(self, name):
+            assert name == "S1"
+            return StubSheet()
+
+        def close(self):
+            self.close_calls += 1
+
+    workbook = StubWorkbook()
+    monkeypatch.setattr(
+        audit.openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: workbook,
+    )
+    if mode == "conversion":
+        monkeypatch.setattr(
+            audit,
+            "_fill_sheet_from_rows",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(expected),
+        )
+
+    if mode == "success":
+        assert audit._load_workbook_openpyxl("input.xlsx")["S1"] is not None
+    else:
+        with pytest.raises(RuntimeError) as exc_info:
+            audit._load_workbook_openpyxl("input.xlsx")
+        assert exc_info.value is expected
+
+    assert workbook.close_calls == 1
+
+
 @pytest.mark.parametrize("suffix", [".xlsx", ".xlsm"])
 def test_default_loader_falls_back_to_openpyxl_for_wide_ooxml_integers(
     tmp_path, monkeypatch, suffix

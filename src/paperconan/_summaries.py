@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fractions import Fraction
 import math
 from typing import Any
 
@@ -42,18 +43,36 @@ class CrossSheetSummary:
 
 
 def _vector_is_patterned(vec):
-    if len({round(v, 6) for v in vec}) < 3:
+    if len(set(vec)) < 3:
         return True
     differences = [vec[i + 1] - vec[i] for i in range(len(vec) - 1)]
     if all(abs(value - differences[0]) < 1e-9 for value in differences):
         return True
     nonzero = [value for value in vec if abs(value) > 1e-12]
     if len(nonzero) == len(vec):
-        ratios = [vec[i + 1] / vec[i] for i in range(len(vec) - 1)]
-        if all(abs(value - ratios[0]) < 1e-9 for value in ratios):
+        if all(isinstance(value, int) for value in vec):
+            ratios = [
+                Fraction(vec[i + 1], vec[i])
+                for i in range(len(vec) - 1)
+            ]
+            same_ratio = all(value == ratios[0] for value in ratios)
+        else:
+            ratios = [
+                vec[i + 1] / vec[i]
+                for i in range(len(vec) - 1)
+            ]
+            same_ratio = all(
+                abs(value - ratios[0]) < 1e-9
+                for value in ratios
+            )
+        if same_ratio:
             return True
     return all(
-        abs(value - round(value / 10.0) * 10.0) < 1e-9
+        (
+            value % 10 == 0
+            if isinstance(value, int)
+            else abs(value - round(value / 10.0) * 10.0) < 1e-9
+        )
         for value in vec
     )
 
@@ -101,7 +120,7 @@ def _iter_valid_window_specs(run_lengths, min_k, max_k, limit):
 
 def _materialize_window(row, start, width):
     return tuple(
-        round(float(value), 6)
+        value if isinstance(value, int) else round(float(value), 6)
         for value in row[start:start + width]
     )
 
@@ -133,7 +152,7 @@ class RecurringRowIndex:
     def __init__(self, budget=3_000_000):
         self._initial_budget = max(0, int(budget))
         self._budget = self._initial_budget
-        self._vectors: dict[tuple[float, ...], dict[str, Any]] = {}
+        self._vectors: dict[tuple[int | float, ...], dict[str, Any]] = {}
 
     @property
     def initial_budget(self):
@@ -218,10 +237,14 @@ class RecurringRowIndex:
             figures = record["figures"]
             if len(figures) < 2:
                 continue
-            all_int = all(abs(value - round(value)) < 1e-9 for value in vector)
+            all_int = all(
+                isinstance(value, int)
+                or abs(value - round(value)) < 1e-9
+                for value in vector
+            )
             if all_int and (
                 len(vector) < 5
-                or len({round(value, 6) for value in vector}) < 4
+                or len(set(vector)) < 4
             ):
                 continue
             sites = record["sites"]
@@ -267,7 +290,7 @@ class RecurringRowIndex:
                 sheet="; ".join(sheets_hit)[:120],
                 sheet_a=record["sheet_min"],
                 sheet_b=record["sheet_max"],
-                vector=[float(value) for value in vector],
+                vector=list(vector),
                 size_a=site_count,
                 size_b=site_count,
                 same_position_count=site_count,
@@ -277,7 +300,7 @@ class RecurringRowIndex:
                 same_figure=False,
                 delta={"pattern": "recurring_row_vector"},
                 pattern="recurring_row_vector",
-                examples=[{"value": float(value)} for value in vector],
+                examples=[{"value": value} for value in vector],
                 severity=(
                     "high"
                     if len(vector) >= 5 and site_count >= 3

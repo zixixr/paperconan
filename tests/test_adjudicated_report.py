@@ -187,6 +187,28 @@ def test_finding_refs_scope_key_evidence_to_the_selected_finding():
     assert "within_col_value_duplication" not in html
 
 
+def test_adjudicated_evidence_keeps_tiny_nonzero_float_signs():
+    scan = _scan_two_findings()
+    evidence = scan["relations_blocks"][0]["relations"][0]["evidence"]
+    evidence["headers"] = ["positive", "negative", "zero"]
+    evidence["col_offset"] = 0
+    evidence["highlight_cols"] = [0, 1, 2]
+    evidence["rows"] = [{
+        "row_idx": 5,
+        "values": [1e-13, -1e-13, 0.0],
+    }]
+    verdict = {
+        "report_md": "## Review\n\nNeutral review.",
+        "finding_refs": [{"sheet": "Alpha", "kind": "constant_offset"}],
+    }
+
+    html = render_adjudicated_report(scan, verdict)
+
+    assert ">1e-13<" in html
+    assert ">-1e-13<" in html
+    assert ">0<" in html
+
+
 def test_omitted_reference_uses_labeled_automatic_selection():
     html = render_adjudicated_report(
         _scan_two_findings(),

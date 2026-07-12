@@ -33,6 +33,9 @@ class ScanCoverage:
     def mark_sheet_succeeded(self) -> None:
         self.sheets_succeeded += 1
 
+    def mark_sheet_unanalyzed(self) -> None:
+        self.sheets_skipped += 1
+
     def mark_sheet_skipped(
         self, file: str, sheet: str, reason: str, **details: Any
     ) -> None:
@@ -52,7 +55,7 @@ class ScanCoverage:
 
     @property
     def status(self) -> ScanStatus:
-        if self.sheets_succeeded == 0:
+        if self.blocks_analyzed == 0:
             return "failed"
         if (
             self.files_failed

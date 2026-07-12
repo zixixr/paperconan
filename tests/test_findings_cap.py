@@ -125,7 +125,7 @@ def test_report_block_cap_counts_remaining_blocks_once_per_sheet(
     ]
 
 
-def test_global_finding_cap_counts_skipped_blocks_without_duplicates(
+def test_global_finding_cap_counts_omissions_without_duplicates(
     tmp_path, monkeypatch
 ):
     data = tmp_path / "blocks"
@@ -139,37 +139,17 @@ def test_global_finding_cap_counts_skipped_blocks_without_duplicates(
 
     coverage = scan["coverage"]
     assert scan["scan_status"] == "partial"
-    assert coverage["blocks_analyzed"] == 1
-    assert coverage["blocks_skipped"] == 3
-    block_limits = [
-        item
-        for item in coverage["limitations"]
-        if item["scope"] == "block" and item["reason"] == "finding_limit"
-    ]
-    assert len(block_limits) == 1
-    assert block_limits[0]["omitted_findings"] > 0
-    assert scan["findings_omitted"] == block_limits[0]["omitted_findings"]
-    assert [
-        item
-        for item in coverage["limitations"]
-        if item["scope"] == "sheet" and item["reason"] == "finding_limit"
-    ] == [
+    assert coverage["blocks_analyzed"] == 4
+    assert coverage["blocks_skipped"] == 0
+    assert coverage["limitations"] == [
         {
-            "scope": "sheet",
-            "reason": "finding_limit",
-            "count": 1,
-            "file": "multi.xlsx",
-            "sheet": "First",
-        },
-        {
-            "scope": "sheet",
-            "reason": "finding_limit",
-            "count": 2,
-            "file": "multi.xlsx",
-            "sheet": "Second",
-        },
+            "scope": "scan",
+            "reason": "global_finding_limit",
+            "limit": 1,
+            "omitted_findings": 11,
+        }
     ]
-    assert len(coverage["limitations"]) == 3
+    assert scan["findings_omitted"] == 11
 
 
 def test_cap_keeps_highest_severity_first():
@@ -211,3 +191,200 @@ def test_cap_none_is_unlimited():
     groups = {"relations": [{"severity": "low"}] * 500}
     assert _cap_block_findings(groups, None) == 0
     assert len(groups["relations"]) == 500
+
+
+def _patch_scan_finding_sources(monkeypatch, block_findings, cross_findings):
+    monkeypatch.setattr(
+        A,
+        "detect_relations",
+        lambda *_args, **_kwargs: [dict(item) for item in block_findings],
+    )
+    for name in (
+        "detect_arithmetic_progression",
+        "detect_equal_pairs",
+        "detect_within_column_patterns",
+        "detect_dispersed_repeats",
+        "detect_identical_after_rounding",
+        "detect_grim_grimmer",
+    ):
+        monkeypatch.setattr(A, name, lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        A,
+        "detect_row_pair_digit_coupling",
+        lambda *_args, **_kwargs: ([], {"findings_omitted": 0}),
+    )
+    monkeypatch.setattr(
+        A,
+        "detect_within_sheet_fraction_reuse",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        A,
+        "detect_collisions",
+        lambda *_args, **_kwargs: [dict(item) for item in cross_findings],
+    )
+    monkeypatch.setattr(
+        A,
+        "detect_cross_sheet_column_duplicates",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        A,
+        "apply_profile_to_findings",
+        lambda *_args, **_kwargs: None,
+    )
+
+
+def _write_budget_csv(path):
+    path.write_text(
+        "a,b\n"
+        "1.125,7.375\n"
+        "2.625,4.875\n"
+        "5.375,3.125\n",
+        encoding="utf-8",
+    )
+
+
+def _retained_findings(scan):
+    block = [
+        finding
+        for report_block in scan["relations_blocks"]
+        for group in BLOCK_FINDING_GROUPS
+        for finding in report_block[group]
+    ]
+    return block + scan["cross_sheet_findings"]
+
+
+def test_directory_budget_selects_by_severity_across_finding_families(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_budget_csv(data / "values.csv")
+    _patch_scan_finding_sources(
+        monkeypatch,
+        block_findings=[
+            {
+                "kind": "block_low",
+                "severity": "low",
+                "rule": "low block",
+            },
+            {
+                "kind": "block_medium",
+                "severity": "medium",
+                "rule": "medium block",
+            },
+        ],
+        cross_findings=[{
+            "kind": "cross_high",
+            "severity": "high",
+            "rule": "high cross-sheet",
+        }],
+    )
+    monkeypatch.setattr(A, "_MAX_FINDINGS_PER_BLOCK", 0)
+    monkeypatch.setattr(A, "_MAX_TOTAL_FINDINGS", 2)
+
+    scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+
+    retained = _retained_findings(scan)
+    assert [finding["kind"] for finding in retained] == [
+        "block_medium",
+        "cross_high",
+    ]
+    assert scan["findings_omitted"] == 1
+    assert [
+        item for item in scan["coverage"]["limitations"]
+        if item["reason"] == "global_finding_limit"
+    ] == [{
+        "scope": "scan",
+        "reason": "global_finding_limit",
+        "limit": 2,
+        "omitted_findings": 1,
+    }]
+
+
+def test_directory_budget_caps_cross_sheet_only_output_deterministically(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_budget_csv(data / "values.csv")
+    cross = [
+        {
+            "kind": "cross_first",
+            "severity": "high",
+            "rule": "first high",
+        },
+        {
+            "kind": "cross_second",
+            "severity": "high",
+            "rule": "second high",
+        },
+        {
+            "kind": "cross_low",
+            "severity": "low",
+            "rule": "low",
+        },
+    ]
+    _patch_scan_finding_sources(
+        monkeypatch,
+        block_findings=[],
+        cross_findings=cross,
+    )
+    monkeypatch.setattr(A, "_MAX_TOTAL_FINDINGS", 1)
+
+    first = scan_dir(
+        str(data), str(tmp_path / "first"), write_html=False
+    )
+    second = scan_dir(
+        str(data), str(tmp_path / "second"), write_html=False
+    )
+
+    assert first["cross_sheet_findings"] == second["cross_sheet_findings"]
+    assert [
+        finding["kind"] for finding in first["cross_sheet_findings"]
+    ] == ["cross_first"]
+    assert first["findings_omitted"] == 2
+
+
+def test_global_omissions_do_not_double_count_detector_specific_caps(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_budget_csv(data / "values.csv")
+    _patch_scan_finding_sources(
+        monkeypatch,
+        block_findings=[
+            {
+                "kind": "block_first",
+                "severity": "medium",
+                "rule": "first block",
+            },
+            {
+                "kind": "block_second",
+                "severity": "low",
+                "rule": "second block",
+            },
+        ],
+        cross_findings=[{
+            "kind": "cross_high",
+            "severity": "high",
+            "rule": "high cross-sheet",
+        }],
+    )
+    monkeypatch.setattr(A, "_MAX_FINDINGS_PER_BLOCK", 1)
+    monkeypatch.setattr(A, "_MAX_TOTAL_FINDINGS", 1)
+
+    scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+
+    assert [
+        finding["kind"] for finding in _retained_findings(scan)
+    ] == ["cross_high"]
+    assert scan["findings_omitted"] == 2
+    omissions = [
+        item["omitted_findings"]
+        for item in scan["coverage"]["limitations"]
+        if item["reason"] in {"finding_limit", "global_finding_limit"}
+    ]
+    assert omissions == [1, 1]

@@ -1,7 +1,7 @@
 import pytest
 
 from paperconan._audit import _markdown_inline_code, write_markdown_report
-from paperconan._html import write_html_report
+from paperconan._html import _fmt_cell, write_html_report
 
 
 _MISSING = object()
@@ -68,6 +68,29 @@ def _render_markdown(tmp_path, scan, name="REPORT.md"):
     out = tmp_path / name
     write_markdown_report(scan, str(out))
     return out.read_text(encoding="utf-8")
+
+
+def _omission_warning(html):
+    warnings = [
+        part.split("</div>", 1)[0]
+        for part in html.split('<div class="warn">')[1:]
+    ]
+    return next(warning for warning in warnings if "omitted" in warning)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param(0.0, "0", id="zero"),
+        pytest.param(1e-13, "1e-13", id="positive-tiny"),
+        pytest.param(-1e-13, "-1e-13", id="negative-tiny"),
+        pytest.param(float("nan"), "", id="nan"),
+        pytest.param(float("inf"), "", id="positive-infinity"),
+        pytest.param(float("-inf"), "", id="negative-infinity"),
+    ],
+)
+def test_float_cell_formatting_is_truthful(value, expected):
+    assert _fmt_cell(value) == expected
 
 
 def _nested_limitations(reordered=False):
@@ -199,6 +222,83 @@ def test_partial_html_lists_escaped_limit_and_retains_findings(tmp_path):
         < html.index('<details class="finding"')
     )
     assert "constant_offset" in html
+
+
+@pytest.mark.parametrize(
+    ("limitations", "expected_control", "unexpected_control"),
+    [
+        pytest.param(
+            [{"scope": "block", "reason": "finding_limit"}],
+            "PAPERCONAN_MAX_FINDINGS_PER_BLOCK",
+            "PAPERCONAN_MAX_TOTAL_FINDINGS",
+            id="block",
+        ),
+        pytest.param(
+            [{"scope": "scan", "reason": "global_finding_limit"}],
+            "PAPERCONAN_MAX_TOTAL_FINDINGS",
+            "PAPERCONAN_MAX_FINDINGS_PER_BLOCK",
+            id="global",
+        ),
+        pytest.param(
+            [{
+                "scope": "scan",
+                "reason": "recurring_row_vector_finding_limit",
+            }],
+            "recurring_row_vector_finding_limit",
+            "PAPERCONAN_MAX_FINDINGS_PER_BLOCK",
+            id="recurring",
+        ),
+    ],
+)
+def test_omission_warning_uses_coverage_reason_and_neutral_severity(
+    tmp_path, limitations, expected_control, unexpected_control
+):
+    scan = _scan("partial", limitations)
+    scan["findings_omitted"] = 2
+
+    html = _render_html(tmp_path, scan)
+    warning = _omission_warning(html)
+
+    assert "2 findings were omitted" in warning
+    assert "lower-severity" not in warning
+    assert expected_control in warning
+    assert unexpected_control not in warning
+
+
+def test_legacy_omission_warning_stays_generic_and_neutral(tmp_path):
+    scan = _scan("complete")
+    scan["findings_omitted"] = 1
+    scan.pop("coverage")
+
+    html = _render_html(tmp_path, scan)
+    warning = _omission_warning(html)
+
+    assert "1 finding was omitted" in warning
+    assert "lower-severity" not in warning
+    assert "PAPERCONAN_MAX_FINDINGS_PER_BLOCK" not in warning
+    assert "PAPERCONAN_MAX_TOTAL_FINDINGS" not in warning
+
+
+def test_raw_html_evidence_keeps_tiny_nonzero_float_signs(tmp_path):
+    scan = _scan("complete")
+    _add_finding(scan)
+    scan["relations_blocks"][0]["relations"][0]["evidence"] = {
+        "headers": ["positive", "negative", "zero"],
+        "col_offset": 0,
+        "highlight_cols": [0, 1, 2],
+        "highlight_rows": [1],
+        "rows": [{
+            "row_idx": 1,
+            "is_context": False,
+            "values": [1e-13, -1e-13, 0.0],
+        }],
+    }
+
+    html = _render_html(tmp_path, scan)
+
+    assert ">1e-13<" in html
+    assert ">-1e-13<" in html
+    assert ">0<" in html
 
 
 def test_legacy_html_reports_unknown_detailed_coverage(tmp_path):

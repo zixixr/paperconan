@@ -23,7 +23,7 @@ def _fmt_cell(v: Any) -> str:
     if isinstance(v, float):
         if v != v or v in (float("inf"), float("-inf")):
             return ""
-        if abs(v) < 1e-12:
+        if v == 0:
             return "0"
         if v == int(v) and abs(v) < 1e15:
             return f"{int(v)}"
@@ -182,6 +182,48 @@ def _render_scan_status(scan: dict) -> str:
     )
 
 
+def _render_omission_warning(scan: dict, omitted: int) -> str:
+    noun = "finding was" if omitted == 1 else "findings were"
+    base = (
+        f"{omitted:,} {noun} omitted to bound retained report output."
+    )
+    coverage = scan.get("coverage")
+    if not isinstance(coverage, dict):
+        return f'<div class="warn">{base}</div>'
+
+    relevant_reasons = {
+        "finding_limit": "PAPERCONAN_MAX_FINDINGS_PER_BLOCK",
+        "global_finding_limit": "PAPERCONAN_MAX_TOTAL_FINDINGS",
+        "row_pair_finding_limit": None,
+        "recurring_row_vector_finding_limit": None,
+    }
+    reasons = []
+    controls = []
+    for limitation in coverage.get("limitations") or []:
+        if not isinstance(limitation, dict):
+            continue
+        reason = str(limitation.get("reason") or "")
+        if reason not in relevant_reasons or reason in reasons:
+            continue
+        reasons.append(reason)
+        control = relevant_reasons[reason]
+        if control and control not in controls:
+            controls.append(control)
+
+    details = ""
+    if reasons:
+        reason_codes = ", ".join(
+            f"<code>{_esc(reason)}</code>" for reason in reasons
+        )
+        details += f" Coverage reasons: {reason_codes}."
+    if controls:
+        control_codes = ", ".join(
+            f"<code>{_esc(control)}</code>" for control in controls
+        )
+        details += f" Applicable controls: {control_codes}."
+    return f'<div class="warn">{base}{details}</div>'
+
+
 # ---------- evidence table rendering ----------
 
 def _render_evidence_table(ev: dict | None) -> str:
@@ -189,13 +231,20 @@ def _render_evidence_table(ev: dict | None) -> str:
         return '<p class="no-evidence">no evidence table</p>'
     headers = ev.get("headers") or []
     col_offset = int(ev.get("col_offset") or 0)
+    col_indices = ev.get("col_indices")
+    if col_indices is None:
+        col_indices = [
+            col_offset + index for index in range(len(headers))
+        ]
+    else:
+        col_indices = [int(index) for index in col_indices]
     hi_cols = set(int(c) for c in ev.get("highlight_cols") or [])
     hi_rows = set(int(r) for r in ev.get("highlight_rows") or [])
 
     # Header row: empty corner, then each header cell. Highlight matching columns.
     head_cells = ['<th class="row-label">row</th>']
     for i, h in enumerate(headers):
-        abs_col = col_offset + i
+        abs_col = col_indices[i]
         cls = "hi-col" if abs_col in hi_cols else ""
         label = _esc(h) if h not in (None, "") else f"<span class='muted'>col {abs_col + 1}</span>"
         head_cells.append(f'<th class="{cls}">{label}</th>')
@@ -213,7 +262,7 @@ def _render_evidence_table(ev: dict | None) -> str:
         tr_cls = " ".join(tr_cls_parts)
         cells = [f'<td class="row-label">{row_idx}</td>']
         for i, v in enumerate(row.get("values") or []):
-            abs_col = col_offset + i
+            abs_col = col_indices[i]
             cls = "hi-col" if abs_col in hi_cols else ""
             cells.append(f'<td class="{cls}">{_fmt_cell(v)}</td>')
         body_rows.append(f'<tr class="{tr_cls}">{"".join(cells)}</tr>')
@@ -689,13 +738,7 @@ def write_html_report(scan: dict, out_path: str) -> None:
     omitted = int(scan.get("findings_omitted") or 0)
     omitted_html = ""
     if omitted:
-        omitted_html = (
-            f'<div class="warn">{omitted:,} lower-severity findings were omitted to bound '
-            'report size (dense/correlated blocks emit thousands of near-duplicate pairwise '
-            'signals). The highest-severity findings per block are kept; raise '
-            '<code>PAPERCONAN_MAX_FINDINGS_PER_BLOCK</code> / '
-            '<code>PAPERCONAN_MAX_TOTAL_FINDINGS</code> to see more.</div>'
-        )
+        omitted_html = _render_omission_warning(scan, omitted)
 
     ver = scan.get("tool_version", "")
     ts = scan.get("scanned_at")

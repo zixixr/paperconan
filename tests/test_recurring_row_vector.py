@@ -53,6 +53,17 @@ def _b2_oracle(panels, vec, min_occ=3, min_ns=2):
 
 
 VEC = [220.0, 188.0, 122.0, 166.0, 128.0, 166.0]     # high-information, not a ladder
+WIDE_VEC = [
+    coefficient * 2**53 + offset
+    for coefficient, offset in (
+        (1, 0),
+        (3, 17),
+        (2, 3),
+        (5, 21),
+        (4, 8),
+        (7, 14),
+    )
+]
 
 
 def test_b2_flags_recurring_vector_across_figures_and_matches_oracle():
@@ -283,3 +294,41 @@ def test_b2_findings_reports_exact_truncation_metadata():
 
     assert len(findings) == 1
     assert meta == {"findings_omitted": 1}
+
+
+def test_recurring_vector_preserves_identical_wide_integers_in_evidence():
+    panels = {
+        ("M1.xlsx", "Figure 1a"): _panel(WIDE_VEC, 10),
+        ("M2.xlsx", "Figure 2a"): _panel(WIDE_VEC, 40),
+        ("M3.xlsx", "Figure 3a"): _panel(WIDE_VEC, 70),
+    }
+
+    findings = detect_recurring_row_vectors({
+        key: _sheet(rows) for key, rows in panels.items()
+    })
+    match = next(
+        finding for finding in findings
+        if finding["vector"] == WIDE_VEC
+    )
+
+    assert all(isinstance(value, int) for value in match["vector"])
+    assert [example["value"] for example in match["examples"]] == WIDE_VEC
+    assert all(
+        isinstance(example["value"], int)
+        for example in match["examples"]
+    )
+
+
+def test_distinct_wide_integer_vectors_do_not_collapse_into_recurrence():
+    base = [coefficient * 2**55 for coefficient in (1, 3, 2, 5, 4, 7)]
+    panels = {
+        ("M1.xlsx", "Figure 1a"): _panel(base, 10),
+        ("M2.xlsx", "Figure 2a"): _panel([value + 1 for value in base], 40),
+        ("M3.xlsx", "Figure 3a"): _panel([value + 2 for value in base], 70),
+    }
+
+    findings = detect_recurring_row_vectors({
+        key: _sheet(rows) for key, rows in panels.items()
+    })
+
+    assert findings == []

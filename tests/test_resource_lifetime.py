@@ -270,7 +270,7 @@ def test_recurring_index_initial_budget_is_read_only():
         index.initial_budget = 9
 
 
-def test_sheet_elapsed_excludes_numeric_block_analysis_time(
+def test_sheet_and_file_elapsed_cover_loading_conversion_and_analysis(
     tmp_path, monkeypatch
 ):
     data = tmp_path / "data"
@@ -288,8 +288,25 @@ def test_sheet_elapsed_excludes_numeric_block_analysis_time(
     def perf_counter():
         return now[0]
 
+    original_from_rows = Sheet.from_rows
+
+    def load_table(_path):
+        now[0] += 2.0
+        return TableLoadResult({
+            "timing": [
+                ["a", "b"],
+                [1.125, 7.375],
+                [2.625, 4.875],
+                [5.375, 3.125],
+            ],
+        })
+
+    def from_rows(rows):
+        now[0] += 1.0
+        return original_from_rows(rows)
+
     def block_detector(*_args, **_kwargs):
-        now[0] += 5.0
+        now[0] += 3.0
         return []
 
     def digit_report(*_args, **_kwargs):
@@ -297,6 +314,8 @@ def test_sheet_elapsed_excludes_numeric_block_analysis_time(
         return None
 
     monkeypatch.setattr(audit.time, "perf_counter", perf_counter)
+    monkeypatch.setattr(audit, "load_table_result", load_table)
+    monkeypatch.setattr(Sheet, "from_rows", from_rows)
     monkeypatch.setattr(audit, "detect_relations", block_detector)
     monkeypatch.setattr(audit, "detect_last_digit", digit_report)
     state = audit.ScanBudgetState(
@@ -312,7 +331,8 @@ def test_sheet_elapsed_excludes_numeric_block_analysis_time(
         state=state,
     )
 
-    assert result.stats["sheets"][0]["elapsed_ms"] == 2000.0
+    assert result.stats["sheets"][0]["elapsed_ms"] == 6000.0
+    assert result.stats["files"][0]["elapsed_ms"] == 8000.0
 
 
 def test_scan_maps_collision_grid_cell_limit_with_counts(
