@@ -841,6 +841,30 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                                                f"{n_real_frac}/{n} rows ({distinct_hp} distinct high-precision "
                                                f"fractions) but differ by whole numbers")))
                     continue
+                # B5b: the same shared-fraction + integer-difference fingerprint at LOWER
+                # (2-3 decimal) precision, admitted ONLY when every non-zero integer
+                # difference is a multiple of 10. A "nudge the value by a round number,
+                # keep the decimals" edit has no benign additive transform, so the
+                # round-shift constraint compensates for the less-distinctive 2-digit
+                # fraction the high-precision B5 above requires. (Integer-only columns have
+                # no genuine fraction and are excluded by the distinct-fraction floor.)
+                nz = diff_is_int & (np.abs(np.round(diff)) >= 1)
+                round10 = nz & (np.abs(np.round(diff) - np.round(diff / 10.0) * 10.0) < 0.5)
+                shared_frac = diff_is_int & (np.abs(frac_x) > 1e-6)
+                distinct_frac = len({round(float(v), 6) for v in frac_x[shared_frac]})
+                if (int(round10.sum()) >= max(5, int(round(0.7 * n)))
+                        and int(round10.sum()) == int(nz.sum())
+                        and distinct_frac >= 3):
+                    findings.append(dict(kind="round_shift_shared_fraction",
+                                         col_a=header[ci - c0], col_b=header[cj - c0],
+                                         col_a_idx=ci, col_b_idx=cj, n=n,
+                                         n_shared_fraction=int(shared_frac.sum()),
+                                         severity="high",
+                                         col_a_sample=sa, col_b_sample=sb,
+                                         rule=(f"col[{cj}] and col[{ci}] share the same decimal fraction on "
+                                               f"{int(shared_frac.sum())}/{n} rows and differ only by non-zero "
+                                               f"multiples of 10 (copy-then-round-shift fingerprint)")))
+                    continue
             # small discrete diff set
             if n >= 8:
                 diff_rounded = np.round(diff, 4)
