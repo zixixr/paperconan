@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from collections import Counter
 import json
 from pathlib import Path
 import re
@@ -9,6 +10,8 @@ try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10 lacks the stdlib tomllib
     import tomli as tomllib
+
+import pytest
 
 from paperconan import __version__
 
@@ -65,6 +68,34 @@ EXPECTED_CI_PYTEST_STEPS = [
     {"run": "uv sync --frozen"},
     {"run": "uv run --frozen pytest -q"},
 ]
+INLINE_MATRIX_JOB = """
+pytest:
+  strategy:
+    matrix:
+      python-version: ["3.10", "3.11"]
+"""
+BLOCK_MATRIX_JOB = """
+pytest:
+  strategy:
+    matrix:
+      python-version:
+        - "3.10"
+        - "3.11"
+"""
+NAMED_PYTEST_JOB = """
+pytest:
+  steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Sync
+      run: uv sync --frozen
+    - name: Test
+      run: uv run --frozen pytest -q
+"""
 
 
 def _load_toml(relative_path):
@@ -77,6 +108,25 @@ def _project_lock_entry():
     return next(
         item for item in lock["package"]
         if item["name"] == "paperconan"
+    )
+
+
+def _semantic_identity(value):
+    if isinstance(value, dict):
+        return tuple(
+            sorted(
+                (key, _semantic_identity(item))
+                for key, item in value.items()
+            )
+        )
+    if isinstance(value, list):
+        return tuple(_semantic_identity(item) for item in value)
+    return value
+
+
+def _assert_semantic_members(actual, expected):
+    assert Counter(map(_semantic_identity, actual)) == Counter(
+        map(_semantic_identity, expected)
     )
 
 
@@ -152,8 +202,15 @@ def _workflow_steps(job):
                     section = key
             elif indent == list_indent + 4 and section is not None:
                 step[section][key] = value
+        step.pop("name", None)
         steps.append(step)
     return steps
+
+
+def _yaml_scalar(value):
+    if value.startswith(("[", '"', "'")):
+        return ast.literal_eval(value)
+    return value
 
 
 def _workflow_matrix(job):
@@ -166,7 +223,10 @@ def _workflow_matrix(job):
         len(lines[matrix_index]) - len(lines[matrix_index].lstrip())
     )
     matrix = {}
-    for line in lines[matrix_index + 1:]:
+    for index, line in enumerate(
+        lines[matrix_index + 1:],
+        start=matrix_index + 1,
+    ):
         if not line.strip():
             continue
         indent = len(line) - len(line.lstrip())
@@ -176,22 +236,144 @@ def _workflow_matrix(job):
             continue
         key, value = line.strip().split(":", 1)
         value = value.strip()
-        matrix[key] = ast.literal_eval(value) if value.startswith("[") else value
+        if value:
+            matrix[key] = _yaml_scalar(value)
+            continue
+
+        items = []
+        for nested in lines[index + 1:]:
+            if not nested.strip():
+                continue
+            nested_indent = len(nested) - len(nested.lstrip())
+            if nested_indent <= indent:
+                break
+            if (
+                nested_indent != indent + 2
+                or not nested.lstrip().startswith("- ")
+            ):
+                raise AssertionError("unsupported matrix presentation")
+            items.append(_yaml_scalar(nested.lstrip()[2:].strip()))
+        matrix[key] = items
     return matrix
+
+
+def test_semantic_dependency_contract_ignores_harmless_reordering():
+    _assert_semantic_members(
+        list(reversed(EXPECTED_PIP_EXTRA)),
+        EXPECTED_PIP_EXTRA,
+    )
+    _assert_semantic_members(
+        list(reversed(EXPECTED_LOCK_DEV_METADATA)),
+        EXPECTED_LOCK_DEV_METADATA,
+    )
+
+
+def test_semantic_dependency_contract_rejects_identity_changes():
+    changed_marker = [
+        dict(item)
+        for item in EXPECTED_LOCK_DEV_METADATA
+    ]
+    changed_marker[4]["marker"] = "python_version < '3.11'"
+    changed_specifier = [
+        dict(item)
+        for item in EXPECTED_LOCK_DEV_METADATA
+    ]
+    changed_specifier[0]["specifier"] = ">=1.1"
+
+    changed_contracts = [
+        EXPECTED_PIP_EXTRA[:-1],
+        [*EXPECTED_PIP_EXTRA, "coverage>=7"],
+        ["pytest>=9", *EXPECTED_PIP_EXTRA[1:]],
+        [*EXPECTED_PIP_EXTRA, EXPECTED_PIP_EXTRA[0]],
+        EXPECTED_LOCK_DEV_METADATA[:-1],
+        [
+            *EXPECTED_LOCK_DEV_METADATA,
+            {"name": "coverage", "specifier": ">=7"},
+        ],
+        [
+            *EXPECTED_LOCK_DEV_METADATA,
+            EXPECTED_LOCK_DEV_METADATA[0],
+        ],
+        changed_marker,
+        changed_specifier,
+    ]
+    expected_contracts = [
+        EXPECTED_PIP_EXTRA,
+        EXPECTED_PIP_EXTRA,
+        EXPECTED_PIP_EXTRA,
+        EXPECTED_PIP_EXTRA,
+        EXPECTED_LOCK_DEV_METADATA,
+        EXPECTED_LOCK_DEV_METADATA,
+        EXPECTED_LOCK_DEV_METADATA,
+        EXPECTED_LOCK_DEV_METADATA,
+        EXPECTED_LOCK_DEV_METADATA,
+    ]
+
+    for actual, expected in zip(changed_contracts, expected_contracts):
+        with pytest.raises(AssertionError):
+            _assert_semantic_members(actual, expected)
+
+
+def test_workflow_matrix_accepts_inline_and_block_lists():
+    expected = {"python-version": ["3.10", "3.11"]}
+
+    assert _workflow_matrix(INLINE_MATRIX_JOB) == expected
+    assert _workflow_matrix(BLOCK_MATRIX_JOB) == expected
+
+
+def test_workflow_steps_ignore_optional_name_fields():
+    assert _workflow_steps(NAMED_PYTEST_JOB) == EXPECTED_CI_PYTEST_STEPS
+
+
+def test_workflow_steps_preserve_behavior_changing_fields_and_commands():
+    extra_env = NAMED_PYTEST_JOB.replace(
+        "      run: uv sync --frozen",
+        (
+            "      run: uv sync --frozen\n"
+            "      env:\n"
+            "        UV_NO_CACHE: \"1\""
+        ),
+    )
+    changed_action = NAMED_PYTEST_JOB.replace(
+        "astral-sh/setup-uv@v6",
+        "astral-sh/setup-uv@v5",
+    )
+    changed_with = NAMED_PYTEST_JOB.replace(
+        "python-version: ${{ matrix.python-version }}",
+        "python-version: 3.14",
+    )
+    changed_run = NAMED_PYTEST_JOB.replace(
+        "run: uv sync --frozen",
+        "run: uv sync",
+    )
+    extra_command = (
+        NAMED_PYTEST_JOB
+        + "    - name: Extra\n"
+        + "      run: echo extra\n"
+    )
+
+    for job in (
+        extra_env,
+        changed_action,
+        changed_with,
+        changed_run,
+        extra_command,
+    ):
+        assert _workflow_steps(job) != EXPECTED_CI_PYTEST_STEPS
 
 
 def test_optional_test_extra_remains_pip_compatible():
     pyproject = _load_toml("pyproject.toml")
 
     extras = pyproject["project"]["optional-dependencies"]
-    assert extras["test"] == EXPECTED_PIP_EXTRA
+    _assert_semantic_members(extras["test"], EXPECTED_PIP_EXTRA)
 
 
 def test_optional_dev_extra_remains_pip_compatible():
     pyproject = _load_toml("pyproject.toml")
 
     extras = pyproject["project"]["optional-dependencies"]
-    assert extras["dev"] == EXPECTED_PIP_EXTRA
+    _assert_semantic_members(extras["dev"], EXPECTED_PIP_EXTRA)
 
 
 def test_committed_demo_scan_version_matches_package():
@@ -209,10 +391,13 @@ def test_pyproject_version_matches_package():
     assert pyproject["project"]["version"] == __version__
 
 
-def test_uv_dev_dependency_group_is_exact_and_ordered():
+def test_uv_dev_dependency_group_is_exact():
     pyproject = _load_toml("pyproject.toml")
 
-    assert pyproject["dependency-groups"]["dev"] == EXPECTED_DEV_GROUP
+    _assert_semantic_members(
+        pyproject["dependency-groups"]["dev"],
+        EXPECTED_DEV_GROUP,
+    )
 
 
 def test_uv_default_group_is_exact():
@@ -268,10 +453,10 @@ def test_build_backend_is_exact():
 def test_setuptools_build_requirement_floor_is_exact():
     pyproject = _load_toml("pyproject.toml")
 
-    assert pyproject["build-system"]["requires"] == [
-        "setuptools>=77",
-        "wheel",
-    ]
+    _assert_semantic_members(
+        pyproject["build-system"]["requires"],
+        ["setuptools>=77", "wheel"],
+    )
 
 
 def test_supported_python_classifiers_cover_310_through_314():
@@ -294,9 +479,9 @@ def test_lock_project_version_matches_package():
 def test_lock_dev_dependency_resolution_matches_pyproject():
     project = _project_lock_entry()
 
-    assert (
-        project["dev-dependencies"]["dev"]
-        == EXPECTED_LOCK_DEV_DEPENDENCIES
+    _assert_semantic_members(
+        project["dev-dependencies"]["dev"],
+        EXPECTED_LOCK_DEV_DEPENDENCIES,
     )
 
     lock = _load_toml("uv.lock")
@@ -310,9 +495,9 @@ def test_lock_dev_dependency_resolution_matches_pyproject():
 def test_lock_dev_dependency_metadata_matches_pyproject():
     project = _project_lock_entry()
 
-    assert (
-        project["metadata"]["requires-dev"]["dev"]
-        == EXPECTED_LOCK_DEV_METADATA
+    _assert_semantic_members(
+        project["metadata"]["requires-dev"]["dev"],
+        EXPECTED_LOCK_DEV_METADATA,
     )
 
 
