@@ -323,6 +323,16 @@ def _tracked_public_files(root=ROOT):
     }
 
 
+def _sdist_allowlist(root=ROOT):
+    return {
+        line.removeprefix("include ").strip()
+        for line in (root / "MANIFEST.in").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.startswith("include ")
+    }
+
+
 def _replace_sdist_job(old, new=""):
     assert old in EQUIVALENT_SDIST_JOB
     return EQUIVALENT_SDIST_JOB.replace(old, new, 1)
@@ -1272,6 +1282,13 @@ def test_tracked_public_files_requires_exact_repository_root():
     assert _tracked_public_files(ROOT / "tests") is None
 
 
+def test_sdist_allowlist_matches_tracked_public_files():
+    tracked_public = _tracked_public_files()
+    if tracked_public is None:
+        return
+    assert _sdist_allowlist() == tracked_public
+
+
 def test_sdist_contains_test_and_skill_closure(tmp_path):
     dist = tmp_path / "dist"
     probes = [
@@ -1316,8 +1333,6 @@ def test_sdist_contains_test_and_skill_closure(tmp_path):
             if member.isfile() and "/" in member.name
         }
 
-    tracked_public = _tracked_public_files()
-    assert tracked_public is not None
-    assert names == tracked_public | SDIST_GENERATED_METADATA
+    assert names == _sdist_allowlist() | SDIST_GENERATED_METADATA
 
     assert not {probe.relative_to(ROOT).as_posix() for probe in probes} & names
