@@ -3790,6 +3790,24 @@ _RECURRING_ROW_VECTOR_UNIQUE_BUDGET = int(
         "100000",
     )
 )
+_RECURRING_ROW_VECTOR_FINALIZATION_CANDIDATE_BUDGET = int(
+    os.environ.get(
+        "PAPERCONAN_RECURRING_ROW_VECTOR_FINALIZATION_CANDIDATE_BUDGET",
+        "10000",
+    )
+)
+_RECURRING_ROW_VECTOR_FINALIZATION_PAIR_BUDGET = int(
+    os.environ.get(
+        "PAPERCONAN_RECURRING_ROW_VECTOR_FINALIZATION_PAIR_BUDGET",
+        "200000",
+    )
+)
+_RECURRING_ROW_VECTOR_FINALIZATION_CELL_BUDGET = int(
+    os.environ.get(
+        "PAPERCONAN_RECURRING_ROW_VECTOR_FINALIZATION_CELL_BUDGET",
+        "1000000",
+    )
+)
 _RECURRING_ROW_VECTOR_MAX_FINDINGS = 20
 _FRACTION_REUSE_PAIR_BUDGET = int(
     os.environ.get("PAPERCONAN_FRACTION_REUSE_PAIR_BUDGET", "10000")
@@ -3813,6 +3831,7 @@ class ScanBudgetState:
     evidence: bool
     findings_kept: int = 0
     findings_omitted: int = 0
+    findings_omitted_is_lower_bound: bool = False
     report_blocks_kept: int = 0
     include_runtime: bool = True
     defer_evidence: bool = False
@@ -4634,6 +4653,15 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         recurring_index=RecurringRowIndex(
             budget=_RECURRING_ROW_VECTOR_BUDGET,
             unique_budget=_RECURRING_ROW_VECTOR_UNIQUE_BUDGET,
+            finalization_candidate_budget=(
+                _RECURRING_ROW_VECTOR_FINALIZATION_CANDIDATE_BUDGET
+            ),
+            finalization_pair_budget=(
+                _RECURRING_ROW_VECTOR_FINALIZATION_PAIR_BUDGET
+            ),
+            finalization_cell_budget=(
+                _RECURRING_ROW_VECTOR_FINALIZATION_CELL_BUDGET
+            ),
         ),
         profile=profile,
         evidence=evidence,
@@ -4716,7 +4744,18 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             ],
         )
     recurring_omitted = recurring_meta["findings_omitted"]
-    if recurring_omitted > 0:
+    finalization_limitation = recurring_meta.get(
+        "finalization_limitation"
+    )
+    if finalization_limitation is not None:
+        coverage.add_limitation(
+            "scan",
+            "recurring_row_vector_finalization_limit",
+            **finalization_limitation,
+        )
+        state.findings_omitted_is_lower_bound = True
+        state.findings_omitted += recurring_omitted
+    elif recurring_omitted > 0:
         coverage.add_limitation(
             "scan",
             "recurring_row_vector_finding_limit",
@@ -4785,6 +4824,8 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                digit_distribution=digit_reports,
                decimal_endings=decimal_reports,
                cross_sheet_findings=cross_sheet_findings)
+    if state.findings_omitted_is_lower_bound:
+        out["findings_omitted_is_lower_bound"] = True
     os.makedirs(out_dir, exist_ok=True)
     if write_json:
         with open(os.path.join(out_dir, "scan.json"), "w") as fh:

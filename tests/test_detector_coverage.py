@@ -304,6 +304,69 @@ def test_fraction_reuse_work_limit_is_disclosed_once(
     assert scan["coverage"]["truncated"] is True
 
 
+def test_recurring_finalization_limit_is_disclosed_at_scan_level(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        audit,
+        "_RECURRING_ROW_VECTOR_FINALIZATION_CANDIDATE_BUDGET",
+        0,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        audit,
+        "_RECURRING_ROW_VECTOR_FINALIZATION_PAIR_BUDGET",
+        100,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        audit,
+        "_RECURRING_ROW_VECTOR_FINALIZATION_CELL_BUDGET",
+        1_000,
+        raising=False,
+    )
+    data = tmp_path / "data"
+    data.mkdir()
+    for figure in range(1, 4):
+        (data / f"Figure {figure}.csv").write_text(
+            (
+                "a,b,c,d,e,f\n"
+                "203,217,208,229,211,223\n"
+                f"{300 + figure},317,308,329,311,323\n"
+                f"{400 + figure},417,408,429,411,423\n"
+            ),
+            encoding="utf-8",
+        )
+
+    scan = audit.scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    limitations = _limitations(
+        scan, "recurring_row_vector_finalization_limit"
+    )
+    assert len(limitations) == 1
+    limitation = limitations[0]
+    assert limitation["scope"] == "scan"
+    assert limitation["candidate_limit"] == 0
+    assert limitation["pair_limit"] == 100
+    assert limitation["cell_limit"] == 1_000
+    assert limitation["qualifying_candidates"] >= 1
+    assert limitation["candidates_retained"] == 0
+    assert limitation["candidates_omitted"] == (
+        limitation["qualifying_candidates"]
+    )
+    assert limitation["candidates_processed"] == 0
+    assert limitation["pair_comparisons"] == 0
+    assert limitation["cell_references_retained"] == 0
+    assert limitation["limits_reached"] == ["candidate"]
+    assert limitation["omitted_findings_lower_bound"] == 0
+    assert scan["findings_omitted"] == 0
+    assert scan["findings_omitted_is_lower_bound"] is True
+    assert scan["scan_status"] == "partial"
+    assert scan["coverage"]["truncated"] is True
+
+
 def test_detector_helpers_expose_coverage_without_changing_default_shapes():
     grid_sheet = Sheet.from_rows([
         ["a", "b"],

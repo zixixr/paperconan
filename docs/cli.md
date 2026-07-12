@@ -93,9 +93,16 @@ write_adjudicated_report(scan, verdict, "adjudication.html")  # scan/verdict 均
 | `PAPERCONAN_MAX_EVIDENCE_COLS` | `30` | 单条 evidence 片段最多列数 |
 | `PAPERCONAN_RECURRING_ROW_VECTOR_BUDGET` | `3000000` | recurring-row detector 的全局窗口工作预算；耗尽时记录精确跳过窗口数 |
 | `PAPERCONAN_RECURRING_ROW_VECTOR_UNIQUE_BUDGET` | `100000` | recurring-row detector 全局保留的唯一向量数；已知向量仍继续更新，新向量遗漏以明确下界记录 |
+| `PAPERCONAN_RECURRING_ROW_VECTOR_FINALIZATION_CANDIDATE_BUDGET` | `10000` | recurring-row finalization 最多保留的候选向量数；超限时记录候选遗漏数与 finding 遗漏下界 |
+| `PAPERCONAN_RECURRING_ROW_VECTOR_FINALIZATION_PAIR_BUDGET` | `200000` | recurring-row finalization 最多执行的 indexed overlap 候选比较数 |
+| `PAPERCONAN_RECURRING_ROW_VECTOR_FINALIZATION_CELL_BUDGET` | `1000000` | recurring-row finalization 最多保留的候选 cell 引用数 |
 | `PAPERCONAN_FRACTION_REUSE_PAIR_BUDGET` | `10000` | 同一 sheet 内 fraction-reuse detector 最多检查的 block pair 数 |
 | `PAPERCONAN_FRACTION_REUSE_CELL_BUDGET` | `1000000` | 同一 sheet 内 fraction-reuse detector 最多检查的位置 cell 数；与 pair 预算分别生效 |
 | `PAPERCONAN_MAX_PAPER_MB` | `1500` | `fetch` 下载/解压到一个 paper 目录的总量上限 |
 | `PAPERCONAN_ARCHIVE_MEMBER_LIMIT` | `10000` | 单个 ZIP/TAR 最多检查的 member 元数据数（包括非表格 member）；超限记录遗漏下界 |
 | `PAPERCONAN_ARCHIVE_MEMBER_NAME_BYTES` | `8388608` | 单个 ZIP/TAR 已检查 member 名称的累计 UTF-8 字节预算 |
+| `PAPERCONAN_ARCHIVE_METADATA_BYTES` | `8388608` | 单个 TAR 的 PAX、GNU long-name / long-link 等扩展元数据累计字节预算；在读取或解码超限 payload 前停止 |
 | `PAPERCONAN_ARCHIVE_OUTPUT_FILE_LIMIT` | `5000` | 单个 ZIP/TAR 最多写出的可扫描文件数；每个被此预算跳过的已保留 member 都会列入 `skipped` |
+| `PAPERCONAN_SOURCE_SIDECAR_MAX_BYTES` | `2097152` | 已有 `paperconan_source.json` 在解析前允许的最大文件字节数；超限时保留原 sidecar 与既有 managed outputs |
+| `PAPERCONAN_SOURCE_SIDECAR_ENTRY_LIMIT` | `10000` | provenance sidecar 允许检查及新写入的 managed-name 条目上限 |
+| `PAPERCONAN_SOURCE_SIDECAR_NAME_BYTES` | `1048576` | provenance sidecar 保留的唯一 managed-name 累计 UTF-8 字节预算 |

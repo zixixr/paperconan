@@ -25,6 +25,11 @@
 
 （若某张密集/高相关表触发了海量成对信号，报告会按 severity 保留每个 block 的前若干条并在顶部提示省略数量，可用 `PAPERCONAN_MAX_FINDINGS_PER_BLOCK` 调整，见 [命令行与库参考 › 内存 / 输出保护](cli.md#内存--输出保护)。）
 
+若 detector finalization 在完成前耗尽工作或状态预算，`scan.json` 会将
+`findings_omitted_is_lower_bound` 设为 `true`，coverage limitation 同时记录已执行工作、
+配置上限及 `omitted_findings_lower_bound`。HTML 顶部会将此类数量明确显示为
+"At least"，不能把该数字解读为精确遗漏总数。
+
 `scan.json` 完整结构见 [`references/output-schema.md`](../skills/paperconan/references/output-schema.md)。
 
 ## 误报控制：profiles 和 prefilter

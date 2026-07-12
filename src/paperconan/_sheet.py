@@ -33,10 +33,10 @@ def _sparse_payload_bytes(value):
         (datetime.date, datetime.time, datetime.datetime),
     ):
         return len(value.isoformat().encode("ascii"))
-    if isinstance(value, int):
-        return len(str(value).encode("ascii"))
     if isinstance(value, bool):
         return 1
+    if isinstance(value, int):
+        return len(str(value).encode("ascii"))
     rendered = f"{type(value).__module__}.{type(value).__qualname__}:{value}"
     return len(rendered.encode("utf-8", errors="backslashreplace"))
 

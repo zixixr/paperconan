@@ -205,6 +205,313 @@ def test_manifest_read_rejects_non_list_managed_files(
     }
 
 
+def test_oversized_sidecar_rejects_before_json_load_and_preserves_state(
+    tmp_path, monkeypatch
+):
+    managed = tmp_path / "old.csv"
+    managed.write_bytes(b"old")
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    payload = json.dumps({
+        "managed_files": ["old.csv"],
+        "title": "x" * 200,
+    }).encode("utf-8")
+    sidecar.write_bytes(payload)
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", len(payload) - 1,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download.json,
+        "load",
+        lambda _stream: (_ for _ in ()).throw(
+            AssertionError("over-budget sidecar must not be decoded")
+        ),
+    )
+    download_calls = []
+    monkeypatch.setattr(
+        _download,
+        "download_file",
+        lambda *_args, **_kwargs: download_calls.append(True),
+    )
+
+    result = _download.download_candidate(
+        _candidate("new.csv", "https://x/new"),
+        str(tmp_path),
+    )
+
+    assert result["downloaded"] == []
+    assert result["skipped"] == [{
+        "name": _download.SOURCE_SIDECAR,
+        "reason": "source sidecar byte limit",
+        "limit": len(payload) - 1,
+        "observed_bytes": len(payload),
+        "ownership_preserved": True,
+    }]
+    assert download_calls == []
+    assert managed.read_bytes() == b"old"
+    assert sidecar.read_bytes() == payload
+
+
+def test_sidecar_entry_limit_rejects_without_ownership_transition(
+    tmp_path, monkeypatch
+):
+    first = tmp_path / "first.csv"
+    second = tmp_path / "second.csv"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    _write_sidecar(
+        tmp_path,
+        [None, "../unsafe.csv", "first.csv", "second.csv"],
+        doi="10.x/old",
+    )
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    original_sidecar = sidecar.read_bytes()
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", 10_000,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_ENTRY_LIMIT", 3,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_NAME_BYTES", 10_000,
+        raising=False,
+    )
+    download_calls = []
+    monkeypatch.setattr(
+        _download,
+        "download_file",
+        lambda *_args, **_kwargs: download_calls.append(True),
+    )
+
+    result = _download.download_candidate(
+        _candidate("new.csv", "https://x/new"),
+        str(tmp_path),
+    )
+
+    assert result["downloaded"] == []
+    assert result["skipped"] == [{
+        "name": _download.SOURCE_SIDECAR,
+        "reason": "source sidecar managed entry limit",
+        "limit": 3,
+        "managed_entries_inspected": 3,
+        "managed_entries_retained": 1,
+        "managed_name_bytes_retained": len("first.csv"),
+        "omitted_entries_lower_bound": 1,
+        "ownership_preserved": True,
+    }]
+    assert download_calls == []
+    assert first.read_bytes() == b"first"
+    assert second.read_bytes() == b"second"
+    assert sidecar.read_bytes() == original_sidecar
+
+
+def test_sidecar_name_byte_limit_rejects_before_retaining_long_name(
+    tmp_path, monkeypatch
+):
+    first_name = "first.csv"
+    second_name = "second-long-name.csv"
+    first = tmp_path / first_name
+    second = tmp_path / second_name
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    _write_sidecar(tmp_path, [first_name, second_name], doi="10.x/old")
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    original_sidecar = sidecar.read_bytes()
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", 10_000,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_ENTRY_LIMIT", 10,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download,
+        "_SOURCE_SIDECAR_NAME_BYTES",
+        len(first_name),
+        raising=False,
+    )
+
+    result = _download.download_candidate(
+        _candidate("new.csv", "https://x/new"),
+        str(tmp_path),
+    )
+
+    assert result["downloaded"] == []
+    assert result["skipped"] == [{
+        "name": _download.SOURCE_SIDECAR,
+        "reason": "source sidecar managed name byte limit",
+        "limit": len(first_name),
+        "managed_entries_inspected": 2,
+        "managed_entries_retained": 1,
+        "managed_name_bytes_retained": len(first_name),
+        "requested_name_bytes": len(second_name),
+        "omitted_entries_lower_bound": 1,
+        "ownership_preserved": True,
+    }]
+    assert first.read_bytes() == b"first"
+    assert second.read_bytes() == b"second"
+    assert sidecar.read_bytes() == original_sidecar
+
+
+def test_managed_output_name_uses_membership_without_copying_reusable_names(
+    tmp_path,
+):
+    class MembershipOnly:
+        def __contains__(self, name):
+            return name == "table.csv"
+
+        def __iter__(self):
+            raise AssertionError("reusable names must not be copied")
+
+    assert _download._managed_output_name(
+        str(tmp_path),
+        "table.csv",
+        "nested/table.csv",
+        MembershipOnly(),
+    ) == "table.csv"
+
+
+@pytest.mark.parametrize("channel", ["direct", "zip", "tar"])
+def test_sidecar_entry_limit_bounds_new_direct_and_archive_names(
+    tmp_path, monkeypatch, channel
+):
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", 10_000,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_ENTRY_LIMIT", 1,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_NAME_BYTES", 10_000,
+        raising=False,
+    )
+    if channel == "direct":
+        cand = {
+            "cand_id": "source:1",
+            "source": "source",
+            "tabular_files": [
+                {
+                    "name": "first.csv",
+                    "download_url": "https://x/first",
+                },
+                {
+                    "name": "second.csv",
+                    "download_url": "https://x/second",
+                },
+            ],
+        }
+
+        def source_download(url, dest, **kwargs):
+            Path(dest).write_bytes(b"data")
+            return {"ok": True, "path": dest, "size": 4}
+    else:
+        payload = _archive_payload(
+            channel,
+            [
+                ("first.csv", b"first"),
+                ("second.csv", b"second"),
+            ],
+        )
+        cand = {
+            "cand_id": "source:1",
+            "source": "source",
+            "tabular_files": [],
+            **_archive_fields(channel),
+        }
+
+        def source_download(url, dest, **kwargs):
+            Path(dest).write_bytes(payload)
+            return {
+                "ok": True,
+                "path": dest,
+                "size": len(payload),
+            }
+
+    monkeypatch.setattr(_download, "download_file", source_download)
+
+    result = _download.download_candidate(cand, str(tmp_path))
+
+    assert [Path(path).name for path in result["downloaded"]] == [
+        "first.csv"
+    ]
+    assert result["skipped"] == [{
+        "name": "second.csv",
+        "reason": "source sidecar managed entry limit",
+        "limit": 1,
+        "managed_entries_retained": 1,
+        "managed_name_bytes_retained": len("first.csv"),
+        "omitted_entries_lower_bound": 1,
+    }]
+    assert json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(
+            encoding="utf-8"
+        )
+    )["managed_files"] == ["first.csv"]
+
+
+@pytest.mark.parametrize("channel", ["direct", "zip", "tar"])
+def test_sidecar_accounting_does_not_serialize_per_output(
+    tmp_path, monkeypatch, channel
+):
+    names = [f"table-{index}.csv" for index in range(8)]
+    if channel == "direct":
+        cand = {
+            "cand_id": "source:1",
+            "source": "source",
+            "tabular_files": [
+                {
+                    "name": name,
+                    "download_url": f"https://x/{name}",
+                }
+                for name in names
+            ],
+        }
+
+        def source_download(url, dest, **kwargs):
+            Path(dest).write_bytes(b"x")
+            return {"ok": True, "path": dest, "size": 1}
+    else:
+        payload = _archive_payload(
+            channel, [(name, b"x") for name in names]
+        )
+        cand = {
+            "cand_id": "source:1",
+            "source": "source",
+            "tabular_files": [],
+            **_archive_fields(channel),
+        }
+
+        def source_download(url, dest, **kwargs):
+            Path(dest).write_bytes(payload)
+            return {
+                "ok": True,
+                "path": dest,
+                "size": len(payload),
+            }
+
+    monkeypatch.setattr(_download, "download_file", source_download)
+    serialization_calls = []
+    source_sidecar_bytes = _download._source_sidecar_bytes
+
+    def tracked_sidecar_bytes(*args, **kwargs):
+        serialization_calls.append(True)
+        return source_sidecar_bytes(*args, **kwargs)
+
+    monkeypatch.setattr(
+        _download, "_source_sidecar_bytes", tracked_sidecar_bytes
+    )
+
+    result = _download.download_candidate(cand, str(tmp_path))
+
+    assert len(result["downloaded"]) == len(names)
+    assert len(serialization_calls) <= 2
+
+
 def test_manifest_contains_only_sorted_successful_relative_paths(
     tmp_path, monkeypatch
 ):
@@ -2233,6 +2540,8 @@ def test_partial_archive_limit_preserves_unprocessed_managed_outputs(
             "name": archive_name,
             "reason": "archive member count limit",
             "limit": 1,
+            "members_inspected": 1,
+            "eligible_members_retained": 1,
             "retained_members": 1,
             "omitted_members_lower_bound": 1,
         }]

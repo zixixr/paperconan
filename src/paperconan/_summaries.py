@@ -207,11 +207,135 @@ def _location_names(record, prefix):
     })
 
 
+def _recurring_candidate_qualifies(vector, record):
+    site_count = record.site_count
+    if site_count < 3 or _vector_is_patterned(vector):
+        return False
+    if len(record.figures) < 2:
+        return False
+    all_int = all(
+        isinstance(value, int)
+        or abs(value - round(value)) < 1e-9
+        for value in vector
+    )
+    if all_int and (
+        len(vector) < 5
+        or len(set(vector)) < 4
+    ):
+        return False
+    return True
+
+
+def _recurring_candidate_cells(vector, record):
+    return frozenset(
+        (file, sheet, row, start_col + offset)
+        for file, sheet, row, start_col in record.sites
+        for offset in range(len(vector))
+    )
+
+
+def _iter_indexed_candidate_ids(cells, cell_index):
+    pending = []
+    postings = []
+    for cell in sorted(cells):
+        matches = cell_index.get(cell)
+        if not matches:
+            continue
+        posting_index = len(postings)
+        postings.append(matches)
+        heapq.heappush(
+            pending,
+            (matches[0], posting_index, 0),
+        )
+    while pending:
+        candidate_id = pending[0][0]
+        while pending and pending[0][0] == candidate_id:
+            _candidate_id, posting_index, offset = heapq.heappop(
+                pending
+            )
+            next_offset = offset + 1
+            matches = postings[posting_index]
+            if next_offset < len(matches):
+                heapq.heappush(
+                    pending,
+                    (
+                        matches[next_offset],
+                        posting_index,
+                        next_offset,
+                    ),
+                )
+        yield candidate_id
+
+
+def _recurring_finding(vector, record):
+    sheets_hit = _location_names(record, "sheet")
+    files_hit = _location_names(record, "file")
+    site_count = record.site_count
+    figures = record.figures
+    location = "; ".join(sheets_hit[:6])
+    figure_count = len(figures)
+    figure_text = (
+        f"at least {figure_count}"
+        if record.figures_lower_bound
+        else str(figure_count)
+    )
+    finding = dict(
+        kind="recurring_row_vector",
+        file="; ".join(files_hit)[:120],
+        file_a=record.file_min,
+        file_b=record.file_max,
+        same_file=record.file_min == record.file_max,
+        sheet="; ".join(sheets_hit)[:120],
+        sheet_a=record.sheet_min,
+        sheet_b=record.sheet_max,
+        vector=list(vector),
+        size_a=site_count,
+        size_b=site_count,
+        same_position_count=site_count,
+        fraction_of_smaller=1.0,
+        n_occurrences=site_count,
+        n_figures=figure_count,
+        same_figure=False,
+        delta={"pattern": "recurring_row_vector"},
+        pattern="recurring_row_vector",
+        examples=[{"value": value} for value in vector],
+        severity=(
+            "high"
+            if len(vector) >= 5 and site_count >= 3
+            else "medium"
+        ),
+        rule=(
+            f"the {len(vector)}-value vector {list(vector)} recurs at "
+            f"{site_count} places across {figure_text} figures "
+            f"({location})"
+        ),
+    )
+    if record.figures_lower_bound:
+        finding["n_figures_lower_bound"] = True
+    return finding
+
+
 class RecurringRowIndex:
-    def __init__(self, budget=3_000_000, unique_budget=100_000):
+    def __init__(
+        self,
+        budget=3_000_000,
+        unique_budget=100_000,
+        finalization_candidate_budget=10_000,
+        finalization_pair_budget=200_000,
+        finalization_cell_budget=1_000_000,
+    ):
         self._initial_budget = max(0, int(budget))
         self._budget = self._initial_budget
         self._initial_unique_budget = max(0, int(unique_budget))
+        self._finalization_candidate_budget = max(
+            0, int(finalization_candidate_budget)
+        )
+        self._finalization_pair_budget = max(
+            0, int(finalization_pair_budget)
+        )
+        self._finalization_cell_budget = max(
+            0, int(finalization_cell_budget)
+        )
         self._vectors: dict[
             tuple[int | float, ...], _RecurringVectorRecord
         ] = {}
@@ -317,102 +441,131 @@ class RecurringRowIndex:
 
     def findings(
         self, profile="review", max_findings=20
-    ) -> tuple[list[dict], dict[str, int]]:
-        candidates = []
-        for vector, record in self._vectors.items():
-            site_count = record.site_count
-            if site_count < 3 or _vector_is_patterned(vector):
+    ) -> tuple[list[dict], dict[str, Any]]:
+        candidate_heap = []
+        qualifying_candidates = 0
+        candidate_limit = self._finalization_candidate_budget
+        for order, (vector, record) in enumerate(
+            self._vectors.items()
+        ):
+            if not _recurring_candidate_qualifies(vector, record):
                 continue
-            figures = record.figures
-            if len(figures) < 2:
+            qualifying_candidates += 1
+            if candidate_limit <= 0:
                 continue
-            all_int = all(
-                isinstance(value, int)
-                or abs(value - round(value)) < 1e-9
-                for value in vector
+            quality = (
+                record.site_count,
+                len(vector),
+                -order,
             )
-            if all_int and (
-                len(vector) < 5
-                or len(set(vector)) < 4
-            ):
-                continue
-            sites = record.sites
-            if site_count < 3:
-                continue
-            cells = {
-                (file, sheet, row, start_col + offset)
-                for file, sheet, row, start_col in sites
-                for offset in range(len(vector))
-            }
-            candidates.append((vector, record, cells))
+            candidate = (quality, order, vector, record)
+            if len(candidate_heap) < candidate_limit:
+                heapq.heappush(candidate_heap, candidate)
+            elif quality > candidate_heap[0][0]:
+                heapq.heapreplace(candidate_heap, candidate)
 
+        candidates = [
+            (vector, record, order)
+            for _quality, order, vector, record in candidate_heap
+        ]
         candidates.sort(
             key=lambda candidate: (
                 -candidate[1].site_count,
                 -len(candidate[0]),
+                candidate[2],
             )
         )
-        kept = []
-        for candidate in candidates:
-            cells = candidate[2]
-            if any(
-                len(cells & prior[2])
-                >= 0.5 * min(len(cells), len(prior[2]))
-                for prior in kept
-            ):
-                continue
-            kept.append(candidate)
+        candidates_omitted = (
+            qualifying_candidates - len(candidates)
+        )
+        limits_reached = []
+        if candidates_omitted:
+            limits_reached.append("candidate")
 
+        cell_index = {}
+        kept_cells = []
         findings = []
-        for vector, record, _cells in kept:
-            sheets_hit = _location_names(record, "sheet")
-            files_hit = _location_names(record, "file")
-            site_count = record.site_count
-            figures = record.figures
-            location = "; ".join(sheets_hit[:6])
-            figure_count = len(figures)
-            figure_text = (
-                f"at least {figure_count}"
-                if record.figures_lower_bound
-                else str(figure_count)
-            )
-            finding = dict(
-                kind="recurring_row_vector",
-                file="; ".join(files_hit)[:120],
-                file_a=record.file_min,
-                file_b=record.file_max,
-                same_file=record.file_min == record.file_max,
-                sheet="; ".join(sheets_hit)[:120],
-                sheet_a=record.sheet_min,
-                sheet_b=record.sheet_max,
-                vector=list(vector),
-                size_a=site_count,
-                size_b=site_count,
-                same_position_count=site_count,
-                fraction_of_smaller=1.0,
-                n_occurrences=site_count,
-                n_figures=figure_count,
-                same_figure=False,
-                delta={"pattern": "recurring_row_vector"},
-                pattern="recurring_row_vector",
-                examples=[{"value": value} for value in vector],
-                severity=(
-                    "high"
-                    if len(vector) >= 5 and site_count >= 3
-                    else "medium"
-                ),
-                rule=(
-                    f"the {len(vector)}-value vector {list(vector)} recurs at "
-                    f"{site_count} places across {figure_text} figures "
-                    f"({location})"
-                ),
-            )
-            if record.figures_lower_bound:
-                finding["n_figures_lower_bound"] = True
-            findings.append(finding)
-
         limit = max(0, int(max_findings))
-        omitted = max(0, len(findings) - limit)
-        findings = findings[:limit]
+        findings_omitted = 0
+        definite_omissions = 0
+        pair_comparisons = 0
+        cell_references_retained = 0
+        candidates_processed = 0
+        finalization_stopped = False
+        for vector, record, _order in candidates:
+            cells = _recurring_candidate_cells(vector, record)
+            overlaps_prior = False
+            for candidate_id in _iter_indexed_candidate_ids(
+                cells, cell_index
+            ):
+                if (
+                    pair_comparisons
+                    >= self._finalization_pair_budget
+                ):
+                    if "pair" not in limits_reached:
+                        limits_reached.append("pair")
+                    finalization_stopped = True
+                    break
+                pair_comparisons += 1
+                prior_cells = kept_cells[candidate_id]
+                if (
+                    len(cells & prior_cells)
+                    >= 0.5 * min(len(cells), len(prior_cells))
+                ):
+                    overlaps_prior = True
+                    break
+            if finalization_stopped:
+                break
+            if overlaps_prior:
+                candidates_processed += 1
+                continue
+            if (
+                cell_references_retained + len(cells)
+                > self._finalization_cell_budget
+            ):
+                if "cell" not in limits_reached:
+                    limits_reached.append("cell")
+                definite_omissions += 1
+                finalization_stopped = True
+                break
+
+            candidate_id = len(kept_cells)
+            kept_cells.append(cells)
+            for cell in cells:
+                cell_index.setdefault(cell, []).append(candidate_id)
+            cell_references_retained += len(cells)
+            candidates_processed += 1
+            if len(findings) < limit:
+                findings.append(
+                    _recurring_finding(vector, record)
+                )
+            else:
+                findings_omitted += 1
+
+        findings_omitted += definite_omissions
         apply_profile_to_findings(findings, profile)
-        return findings, {"findings_omitted": omitted}
+        if not limits_reached:
+            return findings, {
+                "findings_omitted": findings_omitted
+            }
+        return findings, {
+            "findings_omitted": findings_omitted,
+            "findings_omitted_is_lower_bound": True,
+            "finalization_limitation": {
+                "candidate_limit": (
+                    self._finalization_candidate_budget
+                ),
+                "pair_limit": self._finalization_pair_budget,
+                "cell_limit": self._finalization_cell_budget,
+                "qualifying_candidates": qualifying_candidates,
+                "candidates_retained": len(candidates),
+                "candidates_omitted": candidates_omitted,
+                "candidates_processed": candidates_processed,
+                "pair_comparisons": pair_comparisons,
+                "cell_references_retained": (
+                    cell_references_retained
+                ),
+                "limits_reached": limits_reached,
+                "omitted_findings_lower_bound": findings_omitted,
+            },
+        }

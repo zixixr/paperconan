@@ -1,8 +1,11 @@
+import gzip
 import hashlib
 import io
+import struct
 import tarfile
 import warnings
 import zipfile
+import zlib
 from pathlib import Path
 
 import pytest
@@ -514,6 +517,465 @@ def _extract_bounded_archive(path, archive_kind, out_dir):
     )
 
 
+def _unicode_path_extra(raw_name, unicode_name, *, crc=None):
+    raw_name = raw_name.encode("cp437")
+    encoded_name = unicode_name.encode("utf-8")
+    payload = struct.pack(
+        "<BL",
+        1,
+        zlib.crc32(raw_name) if crc is None else crc,
+    ) + encoded_name
+    return struct.pack("<HH", 0x7075, len(payload)) + payload
+
+
+def _write_unicode_path_archive(
+    path, raw_name, unicode_name, *, crc=None, body=b"a\n1\n"
+):
+    info = zipfile.ZipInfo(raw_name)
+    info.extra = _unicode_path_extra(
+        raw_name, unicode_name, crc=crc
+    )
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(info, body)
+
+
+def _write_zip64_central_archive(
+    path, name, body, *, zip64_payload=None
+):
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(name, body)
+    original = path.read_bytes()
+    central_offset = original.index(zipfile.stringCentralDir)
+    end_offset = original.index(
+        zipfile.stringEndArchive, central_offset
+    )
+    central = list(struct.unpack(
+        zipfile.structCentralDir,
+        original[
+            central_offset:central_offset + zipfile.sizeCentralDir
+        ],
+    ))
+    filename_length = central[zipfile._CD_FILENAME_LENGTH]
+    extra_length = central[zipfile._CD_EXTRA_FIELD_LENGTH]
+    comment_length = central[zipfile._CD_COMMENT_LENGTH]
+    variable_start = central_offset + zipfile.sizeCentralDir
+    raw_name = original[
+        variable_start:variable_start + filename_length
+    ]
+    comment = original[
+        variable_start + filename_length + extra_length:
+        variable_start + filename_length + extra_length + comment_length
+    ]
+    if zip64_payload is None:
+        zip64_payload = struct.pack(
+            "<QQQ", len(body), len(body), 0
+        )
+    zip64_extra = (
+        struct.pack("<HH", 0x0001, len(zip64_payload))
+        + zip64_payload
+    )
+    central[zipfile._CD_UNCOMPRESSED_SIZE] = 0xFFFFFFFF
+    central[zipfile._CD_COMPRESSED_SIZE] = 0xFFFFFFFF
+    central[zipfile._CD_LOCAL_HEADER_OFFSET] = 0xFFFFFFFF
+    central[zipfile._CD_EXTRA_FIELD_LENGTH] = len(zip64_extra)
+    rewritten_central = (
+        struct.pack(zipfile.structCentralDir, *central)
+        + raw_name
+        + zip64_extra
+        + comment
+    )
+    end = list(struct.unpack(
+        zipfile.structEndArchive,
+        original[end_offset:end_offset + zipfile.sizeEndCentDir],
+    ))
+    end[zipfile._ECD_SIZE] += len(zip64_extra) - extra_length
+    rewritten_end = struct.pack(zipfile.structEndArchive, *end)
+    path.write_bytes(
+        original[:central_offset]
+        + rewritten_central
+        + rewritten_end
+        + original[end_offset + zipfile.sizeEndCentDir:]
+    )
+
+
+def _write_extended_tar(path, extension_kind, long_value):
+    tar_format = (
+        tarfile.PAX_FORMAT
+        if extension_kind == "pax"
+        else tarfile.GNU_FORMAT
+    )
+    with tarfile.open(path, "w:gz", format=tar_format) as archive:
+        if extension_kind == "gnu_longlink":
+            info = tarfile.TarInfo("link")
+            info.type = tarfile.SYMTYPE
+            info.linkname = long_value
+            archive.addfile(info)
+            return
+        info = tarfile.TarInfo(long_value)
+        body = b"a\n1\n"
+        info.size = len(body)
+        archive.addfile(info, io.BytesIO(body))
+
+
+def _first_tar_header(path):
+    with gzip.open(path, "rb") as stream:
+        return tarfile.TarInfo.frombuf(
+            stream.read(tarfile.BLOCKSIZE),
+            "utf-8",
+            "surrogateescape",
+        )
+
+
+@pytest.mark.parametrize(
+    ("extension_kind", "processor_name"),
+    [
+        ("pax", "_proc_pax"),
+        ("gnu_longname", "_proc_gnulong"),
+        ("gnu_longlink", "_proc_gnulong"),
+    ],
+)
+def test_tar_extended_metadata_budget_rejects_before_stdlib_handler(
+    tmp_path, monkeypatch, extension_kind, processor_name
+):
+    archive = tmp_path / f"{extension_kind}.tar.gz"
+    long_value = "nested/" + "a" * 200_000 + ".csv"
+    _write_extended_tar(archive, extension_kind, long_value)
+    first_header = _first_tar_header(archive)
+    assert first_header.size > 100_000
+    assert archive.stat().st_size < 5_000
+    processor_calls = []
+    original_processor = getattr(
+        tarfile.TarInfo, processor_name
+    )
+
+    def tracked_processor(info, opened_archive):
+        processor_calls.append(info.size)
+        return original_processor(info, opened_archive)
+
+    monkeypatch.setattr(
+        tarfile.TarInfo, processor_name, tracked_processor
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_METADATA_BYTES", 1, raising=False
+    )
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 10)
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_MEMBER_NAME_BYTES", 1_000_000
+    )
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    extracted, preserved, skipped = _extract_bounded_archive(
+        archive, "tar", out_dir
+    )
+
+    assert processor_calls == []
+    assert extracted == []
+    assert preserved == set()
+    assert skipped == [{
+        "name": archive.name,
+        "reason": "archive metadata byte limit",
+        "limit": 1,
+        "members_inspected": 1,
+        "eligible_members_retained": 0,
+        "retained_members": 0,
+        "metadata_bytes_processed": 0,
+        "requested_metadata_bytes": first_header.size,
+        "omitted_members_lower_bound": 1,
+    }]
+
+
+def test_tar_extension_record_consumes_member_budget_before_payload(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "pax-member-limit.tar.gz"
+    _write_extended_tar(
+        archive,
+        "pax",
+        "nested/" + "a" * 200_000 + ".csv",
+    )
+    processor_calls = []
+    original_processor = tarfile.TarInfo._proc_pax
+
+    def tracked_processor(info, opened_archive):
+        processor_calls.append(info.size)
+        return original_processor(info, opened_archive)
+
+    monkeypatch.setattr(
+        tarfile.TarInfo, "_proc_pax", tracked_processor
+    )
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 1)
+    monkeypatch.setattr(
+        _download,
+        "_ARCHIVE_METADATA_BYTES",
+        1_000_000,
+        raising=False,
+    )
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    extracted, preserved, skipped = _extract_bounded_archive(
+        archive, "tar", out_dir
+    )
+
+    assert processor_calls == []
+    assert extracted == []
+    assert preserved == set()
+    assert skipped == [{
+        "name": archive.name,
+        "reason": "archive member count limit",
+        "limit": 1,
+        "members_inspected": 1,
+        "eligible_members_retained": 0,
+        "retained_members": 0,
+        "omitted_members_lower_bound": 1,
+    }]
+
+
+def test_tar_pax_final_name_budget_rejects_before_decode(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "pax-name-limit.tar.gz"
+    _write_extended_tar(
+        archive,
+        "pax",
+        "nested/" + "a" * 200_000 + ".csv",
+    )
+    first_header = _first_tar_header(archive)
+    processor_calls = []
+    original_processor = tarfile.TarInfo._proc_pax
+
+    def tracked_processor(info, opened_archive):
+        processor_calls.append(info.size)
+        return original_processor(info, opened_archive)
+
+    monkeypatch.setattr(
+        tarfile.TarInfo, "_proc_pax", tracked_processor
+    )
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 10)
+    monkeypatch.setattr(
+        _download,
+        "_ARCHIVE_METADATA_BYTES",
+        1_000_000,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_MEMBER_NAME_BYTES", 1
+    )
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    extracted, preserved, skipped = _extract_bounded_archive(
+        archive, "tar", out_dir
+    )
+
+    assert processor_calls == []
+    assert extracted == []
+    assert preserved == set()
+    assert skipped == [{
+        "name": archive.name,
+        "reason": "archive member name byte limit",
+        "limit": 1,
+        "members_inspected": 1,
+        "eligible_members_retained": 0,
+        "retained_members": 0,
+        "retained_name_bytes": 0,
+        "metadata_bytes_processed": first_header.size,
+        "omitted_members_lower_bound": 1,
+    }]
+
+
+def test_truncated_pax_payload_raises_invalid_header():
+    with pytest.raises(tarfile.InvalidHeaderError):
+        list(_download._pax_path_value_lengths(b"12 path=x\n", 12))
+
+
+@pytest.mark.parametrize(
+    "extension_kind",
+    ["pax", "gnu_longname"],
+)
+def test_tar_extended_names_extract_normally_within_budgets(
+    tmp_path, monkeypatch, extension_kind
+):
+    archive = tmp_path / f"{extension_kind}.tar.gz"
+    final_name = "nested/" + "a" * 180 + ".csv"
+    _write_extended_tar(archive, extension_kind, final_name)
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 10)
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_METADATA_BYTES", 10_000, raising=False
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_MEMBER_NAME_BYTES", 10_000
+    )
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    extracted, preserved, skipped = _extract_bounded_archive(
+        archive, "tar", out_dir
+    )
+
+    assert [Path(path).read_bytes() for path in extracted] == [
+        b"a\n1\n"
+    ]
+    assert preserved == set()
+    assert skipped == []
+
+
+def test_tar_gnu_longlink_continues_to_supported_member_within_budgets(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "gnu-longlink.tar.gz"
+    long_link = "nested/" + "a" * 180
+    with tarfile.open(
+        archive, "w:gz", format=tarfile.GNU_FORMAT
+    ) as output:
+        link = tarfile.TarInfo("link")
+        link.type = tarfile.SYMTYPE
+        link.linkname = long_link
+        output.addfile(link)
+        body = b"a\n1\n"
+        table = tarfile.TarInfo("table.csv")
+        table.size = len(body)
+        output.addfile(table, io.BytesIO(body))
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 10)
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_METADATA_BYTES", 10_000, raising=False
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_MEMBER_NAME_BYTES", 10_000
+    )
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    extracted, preserved, skipped = _extract_bounded_archive(
+        archive, "tar", out_dir
+    )
+
+    assert [Path(path).read_bytes() for path in extracted] == [body]
+    assert preserved == set()
+    assert skipped == []
+
+
+def test_zip_unicode_path_budget_charges_sanitized_final_name(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "unicode.zip"
+    raw_name = "a.csv"
+    final_name = "nested/" + "u" * 80 + ".csv"
+    _write_unicode_path_archive(archive, raw_name, final_name)
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_MEMBER_NAME_BYTES", len(raw_name)
+    )
+    monkeypatch.setattr(
+        zipfile.ZipInfo,
+        "_decodeExtra",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ZIP extras must use local parsing")
+        ),
+    )
+
+    with _download._BoundedZipFile(
+        archive, archive_name=archive.name
+    ) as bounded:
+        assert bounded.filelist == []
+        assert bounded.NameToInfo == {}
+        assert bounded.selection_skipped == [{
+            "name": archive.name,
+            "reason": "archive member name byte limit",
+            "limit": len(raw_name),
+            "members_inspected": 1,
+            "eligible_members_retained": 0,
+            "retained_members": 0,
+            "retained_name_bytes": 0,
+            "omitted_members_lower_bound": 1,
+        }]
+
+
+def test_zip_unicode_path_crc_mismatch_keeps_raw_name(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "unicode-crc.zip"
+    raw_name = "table.csv"
+    _write_unicode_path_archive(
+        archive,
+        raw_name,
+        "nested/" + "u" * 80 + ".csv",
+        crc=0,
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_MEMBER_NAME_BYTES", len(raw_name)
+    )
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    extracted, preserved, skipped = _extract_bounded_archive(
+        archive, "zip", out_dir
+    )
+
+    assert [Path(path).name for path in extracted] == [raw_name]
+    assert preserved == set()
+    assert skipped == []
+
+
+def test_zip_malformed_unicode_extra_raises_bad_zip_file(tmp_path):
+    archive = tmp_path / "malformed-unicode.zip"
+    info = zipfile.ZipInfo("table.csv")
+    info.extra = struct.pack("<HH", 0x7075, 4) + b"\x01\x00\x00\x00"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr(info, b"a\n1\n")
+
+    with pytest.raises(
+        zipfile.BadZipFile,
+        match="Corrupt unicode path extra field",
+    ):
+        _download._BoundedZipFile(
+            archive, archive_name=archive.name
+        )
+
+
+def test_zip64_extra_is_parsed_locally_for_member_open(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "zip64.zip"
+    body = b"a\n1\n"
+    _write_zip64_central_archive(archive, "table.csv", body)
+    monkeypatch.setattr(
+        zipfile.ZipInfo,
+        "_decodeExtra",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ZIP extras must use local parsing")
+        ),
+    )
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    extracted, preserved, skipped = _extract_bounded_archive(
+        archive, "zip", out_dir
+    )
+
+    assert [Path(path).read_bytes() for path in extracted] == [body]
+    assert preserved == set()
+    assert skipped == []
+
+
+def test_malformed_zip64_extra_raises_bad_zip_file(tmp_path):
+    archive = tmp_path / "malformed-zip64.zip"
+    _write_zip64_central_archive(
+        archive,
+        "table.csv",
+        b"a\n1\n",
+        zip64_payload=struct.pack("<Q", 4),
+    )
+
+    with pytest.raises(
+        zipfile.BadZipFile,
+        match="Corrupt zip64 extra field",
+    ):
+        _download._BoundedZipFile(
+            archive, archive_name=archive.name
+        )
+
+
 @pytest.mark.parametrize("archive_kind", ["zip", "tar"])
 def test_archive_member_limit_bounds_zero_byte_metadata_and_names(
     tmp_path, monkeypatch, archive_kind
@@ -555,6 +1017,8 @@ def test_archive_member_limit_bounds_zero_byte_metadata_and_names(
             "name": archive.name,
             "reason": "archive member count limit",
             "limit": 2,
+            "members_inspected": 2,
+            "eligible_members_retained": 2,
             "retained_members": 2,
             "omitted_members_lower_bound": 1,
         }]
@@ -632,8 +1096,8 @@ def test_archive_member_limit_counts_ineligible_metadata_work(
         archive_kind,
         [
             ("image-1.png", b""),
-            ("image-2.png", b""),
             ("table.csv", b""),
+            ("image-2.png", b""),
         ],
     )
     monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 2)
@@ -647,13 +1111,15 @@ def test_archive_member_limit_counts_ineligible_metadata_work(
         archive, archive_kind, out_dir
     )
 
-    assert extracted == []
+    assert [Path(path).name for path in extracted] == ["table.csv"]
     assert preserved == set()
     assert skipped == [{
         "name": archive.name,
         "reason": "archive member count limit",
         "limit": 2,
-        "retained_members": 2,
+        "members_inspected": 2,
+        "eligible_members_retained": 1,
+        "retained_members": 1,
         "omitted_members_lower_bound": 1,
     }]
 
@@ -693,6 +1159,8 @@ def test_archive_member_name_byte_limit_stops_before_retention(
         "name": archive.name,
         "reason": "archive member name byte limit",
         "limit": first_bytes,
+        "members_inspected": 2,
+        "eligible_members_retained": 1,
         "retained_members": 1,
         "retained_name_bytes": first_bytes,
         "omitted_members_lower_bound": 1,

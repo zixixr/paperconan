@@ -288,6 +288,22 @@ def test_legacy_omission_warning_stays_generic_and_neutral(tmp_path):
     assert "PAPERCONAN_MAX_TOTAL_FINDINGS" not in warning
 
 
+def test_lower_bounded_omission_warning_is_explicit(tmp_path):
+    scan = _scan("partial", [{
+        "scope": "scan",
+        "reason": "recurring_row_vector_finalization_limit",
+        "omitted_findings_lower_bound": 2,
+    }])
+    scan["findings_omitted"] = 2
+    scan["findings_omitted_is_lower_bound"] = True
+
+    html = _render_html(tmp_path, scan)
+    warning = _omission_warning(html)
+
+    assert "At least 2 findings were omitted" in warning
+    assert "recurring_row_vector_finalization_limit" in warning
+
+
 def test_raw_html_evidence_keeps_tiny_nonzero_float_signs(tmp_path):
     scan = _scan("complete")
     _add_finding(scan)

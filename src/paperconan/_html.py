@@ -184,8 +184,13 @@ def _render_scan_status(scan: dict) -> str:
 
 def _render_omission_warning(scan: dict, omitted: int) -> str:
     noun = "finding was" if omitted == 1 else "findings were"
+    prefix = (
+        "At least "
+        if scan.get("findings_omitted_is_lower_bound")
+        else ""
+    )
     base = (
-        f"{omitted:,} {noun} omitted to bound retained report output."
+        f"{prefix}{omitted:,} {noun} omitted to bound retained report output."
     )
     coverage = scan.get("coverage")
     if not isinstance(coverage, dict):
@@ -196,6 +201,7 @@ def _render_omission_warning(scan: dict, omitted: int) -> str:
         "global_finding_limit": "PAPERCONAN_MAX_TOTAL_FINDINGS",
         "row_pair_finding_limit": None,
         "recurring_row_vector_finding_limit": None,
+        "recurring_row_vector_finalization_limit": None,
     }
     reasons = []
     controls = []

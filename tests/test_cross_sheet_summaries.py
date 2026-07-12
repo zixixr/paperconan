@@ -480,6 +480,176 @@ def test_recurring_unique_budget_continues_updating_known_vector():
     ] == 1
 
 
+def _synthetic_recurring_record(index, vector, sites):
+    files = [site[0] for site in sites]
+    sheets = [site[1] for site in sites]
+    record = summaries_module._RecurringVectorRecord(
+        site_count=len(sites),
+        file_min=min(files),
+        file_max=max(files),
+        sheet_min=min(sheets),
+        sheet_max=max(sheets),
+        sites=list(sites),
+        figures={"main:1", "main:2", "main:3"},
+    )
+    index._vectors[tuple(vector)] = record
+
+
+def _nonpattern_vector(number):
+    base = 100 * number
+    return (
+        base + 3,
+        base + 17,
+        base + 8,
+        base + 29,
+        base + 11,
+        base + 23,
+    )
+
+
+def test_recurring_finalization_candidate_state_is_bounded_and_deterministic():
+    index = RecurringRowIndex(
+        unique_budget=10,
+        finalization_candidate_budget=3,
+        finalization_pair_budget=100,
+        finalization_cell_budget=1_000,
+    )
+    for number in range(10):
+        _synthetic_recurring_record(
+            index,
+            _nonpattern_vector(number + 1),
+            [
+                (
+                    f"f{figure}.xlsx",
+                    f"Figure {figure}",
+                    number,
+                    0,
+                )
+                for figure in range(1, 4)
+            ],
+        )
+
+    first_findings, first_meta = index.findings(max_findings=1)
+    second_findings, second_meta = index.findings(max_findings=1)
+
+    assert first_findings == second_findings
+    assert first_meta == second_meta
+    assert [finding["vector"] for finding in first_findings] == [
+        list(_nonpattern_vector(1))
+    ]
+    assert first_meta == {
+        "findings_omitted": 2,
+        "findings_omitted_is_lower_bound": True,
+        "finalization_limitation": {
+            "candidate_limit": 3,
+            "pair_limit": 100,
+            "cell_limit": 1_000,
+            "qualifying_candidates": 10,
+            "candidates_retained": 3,
+            "candidates_omitted": 7,
+            "candidates_processed": 3,
+            "pair_comparisons": 0,
+            "cell_references_retained": 54,
+            "limits_reached": ["candidate"],
+            "omitted_findings_lower_bound": 2,
+        },
+    }
+
+
+def test_recurring_finalization_pair_work_is_hard_capped():
+    index = RecurringRowIndex(
+        unique_budget=4,
+        finalization_candidate_budget=4,
+        finalization_pair_budget=2,
+        finalization_cell_budget=1_000,
+    )
+    for number in range(4):
+        _synthetic_recurring_record(
+            index,
+            _nonpattern_vector(number + 1),
+            [
+                ("common.xlsx", "Figure 1", 0, 0),
+                (
+                    f"unique-{number}-2.xlsx",
+                    "Figure 2",
+                    number,
+                    20,
+                ),
+                (
+                    f"unique-{number}-3.xlsx",
+                    "Figure 3",
+                    number,
+                    40,
+                ),
+            ],
+        )
+
+    findings, meta = index.findings(max_findings=20)
+
+    assert len(findings) == 2
+    assert meta == {
+        "findings_omitted": 0,
+        "findings_omitted_is_lower_bound": True,
+        "finalization_limitation": {
+            "candidate_limit": 4,
+            "pair_limit": 2,
+            "cell_limit": 1_000,
+            "qualifying_candidates": 4,
+            "candidates_retained": 4,
+            "candidates_omitted": 0,
+            "candidates_processed": 2,
+            "pair_comparisons": 2,
+            "cell_references_retained": 36,
+            "limits_reached": ["pair"],
+            "omitted_findings_lower_bound": 0,
+        },
+    }
+
+
+def test_recurring_finalization_cell_state_cap_reports_definite_omission():
+    index = RecurringRowIndex(
+        unique_budget=3,
+        finalization_candidate_budget=3,
+        finalization_pair_budget=100,
+        finalization_cell_budget=20,
+    )
+    for number in range(3):
+        _synthetic_recurring_record(
+            index,
+            _nonpattern_vector(number + 1),
+            [
+                (
+                    f"f{figure}.xlsx",
+                    f"Figure {figure}",
+                    number,
+                    0,
+                )
+                for figure in range(1, 4)
+            ],
+        )
+
+    findings, meta = index.findings(max_findings=20)
+
+    assert len(findings) == 1
+    assert meta == {
+        "findings_omitted": 1,
+        "findings_omitted_is_lower_bound": True,
+        "finalization_limitation": {
+            "candidate_limit": 3,
+            "pair_limit": 100,
+            "cell_limit": 20,
+            "qualifying_candidates": 3,
+            "candidates_retained": 3,
+            "candidates_omitted": 0,
+            "candidates_processed": 1,
+            "pair_comparisons": 0,
+            "cell_references_retained": 18,
+            "limits_reached": ["cell"],
+            "omitted_findings_lower_bound": 1,
+        },
+    }
+
+
 def test_recurring_index_skips_sheet_without_figure_namespace():
     class CountingSource:
         nrows = 1

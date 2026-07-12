@@ -127,6 +127,20 @@ def test_from_rows_does_not_retain_consumed_iterator_rows():
     assert sheet.cell(3, 0) == 3
 
 
+def test_boolean_sparse_payload_uses_one_byte_and_stays_nonnumeric():
+    builder = SheetBuilder(
+        max_cells=1,
+        max_sparse_cells=1,
+        max_sparse_bytes=1,
+    )
+
+    builder.append_row([True])
+    sheet = builder.finish()
+
+    assert sheet.cell(0, 0) is True
+    assert sheet.numeric_mask().tolist() == [[False]]
+
+
 def test_streaming_builder_grows_dense_capacity_geometrically(
     monkeypatch,
 ):

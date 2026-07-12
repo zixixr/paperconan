@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import struct
-import sys
 import tarfile
 import tempfile
 import time
@@ -42,10 +41,36 @@ _ARCHIVE_MEMBER_NAME_BYTES = int(
         str(8 * 1024 * 1024),
     )
 )
+_ARCHIVE_METADATA_BYTES = int(
+    os.environ.get(
+        "PAPERCONAN_ARCHIVE_METADATA_BYTES",
+        str(8 * 1024 * 1024),
+    )
+)
 _ARCHIVE_OUTPUT_FILE_LIMIT = int(
     os.environ.get("PAPERCONAN_ARCHIVE_OUTPUT_FILE_LIMIT", "5000")
 )
+_SOURCE_SIDECAR_MAX_BYTES = int(
+    os.environ.get(
+        "PAPERCONAN_SOURCE_SIDECAR_MAX_BYTES",
+        str(2 * 1024 * 1024),
+    )
+)
+_SOURCE_SIDECAR_ENTRY_LIMIT = int(
+    os.environ.get(
+        "PAPERCONAN_SOURCE_SIDECAR_ENTRY_LIMIT",
+        "10000",
+    )
+)
+_SOURCE_SIDECAR_NAME_BYTES = int(
+    os.environ.get(
+        "PAPERCONAN_SOURCE_SIDECAR_NAME_BYTES",
+        str(1024 * 1024),
+    )
+)
 _ZIP_UTF8_FILENAME_FLAG = 1 << 11
+_ZIP64_EXTRA_FIELD = 0x0001
+_ZIP_UNICODE_PATH_EXTRA_FIELD = 0x7075
 
 
 class _SizeLimitExceeded(ValueError):
@@ -451,12 +476,12 @@ def _safe_managed_path(out_dir, relative):
 
 def _safe_managed_names(out_dir, managed_files):
     if isinstance(managed_files, str):
-        entries = [managed_files]
+        entries = (managed_files,)
     else:
         try:
-            entries = list(managed_files or ())
+            entries = iter(managed_files or ())
         except TypeError:
-            entries = []
+            entries = ()
 
     lexical_root = os.path.abspath(out_dir)
     safe = set()
@@ -470,8 +495,119 @@ def _safe_managed_names(out_dir, managed_files):
     return sorted(safe)
 
 
+class _SourceSidecarLimit(ValueError):
+    def __init__(self, record):
+        self.record = record
+        super().__init__(record["reason"])
+
+
+def _source_sidecar_limit_record(
+    reason,
+    *,
+    limit,
+    observed_bytes=None,
+    managed_entries_inspected=None,
+    managed_entries_retained=None,
+    managed_name_bytes_retained=None,
+    requested_name_bytes=None,
+    ownership_preserved=False,
+):
+    record = {
+        "name": SOURCE_SIDECAR,
+        "reason": reason,
+        "limit": limit,
+    }
+    if observed_bytes is not None:
+        record["observed_bytes"] = observed_bytes
+    if managed_entries_inspected is not None:
+        record["managed_entries_inspected"] = (
+            managed_entries_inspected
+        )
+    if managed_entries_retained is not None:
+        record["managed_entries_retained"] = managed_entries_retained
+    if managed_name_bytes_retained is not None:
+        record["managed_name_bytes_retained"] = (
+            managed_name_bytes_retained
+        )
+    if requested_name_bytes is not None:
+        record["requested_name_bytes"] = requested_name_bytes
+    if reason != "source sidecar byte limit":
+        record["omitted_entries_lower_bound"] = 1
+    if ownership_preserved:
+        record["ownership_preserved"] = True
+    return record
+
+
+def _bounded_sidecar_managed_names(out_dir, managed_files):
+    entry_limit = max(0, int(_SOURCE_SIDECAR_ENTRY_LIMIT))
+    name_byte_limit = max(
+        0, int(_SOURCE_SIDECAR_NAME_BYTES)
+    )
+    lexical_root = os.path.abspath(out_dir)
+    safe = set()
+    entries_inspected = 0
+    retained_name_bytes = 0
+    for relative in managed_files:
+        if entries_inspected >= entry_limit:
+            raise _SourceSidecarLimit(
+                _source_sidecar_limit_record(
+                    "source sidecar managed entry limit",
+                    limit=entry_limit,
+                    managed_entries_inspected=entries_inspected,
+                    managed_entries_retained=len(safe),
+                    managed_name_bytes_retained=(
+                        retained_name_bytes
+                    ),
+                    ownership_preserved=True,
+                )
+            )
+        entries_inspected += 1
+        if not isinstance(relative, str):
+            continue
+        path = _safe_managed_path(out_dir, relative)
+        if path is None:
+            continue
+        normalized = os.path.relpath(path, lexical_root)
+        if normalized in safe:
+            continue
+        name_bytes = len(
+            normalized.encode("utf-8", errors="surrogatepass")
+        )
+        if retained_name_bytes + name_bytes > name_byte_limit:
+            raise _SourceSidecarLimit(
+                _source_sidecar_limit_record(
+                    "source sidecar managed name byte limit",
+                    limit=name_byte_limit,
+                    managed_entries_inspected=entries_inspected,
+                    managed_entries_retained=len(safe),
+                    managed_name_bytes_retained=(
+                        retained_name_bytes
+                    ),
+                    requested_name_bytes=name_bytes,
+                    ownership_preserved=True,
+                )
+            )
+        safe.add(normalized)
+        retained_name_bytes += name_bytes
+    return sorted(safe)
+
+
 def _read_source_sidecar(out_dir):
     path = os.path.join(out_dir, SOURCE_SIDECAR)
+    try:
+        sidecar_size = os.path.getsize(path)
+    except OSError:
+        return {}
+    byte_limit = max(0, int(_SOURCE_SIDECAR_MAX_BYTES))
+    if sidecar_size > byte_limit:
+        raise _SourceSidecarLimit(
+            _source_sidecar_limit_record(
+                "source sidecar byte limit",
+                limit=byte_limit,
+                observed_bytes=sidecar_size,
+                ownership_preserved=True,
+            )
+        )
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -484,7 +620,7 @@ def _read_source_sidecar(out_dir):
         managed_files = data.get("managed_files")
         if not isinstance(managed_files, list):
             managed_files = []
-        data["managed_files"] = _safe_managed_names(
+        data["managed_files"] = _bounded_sidecar_managed_names(
             out_dir, managed_files
         )
     return data
@@ -509,13 +645,7 @@ def _remove_managed_files(out_dir, managed_files):
 
 
 def _managed_output_name(out_dir, base, source_name, reusable_names):
-    reusable = {
-        name for name in (reusable_names or ())
-        if (
-            isinstance(name, str)
-            and not _is_reserved_managed_name(name)
-        )
-    }
+    reusable = reusable_names if reusable_names is not None else ()
     base = os.path.basename(base) or "download"
     if base in (".", ".."):
         base = "download"
@@ -604,6 +734,358 @@ def _archive_occurrence_output_names(member_names):
     return _allocate_archive_output_names(out)
 
 
+def _sanitize_zip_filename(filename):
+    filename = filename.split("\0", 1)[0]
+    if os.sep != "/" and os.sep in filename:
+        filename = filename.replace(os.sep, "/")
+    if os.altsep and os.altsep != "/" and os.altsep in filename:
+        filename = filename.replace(os.altsep, "/")
+    return filename
+
+
+def _zip_extra_uint64(data, offset, field):
+    if len(data) < offset + 8:
+        raise zipfile.BadZipFile(
+            f"Corrupt zip64 extra field. {field} not found."
+        )
+    return struct.unpack_from("<Q", data, offset)[0], offset + 8
+
+
+def _decode_zip_extra(info, raw_filename):
+    extra = info.extra
+    offset = 0
+    while len(extra) - offset >= 4:
+        field_type, field_size = struct.unpack_from(
+            "<HH", extra, offset
+        )
+        data_start = offset + 4
+        data_end = data_start + field_size
+        if data_end > len(extra):
+            raise zipfile.BadZipFile(
+                "Corrupt extra field %04x (size=%d)"
+                % (field_type, field_size)
+            )
+        data = memoryview(extra)[data_start:data_end]
+        if field_type == _ZIP64_EXTRA_FIELD:
+            cursor = 0
+            if info.file_size in (0xFFFFFFFFFFFFFFFF, 0xFFFFFFFF):
+                info.file_size, cursor = _zip_extra_uint64(
+                    data, cursor, "File size"
+                )
+            if info.compress_size == 0xFFFFFFFF:
+                info.compress_size, cursor = _zip_extra_uint64(
+                    data, cursor, "Compress size"
+                )
+            if info.header_offset == 0xFFFFFFFF:
+                info.header_offset, cursor = _zip_extra_uint64(
+                    data, cursor, "Header offset"
+                )
+        elif field_type == _ZIP_UNICODE_PATH_EXTRA_FIELD:
+            if len(data) < 5:
+                raise zipfile.BadZipFile(
+                    "Corrupt unicode path extra field (0x7075)"
+                )
+            version, name_crc = struct.unpack_from("<BL", data, 0)
+            if (
+                version == 1
+                and name_crc == zlib.crc32(raw_filename)
+            ):
+                try:
+                    unicode_name = bytes(data[5:]).decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise zipfile.BadZipFile(
+                        "Corrupt unicode path extra field (0x7075): "
+                        "invalid utf-8 bytes"
+                    ) from error
+                if unicode_name:
+                    info.filename = _sanitize_zip_filename(
+                        unicode_name
+                    )
+                else:
+                    import warnings
+
+                    warnings.warn(
+                        "Empty unicode path extra field (0x7075)",
+                        stacklevel=2,
+                    )
+        offset = data_end
+
+
+class _TarArchiveLimit(ValueError):
+    def __init__(
+        self,
+        reason,
+        state,
+        *,
+        requested_metadata_bytes=None,
+    ):
+        self.reason = reason
+        self.state = dict(state)
+        self.requested_metadata_bytes = requested_metadata_bytes
+        super().__init__(reason)
+
+    def record(self, archive_name):
+        state = self.state
+        record = {
+            "name": archive_name,
+            "reason": self.reason,
+            "limit": (
+                state["member_limit"]
+                if self.reason == "archive member count limit"
+                else state["name_byte_limit"]
+                if self.reason == "archive member name byte limit"
+                else state["metadata_byte_limit"]
+            ),
+            "members_inspected": state["members_inspected"],
+            "eligible_members_retained": state[
+                "eligible_members_retained"
+            ],
+            "retained_members": state[
+                "eligible_members_retained"
+            ],
+        }
+        if self.reason == "archive member name byte limit":
+            record["retained_name_bytes"] = state[
+                "retained_name_bytes"
+            ]
+            if state["metadata_bytes_processed"]:
+                record["metadata_bytes_processed"] = state[
+                    "metadata_bytes_processed"
+                ]
+        elif self.reason == "archive metadata byte limit":
+            record["metadata_bytes_processed"] = state[
+                "metadata_bytes_processed"
+            ]
+            record["requested_metadata_bytes"] = (
+                self.requested_metadata_bytes
+            )
+        record["omitted_members_lower_bound"] = 1
+        return record
+
+
+class _ReplayFile:
+    def __init__(self, inner, replay):
+        self._inner = inner
+        self._replay = replay
+        self._offset = 0
+
+    def read(self, size=-1):
+        remaining = len(self._replay) - self._offset
+        if remaining:
+            if size is None or size < 0:
+                size = remaining
+            take = min(size, remaining)
+            start = self._offset
+            self._offset += take
+            return self._replay[start:start + take]
+        return self._inner.read(size)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _tar_state(archive):
+    return archive._paperconan_budget_state
+
+
+def _raise_tar_limit(
+    archive, reason, *, requested_metadata_bytes=None
+):
+    raise _TarArchiveLimit(
+        reason,
+        _tar_state(archive),
+        requested_metadata_bytes=requested_metadata_bytes,
+    )
+
+
+def _check_tar_extension_budget(info, archive):
+    state = _tar_state(archive)
+    if state["members_inspected"] >= state["member_limit"]:
+        _raise_tar_limit(archive, "archive member count limit")
+    state["members_inspected"] += 1
+    if state["members_inspected"] >= state["member_limit"]:
+        _raise_tar_limit(archive, "archive member count limit")
+    metadata_size = max(0, int(info.size))
+    if (
+        state["metadata_bytes_processed"] + metadata_size
+        > state["metadata_byte_limit"]
+    ):
+        _raise_tar_limit(
+            archive,
+            "archive metadata byte limit",
+            requested_metadata_bytes=metadata_size,
+        )
+    return metadata_size
+
+
+def _read_tar_extension_payload(info, archive, metadata_size):
+    payload = archive.fileobj.read(info._block(info.size))
+    _tar_state(archive)["metadata_bytes_processed"] += metadata_size
+    return payload
+
+
+def _pax_path_value_lengths(payload, payload_size):
+    if len(payload) < payload_size:
+        raise tarfile.InvalidHeaderError("invalid header")
+    position = 0
+    while (
+        position < payload_size
+        and payload[position] != 0
+    ):
+        space = payload.find(b" ", position, payload_size)
+        if space < 0:
+            raise tarfile.InvalidHeaderError("invalid header")
+        try:
+            length = int(payload[position:space])
+        except ValueError:
+            raise tarfile.InvalidHeaderError(
+                "invalid header"
+            ) from None
+        if length < 5:
+            raise tarfile.InvalidHeaderError("invalid header")
+        record_end = position + length
+        if (
+            record_end > payload_size
+            or payload[record_end - 1] != 0x0A
+        ):
+            raise tarfile.InvalidHeaderError("invalid header")
+        equals = payload.find(b"=", space + 1, record_end - 1)
+        if equals < 0 or equals == space + 1:
+            raise tarfile.InvalidHeaderError("invalid header")
+        if payload[space + 1:equals] == b"path":
+            yield record_end - 1 - (equals + 1)
+        position = record_end
+
+
+def _with_replayed_tar_payload(
+    info, archive, payload, processor
+):
+    original = archive.fileobj
+    archive.fileobj = _ReplayFile(original, payload)
+    try:
+        return processor(info, archive)
+    finally:
+        archive.fileobj = original
+
+
+class _BoundedTarInfo(tarfile.TarInfo):
+    def _proc_pax(self, archive):
+        metadata_size = _check_tar_extension_budget(self, archive)
+        payload = _read_tar_extension_payload(
+            self, archive, metadata_size
+        )
+        state = _tar_state(archive)
+        remaining_name_bytes = (
+            state["name_byte_limit"]
+            - state["retained_name_bytes"]
+        )
+        if any(
+            path_length > remaining_name_bytes
+            for path_length in _pax_path_value_lengths(
+                payload, metadata_size
+            )
+        ):
+            _raise_tar_limit(
+                archive, "archive member name byte limit"
+            )
+        return _with_replayed_tar_payload(
+            self,
+            archive,
+            payload,
+            tarfile.TarInfo._proc_pax,
+        )
+
+    def _proc_gnulong(self, archive):
+        metadata_size = _check_tar_extension_budget(self, archive)
+        if self.type == tarfile.GNUTYPE_LONGNAME:
+            state = _tar_state(archive)
+            remaining_name_bytes = (
+                state["name_byte_limit"]
+                - state["retained_name_bytes"]
+            )
+            if max(0, metadata_size - 1) > remaining_name_bytes:
+                _raise_tar_limit(
+                    archive, "archive member name byte limit"
+                )
+        payload = _read_tar_extension_payload(
+            self, archive, metadata_size
+        )
+        return _with_replayed_tar_payload(
+            self,
+            archive,
+            payload,
+            tarfile.TarInfo._proc_gnulong,
+        )
+
+
+def _tar_has_unprocessed_header(archive):
+    fileobj = archive.fileobj
+    original_position = fileobj.tell()
+    try:
+        fileobj.seek(archive.offset)
+        marker = fileobj.read(1)
+    finally:
+        fileobj.seek(original_position)
+    return bool(marker and marker != b"\0")
+
+
+class _BoundedTarFile(tarfile.TarFile):
+    def __init__(self, *args, **kwargs):
+        self._paperconan_budget_state = {
+            "member_limit": max(0, int(_ARCHIVE_MEMBER_LIMIT)),
+            "name_byte_limit": max(
+                0, int(_ARCHIVE_MEMBER_NAME_BYTES)
+            ),
+            "metadata_byte_limit": max(
+                0, int(_ARCHIVE_METADATA_BYTES)
+            ),
+            "members_inspected": 0,
+            "eligible_members_retained": 0,
+            "retained_name_bytes": 0,
+            "metadata_bytes_processed": 0,
+        }
+        super().__init__(*args, **kwargs)
+
+    def next(self):
+        had_first_member = (
+            getattr(self, "firstmember", None) is not None
+        )
+        state = _tar_state(self)
+        if (
+            not had_first_member
+            and state["members_inspected"] >= state["member_limit"]
+        ):
+            if _tar_has_unprocessed_header(self):
+                _raise_tar_limit(
+                    self, "archive member count limit"
+                )
+            self._loaded = True
+            return None
+
+        member = super().next()
+        if member is None or had_first_member:
+            return member
+        self.members.clear()
+        state["members_inspected"] += 1
+        name_bytes = len(
+            member.name.encode("utf-8", errors="surrogatepass")
+        )
+        if (
+            state["retained_name_bytes"] + name_bytes
+            > state["name_byte_limit"]
+        ):
+            _raise_tar_limit(
+                self, "archive member name byte limit"
+            )
+        state["retained_name_bytes"] += name_bytes
+        if (
+            member.isfile()
+            and is_supported_input(member.name)
+        ):
+            state["eligible_members_retained"] += 1
+        return member
+
+
 class _BoundedZipFile(zipfile.ZipFile):
     """Read only budgeted central-directory metadata into ZipFile state."""
 
@@ -639,16 +1121,21 @@ class _BoundedZipFile(zipfile.ZipFile):
 
         fp.seek(self.start_dir)
         total = 0
-        retained_members = 0
+        members_inspected = 0
+        eligible_members_retained = 0
         retained_name_bytes = 0
         header_offsets = []
         while total < size_cd:
-            if retained_members >= self._member_limit:
+            if members_inspected >= self._member_limit:
                 self.selection_skipped.append({
                     "name": self.archive_name,
                     "reason": "archive member count limit",
                     "limit": self._member_limit,
-                    "retained_members": retained_members,
+                    "members_inspected": members_inspected,
+                    "eligible_members_retained": (
+                        eligible_members_retained
+                    ),
+                    "retained_members": eligible_members_retained,
                     "omitted_members_lower_bound": 1,
                 })
                 break
@@ -702,22 +1189,6 @@ class _BoundedZipFile(zipfile.ZipFile):
                     getattr(self, "metadata_encoding", None)
                     or "cp437"
                 )
-            name_bytes = len(
-                filename.encode("utf-8", errors="surrogatepass")
-            )
-            if (
-                retained_name_bytes + name_bytes
-                > self._name_byte_limit
-            ):
-                self.selection_skipped.append({
-                    "name": self.archive_name,
-                    "reason": "archive member name byte limit",
-                    "limit": self._name_byte_limit,
-                    "retained_members": retained_members,
-                    "retained_name_bytes": retained_name_bytes,
-                    "omitted_members_lower_bound": 1,
-                })
-                break
 
             extra = fp.read(extra_length)
             if len(extra) != extra_length:
@@ -763,21 +1234,41 @@ class _BoundedZipFile(zipfile.ZipFile):
                 (raw_time >> 5) & 0x3F,
                 (raw_time & 0x1F) * 2,
             )
-            if sys.version_info >= (3, 12):
-                info._decodeExtra(zlib.crc32(raw_filename))
-            else:
-                info._decodeExtra()
+            _decode_zip_extra(info, raw_filename)
+            final_name_bytes = len(
+                info.filename.encode(
+                    "utf-8", errors="surrogatepass"
+                )
+            )
+            members_inspected += 1
+            if (
+                retained_name_bytes + final_name_bytes
+                > self._name_byte_limit
+            ):
+                self.selection_skipped.append({
+                    "name": self.archive_name,
+                    "reason": "archive member name byte limit",
+                    "limit": self._name_byte_limit,
+                    "members_inspected": members_inspected,
+                    "eligible_members_retained": (
+                        eligible_members_retained
+                    ),
+                    "retained_members": eligible_members_retained,
+                    "retained_name_bytes": retained_name_bytes,
+                    "omitted_members_lower_bound": 1,
+                })
+                break
             info.extra = b""
             info.header_offset += concat
             header_offsets.append(info.header_offset)
 
-            retained_members += 1
-            retained_name_bytes += name_bytes
+            retained_name_bytes += final_name_bytes
             total += entry_size
             if (
                 not info.is_dir()
                 and is_supported_input(info.filename)
             ):
+                eligible_members_retained += 1
                 self.filelist.append(info)
                 self.NameToInfo[info.filename] = info
 
@@ -795,57 +1286,24 @@ class _BoundedZipFile(zipfile.ZipFile):
             )
 
 
-def _select_archive_members(
-    members,
-    *,
-    archive_name,
-    eligible,
-    member_name,
-):
-    member_limit = max(0, int(_ARCHIVE_MEMBER_LIMIT))
-    name_byte_limit = max(0, int(_ARCHIVE_MEMBER_NAME_BYTES))
+def _collect_bounded_tar_members(archive, archive_name):
     selected = []
-    retained_name_bytes = 0
-    retained_members = 0
     skipped = []
-    for member in members:
-        if retained_members >= member_limit:
-            skipped.append({
-                "name": archive_name,
-                "reason": "archive member count limit",
-                "limit": member_limit,
-                "retained_members": retained_members,
-                "omitted_members_lower_bound": 1,
-            })
+    while True:
+        try:
+            member = archive.next()
+        except _TarArchiveLimit as error:
+            skipped.append(error.record(archive_name))
             break
-        name = member_name(member)
-        name_bytes = len(
-            name.encode("utf-8", errors="surrogatepass")
-        )
-        if retained_name_bytes + name_bytes > name_byte_limit:
-            skipped.append({
-                "name": archive_name,
-                "reason": "archive member name byte limit",
-                "limit": name_byte_limit,
-                "retained_members": retained_members,
-                "retained_name_bytes": retained_name_bytes,
-                "omitted_members_lower_bound": 1,
-            })
+        if member is None:
             break
-        retained_members += 1
-        retained_name_bytes += name_bytes
-        if eligible(member):
+        archive.members.clear()
+        if (
+            member.isfile()
+            and is_supported_input(member.name)
+        ):
             selected.append(member)
     return selected, skipped
-
-
-def _iter_uncached_tar_members(archive):
-    while True:
-        member = archive.next()
-        if member is None:
-            return
-        archive.members.clear()
-        yield member
 
 
 def _extract_archive_members(
@@ -859,7 +1317,7 @@ def _extract_archive_members(
     open_member,
     member_errors,
     transient_paths=(),
-    sidecar_delta_for_names=None,
+    managed_name_accounting=None,
     cap_state=None,
     output_journal=None,
     archive_name=None,
@@ -876,7 +1334,6 @@ def _extract_archive_members(
         member_name(member) for member in members
     )
     reusable = set(_safe_managed_names(out_dir, reusable_names))
-    accepted_names = set()
     for index, (member, preferred) in enumerate(
         zip(members, preferred_names)
     ):
@@ -904,11 +1361,26 @@ def _extract_archive_members(
             out_dir, preferred, source_name, reusable
         )
         reuses_old = name in reusable
+        if managed_name_accounting is not None:
+            sidecar_limitation = (
+                managed_name_accounting.limitation_for(name)
+            )
+            if sidecar_limitation is not None:
+                coverage_limited = True
+                sidecar_limitation["name"] = source_name
+                skipped.append(sidecar_limitation)
+                if cap_state is not None:
+                    cap_state["exceeded"] = True
+                if reuses_old and os.path.lexists(
+                    os.path.join(out_dir, name)
+                ):
+                    preserved.add(name)
+                continue
         reusable.discard(name)
         dest = os.path.join(out_dir, name)
         sidecar_delta = (
-            sidecar_delta_for_names(accepted_names | {name})
-            if sidecar_delta_for_names is not None
+            managed_name_accounting.replacement_delta_with(name)
+            if managed_name_accounting is not None
             else 0
         )
         remaining, replacement_credit = (
@@ -987,7 +1459,8 @@ def _extract_archive_members(
             if committed:
                 written = written - replacement_credit + size
                 extracted.append(dest)
-                accepted_names.add(name)
+                if managed_name_accounting is not None:
+                    managed_name_accounting.add(name)
                 skipped.append({
                     "name": source_name,
                     "reason": (
@@ -1011,7 +1484,8 @@ def _extract_archive_members(
             continue
         written = written - replacement_credit + size
         extracted.append(dest)
-        accepted_names.add(name)
+        if managed_name_accounting is not None:
+            managed_name_accounting.add(name)
     if coverage_limited:
         for name in reusable:
             if os.path.lexists(os.path.join(out_dir, name)):
@@ -1044,7 +1518,7 @@ def _extract_tabular_zip_managed(
     max_member_bytes,
     *,
     reusable_names,
-    sidecar_delta_for_names=None,
+    managed_name_accounting=None,
     cap_state=None,
     output_journal=None,
     archive_name=None,
@@ -1072,7 +1546,7 @@ def _extract_tabular_zip_managed(
                 zipfile.BadZipFile,
             ),
             transient_paths=(zip_path,),
-            sidecar_delta_for_names=sidecar_delta_for_names,
+            managed_name_accounting=managed_name_accounting,
             cap_state=cap_state,
             output_journal=output_journal,
             archive_name=stable_archive_name,
@@ -1105,23 +1579,49 @@ def _extract_tabular_tar_managed(
     max_member_bytes,
     *,
     reusable_names,
-    sidecar_delta_for_names=None,
+    managed_name_accounting=None,
     cap_state=None,
     output_journal=None,
     archive_name=None,
 ):
-    with tarfile.open(tar_path, "r:gz") as tf:
-        stable_archive_name = (
-            archive_name or os.path.basename(tar_path)
+    stable_archive_name = (
+        archive_name or os.path.basename(tar_path)
+    )
+    try:
+        tf = _BoundedTarFile.open(
+            tar_path,
+            "r:gz",
+            tarinfo=_BoundedTarInfo,
         )
-        members, selection_skipped = _select_archive_members(
-            _iter_uncached_tar_members(tf),
-            archive_name=stable_archive_name,
-            eligible=lambda member: (
-                member.isfile()
-                and is_supported_input(member.name)
-            ),
+    except _TarArchiveLimit as error:
+        selection_skipped = [error.record(stable_archive_name)]
+        if selection_skipped and cap_state is not None:
+            cap_state["exceeded"] = True
+        return _extract_archive_members(
+            out_dir,
+            [],
+            max_member_bytes,
+            reusable_names=reusable_names,
             member_name=lambda member: member.name,
+            member_size=lambda member: member.size,
+            open_member=lambda member: None,
+            member_errors=(
+                OSError,
+                EOFError,
+                tarfile.TarError,
+            ),
+            transient_paths=(tar_path,),
+            managed_name_accounting=managed_name_accounting,
+            cap_state=cap_state,
+            output_journal=output_journal,
+            archive_name=stable_archive_name,
+            initial_skipped=selection_skipped,
+        )
+    with tf:
+        members, selection_skipped = (
+            _collect_bounded_tar_members(
+                tf, stable_archive_name
+            )
         )
         if selection_skipped and cap_state is not None:
             cap_state["exceeded"] = True
@@ -1139,7 +1639,7 @@ def _extract_tabular_tar_managed(
                 tarfile.TarError,
             ),
             transient_paths=(tar_path,),
-            sidecar_delta_for_names=sidecar_delta_for_names,
+            managed_name_accounting=managed_name_accounting,
             cap_state=cap_state,
             output_journal=output_journal,
             archive_name=stable_archive_name,
@@ -1165,7 +1665,7 @@ def _download_oa_package(
     max_bytes,
     *,
     reusable_names=(),
-    sidecar_delta_for_names=None,
+    managed_name_accounting=None,
     cap_state=None,
     output_journal=None,
 ):
@@ -1186,7 +1686,9 @@ def _download_oa_package(
                     out_dir,
                     max_bytes,
                     reusable_names=reusable_names,
-                    sidecar_delta_for_names=sidecar_delta_for_names,
+                    managed_name_accounting=(
+                        managed_name_accounting
+                    ),
                     cap_state=cap_state,
                     output_journal=output_journal,
                     archive_name=(
@@ -1214,7 +1716,7 @@ def _download_oa_package(
 def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_bytes,
                                     archive_max=_ARCHIVE_MAX, *,
                                     reusable_names=(),
-                                    sidecar_delta_for_names=None,
+                                    managed_name_accounting=None,
                                     cap_state=None,
                                     output_journal=None):
     """Fetch a supplementary zip (Europe PMC), extract its tabular members, drop the zip.
@@ -1237,7 +1739,9 @@ def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_byte
                     out_dir,
                     max_bytes,
                     reusable_names=reusable_names,
-                    sidecar_delta_for_names=sidecar_delta_for_names,
+                    managed_name_accounting=(
+                        managed_name_accounting
+                    ),
                     cap_state=cap_state,
                     output_journal=output_journal,
                     archive_name=(
@@ -1262,24 +1766,198 @@ def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_byte
             pass
 
 
-def _source_sidecar_bytes(cand, out_dir, managed_files):
-    prov = {
+def _source_sidecar_provenance(cand, managed_files):
+    return {
         "doi": cand.get("doi"),
         "title": cand.get("title"),
         "source": cand.get("source"),
         "cand_id": cand.get("cand_id"),
         "related_dois": cand.get("related_dois") or [],
-        "managed_files": _safe_managed_names(out_dir, managed_files),
+        "managed_files": managed_files,
     }
+
+
+def _encode_source_sidecar(provenance):
     return (
         json.dumps(
-            prov,
+            provenance,
             indent=2,
             sort_keys=True,
             default=str,
         )
         + "\n"
     ).encode("utf-8")
+
+
+def _source_sidecar_bytes(cand, out_dir, managed_files):
+    safe_names = _safe_managed_names(out_dir, managed_files)
+    return _encode_source_sidecar(
+        _source_sidecar_provenance(cand, safe_names)
+    )
+
+
+def _encoded_json_name_bytes(name):
+    return len(json.dumps(name).encode("utf-8"))
+
+
+def _managed_name_list_extra_bytes(count, encoded_name_bytes):
+    if count <= 0:
+        return 0
+    return encoded_name_bytes + 8 + 6 * (count - 1)
+
+
+class _ManagedNameAccounting:
+    def __init__(
+        self,
+        cand,
+        out_dir,
+        old_names,
+        new_names,
+    ):
+        self._old_names = old_names
+        self._new_names = new_names
+        self._entry_limit = max(
+            0, int(_SOURCE_SIDECAR_ENTRY_LIMIT)
+        )
+        self._name_byte_limit = max(
+            0, int(_SOURCE_SIDECAR_NAME_BYTES)
+        )
+        self._sidecar_byte_limit = max(
+            0, int(_SOURCE_SIDECAR_MAX_BYTES)
+        )
+        self._previous_size = 0
+        try:
+            self._previous_size = os.path.getsize(
+                os.path.join(out_dir, SOURCE_SIDECAR)
+            )
+        except OSError:
+            pass
+        self._entry_count = len(old_names)
+        self._name_bytes = sum(
+            len(name.encode("utf-8", errors="surrogatepass"))
+            for name in old_names
+        )
+        self._encoded_name_bytes = sum(
+            _encoded_json_name_bytes(name)
+            for name in old_names
+        )
+        self._base_size = len(_encode_source_sidecar(
+            _source_sidecar_provenance(cand, [])
+        ))
+        current_size = self._payload_size()
+        if current_size > self._sidecar_byte_limit:
+            raise _SourceSidecarLimit(
+                _source_sidecar_limit_record(
+                    "source sidecar byte limit",
+                    limit=self._sidecar_byte_limit,
+                    observed_bytes=current_size,
+                    ownership_preserved=True,
+                )
+            )
+
+    def _contains(self, name):
+        return name in self._old_names or name in self._new_names
+
+    def _prospective_counts(self, name):
+        if self._contains(name):
+            return (
+                self._entry_count,
+                self._name_bytes,
+                self._encoded_name_bytes,
+            )
+        return (
+            self._entry_count + 1,
+            self._name_bytes + len(
+                name.encode("utf-8", errors="surrogatepass")
+            ),
+            self._encoded_name_bytes
+            + _encoded_json_name_bytes(name),
+        )
+
+    def _payload_size(
+        self,
+        *,
+        entry_count=None,
+        encoded_name_bytes=None,
+    ):
+        count = (
+            self._entry_count
+            if entry_count is None
+            else entry_count
+        )
+        encoded = (
+            self._encoded_name_bytes
+            if encoded_name_bytes is None
+            else encoded_name_bytes
+        )
+        return (
+            self._base_size
+            + _managed_name_list_extra_bytes(count, encoded)
+        )
+
+    def limitation_for(self, name):
+        entry_count, name_bytes, encoded_name_bytes = (
+            self._prospective_counts(name)
+        )
+        if entry_count > self._entry_limit:
+            return _source_sidecar_limit_record(
+                "source sidecar managed entry limit",
+                limit=self._entry_limit,
+                managed_entries_retained=self._entry_count,
+                managed_name_bytes_retained=self._name_bytes,
+            )
+        requested_name_bytes = (
+            0
+            if self._contains(name)
+            else name_bytes - self._name_bytes
+        )
+        if name_bytes > self._name_byte_limit:
+            return _source_sidecar_limit_record(
+                "source sidecar managed name byte limit",
+                limit=self._name_byte_limit,
+                managed_entries_retained=self._entry_count,
+                managed_name_bytes_retained=self._name_bytes,
+                requested_name_bytes=requested_name_bytes,
+            )
+        payload_size = self._payload_size(
+            entry_count=entry_count,
+            encoded_name_bytes=encoded_name_bytes,
+        )
+        if payload_size > self._sidecar_byte_limit:
+            return _source_sidecar_limit_record(
+                "source sidecar byte limit",
+                limit=self._sidecar_byte_limit,
+                observed_bytes=payload_size,
+            )
+        return None
+
+    def replacement_delta_with(self, name):
+        entry_count, _name_bytes, encoded_name_bytes = (
+            self._prospective_counts(name)
+        )
+        return (
+            self._payload_size(
+                entry_count=entry_count,
+                encoded_name_bytes=encoded_name_bytes,
+            )
+            - self._previous_size
+        )
+
+    def add(self, name):
+        if name in self._new_names:
+            return
+        already_accounted = name in self._old_names
+        self._new_names.add(name)
+        if already_accounted:
+            return
+        self._entry_count += 1
+        self._name_bytes += len(
+            name.encode("utf-8", errors="surrogatepass")
+        )
+        self._encoded_name_bytes += _encoded_json_name_bytes(name)
+
+    def replacement_delta(self):
+        return self._payload_size() - self._previous_size
 
 
 def _source_sidecar_replacement_delta(cand, out_dir, managed_files):
@@ -1341,12 +2019,34 @@ def _download_candidate(
         files = cand.get("tabular_files", [])
     else:
         files = cand.get("all_files") or cand.get("tabular_files", [])
-    previous = _read_source_sidecar(out_dir)
+    downloaded, skipped = [], []
+    try:
+        previous = _read_source_sidecar(out_dir)
+    except _SourceSidecarLimit as error:
+        return {
+            "cand_id": cand.get("cand_id"),
+            "out_dir": out_dir,
+            "downloaded": downloaded,
+            "skipped": [error.record],
+        }
     old_managed = set(previous.get("managed_files") or ())
     reusable_names = set(old_managed)
-    downloaded, skipped = [], []
     new_managed = set()
     preserved_managed = set()
+    try:
+        managed_name_accounting = _ManagedNameAccounting(
+            cand,
+            out_dir,
+            old_managed,
+            new_managed,
+        )
+    except _SourceSidecarLimit as error:
+        return {
+            "cand_id": cand.get("cand_id"),
+            "out_dir": out_dir,
+            "downloaded": downloaded,
+            "skipped": [error.record],
+        }
     cap_state = {"exceeded": False}
     for file_ref in files:
         requested_name = str(file_ref.get("name") or "").strip()
@@ -1363,11 +2063,23 @@ def _download_candidate(
             out_dir, base, source_name, reusable_names
         )
         reuses_old = output_name in reusable_names
+        sidecar_limitation = (
+            managed_name_accounting.limitation_for(output_name)
+        )
+        if sidecar_limitation is not None:
+            sidecar_limitation["name"] = (
+                requested_name or output_name
+            )
+            skipped.append(sidecar_limitation)
+            cap_state["exceeded"] = True
+            preserved_managed.update(old_managed)
+            continue
         reusable_names.discard(output_name)
         dest = os.path.join(out_dir, output_name)
-        potential_managed = old_managed | new_managed | {output_name}
-        sidecar_delta = _source_sidecar_replacement_delta(
-            cand, out_dir, potential_managed
+        sidecar_delta = (
+            managed_name_accounting.replacement_delta_with(
+                output_name
+            )
         )
         remaining, _ = _remaining_final_size_allowance(
             _dir_size(out_dir),
@@ -1401,7 +2113,7 @@ def _download_candidate(
             raise
         if res.get("ok"):
             downloaded.append(res["path"])
-            new_managed.add(output_name)
+            managed_name_accounting.add(output_name)
         else:
             _restore_managed_output(output_journal, dest)
             if (
@@ -1418,16 +2130,6 @@ def _download_candidate(
                 preserved_managed.add(output_name)
     pkg = cand.get("oa_package")
     if pkg and pkg.get("url"):
-        archive_start = len(downloaded)
-        archive_base_managed = old_managed | new_managed
-
-        def archive_sidecar_delta(names):
-            return _source_sidecar_replacement_delta(
-                cand,
-                out_dir,
-                archive_base_managed | set(names),
-            )
-
         archive_ok, archive_preserved = _download_oa_package(
             pkg,
             out_dir,
@@ -1435,27 +2137,15 @@ def _download_candidate(
             skipped,
             max_bytes,
             reusable_names=reusable_names,
-            sidecar_delta_for_names=archive_sidecar_delta,
+            managed_name_accounting=managed_name_accounting,
             cap_state=cap_state,
             output_journal=output_journal,
         )
         preserved_managed.update(archive_preserved)
         if not archive_ok:
             preserved_managed.update(old_managed)
-        for path in downloaded[archive_start:]:
-            new_managed.add(os.path.relpath(path, out_dir))
     arch = cand.get("supplementary_archive")
     if not downloaded and arch and arch.get("url"):
-        archive_start = len(downloaded)
-        archive_base_managed = old_managed | new_managed
-
-        def archive_sidecar_delta(names):
-            return _source_sidecar_replacement_delta(
-                cand,
-                out_dir,
-                archive_base_managed | set(names),
-            )
-
         archive_ok, archive_preserved = _download_supplementary_archive(
             arch,
             out_dir,
@@ -1464,15 +2154,13 @@ def _download_candidate(
             max_bytes,
             archive_max=archive_max,
             reusable_names=reusable_names,
-            sidecar_delta_for_names=archive_sidecar_delta,
+            managed_name_accounting=managed_name_accounting,
             cap_state=cap_state,
             output_journal=output_journal,
         )
         preserved_managed.update(archive_preserved)
         if not archive_ok:
             preserved_managed.update(old_managed)
-        for path in downloaded[archive_start:]:
-            new_managed.add(os.path.relpath(path, out_dir))
     managed_files = new_managed | preserved_managed
     stale_managed = old_managed - managed_files
     committed_managed = managed_files | stale_managed
@@ -1481,9 +2169,7 @@ def _download_candidate(
         and bool(old_managed)
         and not new_managed
     )
-    sidecar_delta = _source_sidecar_replacement_delta(
-        cand, out_dir, committed_managed
-    )
+    sidecar_delta = managed_name_accounting.replacement_delta()
     sidecar_fits = (
         _dir_size(out_dir) + sidecar_delta <= _MAX_PAPER_BYTES
     )
