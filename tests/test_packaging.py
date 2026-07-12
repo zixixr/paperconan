@@ -23,11 +23,26 @@ from paperconan import __version__
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_ARCHIVE_ROOTS = (
     ".github",
-    "tests",
-    "skills",
-    "examples",
     "docs",
+    "examples",
+    "scripts",
+    "skills",
+    "src",
+    "tests",
+    ".gitignore",
+    ".python-version",
+    "LICENSE",
+    "MANIFEST.in",
+    "README.md",
+    "build_skill_zip.sh",
+    "pyproject.toml",
+    "uv.lock",
 )
+SDIST_GENERATED_METADATA = {
+    "PKG-INFO",
+    "setup.cfg",
+    "src/paperconan.egg-info/SOURCES.txt",
+}
 
 EXPECTED_DEV_GROUP = [
     "pytest>=8",
@@ -1259,13 +1274,33 @@ def test_tracked_public_files_requires_exact_repository_root():
 
 def test_sdist_contains_test_and_skill_closure(tmp_path):
     dist = tmp_path / "dist"
-    result = subprocess.run(
-        [sys.executable, "-m", "build", "--outdir", str(dist)],
-        check=True,
-        capture_output=True,
-        cwd=ROOT,
-        text=True,
-    )
+    probes = [
+        ROOT / "docs" / "untracked-sdist-probe.md",
+        ROOT / "examples" / "untracked-sdist-probe.py",
+        ROOT / "skills" / "paperconan" / "untracked-sdist-probe.md",
+        ROOT / "src" / "paperconan" / "untracked_sdist_probe.py",
+        ROOT / "tests" / "untracked_sdist_probe.py",
+    ]
+    try:
+        for probe in probes:
+            probe.write_text("local-only probe\n", encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "build",
+                "--sdist",
+                "--outdir",
+                str(dist),
+            ],
+            check=True,
+            capture_output=True,
+            cwd=ROOT,
+            text=True,
+        )
+    finally:
+        for probe in probes:
+            probe.unlink(missing_ok=True)
     warning_lines = [
         line
         for line in (*result.stdout.splitlines(), *result.stderr.splitlines())
@@ -1276,40 +1311,13 @@ def test_sdist_contains_test_and_skill_closure(tmp_path):
     archive = next(dist.glob("paperconan-*.tar.gz"))
     with tarfile.open(archive, "r:gz") as tf:
         names = {
-            name.split("/", 1)[1]
-            for name in tf.getnames()
-            if "/" in name
+            member.name.split("/", 1)[1]
+            for member in tf.getmembers()
+            if member.isfile() and "/" in member.name
         }
-    required = {
-        "docs/detectors.md",
-        "docs/faq.md",
-        "MANIFEST.in",
-        "tests/__init__.py",
-        "tests/build_fixture.py",
-        "tests/fetch/test_download.py",
-        "tests/fetch/fixtures/dryad_files.json",
-        "tests/fixtures/supp_table.pdf",
-        "tests/golden/tiny_paper.json",
-        "skills/paperconan/SKILL.md",
-        "examples/demo_paper/audit/scan.json",
-        "build_skill_zip.sh",
-        "uv.lock",
-        ".gitignore",
-    }
-    assert required <= names
 
     tracked_public = _tracked_public_files()
-    if tracked_public is not None:
-        assert tracked_public <= names
+    assert tracked_public is not None
+    assert names == tracked_public | SDIST_GENERATED_METADATA
 
-    forbidden = set()
-    for name in names:
-        parts = PurePosixPath(name).parts
-        if (
-            (parts and parts[0] in {"recheck", "batches", ".worktrees"})
-            or "__pycache__" in parts
-            or re.search(r"\.py[cod]$", name)
-            or (parts and parts[-1] == ".DS_Store")
-        ):
-            forbidden.add(name)
-    assert not forbidden
+    assert not {probe.relative_to(ROOT).as_posix() for probe in probes} & names

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 import shutil
 import subprocess
 import zipfile
@@ -73,6 +74,58 @@ def _publishable_skill_files(skill_dir: Path) -> set[str]:
     return files
 
 
+def _skill_zip_sources(script=ROOT / "build_skill_zip.sh") -> set[str]:
+    text = script.read_text(encoding="utf-8")
+    match = re.search(
+        r"^SKILL_ZIP_SOURCES=\(\n(?P<body>.*?)^\)\n",
+        text,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None
+    sources = set()
+    for line in match.group("body").splitlines():
+        tokens = shlex.split(line, comments=True)
+        if tokens:
+            assert len(tokens) == 1
+            sources.add(tokens[0])
+    return sources
+
+
+def _skill_zip_members(script=ROOT / "build_skill_zip.sh") -> set[str]:
+    members = set()
+    for source in _skill_zip_sources(script):
+        if source.startswith("skills/paperconan/"):
+            relative = source.removeprefix("skills/paperconan/")
+        else:
+            assert source.startswith("examples/")
+            relative = source
+        members.add(f"paperconan/{relative}")
+    return members
+
+
+def _tracked_skill_sources() -> set[str] | None:
+    repository = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        check=False,
+        capture_output=True,
+        cwd=ROOT,
+        text=True,
+    )
+    if (
+        repository.returncode != 0
+        or Path(repository.stdout.strip()).resolve() != ROOT.resolve()
+    ):
+        return None
+    result = subprocess.run(
+        ["git", "ls-files", "-z", "--", "skills/paperconan"],
+        check=True,
+        capture_output=True,
+        cwd=ROOT,
+        text=True,
+    )
+    return {name for name in result.stdout.split("\0") if name}
+
+
 def test_local_markdown_links_strip_suffixes_and_skip_external_urls() -> None:
     text = """
     [local](references/local.md#section)
@@ -105,6 +158,18 @@ def test_publishable_skill_files_exclude_generated_files(tmp_path) -> None:
         path.write_text(contents, encoding="utf-8")
 
     assert _publishable_skill_files(skill_dir) == {"paperconan/guide.md"}
+
+
+def test_skill_zip_allowlist_matches_tracked_skill_and_demo_sources() -> None:
+    tracked = _tracked_skill_sources()
+    if tracked is None:
+        return
+
+    expected = tracked | {
+        f"examples/{relative}"
+        for relative in WORKED_EXAMPLE_FILES
+    }
+    assert _skill_zip_sources() == expected
 
 
 def test_skill_routes_all_public_references() -> None:
@@ -170,7 +235,11 @@ def test_skill_zip_contains_complete_path_safe_skill_tree(tmp_path) -> None:
     assert list(tmp_path.rglob("*.zip")) == [out]
 
     with zipfile.ZipFile(out) as zf:
-        names = set(zf.namelist())
+        names = {
+            info.filename
+            for info in zf.infolist()
+            if not info.is_dir()
+        }
 
     local_links = _local_markdown_links()
     for relative in local_links:
@@ -179,14 +248,7 @@ def test_skill_zip_contains_complete_path_safe_skill_tree(tmp_path) -> None:
         )
         assert f"paperconan/{relative}" in names
 
-    skill_files = _publishable_skill_files(SKILL_DIR)
-    assert skill_files <= names
-
-    worked_examples = {
-        f"paperconan/examples/{relative}"
-        for relative in WORKED_EXAMPLE_FILES
-    }
-    assert worked_examples <= names
+    assert names == _skill_zip_members()
 
     forbidden = {
         name
@@ -218,6 +280,14 @@ def test_skill_zip_replaces_stale_output_inside_copied_skill_tree(tmp_path) -> N
     bytecode_dir.mkdir(exist_ok=True)
     (bytecode_dir / "module.pyc").write_bytes(b"bytecode")
     (project / "skills" / "paperconan" / ".DS_Store").write_bytes(b"metadata")
+    (project / "skills" / "paperconan" / "local-note.md").write_text(
+        "local only",
+        encoding="utf-8",
+    )
+    (project / "examples" / "local-note.py").write_text(
+        "local_only = True\n",
+        encoding="utf-8",
+    )
 
     out = project / "skills" / "paperconan" / "stale output.zip"
     with zipfile.ZipFile(out, "w") as zf:
@@ -230,9 +300,10 @@ def test_skill_zip_replaces_stale_output_inside_copied_skill_tree(tmp_path) -> N
     )
 
     with zipfile.ZipFile(out) as zf:
-        names = set(zf.namelist())
+        names = {
+            info.filename
+            for info in zf.infolist()
+            if not info.is_dir()
+        }
 
-    assert "stale-marker.txt" not in names
-    assert "paperconan/stale output.zip" not in names
-    assert "paperconan/SKILL.md" in names
-    assert not {name for name in names if _is_forbidden_zip_member(name)}
+    assert names == _skill_zip_members(project / "build_skill_zip.sh")
