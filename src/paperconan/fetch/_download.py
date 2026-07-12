@@ -504,24 +504,74 @@ def _safe_managed_path(out_dir, relative):
     return lexical_path
 
 
-def _safe_managed_names(out_dir, managed_files):
+def _safe_managed_names(
+    out_dir,
+    managed_files,
+    *,
+    entry_limit=None,
+    name_byte_limit=None,
+):
     if isinstance(managed_files, str):
         entries = (managed_files,)
+    elif managed_files is None:
+        entries = ()
     else:
         try:
-            entries = iter(managed_files or ())
+            entries = iter(managed_files)
         except TypeError:
             entries = ()
 
     lexical_root = os.path.abspath(out_dir)
     safe = set()
+    entries_inspected = 0
+    retained_name_bytes = 0
     for relative in entries:
+        if (
+            entry_limit is not None
+            and entries_inspected >= entry_limit
+        ):
+            raise _SourceSidecarLimit(
+                _source_sidecar_limit_record(
+                    "source sidecar managed entry limit",
+                    limit=entry_limit,
+                    managed_entries_inspected=entries_inspected,
+                    managed_entries_retained=len(safe),
+                    managed_name_bytes_retained=(
+                        retained_name_bytes
+                    ),
+                )
+            )
+        entries_inspected += 1
         if not isinstance(relative, str):
             continue
         path = _safe_managed_path(out_dir, relative)
         if path is None:
             continue
-        safe.add(os.path.relpath(path, lexical_root))
+        normalized = os.path.relpath(path, lexical_root)
+        if normalized in safe:
+            continue
+        name_bytes = len(
+            normalized.encode("utf-8", errors="surrogatepass")
+        )
+        if (
+            name_byte_limit is not None
+            and retained_name_bytes + name_bytes
+            > name_byte_limit
+        ):
+            raise _SourceSidecarLimit(
+                _source_sidecar_limit_record(
+                    "source sidecar managed name byte limit",
+                    limit=name_byte_limit,
+                    managed_entries_inspected=entries_inspected,
+                    managed_entries_retained=len(safe),
+                    managed_name_bytes_retained=(
+                        retained_name_bytes
+                    ),
+                    requested_name_bytes=name_bytes,
+                )
+            )
+        safe.add(normalized)
+        retained_name_bytes += name_bytes
     return sorted(safe)
 
 
@@ -609,60 +659,6 @@ def _source_sidecar_limit_record(
     if ownership_preserved:
         record["ownership_preserved"] = True
     return record
-
-
-def _bounded_sidecar_managed_names(out_dir, managed_files):
-    entry_limit = max(0, int(_SOURCE_SIDECAR_ENTRY_LIMIT))
-    name_byte_limit = max(
-        0, int(_SOURCE_SIDECAR_NAME_BYTES)
-    )
-    lexical_root = os.path.abspath(out_dir)
-    safe = set()
-    entries_inspected = 0
-    retained_name_bytes = 0
-    for relative in managed_files:
-        if entries_inspected >= entry_limit:
-            raise _SourceSidecarLimit(
-                _source_sidecar_limit_record(
-                    "source sidecar managed entry limit",
-                    limit=entry_limit,
-                    managed_entries_inspected=entries_inspected,
-                    managed_entries_retained=len(safe),
-                    managed_name_bytes_retained=(
-                        retained_name_bytes
-                    ),
-                    ownership_preserved=True,
-                )
-            )
-        entries_inspected += 1
-        if not isinstance(relative, str):
-            continue
-        path = _safe_managed_path(out_dir, relative)
-        if path is None:
-            continue
-        normalized = os.path.relpath(path, lexical_root)
-        if normalized in safe:
-            continue
-        name_bytes = len(
-            normalized.encode("utf-8", errors="surrogatepass")
-        )
-        if retained_name_bytes + name_bytes > name_byte_limit:
-            raise _SourceSidecarLimit(
-                _source_sidecar_limit_record(
-                    "source sidecar managed name byte limit",
-                    limit=name_byte_limit,
-                    managed_entries_inspected=entries_inspected,
-                    managed_entries_retained=len(safe),
-                    managed_name_bytes_retained=(
-                        retained_name_bytes
-                    ),
-                    requested_name_bytes=name_bytes,
-                    ownership_preserved=True,
-                )
-            )
-        safe.add(normalized)
-        retained_name_bytes += name_bytes
-    return sorted(safe)
 
 
 def _read_source_sidecar(out_dir):
@@ -1078,27 +1074,6 @@ class _TarArchiveLimit(ValueError):
         return record
 
 
-class _ReplayFile:
-    def __init__(self, inner, replay):
-        self._inner = inner
-        self._replay = replay
-        self._offset = 0
-
-    def read(self, size=-1):
-        remaining = len(self._replay) - self._offset
-        if remaining:
-            if size is None or size < 0:
-                size = remaining
-            take = min(size, remaining)
-            start = self._offset
-            self._offset += take
-            return self._replay[start:start + take]
-        return self._inner.read(size)
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
-
-
 class _TarTraversalFile:
     def __init__(self, inner, state):
         self._inner = inner
@@ -1220,39 +1195,6 @@ def _read_tar_extension_payload(info, archive, metadata_size):
     payload = archive.fileobj.read(info._block(info.size))
     _tar_state(archive)["metadata_bytes_processed"] += metadata_size
     return payload
-
-
-def _pax_path_value_lengths(payload, payload_size):
-    if len(payload) < payload_size:
-        raise tarfile.InvalidHeaderError("invalid header")
-    position = 0
-    while (
-        position < payload_size
-        and payload[position] != 0
-    ):
-        space = payload.find(b" ", position, payload_size)
-        if space < 0:
-            raise tarfile.InvalidHeaderError("invalid header")
-        try:
-            length = int(payload[position:space])
-        except ValueError:
-            raise tarfile.InvalidHeaderError(
-                "invalid header"
-            ) from None
-        if length < 5:
-            raise tarfile.InvalidHeaderError("invalid header")
-        record_end = position + length
-        if (
-            record_end > payload_size
-            or payload[record_end - 1] != 0x0A
-        ):
-            raise tarfile.InvalidHeaderError("invalid header")
-        equals = payload.find(b"=", space + 1, record_end - 1)
-        if equals < 0 or equals == space + 1:
-            raise tarfile.InvalidHeaderError("invalid header")
-        if payload[space + 1:equals] == b"path":
-            yield record_end - 1 - (equals + 1)
-        position = record_end
 
 
 class _RawTarText:
@@ -1494,6 +1436,52 @@ def _read_sparse_metadata_block(archive):
     return block
 
 
+class _SparseLineReader:
+    def __init__(self, archive):
+        self.archive = archive
+        self.buffer = bytearray()
+        self.position = 0
+        self.search_position = 0
+
+    def _record_work(self, byte_count):
+        state = _tar_state(self.archive)
+        state["sparse_line_bytes_processed"] = (
+            state.get("sparse_line_bytes_processed", 0)
+            + byte_count
+        )
+
+    def _append_block(self):
+        block = _read_sparse_metadata_block(self.archive)
+        if not block:
+            raise tarfile.InvalidHeaderError("invalid header")
+        self.buffer.extend(block)
+        self._record_work(len(block))
+
+    def readline(self):
+        if self.position >= len(self.buffer):
+            self._append_block()
+        while True:
+            newline = self.buffer.find(
+                b"\n", self.search_position
+            )
+            if newline >= 0:
+                self._record_work(
+                    newline - self.search_position + 1
+                )
+                line = bytes(
+                    self.buffer[self.position:newline]
+                )
+                self._record_work(len(line))
+                self.position = newline + 1
+                self.search_position = self.position
+                return line
+            self._record_work(
+                len(self.buffer) - self.search_position
+            )
+            self.search_position = len(self.buffer)
+            self._append_block()
+
+
 def _parse_pax_sparse_00(payload, archive):
     offset_count = 0
     numbytes_count = 0
@@ -1586,9 +1574,9 @@ def _parse_pax_sparse_01(value, archive):
 
 
 def _parse_pax_sparse_10(next_info, archive):
-    block = _read_sparse_metadata_block(archive)
+    lines = _SparseLineReader(archive)
+    fields_raw = lines.readline()
     try:
-        fields_raw, buffer = block.split(b"\n", 1)
         fields = int(fields_raw)
     except (ValueError, TypeError):
         raise tarfile.InvalidHeaderError(
@@ -1611,9 +1599,7 @@ def _parse_pax_sparse_10(next_info, archive):
     values_needed = fields * 2
     values_read = 0
     while values_read < values_needed:
-        if b"\n" not in buffer:
-            buffer += _read_sparse_metadata_block(archive)
-        number_raw, buffer = buffer.split(b"\n", 1)
+        number_raw = lines.readline()
         try:
             number = int(number_raw)
         except ValueError:
@@ -1633,7 +1619,7 @@ def _parse_pax_sparse_10(next_info, archive):
     next_info.sparse = entries
 
 
-def _decoded_pax_headers(pax_headers):
+def _decoded_pax_metadata(pax_headers):
     return {
         keyword: (
             value.decode()
@@ -1641,6 +1627,7 @@ def _decoded_pax_headers(pax_headers):
             else value
         )
         for keyword, value in pax_headers.items()
+        if keyword not in ("path", "GNU.sparse.name")
     }
 
 
@@ -1687,45 +1674,43 @@ def _apply_bounded_pax_info(
     final_name_override=None,
     final_name_transform=None,
 ):
-    effective_name = getattr(
-        info, "_paperconan_pending_name", info.name
-    )
-    effective_transform = getattr(
-        info, "_paperconan_pending_name_transform", None
-    )
-    has_name_override = hasattr(
-        info, "_paperconan_pending_name"
-    )
-    for keyword, value in pax_headers.items():
-        if keyword == "GNU.sparse.name":
-            effective_name = value
-            effective_transform = None
-            has_name_override = True
-        elif keyword == "path":
-            effective_name = value
-            effective_transform = "rstrip"
-            has_name_override = True
+    effective_name = None
+    effective_name_field = None
+    effective_transform = None
+    if hasattr(info, "_paperconan_pending_name"):
+        effective_name = info._paperconan_pending_name
+        effective_name_field = "pending"
+        effective_transform = (
+            info._paperconan_pending_name_transform
+        )
+    if "GNU.sparse.name" in pax_headers:
+        effective_name = pax_headers["GNU.sparse.name"]
+        effective_name_field = "GNU.sparse.name"
+        effective_transform = None
+    if "path" in pax_headers:
+        effective_name = pax_headers["path"]
+        effective_name_field = "path"
+        effective_transform = "rstrip"
     if final_name_override is not None:
         effective_name = final_name_override
+        effective_name_field = "final"
         effective_transform = final_name_transform
-        has_name_override = True
-    if has_name_override:
+    decoded_name = None
+    if effective_name is not None:
         _preflight_tar_name(
             archive, effective_name, effective_transform
         )
-
-    pending = getattr(info, "_paperconan_pending_name", None)
-    if pending is not None:
-        info.name = _decode_tar_name(
-            pending,
-            getattr(
-                info, "_paperconan_pending_name_transform", None
-            ),
+        decoded_name = _decode_tar_name(
+            effective_name, effective_transform
         )
+
+    if hasattr(info, "_paperconan_pending_name"):
         del info._paperconan_pending_name
         del info._paperconan_pending_name_transform
 
-    decoded_headers = _decoded_pax_headers(pax_headers)
+    decoded_headers = _decoded_pax_metadata(pax_headers)
+    if effective_name_field in ("path", "GNU.sparse.name"):
+        decoded_headers[effective_name_field] = decoded_name
     for keyword, value in decoded_headers.items():
         if keyword == "GNU.sparse.name":
             info.path = value
@@ -1742,23 +1727,9 @@ def _apply_bounded_pax_info(
             if keyword == "path":
                 value = value.rstrip("/")
             setattr(info, keyword, value)
-    if final_name_override is not None:
-        info.name = _decode_tar_name(
-            final_name_override,
-            final_name_transform,
-        )
+    if effective_name_field in ("pending", "final"):
+        info.name = decoded_name
     info.pax_headers = decoded_headers.copy()
-
-
-def _with_replayed_tar_payload(
-    info, archive, payload, processor
-):
-    original = archive.fileobj
-    archive.fileobj = _ReplayFile(original, payload)
-    try:
-        return processor(info, archive)
-    finally:
-        archive.fileobj = original
 
 
 class _BoundedTarInfo(tarfile.TarInfo):
@@ -1770,13 +1741,17 @@ class _BoundedTarInfo(tarfile.TarInfo):
         if len(structs) > remaining:
             retained = structs[:remaining]
             state["sparse_entries_retained"] += len(retained)
-            _raise_sparse_limit(
-                archive,
-                omitted_sparse_entries=(
-                    len(structs) - len(retained)
-                ),
-                requested_sparse_entries=len(structs),
-            )
+            omitted = len(structs) - len(retained)
+            details = {
+                "requested_sparse_entries": len(structs),
+            }
+            if isextended:
+                details[
+                    "omitted_sparse_entries_lower_bound"
+                ] = omitted
+            else:
+                details["omitted_sparse_entries"] = omitted
+            _raise_sparse_limit(archive, **details)
         state["sparse_entries_retained"] += len(structs)
 
         while isextended:
@@ -1862,7 +1837,7 @@ class _BoundedTarInfo(tarfile.TarInfo):
             ):
                 state["suppress_global_pax"] -= 1
 
-        decoded_headers = _decoded_pax_headers(pax_headers)
+        decoded_headers = _decoded_pax_metadata(pax_headers)
         if "GNU.sparse.map" in decoded_headers:
             next_info.sparse = _parse_pax_sparse_01(
                 decoded_headers["GNU.sparse.map"],
@@ -1988,6 +1963,7 @@ class _BoundedTarFile(tarfile.TarFile):
             "sparse_entries_retained": 0,
             "sparse_extension_blocks_processed": 0,
             "sparse_fields_processed": 0,
+            "sparse_line_bytes_processed": 0,
             "decompressed_bytes_traversed": 0,
             "global_pax_headers": {},
             "suppress_global_pax": 0,
@@ -2756,12 +2732,15 @@ def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_byte
 
 
 def _source_sidecar_provenance(cand, managed_files):
+    related_dois = cand.get("related_dois")
+    if related_dois is None:
+        related_dois = []
     return {
         "doi": cand.get("doi"),
         "title": cand.get("title"),
         "source": cand.get("source"),
         "cand_id": cand.get("cand_id"),
-        "related_dois": cand.get("related_dois") or [],
+        "related_dois": related_dois,
         "managed_files": managed_files,
     }
 
@@ -2784,10 +2763,58 @@ def _encode_source_sidecar(provenance):
 
 
 def _source_sidecar_bytes(cand, out_dir, managed_files):
-    safe_names = _safe_managed_names(out_dir, managed_files)
+    safe_names = _safe_managed_names(
+        out_dir,
+        managed_files,
+        entry_limit=max(0, int(_SOURCE_SIDECAR_ENTRY_LIMIT)),
+        name_byte_limit=max(
+            0, int(_SOURCE_SIDECAR_NAME_BYTES)
+        ),
+    )
     return _encode_source_sidecar(
         _source_sidecar_provenance(cand, safe_names)
     )
+
+
+def _prepare_sidecar_candidate(cand):
+    related_dois = cand.get("related_dois")
+    if (
+        related_dois is None
+        or isinstance(
+            related_dois,
+            (
+                str,
+                bytes,
+                bytearray,
+                list,
+                tuple,
+                dict,
+                set,
+                frozenset,
+            ),
+        )
+    ):
+        return cand
+    try:
+        source = iter(related_dois)
+    except TypeError:
+        return cand
+
+    retained = []
+
+    class CapturingIterable:
+        def __iter__(self):
+            for item in source:
+                retained.append(item)
+                yield item
+
+    prepared = dict(cand)
+    prepared["related_dois"] = CapturingIterable()
+    _encode_source_sidecar(
+        _source_sidecar_provenance(prepared, [])
+    )
+    prepared["related_dois"] = retained
+    return prepared
 
 
 def _encoded_json_name_bytes(name):
@@ -3009,11 +3036,21 @@ def _download_candidate(
     archive_max,
     output_journal,
 ):
+    downloaded, skipped = [], []
+    try:
+        cand = _prepare_sidecar_candidate(cand)
+    except _SourceSidecarLimit as error:
+        error.record["ownership_preserved"] = True
+        return {
+            "cand_id": cand.get("cand_id"),
+            "out_dir": out_dir,
+            "downloaded": downloaded,
+            "skipped": [error.record],
+        }
     if tabular_only:
         files = cand.get("tabular_files", [])
     else:
         files = cand.get("all_files") or cand.get("tabular_files", [])
-    downloaded, skipped = [], []
     try:
         previous = _read_source_sidecar(out_dir)
     except _SourceSidecarLimit as error:

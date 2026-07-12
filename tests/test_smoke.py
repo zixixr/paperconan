@@ -12,7 +12,7 @@ import pytest
 from tests.build_fixture import build
 
 from paperconan import scan_dir, write_html_report
-from paperconan import _audit
+from paperconan import _audit, _source_sidecar
 
 
 @pytest.fixture(scope="module")
@@ -257,6 +257,68 @@ def test_scan_provenance_rejects_large_managed_array_without_json_load(
     )
 
     assert scan["paper"] is None
+
+
+def test_scan_provenance_skips_managed_string_decode(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "t.csv").write_text(
+        "x\n1\n2\n3\n", encoding="utf-8"
+    )
+    managed_token = '"\\udcff.csv"'
+    (data / "paperconan_source.json").write_bytes(
+        (
+            '{"doi":"10.x/example","managed_files":['
+            + managed_token
+            + "]}"
+        ).encode("ascii")
+    )
+    original_raw_decode = json.JSONDecoder.raw_decode
+
+    def reject_stdlib_managed_decode(
+        decoder, text, position=0, *, idx=None
+    ):
+        if idx is not None:
+            position = idx
+        if text.startswith(managed_token, position):
+            raise AssertionError(
+                "scan-only managed names must not use stdlib decode"
+            )
+        return original_raw_decode(decoder, text, position)
+
+    local_calls = []
+
+    def tracked_local_decode(text, start, end):
+        token = text[start:end]
+        local_calls.append(token)
+        if token == managed_token:
+            raise AssertionError(
+                "scan-only managed names must not materialize"
+            )
+        return json.loads(token)
+
+    monkeypatch.setattr(
+        _source_sidecar.json.JSONDecoder,
+        "raw_decode",
+        reject_stdlib_managed_decode,
+    )
+    monkeypatch.setattr(
+        _source_sidecar,
+        "_decode_json_string_token",
+        tracked_local_decode,
+        raising=False,
+    )
+
+    scan = scan_dir(
+        str(data),
+        str(tmp_path / "out"),
+        write_html=False,
+    )
+
+    assert scan["paper"] == {"doi": "10.x/example"}
+    assert managed_token not in local_calls
 
 
 def test_scan_without_provenance_has_null_paper(tmp_path):

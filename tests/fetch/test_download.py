@@ -659,7 +659,14 @@ def _write_raw_tar(path, members):
         stream.write(payload)
 
 
-def _bounded_tar_names(path, tmp_path, monkeypatch, name_limit):
+def _bounded_tar_names(
+    path,
+    tmp_path,
+    monkeypatch,
+    name_limit,
+    *,
+    encoding=None,
+):
     monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 20)
     monkeypatch.setattr(
         _download, "_ARCHIVE_METADATA_BYTES", 100_000, raising=False
@@ -667,11 +674,15 @@ def _bounded_tar_names(path, tmp_path, monkeypatch, name_limit):
     monkeypatch.setattr(
         _download, "_ARCHIVE_MEMBER_NAME_BYTES", name_limit
     )
+    open_kwargs = {}
+    if encoding is not None:
+        open_kwargs["encoding"] = encoding
     try:
         archive = _download._BoundedTarFile.open(
             path,
             "r:gz",
             tarinfo=_download._BoundedTarInfo,
+            **open_kwargs,
         )
     except _download._TarArchiveLimit as error:
         return [], set(), [error.record(path.name)]
@@ -746,22 +757,137 @@ def test_tar_pax_binary_counts_surrogateescape_expansion_before_decode(
     assert preserved == set()
     assert skipped == []
 
-    original_decode = tarfile.TarInfo._decode_pax_field
+    original_decode = _download._RawTarText.decode
 
-    def reject_full_path_decode(info, value, *args):
-        if value == raw_name:
+    def reject_full_path_decode(value):
+        if value.raw == raw_name:
             raise AssertionError(
                 "over-budget PAX path must not be fully decoded"
             )
-        return original_decode(info, value, *args)
+        return original_decode(value)
 
     monkeypatch.setattr(
-        tarfile.TarInfo,
-        "_decode_pax_field",
+        _download._RawTarText,
+        "decode",
         reject_full_path_decode,
     )
     names, preserved, skipped = _bounded_tar_names(
         archive, tmp_path, monkeypatch, exact - 1
+    )
+
+    assert names == []
+    assert preserved == set()
+    assert skipped[0]["reason"] == "archive member name byte limit"
+
+
+def test_tar_pax_uses_first_hdrcharset_for_name_decode(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "pax-first-hdrcharset.tar.gz"
+    raw_name = b"nested/\xc3\xa9.csv"
+    pax = (
+        _pax_record(b"hdrcharset", b"BINARY")
+        + _pax_record(
+            b"hdrcharset",
+            b"ISO-IR 10646 2000 UTF-8",
+        )
+        + _pax_record(b"path", raw_name)
+    )
+    _write_raw_tar(
+        archive,
+        [
+            ("pax", tarfile.XHDTYPE, pax),
+            ("placeholder", tarfile.REGTYPE, b"a\n1\n"),
+        ],
+    )
+    expected = raw_name.decode("latin-1")
+
+    names, preserved, skipped = _bounded_tar_names(
+        archive,
+        tmp_path,
+        monkeypatch,
+        len(expected.encode("utf-8")),
+        encoding="latin-1",
+    )
+
+    assert names == [expected]
+    assert preserved == set()
+    assert skipped == []
+
+
+def test_tar_pax_rejects_winning_local_path_before_local_decode(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "pax-local-over-budget.tar.gz"
+    raw_name = b"nested/" + (b"x" * 1_000) + b".csv"
+    _write_raw_tar(
+        archive,
+        [
+            (
+                "pax",
+                tarfile.XHDTYPE,
+                _pax_record(b"path", raw_name),
+            ),
+            ("placeholder", tarfile.REGTYPE, b"a\n1\n"),
+        ],
+    )
+    original_decode = _download._RawTarText.decode
+
+    def reject_winning_path_decode(value):
+        if value.raw == raw_name:
+            raise AssertionError(
+                "winning local PAX path must be bounded before decode"
+            )
+        return original_decode(value)
+
+    monkeypatch.setattr(
+        _download._RawTarText,
+        "decode",
+        reject_winning_path_decode,
+    )
+
+    names, preserved, skipped = _bounded_tar_names(
+        archive, tmp_path, monkeypatch, 32
+    )
+
+    assert names == []
+    assert preserved == set()
+    assert skipped[0]["reason"] == "archive member name byte limit"
+
+
+def test_tar_pax_rejects_winning_global_path_before_local_decode(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "pax-global-over-budget.tar.gz"
+    raw_name = b"nested/" + (b"x" * 1_000) + b".csv"
+    _write_raw_tar(
+        archive,
+        [
+            (
+                "global",
+                tarfile.XGLTYPE,
+                _pax_record(b"path", raw_name),
+            ),
+            ("placeholder", tarfile.REGTYPE, b"a\n1\n"),
+        ],
+    )
+    original_decode = _download._RawTarText.decode
+
+    def reject_winning_path_decode(value):
+        if value.raw == raw_name:
+            raise AssertionError(
+                "winning global PAX path must be bounded before decode"
+            )
+        return original_decode(value)
+
+    monkeypatch.setattr(
+        _download._RawTarText,
+        "decode",
+        reject_winning_path_decode,
+    )
+
+    names, preserved, skipped = _bounded_tar_names(
+        archive, tmp_path, monkeypatch, 32
     )
 
     assert names == []
@@ -874,6 +1000,20 @@ def test_tar_global_pax_path_can_be_overridden_before_retention(
         ],
     )
     exact = len(final_name.encode("utf-8"))
+    original_decode = _download._RawTarText.decode
+
+    def reject_superseded_global_decode(value):
+        if value.raw.startswith(b"x" * 1_000):
+            raise AssertionError(
+                "superseded global PAX path must not be decoded"
+            )
+        return original_decode(value)
+
+    monkeypatch.setattr(
+        _download._RawTarText,
+        "decode",
+        reject_superseded_global_decode,
+    )
 
     names, preserved, skipped = _bounded_tar_names(
         archive, tmp_path, monkeypatch, exact
@@ -883,6 +1023,149 @@ def test_tar_global_pax_path_can_be_overridden_before_retention(
     assert preserved == set()
     assert skipped == []
 
+    names, preserved, skipped = _bounded_tar_names(
+        archive, tmp_path, monkeypatch, exact - 1
+    )
+
+    assert names == []
+    assert preserved == set()
+    assert skipped[0]["reason"] == "archive member name byte limit"
+
+
+def test_tar_local_pax_path_supersedes_pending_gnu_name_without_decode(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "pax-over-gnu.tar.gz"
+    final_name = "nested/final.csv"
+    raw_gnu_name = b"x" * 1_000 + b".csv\0"
+    _write_raw_tar(
+        archive,
+        [
+            (
+                "pax",
+                tarfile.XHDTYPE,
+                _pax_record(b"path", final_name.encode("utf-8")),
+            ),
+            (
+                "long",
+                tarfile.GNUTYPE_LONGNAME,
+                raw_gnu_name,
+            ),
+            ("placeholder", tarfile.REGTYPE, b"a\n1\n"),
+        ],
+    )
+    original_decode = _download._RawTarText.decode
+
+    def reject_superseded_gnu_decode(value):
+        if value.raw == raw_gnu_name[:-1]:
+            raise AssertionError(
+                "superseded GNU long name must not be decoded"
+            )
+        return original_decode(value)
+
+    monkeypatch.setattr(
+        _download._RawTarText,
+        "decode",
+        reject_superseded_gnu_decode,
+    )
+
+    names, preserved, skipped = _bounded_tar_names(
+        archive,
+        tmp_path,
+        monkeypatch,
+        len(final_name.encode("utf-8")),
+    )
+
+    assert names == [final_name]
+    assert preserved == set()
+    assert skipped == []
+
+
+def test_tar_pax_path_supersedes_sparse_name_without_decode(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "pax-over-sparse-name.tar.gz"
+    final_name = "nested/final.csv"
+    raw_sparse_name = b"x" * 1_000 + b".csv"
+    pax = (
+        _pax_record(b"path", final_name.encode("utf-8"))
+        + _pax_record(b"GNU.sparse.name", raw_sparse_name)
+    )
+    _write_raw_tar(
+        archive,
+        [
+            ("pax", tarfile.XHDTYPE, pax),
+            ("placeholder", tarfile.REGTYPE, b"a\n1\n"),
+        ],
+    )
+    original_decode = _download._RawTarText.decode
+
+    def reject_superseded_sparse_decode(value):
+        if value.raw == raw_sparse_name:
+            raise AssertionError(
+                "superseded GNU sparse name must not be decoded"
+            )
+        return original_decode(value)
+
+    monkeypatch.setattr(
+        _download._RawTarText,
+        "decode",
+        reject_superseded_sparse_decode,
+    )
+
+    names, preserved, skipped = _bounded_tar_names(
+        archive,
+        tmp_path,
+        monkeypatch,
+        len(final_name.encode("utf-8")),
+    )
+
+    assert names == [final_name]
+    assert preserved == set()
+    assert skipped == []
+
+
+def test_tar_sparse_name_uses_exact_boundary_before_decode(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "pax-sparse-name.tar.gz"
+    final_name = "nested/sparse.csv"
+    raw_name = final_name.encode("utf-8")
+    _write_raw_tar(
+        archive,
+        [
+            (
+                "pax",
+                tarfile.XHDTYPE,
+                _pax_record(b"GNU.sparse.name", raw_name),
+            ),
+            ("placeholder", tarfile.REGTYPE, b"a\n1\n"),
+        ],
+    )
+    exact = len(raw_name)
+
+    names, preserved, skipped = _bounded_tar_names(
+        archive, tmp_path, monkeypatch, exact
+    )
+
+    assert names == [final_name]
+    assert preserved == set()
+    assert skipped == []
+
+    original_decode = _download._RawTarText.decode
+
+    def reject_over_budget_sparse_decode(value):
+        if value.raw == raw_name:
+            raise AssertionError(
+                "winning GNU sparse name must be bounded before decode"
+            )
+        return original_decode(value)
+
+    monkeypatch.setattr(
+        _download._RawTarText,
+        "decode",
+        reject_over_budget_sparse_decode,
+    )
     names, preserved, skipped = _bounded_tar_names(
         archive, tmp_path, monkeypatch, exact - 1
     )
@@ -1090,6 +1373,122 @@ def test_tar_legacy_sparse_limit_stops_after_first_extension_block(
     assert limitation["sparse_extension_blocks_processed"] == 1
     assert limitation["metadata_bytes_processed"] == tarfile.BLOCKSIZE
     assert limitation["omitted_sparse_entries_lower_bound"] >= 1
+
+
+def test_tar_legacy_sparse_initial_omission_is_lower_bound_with_extensions(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "legacy-sparse-initial-limit.tar.gz"
+    initial = [(index * 2, 1) for index in range(4)]
+    later = [(100, 1)]
+    payload = (
+        _legacy_sparse_header(
+            "table.csv", initial, extended=True
+        )
+        + _legacy_sparse_extension(later, extended=False)
+    )
+    _write_raw_tar_bytes(archive, payload)
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_SPARSE_ENTRY_LIMIT", 2, raising=False
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_METADATA_BYTES", 100_000, raising=False
+    )
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 20)
+
+    member, limitation = _open_sparse_member(archive)
+
+    assert member is None
+    assert limitation["reason"] == "archive sparse entry limit"
+    assert limitation["sparse_entries_retained"] == 2
+    assert "omitted_sparse_entries" not in limitation
+    assert limitation["omitted_sparse_entries_lower_bound"] == 2
+
+
+def test_tar_legacy_sparse_initial_omission_is_exact_without_extensions(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "legacy-sparse-initial-exact.tar.gz"
+    initial = [(index * 2, 1) for index in range(4)]
+    _write_raw_tar_bytes(
+        archive,
+        _legacy_sparse_header(
+            "table.csv", initial, extended=False
+        ),
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_SPARSE_ENTRY_LIMIT", 2, raising=False
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_METADATA_BYTES", 100_000, raising=False
+    )
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 20)
+
+    member, limitation = _open_sparse_member(archive)
+
+    assert member is None
+    assert limitation["reason"] == "archive sparse entry limit"
+    assert limitation["omitted_sparse_entries"] == 2
+    assert "omitted_sparse_entries_lower_bound" not in limitation
+
+
+def test_tar_sparse_10_long_unterminated_field_has_linear_work():
+    class WorkMeter:
+        scanned_or_copied = 0
+
+    meter = WorkMeter()
+
+    class MeasuredBytes(bytes):
+        def __new__(cls, value):
+            return super().__new__(cls, value)
+
+        def __contains__(self, value):
+            meter.scanned_or_copied += len(self)
+            return super().__contains__(value)
+
+        def __add__(self, value):
+            meter.scanned_or_copied += len(self) + len(value)
+            return MeasuredBytes(super().__add__(value))
+
+        def split(self, separator=None, maxsplit=-1):
+            meter.scanned_or_copied += len(self)
+            return [
+                MeasuredBytes(part)
+                for part in super().split(separator, maxsplit)
+            ]
+
+    class MeasuredStream(io.BytesIO):
+        def read(self, size=-1):
+            return MeasuredBytes(super().read(size))
+
+    blocks = 64
+    admitted = blocks * tarfile.BLOCKSIZE
+    payload = b"1\n" + (b"9" * (admitted - 2))
+    state = {
+        "metadata_byte_limit": admitted,
+        "metadata_bytes_processed": 0,
+        "sparse_extension_blocks_processed": 0,
+        "sparse_fields_processed": 0,
+        "sparse_entry_limit": 1,
+        "sparse_entries_retained": 0,
+    }
+
+    class Archive:
+        fileobj = MeasuredStream(payload)
+        _paperconan_budget_state = state
+
+    with pytest.raises(
+        _download._TarArchiveLimit,
+        match="archive metadata byte limit",
+    ):
+        _download._parse_pax_sparse_10(
+            tarfile.TarInfo("table.csv"),
+            Archive(),
+        )
+
+    assert meter.scanned_or_copied <= admitted * 4
+    line_work = state.get("sparse_line_bytes_processed", 0)
+    assert admitted <= line_work <= admitted * 4
 
 
 @pytest.mark.parametrize("version", ["0.0", "0.1", "1.0"])
@@ -1556,11 +1955,6 @@ def test_tar_pax_final_name_budget_rejects_before_decode(
         "metadata_bytes_processed": first_header.size,
         "omitted_members_lower_bound": 1,
     }]
-
-
-def test_truncated_pax_payload_raises_invalid_header():
-    with pytest.raises(tarfile.InvalidHeaderError):
-        list(_download._pax_path_value_lengths(b"12 path=x\n", 12))
 
 
 @pytest.mark.parametrize(

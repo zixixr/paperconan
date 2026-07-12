@@ -7,6 +7,7 @@ import zipfile
 
 import pytest
 
+from paperconan import _source_sidecar
 from paperconan.fetch import _download
 
 
@@ -357,6 +358,134 @@ def test_sidecar_name_byte_limit_rejects_before_retaining_long_name(
     assert sidecar.read_bytes() == original_sidecar
 
 
+def test_sidecar_escaped_name_limit_precedes_local_decode(
+    tmp_path, monkeypatch
+):
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    token = '"\\udcff.csv"'
+    payload = (
+        '{"doi":"10.x/old","managed_files":['
+        + token
+        + "]}"
+    ).encode("ascii")
+    sidecar.write_bytes(payload)
+    decoded_bytes = len(
+        "\udcff.csv".encode("utf-8", errors="surrogatepass")
+    )
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", len(payload),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_ENTRY_LIMIT", 10,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download,
+        "_SOURCE_SIDECAR_NAME_BYTES",
+        decoded_bytes - 1,
+        raising=False,
+    )
+    original_raw_decode = json.JSONDecoder.raw_decode
+
+    def reject_stdlib_name_decode(
+        decoder, text, position=0, *, idx=None
+    ):
+        if idx is not None:
+            position = idx
+        if text.startswith(token, position):
+            raise AssertionError(
+                "managed name must be preflighted before stdlib decode"
+            )
+        return original_raw_decode(decoder, text, position)
+
+    def reject_local_name_decode(text, start, end):
+        if text[start:end] == token:
+            raise AssertionError(
+                "over-budget managed name must not reach local decode"
+            )
+        return json.loads(text[start:end])
+
+    monkeypatch.setattr(
+        _source_sidecar.json.JSONDecoder,
+        "raw_decode",
+        reject_stdlib_name_decode,
+    )
+    monkeypatch.setattr(
+        _source_sidecar,
+        "_decode_json_string_token",
+        reject_local_name_decode,
+        raising=False,
+    )
+
+    with pytest.raises(_download._SourceSidecarLimit) as error:
+        _download._read_source_sidecar(str(tmp_path))
+
+    assert error.value.record["reason"] == (
+        "source sidecar managed name byte limit"
+    )
+    assert error.value.record["requested_name_bytes"] == decoded_bytes
+
+
+def test_sidecar_escaped_name_accepts_exact_limit_after_local_preflight(
+    tmp_path, monkeypatch
+):
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    token = '"\\ud83d\\ude00.csv"'
+    payload = (
+        '{"managed_files":[' + token + "]}"
+    ).encode("ascii")
+    sidecar.write_bytes(payload)
+    decoded_name = "\N{GRINNING FACE}.csv"
+    exact = len(decoded_name.encode("utf-8"))
+    decode_calls = []
+
+    def tracked_local_decode(text, start, end):
+        decode_calls.append(text[start:end])
+        return json.loads(text[start:end])
+
+    monkeypatch.setattr(
+        _source_sidecar,
+        "_decode_json_string_token",
+        tracked_local_decode,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", len(payload),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_ENTRY_LIMIT", 10,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_NAME_BYTES", exact,
+        raising=False,
+    )
+
+    assert _download._read_source_sidecar(str(tmp_path)) == {
+        "managed_files": [decoded_name],
+    }
+    assert token in decode_calls
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'{"managed_files":["bad\\u12"]}',
+        b'{"managed_files":["bad\\x20.csv"]}',
+        b'{"managed_files":["bad\n.csv"]}',
+        b'{"managed_files":["bad\\ud800\\u"]}',
+    ],
+)
+def test_sidecar_reader_rejects_malformed_string_boundaries(
+    tmp_path, payload
+):
+    (tmp_path / _download.SOURCE_SIDECAR).write_bytes(payload)
+
+    assert _download._read_source_sidecar(str(tmp_path)) == {}
+
+
 def test_sidecar_entry_limit_streams_without_json_load(
     tmp_path, monkeypatch
 ):
@@ -465,19 +594,27 @@ def test_sidecar_reader_stops_at_limit_plus_one_when_stat_underreports(
 def test_source_sidecar_encoding_stops_large_related_doi_iteration(
     tmp_path, monkeypatch
 ):
-    class CountingList(list):
-        def __init__(self, values):
-            super().__init__(values)
+    class CountingIterable:
+        def __init__(self, count):
+            self.count = count
             self.items_yielded = 0
 
         def __iter__(self):
-            for value in super().__iter__():
+            for index in range(self.count):
                 self.items_yielded += 1
-                yield value
+                yield f"10.x/{index}"
 
-    related = CountingList(
-        f"10.x/{index}" for index in range(20_000)
-    )
+        def __bool__(self):
+            raise AssertionError(
+                "lazy related DOIs must not be tested for truthiness"
+            )
+
+        def __str__(self):
+            raise AssertionError(
+                "lazy related DOIs must not use string fallback"
+            )
+
+    related = CountingIterable(20_000)
     cand = {
         "doi": "10.x/example",
         "title": "Example",
@@ -505,7 +642,58 @@ def test_source_sidecar_encoding_stops_large_related_doi_iteration(
         )
 
     assert error.value.record["reason"] == "source sidecar byte limit"
-    assert related.items_yielded < len(related)
+    assert 0 < related.items_yielded < related.count
+
+
+def test_source_sidecar_bounds_lazy_managed_names_before_complete_iteration(
+    tmp_path, monkeypatch
+):
+    class CountingNames:
+        def __init__(self, count):
+            self.count = count
+            self.items_yielded = 0
+
+        def __iter__(self):
+            for index in range(self.count):
+                self.items_yielded += 1
+                yield f"{index}.csv"
+
+        def __bool__(self):
+            raise AssertionError(
+                "lazy managed names must not be tested for truthiness"
+            )
+
+    names = CountingNames(20_000)
+    cand = {
+        "doi": "10.x/example",
+        "title": "Example",
+        "source": "source",
+        "cand_id": "source:1",
+        "related_dois": [],
+    }
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", 10_000,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_ENTRY_LIMIT", 3,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_NAME_BYTES", 10_000,
+        raising=False,
+    )
+
+    with pytest.raises(_download._SourceSidecarLimit) as error:
+        _download._source_sidecar_bytes(
+            cand, str(tmp_path), names
+        )
+
+    assert error.value.record["reason"] == (
+        "source sidecar managed entry limit"
+    )
+    assert error.value.record["managed_entries_inspected"] == 3
+    assert 0 < names.items_yielded < names.count
 
 
 def test_source_sidecar_encoding_rejects_large_title_before_json_escape(
@@ -545,6 +733,140 @@ def test_source_sidecar_encoding_rejects_large_title_before_json_escape(
 
     assert error.value.record["reason"] == "source sidecar byte limit"
     assert error.value.record["observed_bytes_is_lower_bound"] is True
+
+
+def test_source_sidecar_encoding_bounds_escape_heavy_title_incrementally(
+    tmp_path, monkeypatch
+):
+    title = "\n" * 400
+    cand = {
+        "doi": "10.x/example",
+        "title": title,
+        "source": "source",
+        "cand_id": "source:1",
+        "related_dois": [],
+    }
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", 600,
+        raising=False,
+    )
+    original_encoder = json.encoder.encode_basestring_ascii
+
+    def reject_complete_escape(value):
+        if value == title:
+            raise AssertionError(
+                "escape-heavy title must not form a complete token"
+            )
+        return original_encoder(value)
+
+    monkeypatch.setattr(
+        json.encoder,
+        "encode_basestring_ascii",
+        reject_complete_escape,
+    )
+
+    with pytest.raises(_download._SourceSidecarLimit) as error:
+        _download._source_sidecar_bytes(
+            cand, str(tmp_path), []
+        )
+
+    assert error.value.record["reason"] == "source sidecar byte limit"
+    assert error.value.record["observed_bytes_is_lower_bound"] is True
+
+
+def test_source_sidecar_encoding_never_calls_custom_string_fallback(
+    tmp_path, monkeypatch
+):
+    class Unsupported:
+        def __init__(self):
+            self.string_calls = 0
+
+        def __str__(self):
+            self.string_calls += 1
+            raise AssertionError(
+                "unsupported sidecar values must not call __str__"
+            )
+
+    title = Unsupported()
+    cand = {
+        "doi": "10.x/example",
+        "title": title,
+        "source": "source",
+        "cand_id": "source:1",
+        "related_dois": [],
+    }
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", 10_000,
+        raising=False,
+    )
+
+    with pytest.raises(TypeError, match="unsupported sidecar value"):
+        _download._source_sidecar_bytes(
+            cand, str(tmp_path), []
+        )
+
+    assert title.string_calls == 0
+
+
+def test_source_sidecar_encoding_matches_deterministic_json_bytes(
+    tmp_path, monkeypatch
+):
+    cand = {
+        "doi": "10.x/example",
+        "title": "line 1\nline 2 \x7f \N{GRINNING FACE}",
+        "source": "source",
+        "cand_id": "source:1",
+        "related_dois": ["10.x/z", "10.x/a"],
+    }
+    expected_value = {
+        **cand,
+        "managed_files": ["table.csv"],
+    }
+    expected = (
+        json.dumps(expected_value, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    monkeypatch.setattr(
+        _download,
+        "_SOURCE_SIDECAR_MAX_BYTES",
+        len(expected),
+        raising=False,
+    )
+
+    assert _download._source_sidecar_bytes(
+        cand, str(tmp_path), ["table.csv"]
+    ) == expected
+
+
+def test_fetch_preserves_one_shot_related_dois_after_size_accounting(
+    tmp_path, monkeypatch
+):
+    related_dois = iter(["10.x/first", "10.x/second"])
+    cand = _candidate("table.csv", "https://x/table")
+    cand.update({
+        "doi": "10.x/example",
+        "title": "Example",
+        "source": "source",
+        "related_dois": related_dois,
+    })
+
+    def stub_download(_url, dest, **_kwargs):
+        Path(dest).write_bytes(b"x\n1\n")
+        return {"ok": True, "path": dest}
+
+    monkeypatch.setattr(_download, "download_file", stub_download)
+
+    result = _download.download_candidate(cand, str(tmp_path))
+
+    assert result["skipped"] == []
+    payload = json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert payload["related_dois"] == [
+        "10.x/first",
+        "10.x/second",
+    ]
 
 
 def test_source_sidecar_encoding_accepts_exact_limit_and_rejects_one_over(
