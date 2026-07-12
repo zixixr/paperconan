@@ -35,12 +35,19 @@ class _SizeLimitExceeded(ValueError):
     pass
 
 
-def _dir_size(path):
+def _dir_size(path, exclude_paths=()):
+    excluded = {
+        os.path.abspath(os.fspath(excluded_path))
+        for excluded_path in exclude_paths
+    }
     total = 0
     for dp, _, fs in os.walk(path):
         for f in fs:
+            file_path = os.path.join(dp, f)
+            if os.path.abspath(file_path) in excluded:
+                continue
             try:
-                total += os.path.getsize(os.path.join(dp, f))
+                total += os.path.getsize(file_path)
             except OSError:
                 pass
     return total
@@ -79,6 +86,29 @@ def _atomic_stream_write(src, dest_path, max_bytes):
         except OSError:
             pass
         raise
+
+
+def _existing_destination_size(dest_path, reuses_old):
+    if not reuses_old:
+        return 0
+    try:
+        return os.path.getsize(dest_path)
+    except OSError:
+        return 0
+
+
+def _remaining_final_size_allowance(
+    current_size,
+    dest_path,
+    reuses_old,
+):
+    replacement_credit = _existing_destination_size(
+        dest_path, reuses_old
+    )
+    return (
+        _MAX_PAPER_BYTES - current_size + replacement_credit,
+        replacement_credit,
+    )
 
 
 def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
@@ -352,19 +382,17 @@ def _extract_archive_members(
     member_size,
     open_member,
     member_errors,
+    transient_paths=(),
 ):
     extracted = []
     preserved = set()
     skipped = []
-    written = _dir_size(out_dir)
+    written = _dir_size(out_dir, transient_paths)
     preferred_names = _archive_occurrence_output_names(
         member_name(member) for member in members
     )
     reusable = set(_safe_managed_names(out_dir, reusable_names))
     for member, preferred in zip(members, preferred_names):
-        if written > _MAX_PAPER_BYTES:
-            preserved.update(reusable)
-            break
         source_name = member_name(member)
         name = _managed_output_name(
             out_dir, preferred, source_name, reusable
@@ -372,7 +400,18 @@ def _extract_archive_members(
         reuses_old = name in reusable
         reusable.discard(name)
         dest = os.path.join(out_dir, name)
-        if member_size(member) > max_member_bytes:
+        remaining, replacement_credit = (
+            _remaining_final_size_allowance(
+                written,
+                dest,
+                reuses_old,
+            )
+        )
+        write_limit = min(max_member_bytes, remaining)
+        if (
+            write_limit <= 0
+            or member_size(member) > write_limit
+        ):
             if reuses_old and os.path.lexists(dest):
                 preserved.add(name)
             continue
@@ -383,7 +422,7 @@ def _extract_archive_members(
                 raise OSError("could not open archive member")
             with src:
                 size = _atomic_stream_write(
-                    src, dest, max_member_bytes
+                    src, dest, write_limit
                 )
                 committed = True
         except _SizeLimitExceeded:
@@ -392,7 +431,7 @@ def _extract_archive_members(
             continue
         except member_errors as e:
             if committed:
-                written += size
+                written = written - replacement_credit + size
                 extracted.append(dest)
                 skipped.append({
                     "name": source_name,
@@ -409,7 +448,7 @@ def _extract_archive_members(
                 "reason": f"archive member failed: {e}",
             })
             continue
-        written += size
+        written = written - replacement_credit + size
         extracted.append(dest)
     return extracted, preserved, skipped
 
@@ -459,6 +498,7 @@ def _extract_tabular_zip_managed(
                 RuntimeError,
                 zipfile.BadZipFile,
             ),
+            transient_paths=(zip_path,),
         )
 
 
@@ -506,6 +546,7 @@ def _extract_tabular_tar_managed(
                 EOFError,
                 tarfile.TarError,
             ),
+            transient_paths=(tar_path,),
         )
 
 
@@ -677,7 +718,14 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
         )
         reuses_old = output_name in reusable_names
         reusable_names.discard(output_name)
-        if _dir_size(out_dir) > _MAX_PAPER_BYTES:   # per-paper budget reached; stop downloading
+        dest = os.path.join(out_dir, output_name)
+        remaining, _ = _remaining_final_size_allowance(
+            _dir_size(out_dir),
+            dest,
+            reuses_old,
+        )
+        download_limit = min(max_bytes, remaining)
+        if download_limit <= 0:
             skipped.append({
                 "name": requested_name,
                 "reason": "paper data exceeds per-paper cap",
@@ -685,8 +733,11 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
             if reuses_old:
                 preserved_managed.add(output_name)
             continue
-        dest = os.path.join(out_dir, output_name)
-        res = download_file(source_url, dest, max_bytes=max_bytes)
+        res = download_file(
+            source_url,
+            dest,
+            max_bytes=download_limit,
+        )
         if res.get("ok"):
             downloaded.append(res["path"])
             new_managed.add(output_name)

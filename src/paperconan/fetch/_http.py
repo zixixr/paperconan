@@ -1,10 +1,22 @@
 """Thin stdlib HTTP helpers returning parsed JSON. No third-party deps."""
 from __future__ import annotations
 import json
+import urllib.error
 import urllib.parse
 import urllib.request
 
 _UA = "paperconan-fetch/0.6 (+https://github.com/zixixr/paperconan)"
+
+
+def _open_url(req, timeout):
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as error:
+        try:
+            error.close()
+        except Exception:
+            pass
+        raise
 
 
 def get_json(url, params=None, headers=None, timeout=15):
@@ -14,7 +26,7 @@ def get_json(url, params=None, headers=None, timeout=15):
     if headers:
         h.update(headers)
     req = urllib.request.Request(url, headers=h, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _open_url(req, timeout) as resp:
         return json.loads(resp.read().decode("utf-8", "replace"))
 
 
@@ -26,7 +38,7 @@ def get_text(url, params=None, headers=None, timeout=30):
     if headers:
         h.update(headers)
     req = urllib.request.Request(url, headers=h, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _open_url(req, timeout) as resp:
         return resp.read().decode("utf-8", "replace")
 
 
@@ -36,5 +48,5 @@ def post_json(url, payload, headers=None, timeout=15):
     if headers:
         h.update(headers)
     req = urllib.request.Request(url, data=body, headers=h, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _open_url(req, timeout) as resp:
         return json.loads(resp.read().decode("utf-8", "replace"))

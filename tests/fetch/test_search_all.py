@@ -15,6 +15,7 @@ def test_search_all_merges_ranks_and_signals(monkeypatch):
     monkeypatch.setattr(fetch._sources, "search_figshare", lambda q, size=5: fg)
     monkeypatch.setattr(fetch._sources, "search_dryad", lambda q, size=5: [])
     monkeypatch.setattr(fetch._sources, "search_europepmc", lambda q, size=5: [])
+    monkeypatch.setattr(fetch._sources, "search_nature_esm", lambda q, size=5: [])
     monkeypatch.setattr(fetch._resolve, "enrich_via_crossref", lambda doi: None)
 
     cands = fetch.search_all("10.15761/JTS.1000455", per_source=5)
@@ -35,6 +36,7 @@ def test_search_all_includes_europepmc_supplementary(monkeypatch):
     monkeypatch.setattr(fetch._sources, "search_figshare", lambda q, size=5: [])
     monkeypatch.setattr(fetch._sources, "search_dryad", lambda q, size=5: [])
     monkeypatch.setattr(fetch._sources, "search_europepmc", lambda q, size=5: ep)
+    monkeypatch.setattr(fetch._sources, "search_nature_esm", lambda q, size=5: [])
     monkeypatch.setattr(fetch._resolve, "enrich_via_crossref", lambda doi: None)
 
     cands = fetch.search_all("10.1038/paper", per_source=5)

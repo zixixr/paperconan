@@ -1,6 +1,10 @@
 import io
 import json
+import urllib.error
+import warnings
+
 import pytest
+
 from paperconan.fetch import _http
 
 
@@ -38,3 +42,37 @@ def test_post_json_sends_body(monkeypatch):
     assert out == [{"id": 1}]
     assert seen["method"] == "POST"
     assert json.loads(seen["data"]) == {"search_for": "x"}
+
+
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        lambda: _http.get_json("https://api.example.org/data"),
+        lambda: _http.get_text("https://api.example.org/page"),
+        lambda: _http.post_json(
+            "https://api.example.org/search", {"query": "x"}
+        ),
+    ],
+)
+def test_http_helpers_close_and_reraise_identical_http_error(
+    monkeypatch, invoke
+):
+    error = urllib.error.HTTPError(
+        "https://api.example.org/error",
+        503,
+        "Unavailable",
+        {},
+        io.BytesIO(b"temporary failure"),
+    )
+
+    def fail(_req, timeout=None):
+        raise error
+
+    monkeypatch.setattr(_http.urllib.request, "urlopen", fail)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ResourceWarning)
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            invoke()
+
+    assert caught.value is error
+    assert error.closed

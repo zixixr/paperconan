@@ -1043,3 +1043,231 @@ def test_unexpected_member_failure_propagates(
         "doi": "10.x/old",
     }
     assert not list(tmp_path.glob(".paperconan-archive-*"))
+
+
+def _bounded_download_stub(monkeypatch, payloads, calls):
+    def download(url, dest, **kwargs):
+        limit = kwargs["max_bytes"]
+        calls.append((url, limit))
+        try:
+            size = _download._atomic_stream_write(
+                io.BytesIO(payloads[url]),
+                dest,
+                limit,
+            )
+        except _download._SizeLimitExceeded as error:
+            return {
+                "ok": False,
+                "path": dest,
+                "skipped_reason": str(error),
+            }
+        return {"ok": True, "path": dest, "size": size}
+
+    monkeypatch.setattr(_download, "download_file", download)
+    monkeypatch.setattr(
+        _download, "_read_source_sidecar", lambda _out_dir: {}
+    )
+    monkeypatch.setattr(
+        _download,
+        "_write_source_sidecar",
+        lambda _cand, _out_dir, _managed_files: True,
+    )
+
+
+def test_direct_download_accepts_exact_fit_then_stops_at_paper_cap(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "existing.bin").write_bytes(b"seed")
+    payloads = {
+        "https://x/exact": b"123456",
+        "https://x/overflow": b"x",
+    }
+    calls = []
+    _bounded_download_stub(monkeypatch, payloads, calls)
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", 10)
+
+    result = _download.download_candidate({
+        "cand_id": "source:1",
+        "tabular_files": [
+            {
+                "name": "exact.csv",
+                "download_url": "https://x/exact",
+            },
+            {
+                "name": "overflow.csv",
+                "download_url": "https://x/overflow",
+            },
+        ],
+    }, str(tmp_path))
+
+    assert result["downloaded"] == [str(tmp_path / "exact.csv")]
+    assert calls == [("https://x/exact", 6)]
+    assert _download._dir_size(tmp_path) == 10
+    assert not (tmp_path / "overflow.csv").exists()
+
+
+def test_direct_download_rejects_one_byte_paper_cap_overflow(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "existing.bin").write_bytes(b"seed")
+    calls = []
+    _bounded_download_stub(
+        monkeypatch,
+        {"https://x/overflow": b"1234567"},
+        calls,
+    )
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", 10)
+
+    result = _download.download_candidate(
+        _candidate("overflow.csv", "https://x/overflow"),
+        str(tmp_path),
+    )
+
+    assert result["downloaded"] == []
+    assert calls == [("https://x/overflow", 6)]
+    assert _download._dir_size(tmp_path) == 4
+    assert not (tmp_path / "overflow.csv").exists()
+
+
+@pytest.mark.parametrize(
+    ("replacement", "accepted"),
+    [(b"ABCDEF", True), (b"ABCDEFG", False)],
+)
+def test_direct_download_credits_managed_replacement_once(
+    tmp_path, monkeypatch, replacement, accepted
+):
+    old = tmp_path / "table.csv"
+    old.write_bytes(b"123456")
+    (tmp_path / "existing.bin").write_bytes(b"seed")
+    calls = []
+    _bounded_download_stub(
+        monkeypatch,
+        {"https://x/table": replacement},
+        calls,
+    )
+    monkeypatch.setattr(
+        _download,
+        "_read_source_sidecar",
+        lambda _out_dir: {"managed_files": ["table.csv"]},
+    )
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", 10)
+
+    result = _download.download_candidate(
+        _candidate("table.csv", "https://x/table"),
+        str(tmp_path),
+    )
+
+    assert calls == [("https://x/table", 6)]
+    assert result["downloaded"] == (
+        [str(old)] if accepted else []
+    )
+    assert old.read_bytes() == (
+        replacement if accepted else b"123456"
+    )
+    assert _download._dir_size(tmp_path) == 10
+
+
+def _write_archive(path, archive_kind, members):
+    if archive_kind == "zip":
+        with zipfile.ZipFile(path, "w") as archive:
+            for name, body in members:
+                archive.writestr(name, body)
+        return
+    with tarfile.open(path, "w:gz") as archive:
+        for name, body in members:
+            info = tarfile.TarInfo(name)
+            info.size = len(body)
+            archive.addfile(info, io.BytesIO(body))
+
+
+def _extract_archive(path, archive_kind, out_dir, reusable_names=()):
+    extract = (
+        _download._extract_tabular_zip
+        if archive_kind == "zip"
+        else _download._extract_tabular_tar
+    )
+    return extract(
+        str(path),
+        str(out_dir),
+        max_member_bytes=100,
+        reusable_names=reusable_names,
+    )
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+def test_archive_accepts_exact_fit_then_stops_at_paper_cap(
+    tmp_path, monkeypatch, archive_kind
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "existing.bin").write_bytes(b"seed")
+    archive = tmp_path / f"supp.{archive_kind}"
+    _write_archive(
+        archive,
+        archive_kind,
+        [("exact.csv", b"123456"), ("overflow.csv", b"x")],
+    )
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", 10)
+
+    paths = _extract_archive(archive, archive_kind, out_dir)
+
+    assert paths == [str(out_dir / "exact.csv")]
+    assert _download._dir_size(out_dir) == 10
+    assert not (out_dir / "overflow.csv").exists()
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+def test_archive_rejects_one_byte_paper_cap_overflow(
+    tmp_path, monkeypatch, archive_kind
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "existing.bin").write_bytes(b"seed")
+    archive = tmp_path / f"supp.{archive_kind}"
+    _write_archive(
+        archive,
+        archive_kind,
+        [("overflow.csv", b"1234567")],
+    )
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", 10)
+
+    paths = _extract_archive(archive, archive_kind, out_dir)
+
+    assert paths == []
+    assert _download._dir_size(out_dir) == 4
+    assert not (out_dir / "overflow.csv").exists()
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+@pytest.mark.parametrize(
+    ("replacement", "accepted"),
+    [(b"ABCDEF", True), (b"ABCDEFG", False)],
+)
+def test_archive_credits_managed_replacement_once(
+    tmp_path, monkeypatch, archive_kind, replacement, accepted
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    old = out_dir / "table.csv"
+    old.write_bytes(b"123456")
+    (out_dir / "existing.bin").write_bytes(b"seed")
+    archive = tmp_path / f"supp.{archive_kind}"
+    _write_archive(
+        archive,
+        archive_kind,
+        [("table.csv", replacement)],
+    )
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", 10)
+
+    paths = _extract_archive(
+        archive,
+        archive_kind,
+        out_dir,
+        reusable_names=["table.csv"],
+    )
+
+    assert paths == ([str(old)] if accepted else [])
+    assert old.read_bytes() == (
+        replacement if accepted else b"123456"
+    )
+    assert _download._dir_size(out_dir) == 10
