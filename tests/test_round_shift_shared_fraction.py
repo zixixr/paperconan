@@ -40,6 +40,58 @@ def test_no_false_positive_on_independent_two_decimal_columns():
     assert [f for f in findings if f["kind"] == "round_shift_shared_fraction"] == []
 
 
+def _pair_findings(a, b):
+    rows = [["idx", "A", "B"]]
+    for i, (x, y) in enumerate(zip(a, b), 1):
+        rows.append([i, x, y])
+    sheet = Sheet.from_rows(rows)
+    return detect_relations(sheet, 1, 1 + len(a), 1, 3, ["A", "B"])
+
+
+def _has_round_shift(a, b):
+    return any(f["kind"] == "round_shift_shared_fraction" for f in _pair_findings(a, b))
+
+
+def test_mostly_integer_column_with_few_decimals_does_not_fire():
+    # 15 integer rows shifted by tens + only 3 fractional rows: the fractional evidence is
+    # too thin (< 0.7n) even though 'differences are multiples of 10' holds for all rows.
+    a = [70, 120, 150, 110, 80, 90, 130, 160, 40, 200, 60, 100, 30, 170, 140,
+         72.34, 127.58, 148.86]
+    b = [130, 110, 130, 130, 150, 70, 160, 120, 60, 180, 110, 60, 90, 130, 100,
+         132.34, 117.58, 128.86]
+    assert not _has_round_shift(a, b)
+
+
+def test_single_non_multiple_of_ten_diff_blocks_firing():
+    # one row shifted by 7 (not a multiple of 10) must break the pattern entirely.
+    a = [72.34, 127.58, 148.86, 117.91, 83.26, 95.22]
+    b = [132.34, 117.58, 128.86, 137.91, 153.26, 102.22]   # last diff = +7, not mult of 10
+    assert not _has_round_shift(a, b)
+
+
+def test_multiples_of_hundred_fire():
+    # 100/200 are multiples of 10 too — a coarser round shift still fires.
+    a = [72.34, 127.58, 148.86, 117.91, 83.26, 95.22]
+    b = [172.34, 227.58, 48.86, 317.91, 83.26 + 100, 95.22 - 200]
+    assert _has_round_shift(a, b)
+
+
+def test_distinct_fraction_floor_of_three():
+    # only 2 distinct fractions across the shared rows → not distinctive enough → no fire.
+    a = [10.25, 20.50, 30.25, 40.50, 50.25, 60.50]
+    b = [20.25, 30.50, 40.25, 50.50, 60.25, 70.50]   # all +10, but only .25/.50 fractions
+    assert not _has_round_shift(a, b)
+
+
+def test_constant_multiple_of_ten_offset_is_claimed_by_constant_offset():
+    # a CONSTANT +10 offset is the constant_offset case, not round_shift (ordering guard).
+    a = [72.34, 127.58, 148.86, 117.91, 83.26, 95.22]
+    b = [x + 10 for x in a]
+    kinds = {f["kind"] for f in _pair_findings(a, b)}
+    assert "constant_offset" in kinds
+    assert "round_shift_shared_fraction" not in kinds
+
+
 def test_integer_only_multiple_of_ten_shift_does_not_fire():
     # integer counts shifted by 10s (no genuine decimal fraction) must NOT fire — that is
     # ordinary integer data, not a preserved-fraction copy fingerprint.
