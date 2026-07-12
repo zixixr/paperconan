@@ -1,3 +1,4 @@
+import hashlib
 import io
 import tarfile
 import warnings
@@ -412,6 +413,60 @@ def test_archive_output_names_are_deterministic_for_colliding_paths():
     assert len(set(first.values())) == 2
     assert all(name.startswith("table--") for name in first.values())
     assert all(name.endswith(".csv") for name in first.values())
+
+
+def test_zip_generated_hash_name_does_not_collide_with_real_basename(tmp_path):
+    member = "a/table.csv"
+    digest = hashlib.sha256(member.encode("utf-8")).hexdigest()[:10]
+    generated_name = f"table--{digest}.csv"
+    archive = tmp_path / "supp.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr(member, b"a\n1\n")
+        zf.writestr("b/table.csv", b"a\n2\n")
+        zf.writestr(f"literal/{generated_name}", b"a\n3\n")
+
+    extracted_names = []
+    extracted_bodies = []
+    for index in range(2):
+        out = tmp_path / f"out-{index}"
+        out.mkdir()
+        paths = _download._extract_tabular_zip(str(archive), str(out))
+        extracted_names.append([Path(path).name for path in paths])
+        extracted_bodies.append([Path(path).read_bytes() for path in paths])
+
+    assert len(extracted_names[0]) == 3
+    assert len({name.casefold() for name in extracted_names[0]}) == 3
+    assert extracted_names[0] == extracted_names[1]
+    assert set(extracted_bodies[0]) == {b"a\n1\n", b"a\n2\n", b"a\n3\n"}
+    assert extracted_bodies[0] == extracted_bodies[1]
+
+
+def test_zip_occurrence_suffix_does_not_collide_case_insensitively(tmp_path):
+    member = "a/table.csv"
+    digest = hashlib.sha256(member.encode("utf-8")).hexdigest()[:10]
+    occurrence_name = f"TABLE--{digest.upper()}--1.CSV"
+    archive = tmp_path / "supp.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr(member, b"a\n1\n")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            zf.writestr(member, b"a\n2\n")
+        zf.writestr(f"literal/{occurrence_name}", b"a\n3\n")
+
+    extracted_names = []
+    extracted_bodies = []
+    for index in range(2):
+        out = tmp_path / f"out-{index}"
+        out.mkdir()
+        paths = _download._extract_tabular_zip(str(archive), str(out))
+        extracted_names.append([Path(path).name for path in paths])
+        extracted_bodies.append([Path(path).read_bytes() for path in paths])
+
+    assert len(extracted_names[0]) == 3
+    assert len({name.casefold() for name in extracted_names[0]}) == 3
+    assert extracted_names[0] == extracted_names[1]
+    assert set(extracted_bodies[0]) == {b"a\n1\n", b"a\n2\n", b"a\n3\n"}
+    assert extracted_bodies[0] == extracted_bodies[1]
 
 
 def test_archive_extracts_every_scanner_extension(tmp_path):

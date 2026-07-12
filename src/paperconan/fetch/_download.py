@@ -143,6 +143,21 @@ def _archive_output_names(member_names):
     return out
 
 
+def _allocate_archive_output_names(preferred_names):
+    used = set()
+    allocated = []
+    for preferred in preferred_names:
+        candidate = preferred
+        stem, suffix = os.path.splitext(preferred)
+        disambiguator = 2
+        while candidate.casefold() in used:
+            candidate = f"{stem}--{disambiguator}{suffix}"
+            disambiguator += 1
+        used.add(candidate.casefold())
+        allocated.append(candidate)
+    return allocated
+
+
 def _archive_occurrence_output_names(member_names):
     member_names = list(member_names)
     output_names = _archive_output_names(member_names)
@@ -157,7 +172,7 @@ def _archive_occurrence_output_names(member_names):
         seen[member] += 1
         stem, suffix = os.path.splitext(name)
         out.append(f"{stem}--{seen[member]}{suffix}")
-    return out
+    return _allocate_archive_output_names(out)
 
 
 def _extract_tabular_zip(zip_path, out_dir, max_member_bytes=_DEFAULT_MAX):
