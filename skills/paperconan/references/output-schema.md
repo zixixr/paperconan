@@ -112,6 +112,27 @@ legacy scan whose detailed coverage status is unavailable.
 `paperconan <dir> --doi <DOI> --title <T>`. It is `null` when neither is present
 (a bare directory audit) — never read `null` as "no paper".
 
+## Adjudicated verdict evidence binding
+
+`paperconan report scan.json --verdict verdict.json` reads scan findings as
+evidence and binds verdict selectors without modifying `scan.json`. Both the
+primary `findings[].finding_ref` shape and the legacy top-level `finding_refs`
+shape use these rules:
+
+- An omitted or `null` `finding_ref` may select the strongest visible scan
+  finding automatically. The HTML labels this as automatic evidence selection.
+- A matching explicit selector shows only the matched scan finding.
+- An unmatched explicit selector, including `{}`, shows the selector and does
+  not substitute an unrelated evidence table.
+- Every additional legacy `finding_refs` selector is bound independently, so
+  matched and unmatched entries remain visible in their original order.
+
+An explicit primary `"findings": []` remains an empty primary verdict. The
+renderer does not synthesize a legacy finding from top-level `report_md` or
+`finding_refs` in that case. Profile-hidden scan findings remain unavailable for
+evidence binding, and visible findings retain deterministic strongest-first
+ordering.
+
 ## Every finding has
 
 - `kind`: detector name (see [detectors.md](detectors.md))

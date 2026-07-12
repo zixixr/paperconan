@@ -55,6 +55,14 @@ paperconan report audit/scan.json --verdict verdict.json --out adjudication.html
 
 `verdict.json` 的**主形态**是带 `findings` 数组的论文级对象（每条 finding 各带 `finding_ref` / `suspicion_tier` / `impact_scope` / `review_status` / `report_md`，论文级另有 `paper_conclusion` / `overall_impact` / `review_note`）；**单条 finding 只是"列了一条"**，同样富渲染，不再是旧版朴素排版。完整 schema 与例子见 [`references/adjudication-tiers.md`](../skills/paperconan/references/adjudication-tiers.md) › "Multiple Findings In One Paper"。旧的扁平 `report_md` + `finding_refs` 形态向后兼容，现在也会渲染成同样的高保真版式。适合单篇论文复核或批量审计后的归档。
 
+证据绑定有三种明确状态，两种 verdict JSON 形态遵循同一规则：
+
+- 省略 `finding_ref` 或将它设为 `null`：可以自动选择当前 profile 下最强的可见统计信号，页面会明确标注为 automatic evidence selection。
+- 显式 selector 命中：只展示命中的 scan finding。
+- 显式 selector 未命中（包括 `{}`）：展示未命中的 selector，不补入无关 evidence 表。
+
+旧形态的每个 `finding_refs` selector 都会按原顺序独立绑定，额外的未命中 selector 也会显示。主形态若显式提供 `"findings": []`，会保留为空，不会根据顶层 `report_md` / `finding_refs` 合成旧形态 finding。渲染器只读取 `scan.json` 中的 findings 作为 evidence，不会改写 `scan.json`；profile-hidden finding 仍不会进入判定后报告。
+
 扫描状态只改变确定性 `report.html` / `REPORT.md` 的覆盖说明；`paperconan report`
 的判定后报告布局和两种 verdict JSON 形态保持不变，旧 scan 也不需要补写新字段。
 

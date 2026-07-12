@@ -61,8 +61,8 @@ def test_write_adjudicated_report_renders_verdict_and_scan_evidence(tmp_path):
     assert "异常位置" in html
     assert "identical_column" in html
     assert "ED_Fig1.xlsx" in html
-    assert "signal, not verdict" in html
-    assert "fabrication" not in html.lower()
+    assert "statistical signals and data inconsistencies" in html
+    assert "requires the original data, figure legends, Methods" in html
 
 
 def test_report_subcommand_writes_adjudicated_html(tmp_path):
@@ -187,21 +187,86 @@ def test_finding_refs_scope_key_evidence_to_the_selected_finding():
     assert "within_col_value_duplication" not in html
 
 
-def test_without_finding_refs_falls_back_to_strongest_finding():
-    scan = _scan_two_findings()
-    html = render_adjudicated_report(scan, {"verdict": "KEEP", "report_md": "## t"})
-    # no finding_ref -> evidence falls back to the single strongest scan signal
+def test_omitted_reference_uses_labeled_automatic_selection():
+    html = render_adjudicated_report(
+        _scan_two_findings(),
+        {"verdict": "KEEP", "report_md": "## t"},
+    )
+    assert "automatic evidence selection" in html.lower()
     assert html.count('class="finding-card"') == 1
     assert "constant_offset" in html
 
 
-def test_finding_refs_with_no_match_falls_back_to_strongest_finding():
+def test_explicit_unmatched_reference_never_falls_back():
     scan = _scan_two_findings()
-    verdict = {"verdict": "KEEP", "report_md": "## t", "finding_refs": [{"sheet": "Nonexistent"}]}
+    verdict = {
+        "verdict": "KEEP",
+        "report_md": "## t",
+        "finding_refs": [{"sheet": "Nonexistent"}],
+    }
     html = render_adjudicated_report(scan, verdict)
-    # an unmatched ref falls back to the single strongest scan signal
+    assert html.count('class="finding-card"') == 0
+    assert "Nonexistent" in html
+    assert "constant_offset" not in html
+    assert "within_col_value_duplication" not in html
+
+
+def test_explicit_empty_selector_is_unmatched():
+    verdict = {
+        "verdict": "KEEP",
+        "findings": [{
+            "title": "x",
+            "finding_ref": {},
+            "report_md": "x",
+        }],
+    }
+    html = render_adjudicated_report(_scan_two_findings(), verdict)
+    assert "unmatched" in html.lower()
+    assert html.count('class="finding-card"') == 0
+
+
+def test_null_primary_selector_uses_labeled_automatic_selection():
+    verdict = {
+        "verdict": "KEEP",
+        "findings": [{
+            "title": "x",
+            "finding_ref": None,
+            "report_md": "x",
+        }],
+    }
+    html = render_adjudicated_report(_scan_two_findings(), verdict)
+    assert "automatic evidence selection" in html.lower()
     assert html.count('class="finding-card"') == 1
     assert "constant_offset" in html
+
+
+def test_unmatched_extra_reference_is_visible_without_fallback():
+    verdict = {
+        "verdict": "KEEP",
+        "report_md": "## t",
+        "finding_refs": [
+            {"sheet": "Alpha", "kind": "constant_offset"},
+            {"sheet": "Missing", "kind": "constant_ratio"},
+        ],
+    }
+    html = render_adjudicated_report(_scan_two_findings(), verdict)
+    assert html.count('class="finding-card"') == 1
+    assert "Missing" in html
+    assert "constant_ratio" in html
+
+
+def test_explicit_empty_primary_findings_do_not_synthesize_legacy_finding():
+    verdict = {
+        "verdict": "KEEP",
+        "findings": [],
+        "report_md": "## legacy report must not render",
+        "finding_refs": [{"sheet": "Alpha", "kind": "constant_offset"}],
+    }
+    html = render_adjudicated_report(_scan_two_findings(), verdict)
+    assert html.count('class="finding-block"') == 0
+    assert html.count('class="finding-card"') == 0
+    assert "legacy report must not render" not in html
+    assert "constant_offset" not in html
 
 
 def _multi_finding_verdict() -> dict:
