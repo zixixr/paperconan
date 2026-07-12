@@ -1,0 +1,532 @@
+import io
+import json
+import os
+from pathlib import Path
+import tarfile
+import zipfile
+
+import pytest
+
+from paperconan.fetch import _download
+
+
+def _candidate(name, url):
+    return {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": name,
+            "download_url": url,
+        }],
+    }
+
+
+def _write_sidecar(out_dir, managed_files, **extra):
+    payload = {"managed_files": managed_files, **extra}
+    (out_dir / _download.SOURCE_SIDECAR).write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+
+def test_second_fetch_removes_only_previous_managed_files(
+    tmp_path, monkeypatch
+):
+    user = tmp_path / "user.csv"
+    user.write_text("keep", encoding="utf-8")
+
+    def stub_download(url, dest, **kwargs):
+        Path(dest).write_text(url, encoding="utf-8")
+        return {"ok": True, "path": dest}
+
+    monkeypatch.setattr(_download, "download_file", stub_download)
+    _download.download_candidate(
+        _candidate("old.csv", "https://x/old"), str(tmp_path)
+    )
+    _download.download_candidate(
+        _candidate("new.csv", "https://x/new"), str(tmp_path)
+    )
+    assert not (tmp_path / "old.csv").exists()
+    assert (tmp_path / "new.csv").exists()
+    assert user.read_text(encoding="utf-8") == "keep"
+
+
+def test_invalid_manifest_paths_never_leave_output_directory(tmp_path):
+    outside = tmp_path.parent / "outside.csv"
+    outside.write_text("keep", encoding="utf-8")
+    directory = tmp_path / "managed-dir"
+    directory.mkdir()
+
+    _download._remove_managed_files(
+        str(tmp_path),
+        [
+            "",
+            ".",
+            "..",
+            "../outside.csv",
+            str(outside),
+            "managed-dir",
+            ["unhashable"],
+            {"also": "unhashable"},
+        ],
+    )
+
+    assert outside.read_text(encoding="utf-8") == "keep"
+    assert tmp_path.is_dir()
+    assert directory.is_dir()
+
+
+def test_safe_managed_path_rejects_traversal_and_outside_symlink(tmp_path):
+    outside_dir = tmp_path.parent / "outside-dir"
+    outside_dir.mkdir()
+    outside_file = outside_dir / "outside.csv"
+    outside_file.write_text("keep", encoding="utf-8")
+    (tmp_path / "outside-link").symlink_to(outside_dir, target_is_directory=True)
+
+    assert _download._safe_managed_path(str(tmp_path), "") is None
+    assert _download._safe_managed_path(str(tmp_path), ".") is None
+    assert _download._safe_managed_path(str(tmp_path), "..") is None
+    assert _download._safe_managed_path(str(tmp_path), "../outside.csv") is None
+    assert _download._safe_managed_path(str(tmp_path), str(outside_file)) is None
+    assert (
+        _download._safe_managed_path(
+            str(tmp_path), "outside-link/outside.csv"
+        )
+        is None
+    )
+
+
+def test_safe_in_tree_symlink_removal_unlinks_only_named_link(tmp_path):
+    target = tmp_path / "target.csv"
+    target.write_text("keep", encoding="utf-8")
+    link = tmp_path / "managed-link.csv"
+    link.symlink_to(target)
+
+    _download._remove_managed_files(str(tmp_path), ["managed-link.csv"])
+
+    assert not os.path.lexists(link)
+    assert target.read_text(encoding="utf-8") == "keep"
+
+
+def test_manifest_read_tolerates_malformed_shapes_and_entries(tmp_path):
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    sidecar.write_text("[]", encoding="utf-8")
+    assert _download._read_source_sidecar(str(tmp_path)) == {}
+
+    sidecar.write_text("{not json", encoding="utf-8")
+    assert _download._read_source_sidecar(str(tmp_path)) == {}
+
+    sidecar.write_text(
+        json.dumps({
+            "doi": "10.x/example",
+            "managed_files": [
+                "b.csv",
+                ["unhashable"],
+                "a.csv",
+                {"bad": "entry"},
+                "../outside.csv",
+                "bad\u0000.csv",
+                "a.csv",
+                None,
+            ],
+        }),
+        encoding="utf-8",
+    )
+    assert _download._read_source_sidecar(str(tmp_path)) == {
+        "doi": "10.x/example",
+        "managed_files": ["a.csv", "b.csv"],
+    }
+
+
+@pytest.mark.parametrize(
+    "malformed_managed_files",
+    ["a.csv", {"a.csv": True}, 1, None],
+)
+def test_manifest_read_rejects_non_list_managed_files(
+    tmp_path, malformed_managed_files
+):
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    sidecar.write_text(
+        json.dumps({
+            "doi": "10.x/example",
+            "managed_files": malformed_managed_files,
+        }),
+        encoding="utf-8",
+    )
+
+    assert _download._read_source_sidecar(str(tmp_path)) == {
+        "doi": "10.x/example",
+        "managed_files": [],
+    }
+
+
+def test_manifest_contains_only_sorted_successful_relative_paths(
+    tmp_path, monkeypatch
+):
+    def stub_download(url, dest, **kwargs):
+        if url.endswith("skip"):
+            return {"ok": False, "path": dest, "skipped_reason": "unavailable"}
+        Path(dest).write_bytes(b"x")
+        return {"ok": True, "path": dest}
+
+    monkeypatch.setattr(_download, "download_file", stub_download)
+    cand = {
+        "cand_id": "source:1",
+        "tabular_files": [
+            {"name": "b.csv", "download_url": "https://x/b"},
+            {"name": "a.csv", "download_url": "https://x/a"},
+            {"name": "skip.csv", "download_url": "https://x/skip"},
+        ],
+    }
+    _download.download_candidate(cand, str(tmp_path))
+    sidecar = json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+    assert sidecar["managed_files"] == ["a.csv", "b.csv"]
+
+
+def test_source_sidecar_is_deterministic_and_filters_unsafe_paths(tmp_path):
+    cand = {
+        "cand_id": "source:1",
+        "source": "source",
+        "doi": "10.x/example",
+        "title": "Example",
+        "related_dois": ["10.x/related"],
+    }
+    managed = [
+        "b.csv",
+        "../outside.csv",
+        ["unhashable"],
+        "a.csv",
+        "/tmp/absolute.csv",
+        "a.csv",
+    ]
+
+    assert _download._write_source_sidecar(
+        cand, str(tmp_path), managed
+    )
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    first = sidecar.read_bytes()
+    assert _download._write_source_sidecar(
+        cand, str(tmp_path), reversed(managed)
+    )
+
+    assert sidecar.read_bytes() == first
+    assert json.loads(first)["managed_files"] == ["a.csv", "b.csv"]
+    assert not list(tmp_path.glob(f".{_download.SOURCE_SIDECAR}.*.part"))
+
+
+def test_failed_refresh_preserves_reused_managed_file(
+    tmp_path, monkeypatch
+):
+    managed = tmp_path / "table.csv"
+    original = b"old-complete"
+    managed.write_bytes(original)
+    _write_sidecar(tmp_path, ["table.csv"], doi="10.x/old")
+
+    monkeypatch.setattr(
+        _download,
+        "download_file",
+        lambda url, dest, **kwargs: {
+            "ok": False,
+            "path": dest,
+            "skipped_reason": "unavailable",
+        },
+    )
+    result = _download.download_candidate(
+        _candidate("table.csv", "https://x/table.csv"),
+        str(tmp_path),
+    )
+
+    assert managed.read_bytes() == original
+    assert result["downloaded"] == []
+    assert json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )["managed_files"] == ["table.csv"]
+
+
+def test_failed_archive_refresh_preserves_previous_managed_files(
+    tmp_path, monkeypatch
+):
+    managed = tmp_path / "table.csv"
+    original = b"old-complete"
+    managed.write_bytes(original)
+    _write_sidecar(tmp_path, ["table.csv"])
+
+    def bad_archive(url, dest, **kwargs):
+        Path(dest).write_bytes(b"not-a-zip")
+        return {"ok": True, "path": dest}
+
+    monkeypatch.setattr(_download, "download_file", bad_archive)
+    result = _download.download_candidate({
+        "cand_id": "source:1",
+        "tabular_files": [],
+        "supplementary_archive": {
+            "name": "supp.zip",
+            "url": "https://x/supp.zip",
+        },
+    }, str(tmp_path))
+
+    assert managed.read_bytes() == original
+    assert result["downloaded"] == []
+    assert json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )["managed_files"] == ["table.csv"]
+
+
+def test_oversized_reused_archive_member_preserves_previous_file(
+    tmp_path, monkeypatch
+):
+    managed = tmp_path / "table.csv"
+    original = b"old-complete"
+    managed.write_bytes(original)
+    _write_sidecar(tmp_path, ["table.csv"])
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        zf.writestr("nested/table.csv", b"x" * 100)
+    payload = buffer.getvalue()
+
+    def archive_download(url, dest, **kwargs):
+        Path(dest).write_bytes(payload)
+        return {"ok": True, "path": dest}
+
+    monkeypatch.setattr(_download, "download_file", archive_download)
+    result = _download.download_candidate({
+        "cand_id": "source:1",
+        "tabular_files": [],
+        "supplementary_archive": {
+            "name": "supp.zip",
+            "url": "https://x/supp.zip",
+        },
+    }, str(tmp_path), max_bytes=10)
+
+    assert managed.read_bytes() == original
+    assert result["downloaded"] == []
+    assert json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )["managed_files"] == ["table.csv"]
+
+
+def test_oversized_reused_tar_member_preserves_previous_file(
+    tmp_path, monkeypatch
+):
+    managed = tmp_path / "table.csv"
+    original = b"old-complete"
+    managed.write_bytes(original)
+    _write_sidecar(tmp_path, ["table.csv"])
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
+        body = b"x" * 100
+        info = tarfile.TarInfo("nested/table.csv")
+        info.size = len(body)
+        tf.addfile(info, io.BytesIO(body))
+    payload = buffer.getvalue()
+
+    def archive_download(url, dest, **kwargs):
+        Path(dest).write_bytes(payload)
+        return {"ok": True, "path": dest}
+
+    monkeypatch.setattr(_download, "download_file", archive_download)
+    result = _download.download_candidate({
+        "cand_id": "source:1",
+        "tabular_files": [],
+        "oa_package": {
+            "name": "supp.tar.gz",
+            "url": "https://x/supp.tar.gz",
+        },
+    }, str(tmp_path), max_bytes=10)
+
+    assert managed.read_bytes() == original
+    assert result["downloaded"] == []
+    assert json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )["managed_files"] == ["table.csv"]
+
+
+def test_sidecar_commit_failure_does_not_prune_old_managed_files(
+    tmp_path, monkeypatch
+):
+    old = tmp_path / "old.csv"
+    old.write_text("old", encoding="utf-8")
+    _write_sidecar(tmp_path, ["old.csv"], doi="10.x/old")
+    original_sidecar = (
+        tmp_path / _download.SOURCE_SIDECAR
+    ).read_bytes()
+
+    def stub_download(url, dest, **kwargs):
+        Path(dest).write_text("new", encoding="utf-8")
+        return {"ok": True, "path": dest}
+
+    replace = _download.os.replace
+
+    def fail_sidecar_replace(src, dest):
+        if Path(dest).name == _download.SOURCE_SIDECAR:
+            raise OSError("sidecar commit failed")
+        return replace(src, dest)
+
+    monkeypatch.setattr(_download, "download_file", stub_download)
+    monkeypatch.setattr(_download.os, "replace", fail_sidecar_replace)
+    result = _download.download_candidate(
+        _candidate("new.csv", "https://x/new.csv"),
+        str(tmp_path),
+    )
+
+    assert result["downloaded"] == [str(tmp_path / "new.csv")]
+    assert old.read_text(encoding="utf-8") == "old"
+    assert (
+        tmp_path / _download.SOURCE_SIDECAR
+    ).read_bytes() == original_sidecar
+    assert not list(tmp_path.glob(f".{_download.SOURCE_SIDECAR}.*.part"))
+
+
+def test_unmanaged_direct_target_is_preserved(tmp_path, monkeypatch):
+    user = tmp_path / "table.csv"
+    user.write_text("user", encoding="utf-8")
+
+    def stub_download(url, dest, **kwargs):
+        Path(dest).write_text("managed", encoding="utf-8")
+        return {"ok": True, "path": dest}
+
+    monkeypatch.setattr(_download, "download_file", stub_download)
+    result = _download.download_candidate(
+        _candidate("table.csv", "https://x/table.csv"),
+        str(tmp_path),
+    )
+    assert user.read_text(encoding="utf-8") == "user"
+    managed = [Path(path).name for path in result["downloaded"]]
+    assert len(managed) == 1
+    assert managed[0].startswith("table--")
+
+
+@pytest.mark.parametrize(
+    ("unsafe_name", "url"),
+    [
+        (".", "https://x/."),
+        ("..", "https://x/.."),
+        ("", "https://x/.."),
+    ],
+)
+def test_unsafe_direct_basename_uses_download_fallback(
+    tmp_path, monkeypatch, unsafe_name, url
+):
+    def stub_download(url, dest, **kwargs):
+        Path(dest).write_text("managed", encoding="utf-8")
+        return {"ok": True, "path": dest}
+
+    monkeypatch.setattr(_download, "download_file", stub_download)
+    result = _download.download_candidate(
+        _candidate(unsafe_name, url),
+        str(tmp_path),
+    )
+
+    assert result["downloaded"] == [str(tmp_path / "download")]
+    assert (tmp_path / "download").read_text(encoding="utf-8") == "managed"
+
+
+def test_unmanaged_archive_target_is_preserved(tmp_path):
+    user = tmp_path / "table.csv"
+    user.write_text("user", encoding="utf-8")
+    archive = tmp_path / "supp.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("nested/table.csv", b"a\n1\n")
+
+    paths = _download._extract_tabular_zip(
+        str(archive),
+        str(tmp_path),
+        reusable_names=set(),
+    )
+    assert user.read_text(encoding="utf-8") == "user"
+    assert len(paths) == 1
+    assert Path(paths[0]).name.startswith("table--")
+
+
+def test_unmanaged_tar_target_is_preserved(tmp_path):
+    user = tmp_path / "table.csv"
+    user.write_text("user", encoding="utf-8")
+    archive = tmp_path / "supp.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        body = b"a\n1\n"
+        info = tarfile.TarInfo("nested/table.csv")
+        info.size = len(body)
+        tf.addfile(info, io.BytesIO(body))
+
+    paths = _download._extract_tabular_tar(
+        str(archive),
+        str(tmp_path),
+        reusable_names=set(),
+    )
+
+    assert user.read_text(encoding="utf-8") == "user"
+    assert len(paths) == 1
+    assert Path(paths[0]).name.startswith("table--")
+
+
+def test_archive_member_reuses_only_previous_managed_name(tmp_path):
+    managed = tmp_path / "table.csv"
+    managed.write_text("old", encoding="utf-8")
+    archive = tmp_path / "supp.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("nested/table.csv", b"a\n1\n")
+
+    paths = _download._extract_tabular_zip(
+        str(archive),
+        str(tmp_path),
+        reusable_names={"table.csv"},
+    )
+
+    assert paths == [str(managed)]
+    assert managed.read_bytes() == b"a\n1\n"
+
+
+@pytest.mark.parametrize("package_kind", ["zip", "tar"])
+def test_archive_package_temporary_never_uses_candidate_basename(
+    tmp_path, monkeypatch, package_kind
+):
+    candidate_name = "user-package.zip" if package_kind == "zip" else "user-package.tar.gz"
+    user = tmp_path / candidate_name
+    user.write_text("keep", encoding="utf-8")
+    seen_destinations = []
+
+    if package_kind == "zip":
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as zf:
+            zf.writestr("nested/table.csv", b"a\n1\n")
+        payload = buffer.getvalue()
+        archive_fields = {
+            "supplementary_archive": {
+                "name": candidate_name,
+                "url": "https://x/package.zip",
+            },
+        }
+    else:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
+            body = b"a\n1\n"
+            info = tarfile.TarInfo("nested/table.csv")
+            info.size = len(body)
+            tf.addfile(info, io.BytesIO(body))
+        payload = buffer.getvalue()
+        archive_fields = {
+            "oa_package": {
+                "name": candidate_name,
+                "url": "https://x/package.tar.gz",
+            },
+        }
+
+    def stub_download(url, dest, **kwargs):
+        seen_destinations.append(Path(dest))
+        Path(dest).write_bytes(payload)
+        return {"ok": True, "path": dest}
+
+    monkeypatch.setattr(_download, "download_file", stub_download)
+    result = _download.download_candidate({
+        "cand_id": "source:1",
+        "tabular_files": [],
+        **archive_fields,
+    }, str(tmp_path))
+
+    assert user.read_text(encoding="utf-8") == "keep"
+    assert [Path(path).name for path in result["downloaded"]] == ["table.csv"]
+    assert len(seen_destinations) == 1
+    assert seen_destinations[0] != user
+    assert not seen_destinations[0].exists()

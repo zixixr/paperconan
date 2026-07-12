@@ -2998,9 +2998,16 @@ def _load_provenance(in_dir, paper):
     if os.path.isfile(sidecar):
         try:
             with open(sidecar, encoding="utf-8") as fh:
-                return json.load(fh)
+                data = json.load(fh)
         except (OSError, ValueError):
             return None
+        if not isinstance(data, dict):
+            return None
+        return {
+            key: value
+            for key, value in data.items()
+            if key != "managed_files"
+        }
     return None
 
 

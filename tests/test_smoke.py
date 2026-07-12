@@ -186,10 +186,38 @@ def test_scan_paper_arg_overrides_sidecar(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
     (data / "t.csv").write_text("a,b\n1.234,5.678\n2.345,6.789\n3.456,7.890\n", encoding="utf-8")
-    (data / "paperconan_source.json").write_text('{"doi": "10.x/sidecar"}', encoding="utf-8")
+    (data / "paperconan_source.json").write_text(
+        '{"doi": "10.x/sidecar", "managed_files": ["t.csv"]}',
+        encoding="utf-8",
+    )
     res = scan_dir(str(data), str(tmp_path / "out"), write_html=False,
                    paper={"doi": "10.x/override"})
-    assert res["paper"]["doi"] == "10.x/override"
+    assert res["paper"] == {"doi": "10.x/override"}
+
+
+def test_managed_files_do_not_enter_scan_paper_metadata(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "t.csv").write_text("x\n1\n2\n3\n", encoding="utf-8")
+    (data / "paperconan_source.json").write_text(
+        json.dumps({
+            "doi": "10.x/example",
+            "title": "Example",
+            "source": "source",
+            "cand_id": "source:1",
+            "related_dois": ["10.x/related"],
+            "managed_files": ["t.csv"],
+        }),
+        encoding="utf-8",
+    )
+    scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+    assert scan["paper"] == {
+        "doi": "10.x/example",
+        "title": "Example",
+        "source": "source",
+        "cand_id": "source:1",
+        "related_dois": ["10.x/related"],
+    }
 
 
 def test_scan_without_provenance_has_null_paper(tmp_path):

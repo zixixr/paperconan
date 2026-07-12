@@ -9,6 +9,7 @@ import tarfile
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -125,6 +126,142 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
     return {"ok": False, "path": dest_path, "skipped_reason": last_reason}
 
 
+def _safe_managed_path(out_dir, relative):
+    if not isinstance(relative, str) or not relative:
+        return None
+    try:
+        if os.path.isabs(relative):
+            return None
+    except (OSError, TypeError, ValueError):
+        return None
+    parts = relative.split(os.sep)
+    if os.altsep:
+        parts = [
+            part
+            for component in parts
+            for part in component.split(os.altsep)
+        ]
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+
+    try:
+        lexical_root = os.path.abspath(out_dir)
+        lexical_path = os.path.abspath(os.path.join(lexical_root, relative))
+        real_root = os.path.realpath(lexical_root)
+        real_path = os.path.realpath(lexical_path)
+    except (OSError, TypeError, ValueError):
+        return None
+    try:
+        if (
+            lexical_path == lexical_root
+            or os.path.commonpath([lexical_root, lexical_path]) != lexical_root
+        ):
+            return None
+    except ValueError:
+        return None
+
+    try:
+        if (
+            real_path == real_root
+            or os.path.commonpath([real_root, real_path]) != real_root
+        ):
+            return None
+    except ValueError:
+        return None
+    return lexical_path
+
+
+def _safe_managed_names(out_dir, managed_files):
+    if isinstance(managed_files, str):
+        entries = [managed_files]
+    else:
+        try:
+            entries = list(managed_files or ())
+        except TypeError:
+            entries = []
+
+    lexical_root = os.path.abspath(out_dir)
+    safe = set()
+    for relative in entries:
+        if not isinstance(relative, str):
+            continue
+        path = _safe_managed_path(out_dir, relative)
+        if path is None:
+            continue
+        safe.add(os.path.relpath(path, lexical_root))
+    return sorted(safe)
+
+
+def _read_source_sidecar(out_dir):
+    path = os.path.join(out_dir, SOURCE_SIDECAR)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    data = dict(data)
+    if "managed_files" in data:
+        managed_files = data.get("managed_files")
+        if not isinstance(managed_files, list):
+            managed_files = []
+        data["managed_files"] = _safe_managed_names(
+            out_dir, managed_files
+        )
+    return data
+
+
+def _remove_managed_files(out_dir, managed_files):
+    for relative in _safe_managed_names(out_dir, managed_files):
+        path = _safe_managed_path(out_dir, relative)
+        if path is None:
+            continue
+        if os.path.isdir(path) and not os.path.islink(path):
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _managed_output_name(out_dir, base, source_name, reusable_names):
+    reusable = {
+        name for name in (reusable_names or ())
+        if isinstance(name, str)
+    }
+    base = os.path.basename(base) or "download"
+    if base in (".", ".."):
+        base = "download"
+
+    def available(name):
+        return (
+            name in reusable
+            or not os.path.lexists(os.path.join(out_dir, name))
+        )
+
+    if available(base):
+        return base
+
+    stem, suffix = os.path.splitext(base)
+    digest = hashlib.sha256(
+        str(source_name).encode("utf-8")
+    ).hexdigest()
+    for width in range(10, len(digest) + 1, 2):
+        candidate = f"{stem}--{digest[:width]}{suffix.lower()}"
+        if available(candidate):
+            return candidate
+
+    counter = 2
+    while True:
+        candidate = (
+            f"{stem}--{digest}-{counter}{suffix.lower()}"
+        )
+        if available(candidate):
+            return candidate
+        counter += 1
+
+
 def _archive_output_names(member_names):
     eligible = sorted(member_names)
     counts = Counter(
@@ -175,80 +312,183 @@ def _archive_occurrence_output_names(member_names):
     return _allocate_archive_output_names(out)
 
 
-def _extract_tabular_zip(zip_path, out_dir, max_member_bytes=_DEFAULT_MAX):
+def _extract_tabular_zip(
+    zip_path,
+    out_dir,
+    max_member_bytes=_DEFAULT_MAX,
+    *,
+    reusable_names=(),
+):
     """Extract scanner-supported inputs from a supplementary zip into
     out_dir, flattening internal paths to the basename (no path traversal) and
     capping per-member size. Returns the list of extracted file paths."""
+    extracted, _ = _extract_tabular_zip_managed(
+        zip_path,
+        out_dir,
+        max_member_bytes,
+        reusable_names=reusable_names,
+    )
+    return extracted
+
+
+def _extract_tabular_zip_managed(
+    zip_path,
+    out_dir,
+    max_member_bytes,
+    *,
+    reusable_names,
+):
     extracted = []
+    preserved = set()
     written = _dir_size(out_dir)
     with zipfile.ZipFile(zip_path) as zf:
         infos = [
             info for info in zf.infolist()
             if not info.is_dir() and is_supported_input(info.filename)
         ]
-        names = _archive_occurrence_output_names(
+        preferred_names = _archive_occurrence_output_names(
             info.filename for info in infos
         )
-        for info, name in zip(infos, names):
+        reusable = set(_safe_managed_names(out_dir, reusable_names))
+        for info, preferred in zip(infos, preferred_names):
             if written > _MAX_PAPER_BYTES:        # per-paper budget reached; stop extracting
+                preserved.update(reusable)
                 break
+            name = _managed_output_name(
+                out_dir, preferred, info.filename, reusable
+            )
+            reuses_old = name in reusable
+            reusable.discard(name)
             if not name or info.file_size > max_member_bytes:
+                if reuses_old and os.path.lexists(os.path.join(out_dir, name)):
+                    preserved.add(name)
                 continue
             dest = os.path.join(out_dir, name)
             with zf.open(info) as src:
                 try:
                     size = _atomic_stream_write(src, dest, max_member_bytes)
                 except _SizeLimitExceeded:
+                    if reuses_old and os.path.lexists(dest):
+                        preserved.add(name)
                     continue
             written += size
             extracted.append(dest)
-    return extracted
+    return extracted, preserved
 
 
-def _extract_tabular_tar(tar_path, out_dir, max_member_bytes=_DEFAULT_MAX):
+def _extract_tabular_tar(
+    tar_path,
+    out_dir,
+    max_member_bytes=_DEFAULT_MAX,
+    *,
+    reusable_names=(),
+):
     """Extract scanner-supported inputs from a .tar.gz into out_dir,
     flattening internal paths to the basename and capping per-member size.
     Returns the list of extracted file paths."""
+    extracted, _ = _extract_tabular_tar_managed(
+        tar_path,
+        out_dir,
+        max_member_bytes,
+        reusable_names=reusable_names,
+    )
+    return extracted
+
+
+def _extract_tabular_tar_managed(
+    tar_path,
+    out_dir,
+    max_member_bytes,
+    *,
+    reusable_names,
+):
     extracted = []
+    preserved = set()
     written = _dir_size(out_dir)
     with tarfile.open(tar_path, "r:gz") as tf:
         members = [
             member for member in tf.getmembers()
             if member.isfile() and is_supported_input(member.name)
         ]
-        names = _archive_occurrence_output_names(
+        preferred_names = _archive_occurrence_output_names(
             member.name for member in members
         )
-        for member, name in zip(members, names):
+        reusable = set(_safe_managed_names(out_dir, reusable_names))
+        for member, preferred in zip(members, preferred_names):
             if written > _MAX_PAPER_BYTES:        # per-paper budget reached; stop extracting
+                preserved.update(reusable)
                 break
+            name = _managed_output_name(
+                out_dir, preferred, member.name, reusable
+            )
+            reuses_old = name in reusable
+            reusable.discard(name)
             if not name or member.size > max_member_bytes:
+                if reuses_old and os.path.lexists(os.path.join(out_dir, name)):
+                    preserved.add(name)
                 continue
             src = tf.extractfile(member)
             if src is None:
+                if reuses_old and os.path.lexists(os.path.join(out_dir, name)):
+                    preserved.add(name)
                 continue
             dest = os.path.join(out_dir, name)
             with src:
                 try:
                     size = _atomic_stream_write(src, dest, max_member_bytes)
                 except _SizeLimitExceeded:
+                    if reuses_old and os.path.lexists(dest):
+                        preserved.add(name)
                     continue
             written += size
             extracted.append(dest)
-    return extracted
+    return extracted, preserved
 
 
-def _download_oa_package(pkg, out_dir, downloaded, skipped, max_bytes):
+def _temporary_archive_path(out_dir, suffix):
+    fd, path = tempfile.mkstemp(
+        prefix=".paperconan-archive-",
+        suffix=suffix,
+        dir=out_dir,
+    )
+    os.close(fd)
+    return path
+
+
+def _download_oa_package(
+    pkg,
+    out_dir,
+    downloaded,
+    skipped,
+    max_bytes,
+    *,
+    reusable_names=(),
+):
     """Download the static PMC OA tar.gz, extract its tabular members, drop the tarball."""
-    tmp = os.path.join(out_dir, pkg.get("name") or "oa_package.tar.gz")
-    res = download_file(pkg["url"], tmp, max_bytes=_ARCHIVE_MAX)
-    if not res.get("ok"):
-        skipped.append({"name": pkg.get("name"), "reason": res.get("skipped_reason")})
-        return
+    tmp = _temporary_archive_path(out_dir, ".tar.gz")
     try:
-        downloaded.extend(_extract_tabular_tar(tmp, out_dir, max_bytes))
-    except (tarfile.TarError, OSError) as e:
-        skipped.append({"name": pkg.get("name"), "reason": f"bad tar.gz: {e}"})
+        res = download_file(pkg["url"], tmp, max_bytes=_ARCHIVE_MAX)
+        if not res.get("ok"):
+            skipped.append({
+                "name": pkg.get("name"),
+                "reason": res.get("skipped_reason"),
+            })
+            return False, set()
+        try:
+            extracted, preserved = _extract_tabular_tar_managed(
+                tmp,
+                out_dir,
+                max_bytes,
+                reusable_names=reusable_names,
+            )
+            downloaded.extend(extracted)
+        except (tarfile.TarError, OSError) as e:
+            skipped.append({
+                "name": pkg.get("name"),
+                "reason": f"bad tar.gz: {e}",
+            })
+            return False, set()
+        return True, preserved
     finally:
         try:
             os.remove(tmp)
@@ -257,20 +497,36 @@ def _download_oa_package(pkg, out_dir, downloaded, skipped, max_bytes):
 
 
 def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_bytes,
-                                    archive_max=_ARCHIVE_MAX):
+                                    archive_max=_ARCHIVE_MAX, *,
+                                    reusable_names=()):
     """Fetch a supplementary zip (Europe PMC), extract its tabular members, drop the zip.
 
     The archive downloads with the larger ``archive_max`` cap; each extracted table is
     still capped at the per-file ``max_bytes``."""
-    tmp_zip = os.path.join(out_dir, arch.get("name") or "supplementary.zip")
-    res = download_file(arch["url"], tmp_zip, max_bytes=archive_max)
-    if not res.get("ok"):
-        skipped.append({"name": arch.get("name"), "reason": res.get("skipped_reason")})
-        return
+    tmp_zip = _temporary_archive_path(out_dir, ".zip")
     try:
-        downloaded.extend(_extract_tabular_zip(tmp_zip, out_dir, max_bytes))
-    except zipfile.BadZipFile:
-        skipped.append({"name": arch.get("name"), "reason": "not a valid zip archive"})
+        res = download_file(arch["url"], tmp_zip, max_bytes=archive_max)
+        if not res.get("ok"):
+            skipped.append({
+                "name": arch.get("name"),
+                "reason": res.get("skipped_reason"),
+            })
+            return False, set()
+        try:
+            extracted, preserved = _extract_tabular_zip_managed(
+                tmp_zip,
+                out_dir,
+                max_bytes,
+                reusable_names=reusable_names,
+            )
+            downloaded.extend(extracted)
+        except (zipfile.BadZipFile, OSError):
+            skipped.append({
+                "name": arch.get("name"),
+                "reason": "not a valid zip archive",
+            })
+            return False, set()
+        return True, preserved
     finally:
         try:
             os.remove(tmp_zip)
@@ -278,16 +534,48 @@ def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_byte
             pass
 
 
-def _write_source_sidecar(cand, out_dir):
+def _write_source_sidecar(cand, out_dir, managed_files):
     """Record which paper/dataset these downloads came from, for scan.json provenance."""
     prov = {"doi": cand.get("doi"), "title": cand.get("title"),
             "source": cand.get("source"), "cand_id": cand.get("cand_id"),
-            "related_dois": cand.get("related_dois") or []}
+            "related_dois": cand.get("related_dois") or [],
+            "managed_files": _safe_managed_names(out_dir, managed_files)}
+    fd = None
+    temp_path = None
     try:
-        with open(os.path.join(out_dir, SOURCE_SIDECAR), "w", encoding="utf-8") as fh:
-            json.dump(prov, fh, indent=2, default=str)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f".{SOURCE_SIDECAR}.",
+            suffix=".part",
+            dir=out_dir,
+        )
+        stream = os.fdopen(fd, "w", encoding="utf-8")
+        fd = None
+        with stream as fh:
+            json.dump(
+                prov,
+                fh,
+                indent=2,
+                sort_keys=True,
+                default=str,
+            )
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp_path, os.path.join(out_dir, SOURCE_SIDECAR))
+        return True
     except OSError:
-        pass  # provenance is best-effort; never fail a download over it
+        return False
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if temp_path is not None:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
 def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
@@ -297,24 +585,83 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
     else:
         files = cand.get("all_files") or cand.get("tabular_files", [])
     os.makedirs(out_dir, exist_ok=True)
-    _write_source_sidecar(cand, out_dir)
+    previous = _read_source_sidecar(out_dir)
+    old_managed = set(previous.get("managed_files") or ())
+    reusable_names = set(old_managed)
     downloaded, skipped = [], []
-    for f in files:
+    new_managed = set()
+    preserved_managed = set()
+    for file_ref in files:
+        requested_name = str(file_ref.get("name") or "").strip()
+        source_url = str(file_ref.get("download_url") or "")
+        source_name = requested_name or source_url
+        base = (
+            os.path.basename(requested_name)
+            or os.path.basename(urllib.parse.urlsplit(source_url).path)
+            or "download"
+        )
+        if base in (".", ".."):
+            base = "download"
+        output_name = _managed_output_name(
+            out_dir, base, source_name, reusable_names
+        )
+        reuses_old = output_name in reusable_names
+        reusable_names.discard(output_name)
         if _dir_size(out_dir) > _MAX_PAPER_BYTES:   # per-paper budget reached; stop downloading
-            skipped.append({"name": f["name"], "reason": "paper data exceeds per-paper cap"})
+            skipped.append({
+                "name": requested_name,
+                "reason": "paper data exceeds per-paper cap",
+            })
+            if reuses_old:
+                preserved_managed.add(output_name)
             continue
-        dest = os.path.join(out_dir, os.path.basename(f["name"]))
-        res = download_file(f["download_url"], dest, max_bytes=max_bytes)
+        dest = os.path.join(out_dir, output_name)
+        res = download_file(source_url, dest, max_bytes=max_bytes)
         if res.get("ok"):
             downloaded.append(res["path"])
+            new_managed.add(output_name)
         else:
-            skipped.append({"name": f["name"], "reason": res.get("skipped_reason")})
+            skipped.append({
+                "name": requested_name,
+                "reason": res.get("skipped_reason"),
+            })
+            if reuses_old:
+                preserved_managed.add(output_name)
     pkg = cand.get("oa_package")
     if pkg and pkg.get("url"):
-        _download_oa_package(pkg, out_dir, downloaded, skipped, max_bytes)
+        archive_start = len(downloaded)
+        archive_ok, archive_preserved = _download_oa_package(
+            pkg,
+            out_dir,
+            downloaded,
+            skipped,
+            max_bytes,
+            reusable_names=reusable_names,
+        )
+        preserved_managed.update(archive_preserved)
+        if not archive_ok:
+            preserved_managed.update(old_managed)
+        for path in downloaded[archive_start:]:
+            new_managed.add(os.path.relpath(path, out_dir))
     arch = cand.get("supplementary_archive")
     if not downloaded and arch and arch.get("url"):
-        _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_bytes,
-                                        archive_max=archive_max)
+        archive_start = len(downloaded)
+        archive_ok, archive_preserved = _download_supplementary_archive(
+            arch,
+            out_dir,
+            downloaded,
+            skipped,
+            max_bytes,
+            archive_max=archive_max,
+            reusable_names=reusable_names,
+        )
+        preserved_managed.update(archive_preserved)
+        if not archive_ok:
+            preserved_managed.update(old_managed)
+        for path in downloaded[archive_start:]:
+            new_managed.add(os.path.relpath(path, out_dir))
+    managed_files = new_managed | preserved_managed
+    if _write_source_sidecar(cand, out_dir, managed_files):
+        _remove_managed_files(out_dir, old_managed - managed_files)
     return {"cand_id": cand.get("cand_id"), "out_dir": out_dir,
             "downloaded": downloaded, "skipped": skipped}
