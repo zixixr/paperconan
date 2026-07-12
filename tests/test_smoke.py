@@ -6,16 +6,12 @@ and asserts both the scan.json structure and that report.html is well-formed.
 from __future__ import annotations
 
 import json
-import os
-import sys
 
 import pytest
 
-# Make tests/build_fixture importable when running pytest from repo root.
-sys.path.insert(0, os.path.dirname(__file__))
-from build_fixture import build  # noqa: E402
+from tests.build_fixture import build
 
-from paperconan import scan_dir, write_html_report  # noqa: E402
+from paperconan import scan_dir, write_html_report
 
 
 @pytest.fixture(scope="module")

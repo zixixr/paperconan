@@ -26,9 +26,8 @@ def test_big_block_truncated_keeps_highlight():
 
 
 def test_write_json_false_skips_file(tmp_path):
-    import sys, pathlib
-    sys.path.insert(0, str(pathlib.Path(__file__).parent))
-    from build_fixture import build as build_tiny
+    from tests.build_fixture import build as build_tiny
+
     ind = tmp_path / "in"; out = tmp_path / "out"; ind.mkdir()
     build_tiny(str(ind))
     res = scan_dir(str(ind), str(out), write_md=False, write_html=False, write_json=False)

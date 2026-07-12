@@ -1,13 +1,9 @@
 """End-to-end: GRIM/GRIMMER surfaces through scan_dir, and continuous data does not."""
 from __future__ import annotations
 
-import os
-import sys
+from tests.build_fixture import build
 
-sys.path.insert(0, os.path.dirname(__file__))
-from build_fixture import build  # noqa: E402
-
-from paperconan import scan_dir  # noqa: E402
+from paperconan import scan_dir
 
 
 def _grim_findings(scan):

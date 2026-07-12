@@ -4,7 +4,7 @@ import json
 import subprocess
 import sys
 
-from build_fixture import build
+from tests.build_fixture import build
 
 from paperconan import scan_dir, write_adjudicated_report
 from paperconan._adjudicated_html import _render_md, render_adjudicated_report

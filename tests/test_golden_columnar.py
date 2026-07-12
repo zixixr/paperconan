@@ -19,15 +19,12 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-import sys
 
 import pytest
 
-# Make tests/build_fixture importable when running pytest from repo root.
-sys.path.insert(0, os.path.dirname(__file__))
-from build_fixture import build as build_tiny_paper  # noqa: E402
+from tests.build_fixture import build as build_tiny_paper
 
-from paperconan._audit import scan_dir  # noqa: E402
+from paperconan._audit import scan_dir
 
 HERE = pathlib.Path(__file__).parent
 GOLD = HERE / "golden"
