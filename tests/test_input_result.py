@@ -50,7 +50,10 @@ def test_table_load_result_keeps_compatibility_dict(tmp_path):
             equal_nan=True,
         )
         assert legacy_sheet._text == result_sheet._text
-        assert legacy_sheet._ints == result_sheet._ints
+        assert np.array_equal(
+            legacy_sheet._ints,
+            result_sheet._ints,
+        )
         assert legacy_sheet._wide_ints == result_sheet._wide_ints
 
 

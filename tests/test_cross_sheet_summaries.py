@@ -414,6 +414,100 @@ def test_recurring_budget_stops_window_materialization_but_counts_skips(
     assert meta == {"budget_exhausted": True, "windows_skipped": 47}
 
 
+def test_recurring_unique_vector_budget_bounds_keys_and_reports_lower_bound():
+    source = Sheet.from_rows([
+        [11.25, 7.5, 19.75, 3.125],
+        [21.25, 17.5, 29.75, 13.125],
+        [31.25, 27.5, 39.75, 23.125],
+    ])
+    index = RecurringRowIndex(budget=100, unique_budget=1)
+
+    index.add_sheet(
+        "a.xlsx",
+        "Figure 1",
+        source,
+        blocks=[(0, source.nrows, 0, source.ncols)],
+        figure_id="main:1",
+        min_k=4,
+        max_k=4,
+    )
+
+    assert len(index._vectors) == 1
+    assert index.unique_budget_metadata() == {
+        "budget_exhausted": True,
+        "limit": 1,
+        "vectors_retained": 1,
+        "skipped_new_vector_windows": 2,
+        "skipped_new_vectors_lower_bound": 1,
+    }
+    record = next(iter(index._vectors.values()))
+    assert not isinstance(record, dict)
+    assert not hasattr(record, "vector")
+
+
+def test_recurring_unique_budget_continues_updating_known_vector():
+    vector = [220.0, 188.0, 122.0, 166.0, 128.0, 166.0]
+    other = [311.0, 277.0, 203.0, 255.0, 199.0, 241.0]
+    index = RecurringRowIndex(budget=100, unique_budget=1)
+
+    for number, values in (
+        (1, vector),
+        (2, other),
+        (3, vector),
+        (4, vector),
+    ):
+        source = Sheet.from_rows([values])
+        index.add_sheet(
+            f"M{number}.xlsx",
+            f"Figure {number}",
+            source,
+            blocks=[(0, 1, 0, source.ncols)],
+            figure_id=f"main:{number}",
+            min_k=6,
+            max_k=6,
+        )
+
+    findings, _meta = index.findings()
+
+    match = next(
+        finding for finding in findings
+        if finding["vector"] == vector
+    )
+    assert match["n_occurrences"] == 3
+    assert match["n_figures"] == 3
+    assert index.unique_budget_metadata()[
+        "skipped_new_vector_windows"
+    ] == 1
+
+
+def test_recurring_index_skips_sheet_without_figure_namespace():
+    class CountingSource:
+        nrows = 1
+        ncols = 6
+
+        def __init__(self):
+            self.cell_calls = 0
+
+        def cell(self, row, col):
+            self.cell_calls += 1
+            return float(col) + 0.125
+
+    source = CountingSource()
+    index = RecurringRowIndex(budget=100, unique_budget=10)
+
+    meta = index.add_sheet(
+        "a.xlsx",
+        "Sheet1",
+        source,
+        blocks=[(0, 1, 0, 6)],
+        figure_id=None,
+    )
+
+    assert source.cell_calls == 0
+    assert len(index._vectors) == 0
+    assert meta == {"budget_exhausted": False, "windows_skipped": 0}
+
+
 def test_negative_collision_row_limit_uses_zero_rows():
     source = Sheet.from_rows([
         [1.1234, 2.2345],
@@ -472,9 +566,20 @@ def test_scan_uses_compact_cross_sheet_state(tmp_path, monkeypatch):
 
     within_sizes = []
 
-    def capture_within(sheets, profile="review", min_cells=10):
+    def capture_within(
+        sheets,
+        profile="review",
+        min_cells=10,
+        *,
+        with_coverage=False,
+    ):
         within_sizes.append(len(sheets))
-        return original_within(sheets, profile=profile, min_cells=min_cells)
+        return original_within(
+            sheets,
+            profile=profile,
+            min_cells=min_cells,
+            with_coverage=with_coverage,
+        )
 
     indexes = []
 

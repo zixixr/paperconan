@@ -7,10 +7,12 @@ from dataclasses import fields, is_dataclass
 
 import numpy as np
 import paperconan._audit as audit
+import paperconan._extract as extract
 import pytest
 from paperconan._coverage import ScanCoverage
 from paperconan._input import TableLoadResult
 from paperconan._sheet import Sheet
+from paperconan._sheet import SheetBuilder
 from paperconan._summaries import RecurringRowIndex
 
 
@@ -101,6 +103,180 @@ def test_scan_streams_numeric_values_and_releases_previous_sheet(
         str(data), str(tmp_path / "out"), write_html=False
     )
     assert scan["coverage"]["files_succeeded"] == 2
+
+
+def test_pdf_scan_releases_completed_table_before_extracting_next(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    path = data / "tables.pdf"
+    path.write_bytes(b"placeholder")
+    sheet_refs = []
+    original_finish = SheetBuilder.finish
+
+    def tracked_finish(builder):
+        sheet = original_finish(builder)
+        sheet_refs.append(weakref.ref(sheet.numeric))
+        return sheet
+
+    class StubTable:
+        def __init__(self, index):
+            self.index = index
+
+        def extract(self):
+            if self.index == 2:
+                gc.collect()
+                assert sheet_refs[-1]() is None
+            return [
+                ["a", "b"],
+                *[
+                    [
+                        str(self.index + offset),
+                        str(self.index + offset),
+                    ]
+                    for offset in range(6)
+                ],
+            ]
+
+    class StubPage:
+        def find_tables(self):
+            return [StubTable(1), StubTable(2)]
+
+    class StubPdf:
+        pages = [StubPage()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    pdfplumber = __import__("pdfplumber")
+    monkeypatch.setattr(SheetBuilder, "finish", tracked_finish)
+    monkeypatch.setattr(
+        pdfplumber, "open", lambda _path: StubPdf()
+    )
+
+    scan = audit.scan_dir(
+        str(data),
+        str(tmp_path / "out"),
+        write_html=False,
+        evidence=True,
+    )
+
+    assert scan["coverage"]["files_succeeded"] == 1
+    assert len(sheet_refs) == 4
+
+
+def test_docx_scan_releases_completed_table_before_extracting_next(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    path = data / "tables.docx"
+    path.write_bytes(b"placeholder")
+    sheet_refs = []
+    original_finish = SheetBuilder.finish
+
+    def tracked_finish(builder):
+        sheet = original_finish(builder)
+        sheet_refs.append(weakref.ref(sheet.numeric))
+        return sheet
+
+    class Identity:
+        pass
+
+    class StubCell:
+        def __init__(self, text):
+            self.text = text
+            self._tc = Identity()
+
+    class StubRow:
+        def __init__(self, index):
+            self.cells = [
+                StubCell(str(index)),
+                StubCell(str(index)),
+            ]
+
+    class StubTable:
+        def __init__(self, index):
+            self.index = index
+
+        @property
+        def rows(self):
+            if self.index == 2:
+                gc.collect()
+                assert sheet_refs[-1]() is None
+            return [
+                StubRow(self.index + offset)
+                for offset in range(7)
+            ]
+
+    class StubDocument:
+        tables = [StubTable(1), StubTable(2)]
+
+    docx = __import__("docx")
+    monkeypatch.setattr(SheetBuilder, "finish", tracked_finish)
+    monkeypatch.setattr(
+        docx, "Document", lambda _path: StubDocument()
+    )
+
+    scan = audit.scan_dir(
+        str(data),
+        str(tmp_path / "out"),
+        write_html=False,
+        evidence=True,
+    )
+
+    assert scan["coverage"]["files_succeeded"] == 1
+    assert len(sheet_refs) == 4
+
+
+def test_docx_merged_identity_state_releases_rows_older_than_previous(
+    monkeypatch,
+):
+    identity_refs = []
+
+    class Identity:
+        pass
+
+    class StubCell:
+        def __init__(self, identity, text):
+            self._tc = identity
+            self.text = text
+
+    class StubRow:
+        def __init__(self, identity, text):
+            self.cells = [StubCell(identity, text)]
+
+    class StubTable:
+        @property
+        def rows(self):
+            for index in range(8):
+                if index >= 2:
+                    gc.collect()
+                    assert identity_refs[index - 2]() is None
+                identity = Identity()
+                identity_refs.append(weakref.ref(identity))
+                row = StubRow(identity, str(index))
+                yield row
+                del row
+                del identity
+
+    class StubDocument:
+        tables = [StubTable()]
+
+    docx = __import__("docx")
+    monkeypatch.setattr(
+        docx, "Document", lambda _path: StubDocument()
+    )
+
+    sheets = extract.load_docx_tables("tables.docx")
+
+    sheet = sheets["tables!t1"]
+    assert sheet.nrows == 8
+    assert [sheet.cell(row, 0) for row in range(8)] == list(range(8))
 
 
 def test_large_single_column_sheet_keeps_retained_state_bounded(
@@ -594,6 +770,50 @@ def test_scan_reports_exact_recurring_window_budget_once(
         "sheet": "Figure 1",
         "windows_skipped": 8,
         "limit": 1,
+    }]
+    assert scan["coverage"]["truncated"] is True
+
+
+def test_scan_reports_recurring_unique_vector_exhaustion_once(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    for figure in range(1, 4):
+        rows = [
+            ",".join(
+                str(figure * 100 + row * 10 + col + 0.125)
+                for col in range(6)
+            )
+            for row in range(3)
+        ]
+        (data / f"Figure {figure}.csv").write_text(
+            "a,b,c,d,e,f\n" + "\n".join(rows) + "\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(
+        audit,
+        "_RECURRING_ROW_VECTOR_UNIQUE_BUDGET",
+        1,
+        raising=False,
+    )
+
+    scan = audit.scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    limitations = [
+        item
+        for item in scan["coverage"]["limitations"]
+        if item["reason"] == "recurring_row_unique_vector_limit"
+    ]
+    assert limitations == [{
+        "scope": "scan",
+        "reason": "recurring_row_unique_vector_limit",
+        "limit": 1,
+        "vectors_retained": 1,
+        "skipped_new_vector_windows": 53,
+        "skipped_new_vectors_lower_bound": 1,
     }]
     assert scan["coverage"]["truncated"] is True
 

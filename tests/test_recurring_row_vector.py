@@ -169,9 +169,11 @@ def test_b2_same_sheet_name_across_files_not_conflated():
         ("A.xls", "Sheet1"): _panel(v1, 10),                 # figure_key None
         ("A.xls", "Figure 4b"): _panel(v1, 40),              # main:4
         ("A.xls", "Extended Data Fig. 2a"): _panel(v1, 70),  # ext:2
+        ("A.xls", "Figure 6b"): _panel(v1, 90),              # main:6
         ("B.xls", "Sheet1"): _panel(v2, 11),                 # same sheet name, different file/vector
         ("B.xls", "Figure 5b"): _panel(v2, 41),              # main:5
         ("B.xls", "Extended Data Fig. 3a"): _panel(v2, 71),  # ext:3
+        ("B.xls", "Figure 7b"): _panel(v2, 91),              # main:7
     }
     f = detect_recurring_row_vectors({k: _sheet(v) for k, v in panels.items()})
     vecs = {tuple(x["vector"]) for x in f if x["severity"] == "high"}
@@ -251,6 +253,46 @@ def test_b2_repeated_start_columns_in_one_row_count_as_one_occurrence():
 
     assert not any(finding["vector"] == VEC for finding in findings)
     assert meta == {"findings_omitted": 0}
+
+
+def test_b2_separate_blocks_do_not_recount_a_previously_visited_row():
+    index = RecurringRowIndex()
+    other = [311.0, 277.0, 203.0, 255.0, 199.0, 241.0]
+    source_a = Sheet.from_rows([
+        VEC + [None] + VEC,
+        VEC + [None] + other,
+    ])
+    source_b = Sheet.from_rows([VEC])
+
+    index.add_sheet(
+        "M1.xls",
+        "Figure 1a",
+        source_a,
+        blocks=[
+            (0, 2, 0, 6),
+            (0, 2, 7, 13),
+        ],
+        figure_id="main:1",
+        min_k=6,
+        max_k=6,
+    )
+    index.add_sheet(
+        "M2.xls",
+        "Figure 2a",
+        source_b,
+        blocks=[(0, 1, 0, 6)],
+        figure_id="main:2",
+        min_k=6,
+        max_k=6,
+    )
+
+    findings, _meta = index.findings()
+
+    match = next(
+        finding for finding in findings
+        if finding["vector"] == VEC
+    )
+    assert match["n_occurrences"] == 3
 
 
 def test_b2_location_metadata_includes_occurrences_after_site_cap():

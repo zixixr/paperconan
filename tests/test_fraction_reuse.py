@@ -182,14 +182,21 @@ def test_process_file_runs_fraction_reuse_while_sheet_is_live(
     }
     seen = []
 
-    def capture(sheets, profile="review", min_cells=10):
+    def capture(
+        sheets,
+        profile="review",
+        min_cells=10,
+        *,
+        with_coverage=False,
+    ):
         assert profile == "review"
         assert min_cells == 10
+        assert with_coverage is True
         assert list(sheets) == [("source.csv", "source")]
         sheet = sheets[("source.csv", "source")]
         assert isinstance(sheet, Sheet)
         seen.append(sheet.numeric.shape)
-        return [marker]
+        return [marker], []
 
     monkeypatch.setattr(
         audit, "detect_within_sheet_fraction_reuse", capture
@@ -256,3 +263,128 @@ def test_fraction_reuse_streams_large_block_pairs_with_bounded_state(
     assert stats.shared == rows_per_block
     assert len(stats.fraction_representatives) <= 5
     assert len(stats.difference_representatives) <= 2
+
+
+def test_fraction_reuse_rejects_impossible_geometry_before_cells(
+    monkeypatch,
+):
+    class NoCellSheet:
+        nrows = 6
+        ncols = 1
+
+        def exact_numeric(self, _row, _col):
+            raise AssertionError(
+                "pairs below min_cells must not examine cells"
+            )
+
+    blocks = [(row, row + 1, 0, 1) for row in range(6)]
+    monkeypatch.setattr(
+        audit, "find_numeric_blocks", lambda _sheet: blocks
+    )
+
+    findings, limitations = detect_within_sheet_fraction_reuse(
+        {("small.csv", "Figure 1"): NoCellSheet()},
+        min_cells=2,
+        pair_budget=100,
+        cell_budget=100,
+        with_coverage=True,
+    )
+
+    assert findings == []
+    assert limitations == []
+
+
+def test_fraction_reuse_pair_budget_is_deterministic_and_exact(
+    monkeypatch,
+):
+    blocks = [
+        (index * 20, index * 20 + 10, 0, 1)
+        for index in range(5)
+    ]
+    examined = []
+
+    def capture(_sheet, block_a, block_b):
+        examined.append((block_a, block_b))
+        return audit._FractionReusePairStats(
+            common=0,
+            shared=0,
+            integer_differences=0,
+            high_precision=0,
+            fraction_representatives=(),
+            difference_representatives=(),
+        )
+
+    monkeypatch.setattr(
+        audit, "find_numeric_blocks", lambda _sheet: blocks
+    )
+    monkeypatch.setattr(audit, "_fraction_reuse_pair_stats", capture)
+
+    findings, limitations = detect_within_sheet_fraction_reuse(
+        {("many.csv", "Figure 1"): object()},
+        pair_budget=2,
+        cell_budget=1_000,
+        with_coverage=True,
+    )
+
+    assert findings == []
+    assert examined == [
+        (blocks[0], blocks[1]),
+        (blocks[0], blocks[2]),
+    ]
+    assert limitations == [{
+        "file": "many.csv",
+        "sheet": "Figure 1",
+        "pair_limit": 2,
+        "cell_limit": 1_000,
+        "pairs_examined": 2,
+        "cells_examined": 20,
+        "pairs_skipped": 8,
+        "limits_reached": ["pair"],
+    }]
+
+
+def test_fraction_reuse_cell_budget_stops_before_partial_pair(
+    monkeypatch,
+):
+    blocks = [
+        (index * 20, index * 20 + 6, 0, 1)
+        for index in range(4)
+    ]
+    examined = []
+
+    def capture(_sheet, block_a, block_b):
+        examined.append((block_a, block_b))
+        return audit._FractionReusePairStats(
+            common=0,
+            shared=0,
+            integer_differences=0,
+            high_precision=0,
+            fraction_representatives=(),
+            difference_representatives=(),
+        )
+
+    monkeypatch.setattr(
+        audit, "find_numeric_blocks", lambda _sheet: blocks
+    )
+    monkeypatch.setattr(audit, "_fraction_reuse_pair_stats", capture)
+
+    findings, limitations = detect_within_sheet_fraction_reuse(
+        {("many.csv", "Figure 1"): object()},
+        min_cells=1,
+        pair_budget=100,
+        cell_budget=10,
+        with_coverage=True,
+    )
+
+    assert findings == []
+    assert examined == [(blocks[0], blocks[1])]
+    assert limitations == [{
+        "file": "many.csv",
+        "sheet": "Figure 1",
+        "pair_limit": 100,
+        "cell_limit": 10,
+        "pairs_examined": 1,
+        "cells_examined": 6,
+        "pairs_skipped": 5,
+        "limits_reached": ["cell"],
+    }]

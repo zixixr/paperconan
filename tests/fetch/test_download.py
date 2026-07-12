@@ -5,6 +5,8 @@ import warnings
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from paperconan._input import SUPPORTED_INPUT_EXTS
 from paperconan.fetch import _download
 
@@ -482,3 +484,216 @@ def test_archive_extracts_every_scanner_extension(tmp_path):
     assert {Path(path).suffix.lstrip(".") for path in paths} == set(
         SUPPORTED_INPUT_EXTS
     )
+
+
+def _write_bounded_archive(path, archive_kind, members):
+    if archive_kind == "zip":
+        with zipfile.ZipFile(path, "w") as archive:
+            for name, body in members:
+                archive.writestr(name, body)
+        return
+    with tarfile.open(path, "w:gz") as archive:
+        for name, body in members:
+            info = tarfile.TarInfo(name)
+            info.size = len(body)
+            archive.addfile(info, io.BytesIO(body))
+
+
+def _extract_bounded_archive(path, archive_kind, out_dir):
+    extract = (
+        _download._extract_tabular_zip_managed
+        if archive_kind == "zip"
+        else _download._extract_tabular_tar_managed
+    )
+    return extract(
+        str(path),
+        str(out_dir),
+        100,
+        reusable_names=(),
+        archive_name=path.name,
+    )
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+def test_archive_member_limit_bounds_zero_byte_metadata_and_names(
+    tmp_path, monkeypatch, archive_kind
+):
+    archive = tmp_path / f"supp.{archive_kind}"
+    members = [
+        ("a/table.csv", b""),
+        ("b/table.csv", b""),
+        ("c/table.csv", b""),
+        ("d/table.csv", b""),
+    ]
+    _write_bounded_archive(archive, archive_kind, members)
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 2)
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_MEMBER_NAME_BYTES", 1_000
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_OUTPUT_FILE_LIMIT", 10
+    )
+    if archive_kind == "tar":
+        monkeypatch.setattr(
+            tarfile.TarFile,
+            "getmembers",
+            lambda _archive: (_ for _ in ()).throw(
+                AssertionError("TAR extraction must stream metadata")
+            ),
+        )
+
+    runs = []
+    for index in range(2):
+        out_dir = tmp_path / f"out-{index}"
+        out_dir.mkdir()
+        extracted, preserved, skipped = _extract_bounded_archive(
+            archive, archive_kind, out_dir
+        )
+        runs.append([Path(path).name for path in extracted])
+        assert preserved == set()
+        assert skipped == [{
+            "name": archive.name,
+            "reason": "archive member count limit",
+            "limit": 2,
+            "retained_members": 2,
+            "omitted_members_lower_bound": 1,
+        }]
+
+    assert runs[0] == runs[1]
+    assert len(runs[0]) == 2
+    assert len({name.casefold() for name in runs[0]}) == 2
+
+
+def test_zip_member_budget_avoids_eager_central_directory_reader(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "supp.zip"
+    _write_bounded_archive(
+        archive,
+        "zip",
+        [(f"{index}.csv", b"") for index in range(4)],
+    )
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 2)
+    monkeypatch.setattr(
+        _download.zipfile.ZipFile,
+        "_RealGetContents",
+        lambda _archive: (_ for _ in ()).throw(
+            AssertionError("ZIP metadata must be read incrementally")
+        ),
+    )
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    extracted, preserved, skipped = _extract_bounded_archive(
+        archive, "zip", out_dir
+    )
+
+    assert len(extracted) == 2
+    assert preserved == set()
+    assert skipped[0]["reason"] == "archive member count limit"
+
+
+def test_tar_member_budget_avoids_caching_archive_iterator(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "supp.tar"
+    _write_bounded_archive(
+        archive,
+        "tar",
+        [(f"{index}.csv", b"") for index in range(4)],
+    )
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 2)
+    monkeypatch.setattr(
+        _download.tarfile.TarFile,
+        "__iter__",
+        lambda _archive: (_ for _ in ()).throw(
+            AssertionError("TAR metadata must not use the caching iterator")
+        ),
+    )
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    extracted, preserved, skipped = _extract_bounded_archive(
+        archive, "tar", out_dir
+    )
+
+    assert len(extracted) == 2
+    assert preserved == set()
+    assert skipped[0]["reason"] == "archive member count limit"
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+def test_archive_member_limit_counts_ineligible_metadata_work(
+    tmp_path, monkeypatch, archive_kind
+):
+    archive = tmp_path / f"supp.{archive_kind}"
+    _write_bounded_archive(
+        archive,
+        archive_kind,
+        [
+            ("image-1.png", b""),
+            ("image-2.png", b""),
+            ("table.csv", b""),
+        ],
+    )
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 2)
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_MEMBER_NAME_BYTES", 1_000
+    )
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    extracted, preserved, skipped = _extract_bounded_archive(
+        archive, archive_kind, out_dir
+    )
+
+    assert extracted == []
+    assert preserved == set()
+    assert skipped == [{
+        "name": archive.name,
+        "reason": "archive member count limit",
+        "limit": 2,
+        "retained_members": 2,
+        "omitted_members_lower_bound": 1,
+    }]
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+def test_archive_member_name_byte_limit_stops_before_retention(
+    tmp_path, monkeypatch, archive_kind
+):
+    first = "nested/" + "a" * 20 + ".csv"
+    second = "nested/" + "b" * 20 + ".csv"
+    archive = tmp_path / f"supp.{archive_kind}"
+    _write_bounded_archive(
+        archive,
+        archive_kind,
+        [(first, b""), (second, b"")],
+    )
+    first_bytes = len(first.encode("utf-8"))
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 10)
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_MEMBER_NAME_BYTES", first_bytes
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_OUTPUT_FILE_LIMIT", 10
+    )
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    extracted, preserved, skipped = _extract_bounded_archive(
+        archive, archive_kind, out_dir
+    )
+
+    assert [Path(path).name for path in extracted] == [
+        Path(first).name
+    ]
+    assert preserved == set()
+    assert skipped == [{
+        "name": archive.name,
+        "reason": "archive member name byte limit",
+        "limit": first_bytes,
+        "retained_members": 1,
+        "retained_name_bytes": first_bytes,
+        "omitted_members_lower_bound": 1,
+    }]

@@ -82,6 +82,8 @@ write_adjudicated_report(scan, verdict, "adjudication.html")  # scan/verdict 均
 |----------|--------|------|
 | `PAPERCONAN_MAX_FILE_MB` | `200` | 单文件读取前体积上限 |
 | `PAPERCONAN_MAX_CELLS` | `10000000` | 单 sheet / workbook 累计 cell 预算 |
+| `PAPERCONAN_MAX_SPARSE_CELLS` | `250000` | 单 sheet 保留的文本、日期/对象及超宽整数稀疏 cell 数上限；超限 sheet 会跳过并记录实际观测值 |
+| `PAPERCONAN_MAX_SPARSE_BYTES` | `67108864` | 单 sheet 稀疏 payload 字节预算；超限 sheet 会跳过并记录实际观测值 |
 | `PAPERCONAN_COLUMN_FINGERPRINT_MAX_COLUMNS` | `512` | 跨 sheet 列指纹按物理列顺序最多处理的列数；超出部分会记录精确覆盖限制 |
 | `PAPERCONAN_MAX_BLOCK_COLS` | `120` | 宽 block 跳过 O(col²) 关系 / equal-pair 检测 |
 | `PAPERCONAN_MAX_REPORT_BLOCKS` | `2000` | 最多收集多少个带 finding 的 block |
@@ -89,4 +91,11 @@ write_adjudicated_report(scan, verdict, "adjudication.html")  # scan/verdict 均
 | `PAPERCONAN_MAX_TOTAL_FINDINGS` | `5000` | 全部 block 合计 finding 上限（防病态语料把 `scan.json` / `report.html` 撑到 GB 级）；`0` 关闭 |
 | `PAPERCONAN_MAX_EVIDENCE_ROWS` | `50` | 单条 evidence 片段最多行数 |
 | `PAPERCONAN_MAX_EVIDENCE_COLS` | `30` | 单条 evidence 片段最多列数 |
+| `PAPERCONAN_RECURRING_ROW_VECTOR_BUDGET` | `3000000` | recurring-row detector 的全局窗口工作预算；耗尽时记录精确跳过窗口数 |
+| `PAPERCONAN_RECURRING_ROW_VECTOR_UNIQUE_BUDGET` | `100000` | recurring-row detector 全局保留的唯一向量数；已知向量仍继续更新，新向量遗漏以明确下界记录 |
+| `PAPERCONAN_FRACTION_REUSE_PAIR_BUDGET` | `10000` | 同一 sheet 内 fraction-reuse detector 最多检查的 block pair 数 |
+| `PAPERCONAN_FRACTION_REUSE_CELL_BUDGET` | `1000000` | 同一 sheet 内 fraction-reuse detector 最多检查的位置 cell 数；与 pair 预算分别生效 |
 | `PAPERCONAN_MAX_PAPER_MB` | `1500` | `fetch` 下载/解压到一个 paper 目录的总量上限 |
+| `PAPERCONAN_ARCHIVE_MEMBER_LIMIT` | `10000` | 单个 ZIP/TAR 最多检查的 member 元数据数（包括非表格 member）；超限记录遗漏下界 |
+| `PAPERCONAN_ARCHIVE_MEMBER_NAME_BYTES` | `8388608` | 单个 ZIP/TAR 已检查 member 名称的累计 UTF-8 字节预算 |
+| `PAPERCONAN_ARCHIVE_OUTPUT_FILE_LIMIT` | `5000` | 单个 ZIP/TAR 最多写出的可扫描文件数；每个被此预算跳过的已保留 member 都会列入 `skipped` |

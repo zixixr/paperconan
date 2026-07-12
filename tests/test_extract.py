@@ -61,23 +61,24 @@ def test_tables_to_sheets_coerces_numbers_keeps_text_and_names_sheets():
     raw = [("p1_t1", [["sample", "x"], ["s1", "1.5"], ["s2", "2.5"]])]
     sheets = tables_to_sheets("supp", raw)
     assert list(sheets) == ["supp!p1_t1"]
-    rows = sheets["supp!p1_t1"]
-    assert rows[0] == ["sample", "x"]
-    assert rows[1] == ["s1", 1.5]   # numeric string -> float
-    assert rows[2] == ["s2", 2.5]
+    sheet = sheets["supp!p1_t1"]
+    assert isinstance(sheet, Sheet)
+    assert sheet.cell(0, 0) == "sample"
+    assert sheet.cell(1, 1) == 1.5
+    assert sheet.cell(2, 1) == 2.5
 
 
 def test_tables_to_sheets_pads_ragged_rows():
     raw = [("t1", [["a", "b", "c"], ["1"], ["2", "3"]])]
-    rows = tables_to_sheets("d", raw)["d!t1"]
-    assert all(len(r) == 3 for r in rows), "rows should be padded to the widest"
-    assert rows[1] == [1, None, None]
+    sheet = tables_to_sheets("d", raw)["d!t1"]
+    assert sheet.ncols == 3
+    assert [sheet.cell(1, col) for col in range(3)] == [1, None, None]
 
 
 def test_tables_to_sheets_handles_none_cells():
     raw = [("t1", [["a", "b"], ["1.5", None]])]
-    rows = tables_to_sheets("d", raw)["d!t1"]
-    assert rows[1] == [1.5, None]
+    sheet = tables_to_sheets("d", raw)["d!t1"]
+    assert [sheet.cell(1, col) for col in range(2)] == [1.5, None]
 
 
 def test_tables_to_sheets_drops_fully_empty_tables():
@@ -109,9 +110,11 @@ def test_default_drops_over_budget_empty_table_after_budget_is_used():
         ("empty", [["", "", ""], [None, None, None]]),
     ]
 
-    assert tables_to_sheets("d", raw, max_cells=2) == {
-        "d!used": [["value", 1]]
-    }
+    result = tables_to_sheets("d", raw, max_cells=2)
+    assert list(result) == ["d!used"]
+    assert isinstance(result["d!used"], Sheet)
+    assert result["d!used"].cell(0, 0) == "value"
+    assert result["d!used"].cell(0, 1) == 1
 
 
 def test_metadata_drops_over_budget_empty_table_after_budget_is_used():
@@ -124,7 +127,8 @@ def test_metadata_drops_over_budget_empty_table_after_budget_is_used():
         "d", raw, max_cells=2, with_metadata=True
     )
 
-    assert result.tables == {"d!used": [["value", 1]]}
+    assert list(result.tables) == ["d!used"]
+    assert isinstance(result.tables["d!used"], Sheet)
     assert result.limitations == []
 
 
@@ -200,7 +204,8 @@ def test_rejected_table_closes_generators_before_sibling_processing():
 
     assert events == ["row_closed", "table_closed", "sibling_started"]
     assert result.tables["d!t1"] is None
-    assert result.tables["d!t2"] == [["ok"]]
+    assert isinstance(result.tables["d!t2"], Sheet)
+    assert result.tables["d!t2"].cell(0, 0) == "ok"
 
 
 def test_owned_production_modules_use_neutral_language():
@@ -246,6 +251,28 @@ def test_extracted_tables_share_one_dense_cell_budget():
     assert result.limitations[0].reason == "cell_limit"
 
 
+def test_extracted_table_sparse_limit_uses_shared_builder():
+    result = tables_to_sheets(
+        "d",
+        [("t1", [["a", "b"], ["alpha", "beta"]])],
+        max_cells=20,
+        max_sparse_cells=3,
+        max_sparse_bytes=100,
+        with_metadata=True,
+    )
+
+    assert result.tables == {"d!t1": None}
+    assert [item.to_dict() for item in result.limitations] == [{
+        "scope": "sheet",
+        "reason": "sparse_cell_limit",
+        "sheet": "d!t1",
+        "max_sparse_bytes": 100,
+        "max_sparse_cells": 3,
+        "observed_sparse_bytes": 11,
+        "observed_sparse_cells": 4,
+    }]
+
+
 def test_ragged_extracted_table_uses_dense_geometry():
     raw = [("t1", [["1"], ["2"], ["3", "4", "5", "6"]])]
     result = tables_to_sheets(
@@ -269,11 +296,51 @@ def test_docx_merged_cells_emit_text_once(tmp_path):
     table.cell(2, 1).text = "same"
     doc.save(path)
 
-    rows = load_docx_tables(str(path))["merged!t1"]
-    assert rows[0][:2] == ["merged", None]
-    assert rows[1][0] == "vertical"
-    assert rows[2][0] is None
-    assert rows[1][1] == rows[2][1] == "same"
+    sheet = load_docx_tables(str(path))["merged!t1"]
+    assert [sheet.cell(0, col) for col in range(2)] == ["merged", None]
+    assert sheet.cell(1, 0) == "vertical"
+    assert sheet.cell(2, 0) is None
+    assert sheet.cell(1, 1) == sheet.cell(2, 1) == "same"
+
+
+def test_pdf_adapter_extracts_one_table_at_a_time(monkeypatch):
+    events = []
+
+    class StubTable:
+        def __init__(self, index):
+            self.index = index
+
+        def extract(self):
+            events.append(f"extract:{self.index}")
+            return [["value"], [str(self.index)]]
+
+    class StubPage:
+        def find_tables(self):
+            events.append("find")
+            return [StubTable(1), StubTable(2)]
+
+        def extract_tables(self):
+            events.append("extract_all")
+            return [[["value"], ["1"]], [["value"], ["2"]]]
+
+    class StubPdf:
+        pages = [StubPage()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    pdfplumber = __import__("pdfplumber")
+    monkeypatch.setattr(
+        pdfplumber, "open", lambda _path: StubPdf()
+    )
+
+    sheets = extract.load_pdf_tables("tables.pdf")
+
+    assert events == ["find", "extract:1", "extract:2"]
+    assert all(isinstance(sheet, Sheet) for sheet in sheets.values())
 
 
 @pytest.mark.parametrize(
@@ -290,8 +357,21 @@ def test_load_table_result_calls_extractor_once_with_metadata(
     path.write_bytes(b"placeholder")
     calls = []
 
-    def stub_loader(called_path, *, max_cells, with_metadata):
-        calls.append((called_path, max_cells, with_metadata))
+    def stub_loader(
+        called_path,
+        *,
+        max_cells,
+        max_sparse_cells,
+        max_sparse_bytes,
+        with_metadata,
+    ):
+        calls.append((
+            called_path,
+            max_cells,
+            max_sparse_cells,
+            max_sparse_bytes,
+            with_metadata,
+        ))
         return ExtractedTableResult(
             tables={sheet_name: [["value"], [1]]}
         )
@@ -301,21 +381,42 @@ def test_load_table_result_calls_extractor_once_with_metadata(
 
     result = audit.load_table_result(str(path))
 
-    assert calls == [(str(path), 7, True)]
+    assert calls == [(
+        str(path),
+        7,
+        audit._MAX_SPARSE_CELLS,
+        audit._MAX_SPARSE_BYTES,
+        True,
+    )]
     assert result.limitations == []
     assert isinstance(result.sheets[sheet_name], Sheet)
     assert result.sheets[sheet_name].cell(1, 0) == 1
 
 
 @pytest.mark.parametrize(
-    ("suffix", "loader_name", "sheet_name"),
+    ("suffix", "loader_name", "iter_name", "sheet_name"),
     [
-        (".pdf", "load_pdf_tables", "tables!p1_t1"),
-        (".docx", "load_docx_tables", "tables!t1"),
+        (
+            ".pdf",
+            "load_pdf_tables",
+            "iter_pdf_tables",
+            "tables!p1_t1",
+        ),
+        (
+            ".docx",
+            "load_docx_tables",
+            "iter_docx_tables",
+            "tables!t1",
+        ),
     ],
 )
 def test_deferred_evidence_reload_preserves_extraction_cell_cap(
-    tmp_path, monkeypatch, suffix, loader_name, sheet_name
+    tmp_path,
+    monkeypatch,
+    suffix,
+    loader_name,
+    iter_name,
+    sheet_name,
 ):
     data = tmp_path / "data"
     data.mkdir()
@@ -344,15 +445,47 @@ def test_deferred_evidence_reload_preserves_extraction_cell_cap(
     }
 
     def stub_loader(
-        called_path, *, max_cells=None, with_metadata=False
+        called_path,
+        *,
+        max_cells=None,
+        max_sparse_cells=None,
+        max_sparse_bytes=None,
+        with_metadata=False,
     ):
-        calls.append((called_path, max_cells, with_metadata))
+        calls.append((
+            called_path,
+            max_cells,
+            max_sparse_cells,
+            max_sparse_bytes,
+            with_metadata,
+        ))
         if with_metadata:
             return ExtractedTableResult(tables=tables)
         return tables
 
-    monkeypatch.setattr(audit, "_MAX_CELLS", 11)
+    def stub_iter(
+        called_path,
+        *,
+        max_cells=None,
+        max_sparse_cells=None,
+        max_sparse_bytes=None,
+    ):
+        calls.append((
+            called_path,
+            max_cells,
+            max_sparse_cells,
+            max_sparse_bytes,
+            False,
+        ))
+        yield (
+            sheet_name,
+            Sheet.from_rows(tables[sheet_name]),
+            [],
+        )
+
+    monkeypatch.setattr(audit, "_MAX_CELLS", 100)
     monkeypatch.setattr(extract, loader_name, stub_loader)
+    monkeypatch.setattr(extract, iter_name, stub_iter)
 
     scan = audit.scan_dir(
         str(data), str(tmp_path / "out"), write_html=False
@@ -366,8 +499,20 @@ def test_deferred_evidence_reload_preserves_extraction_cell_cap(
         for finding in block[group]
     )
     assert calls == [
-        (str(path), 11, True),
-        (str(path), 11, True),
+        (
+            str(path),
+            100,
+            audit._MAX_SPARSE_CELLS,
+            audit._MAX_SPARSE_BYTES,
+            False,
+        ),
+        (
+            str(path),
+            100,
+            audit._MAX_SPARSE_CELLS,
+            audit._MAX_SPARSE_BYTES,
+            False,
+        ),
     ]
 
 
@@ -378,31 +523,50 @@ def test_scan_counts_extracted_cell_limit_once(tmp_path, monkeypatch):
     path.write_bytes(b"placeholder")
     calls = []
 
-    def stub_loader(called_path, *, max_cells, with_metadata):
-        calls.append((called_path, max_cells, with_metadata))
-        return ExtractedTableResult(
-            tables={
-                "tables!p1_t1": [["value"], [1], [2], [3]],
-                "tables!p1_t2": None,
-            },
-            limitations=[
+    def stub_iter(
+        called_path,
+        *,
+        max_cells,
+        max_sparse_cells,
+        max_sparse_bytes,
+    ):
+        calls.append((
+            called_path,
+            max_cells,
+            max_sparse_cells,
+            max_sparse_bytes,
+        ))
+        yield (
+            "tables!p1_t1",
+            Sheet.from_rows([["value"], [1], [2], [3]]),
+            [],
+        )
+        yield (
+            "tables!p1_t2",
+            None,
+            [
                 InputLimitation(
                     scope="sheet",
                     reason="cell_limit",
                     sheet="tables!p1_t2",
-                    details={"cells": 8, "max_cells": max_cells},
-                )
+                        details={"cells": 8, "max_cells": max_cells},
+                    )
             ],
         )
 
     monkeypatch.setattr(audit, "_MAX_CELLS", 6)
-    monkeypatch.setattr(extract, "load_pdf_tables", stub_loader)
+    monkeypatch.setattr(extract, "iter_pdf_tables", stub_iter)
 
     scan = audit.scan_dir(
         str(data), str(tmp_path / "out"), write_html=False
     )
 
-    assert calls == [(str(path), 6, True)]
+    assert calls == [(
+        str(path),
+        6,
+        audit._MAX_SPARSE_CELLS,
+        audit._MAX_SPARSE_BYTES,
+    )]
     assert scan["coverage"]["sheets_succeeded"] == 1
     assert scan["coverage"]["sheets_skipped"] == 1
     assert scan["coverage"]["limitations"] == [{

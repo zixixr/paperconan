@@ -107,3 +107,35 @@ def test_to_dict_has_exact_key_order():
         "truncated",
         "limitations",
     ]
+
+
+def test_sparse_only_rejection_fails_scan_with_truthful_limitation(
+    tmp_path, monkeypatch
+):
+    import paperconan._audit as audit
+
+    (tmp_path / "text.csv").write_text(
+        "a,b\nalpha,beta\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(audit, "_MAX_SPARSE_CELLS", 3, raising=False)
+    monkeypatch.setattr(audit, "_MAX_SPARSE_BYTES", 100, raising=False)
+
+    scan = audit.scan_dir(
+        str(tmp_path),
+        str(tmp_path / "out"),
+        write_html=False,
+    )
+
+    assert scan["scan_status"] == "failed"
+    assert scan["coverage"]["sheets_skipped"] == 1
+    assert scan["coverage"]["limitations"] == [{
+        "scope": "sheet",
+        "reason": "sparse_cell_limit",
+        "file": "text.csv",
+        "sheet": "text",
+        "max_sparse_bytes": 100,
+        "max_sparse_cells": 3,
+        "observed_sparse_bytes": 11,
+        "observed_sparse_cells": 4,
+    }]

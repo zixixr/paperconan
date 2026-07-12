@@ -216,7 +216,9 @@ def _patch_scan_finding_sources(monkeypatch, block_findings, cross_findings):
     monkeypatch.setattr(
         A,
         "detect_within_sheet_fraction_reuse",
-        lambda *_args, **_kwargs: [],
+        lambda *_args, **kwargs: (
+            ([], []) if kwargs.get("with_coverage") else []
+        ),
     )
     monkeypatch.setattr(
         A,

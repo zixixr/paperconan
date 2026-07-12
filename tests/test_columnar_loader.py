@@ -70,7 +70,7 @@ def test_streaming_matches_from_rows(tmp_path):
     assert np.array_equal(np.nan_to_num(streamed.numeric, nan=-123456.5),
                           np.nan_to_num(ref.numeric, nan=-123456.5))
     assert streamed._text == ref._text
-    assert streamed._ints == ref._ints
+    assert np.array_equal(streamed._ints, ref._ints)
 
 
 def test_load_csv_returns_sheet(tmp_path):
@@ -82,6 +82,73 @@ def test_load_csv_returns_sheet(tmp_path):
     assert s.cell(1, 0) == 1 and isinstance(s.cell(1, 0), int)
     assert s.cell(1, 1) == 2.5
     assert s.cell(2, 1) == "x"
+
+
+def test_csv_loader_streams_into_builder_without_sheet_from_rows(
+    tmp_path, monkeypatch
+):
+    import paperconan._audit as audit
+
+    path = tmp_path / "stream.csv"
+    path.write_text("a,b\n1,2.5\n3,x\n", encoding="utf-8")
+
+    def forbidden(_rows):
+        raise AssertionError("CSV must not materialize normalized rows")
+
+    monkeypatch.setattr(Sheet, "from_rows", forbidden)
+
+    sheet = audit.load_csv_rows(str(path), ",")["stream"]
+
+    assert isinstance(sheet, Sheet)
+    assert sheet.cell(2, 1) == "x"
+
+
+def test_csv_sparse_cell_limit_is_structured_and_exact(
+    tmp_path, monkeypatch
+):
+    import paperconan._audit as audit
+
+    path = tmp_path / "text.csv"
+    path.write_text("a,b\nalpha,beta\n", encoding="utf-8")
+    monkeypatch.setattr(audit, "_MAX_SPARSE_CELLS", 3, raising=False)
+    monkeypatch.setattr(audit, "_MAX_SPARSE_BYTES", 100, raising=False)
+
+    result = audit.load_table_result(str(path))
+
+    assert result.sheets == {"text": None}
+    assert [item.to_dict() for item in result.limitations] == [{
+        "scope": "sheet",
+        "reason": "sparse_cell_limit",
+        "sheet": "text",
+        "max_sparse_bytes": 100,
+        "max_sparse_cells": 3,
+        "observed_sparse_bytes": 11,
+        "observed_sparse_cells": 4,
+    }]
+
+
+def test_csv_sparse_payload_limit_counts_exact_wide_integer_bytes(
+    tmp_path, monkeypatch
+):
+    import paperconan._audit as audit
+
+    path = tmp_path / "wide.csv"
+    path.write_text("x\n9007199254740993\n", encoding="utf-8")
+    monkeypatch.setattr(audit, "_MAX_SPARSE_CELLS", 10, raising=False)
+    monkeypatch.setattr(audit, "_MAX_SPARSE_BYTES", 16, raising=False)
+
+    result = audit.load_table_result(str(path))
+
+    assert result.sheets == {"wide": None}
+    assert [item.to_dict() for item in result.limitations] == [{
+        "scope": "sheet",
+        "reason": "sparse_payload_limit",
+        "sheet": "wide",
+        "max_sparse_bytes": 16,
+        "max_sparse_cells": 10,
+        "observed_sparse_bytes": 17,
+        "observed_sparse_cells": 2,
+    }]
 
 
 def test_load_table_yields_sheets(tmp_path):
@@ -105,7 +172,8 @@ def test_calamine_matches_openpyxl(tmp_path):
         if a is not None:
             assert a.nrows == b.nrows and a.ncols == b.ncols
             assert np.array_equal(np.nan_to_num(a.numeric, nan=-1.5e9), np.nan_to_num(b.numeric, nan=-1.5e9))
-            assert a._text == b._text and a._ints == b._ints
+            assert a._text == b._text
+            assert np.array_equal(a._ints, b._ints)
 
 
 def test_calamine_huge_bounding_box_is_none_not_oom(tmp_path, monkeypatch):

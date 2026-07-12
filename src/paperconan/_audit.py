@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 from bisect import bisect_left
 import csv as _csv
-import ctypes
 import datetime
 import hashlib
 import json
@@ -49,7 +48,12 @@ from ._input import (
 )
 from ._numeric import integer_shift_close, relation_close
 from ._profiles import apply_profile_to_findings, normalize_profile
-from ._sheet import Sheet, _MAX_EXACT_FLOAT_INT
+from ._sheet import (
+    Sheet,
+    SheetBuilder,
+    SheetBuildLimit,
+    _MAX_EXACT_FLOAT_INT,
+)
 from ._summaries import (
     ColumnFingerprint,
     CrossSheetSummary,
@@ -312,45 +316,27 @@ def _dense_cells(row_count, max_width):
     return row_count * max_width
 
 
-def _move_numeric_rows_in_place(numeric, old_cols, new_cols, used_rows, used_cols):
-    if not used_rows or not used_cols or old_cols == new_cols:
-        return
-    rows = (
-        range(used_rows)
-        if new_cols < old_cols
-        else range(used_rows - 1, -1, -1)
+def _sheet_build_limitation(error, sheet_name):
+    details = error.limitation_details()
+    if error.reason == "cell_limit":
+        details["max_cells"] = _MAX_CELLS
+    return InputLimitation(
+        scope="sheet",
+        reason=error.reason,
+        sheet=sheet_name,
+        details=details,
     )
-    address = numeric.ctypes.data
-    row_bytes = used_cols * numeric.itemsize
-    for row in rows:
-        source = address + row * old_cols * numeric.itemsize
-        target = address + row * new_cols * numeric.itemsize
-        if source != target:
-            ctypes.memmove(target, source, row_bytes)
 
 
-def _resize_numeric_in_place(
-    numeric, target_rows, target_cols, used_rows, used_cols
+def _fill_sheet_from_rows(
+    rows_iter,
+    mr,
+    mc,
+    loaded,
+    *,
+    limitation_sink=None,
+    sheet_name=None,
 ):
-    old_rows, old_cols = numeric.shape
-    if (old_rows, old_cols) == (target_rows, target_cols):
-        return
-    if target_cols < old_cols:
-        _move_numeric_rows_in_place(
-            numeric, old_cols, target_cols, used_rows, used_cols
-        )
-    numeric.resize((target_rows, target_cols), refcheck=False)
-    if target_cols > old_cols:
-        _move_numeric_rows_in_place(
-            numeric, old_cols, target_cols, used_rows, used_cols
-        )
-    if used_rows and target_cols > used_cols:
-        numeric[:used_rows, used_cols:target_cols] = np.nan
-    if target_rows > used_rows:
-        numeric[used_rows:target_rows, :] = np.nan
-
-
-def _fill_sheet_from_rows(rows_iter, mr, mc, loaded):
     """Stream rows of openpyxl-shaped cell values (int/float/str/datetime/bool/None)
     into a Sheet, honouring the cumulative `_MAX_CELLS` budget that `loaded` cells
     have already consumed across this file.
@@ -366,64 +352,41 @@ def _fill_sheet_from_rows(rows_iter, mr, mc, loaded):
     grows on demand if a reader under-declares dimensions."""
     declared = _dense_cells(mr, mc)
     if loaded >= _MAX_CELLS or loaded + declared > _MAX_CELLS:
-        return None, declared
-    remaining = _MAX_CELLS - loaded
-    numeric = np.full((mr, mc), np.nan, dtype=float) if (mr and mc) else np.empty((0, 0))
-    text = {}
-    ints = set()
-    wide_ints = {}
-    r = 0                                        # rows consumed (== final nrows)
-    max_w = 0                                    # max row width seen (== final ncols)
-    for row in rows_iter:
-        width = len(row)
-        projected_rows = r + 1
-        projected_width = max(max_w, width)
-        cells = _dense_cells(projected_rows, projected_width)
-        if loaded + cells > _MAX_CELLS:
-            return None, cells
-        if projected_rows > numeric.shape[0] or projected_width > numeric.shape[1]:
-            target_rows = max(numeric.shape[0], projected_rows)
-            target_cols = max(numeric.shape[1], projected_width)
-            if _dense_cells(target_rows, target_cols) > remaining:
-                target_rows, target_cols = projected_rows, projected_width
-            if _dense_cells(target_rows, target_cols) > remaining:
-                return None, cells
-            _resize_numeric_in_place(
-                numeric, target_rows, target_cols, r, max_w
+        error = SheetBuildLimit(
+            "cell_limit",
+            cells=declared,
+            observed_sparse_cells=0,
+            observed_sparse_bytes=0,
+            max_sparse_cells=_MAX_SPARSE_CELLS,
+            max_sparse_bytes=_MAX_SPARSE_BYTES,
+        )
+        if limitation_sink is not None:
+            limitation_sink.append(
+                _sheet_build_limitation(error, sheet_name)
             )
-        for c, v in enumerate(row):
-            if is_num(v):
-                if isinstance(v, int) and abs(v) > _MAX_EXACT_FLOAT_INT:
-                    wide_ints[(r, c)] = v
-                else:
-                    numeric[r, c] = float(v)
-                    if isinstance(v, int) and not isinstance(v, bool):
-                        ints.add((r, c))
-            elif v is not None:
-                text[(r, c)] = v
-        max_w = projected_width
-        r += 1
-    cells = _dense_cells(r, max_w)
-    # Trim to the geometry Sheet.from_rows would produce: nrows == rows consumed,
-    # ncols == max(len(row)). (numeric may be larger if the reader over-declared.)
-    n_rows, n_cols = r, max_w
-    _resize_numeric_in_place(numeric, n_rows, n_cols, n_rows, n_cols)
-    text = {(rr, cc): val for (rr, cc), val in text.items()
-            if rr < n_rows and cc < n_cols}
-    ints = {(rr, cc) for (rr, cc) in ints if rr < n_rows and cc < n_cols}
-    wide_ints = {(rr, cc): val for (rr, cc), val in wide_ints.items()
-                 if rr < n_rows and cc < n_cols}
-    return Sheet(
-        numeric.shape[0],
-        numeric.shape[1],
-        numeric,
-        text,
-        ints,
-        wide_ints,
-    ), cells
+        return None, declared
+    try:
+        builder = SheetBuilder(
+            declared_rows=mr,
+            declared_cols=mc,
+            loaded_cells=loaded,
+            max_cells=_MAX_CELLS,
+            max_sparse_cells=_MAX_SPARSE_CELLS,
+            max_sparse_bytes=_MAX_SPARSE_BYTES,
+        )
+        for row in rows_iter:
+            builder.append_row(row)
+        sheet = builder.finish()
+    except SheetBuildLimit as error:
+        if limitation_sink is not None:
+            limitation_sink.append(
+                _sheet_build_limitation(error, sheet_name)
+            )
+        return None, error.cells
+    return sheet, builder.cells
 
 
-def _load_workbook_openpyxl(path):
+def _load_workbook_openpyxl(path, *, _limitations=None):
     """Return dict of sheet_name -> Sheet via openpyxl (the reference reader). A sheet
     over _MAX_CELLS (on its own, or once this file's cumulative cell budget is spent)
     is returned as None (oversized), preserving the legacy memory guard. Rows stream
@@ -442,8 +405,18 @@ def _load_workbook_openpyxl(path):
             if loaded >= _MAX_CELLS or loaded + declared > _MAX_CELLS:
                 out[s] = None
                 continue
+            fill_kwargs = {}
+            if _limitations is not None:
+                fill_kwargs = {
+                    "limitation_sink": _limitations,
+                    "sheet_name": s,
+                }
             sheet, cells = _fill_sheet_from_rows(
-                ws.iter_rows(values_only=True), mr, mc, loaded
+                ws.iter_rows(values_only=True),
+                mr,
+                mc,
+                loaded,
+                **fill_kwargs,
             )
             out[s] = sheet
             if sheet is not None:
@@ -485,7 +458,7 @@ _CALAMINE_OPENPYXL_FALLBACK = object()
 _CALAMINE_READER_ERROR = object()
 
 
-def _load_workbook_calamine_scoped(path):
+def _load_workbook_calamine_scoped(path, *, _limitations=None):
     """Read with Calamine, returning a fallback signal before openpyxl is opened.
 
     Keeping Calamine state in this helper ensures its workbook, sheets, row iterators,
@@ -521,7 +494,15 @@ def _load_workbook_calamine_scoped(path):
                     normalized.append(_calamine_cell(value))
                 yield normalized
 
-        sheet, cells = _fill_sheet_from_rows(normalized_rows(), h, w, loaded)
+        fill_kwargs = {}
+        if _limitations is not None:
+            fill_kwargs = {
+                "limitation_sink": _limitations,
+                "sheet_name": name,
+            }
+        sheet, cells = _fill_sheet_from_rows(
+            normalized_rows(), h, w, loaded, **fill_kwargs
+        )
         out[name] = sheet
         if sheet is not None:
             if wide_ooxml_integer:
@@ -530,35 +511,59 @@ def _load_workbook_calamine_scoped(path):
     return out
 
 
-def _load_workbook_calamine(path):
+def _load_workbook_calamine(path, *, _limitations=None):
     """Return dict of sheet_name -> Sheet via python-calamine (a fast Rust reader),
     producing a Sheet byte-identical to _load_workbook_openpyxl. Same _MAX_CELLS
     per-sheet + cumulative guard, same oversized->None, same trim-to-max-width."""
-    result = _load_workbook_calamine_scoped(path)
+    pending_limitations = []
+    result = _load_workbook_calamine_scoped(
+        path,
+        _limitations=(
+            pending_limitations
+            if _limitations is not None
+            else None
+        ),
+    )
     if result is _CALAMINE_OPENPYXL_FALLBACK:
-        return _load_workbook_openpyxl(path)
+        if _limitations is None:
+            return _load_workbook_openpyxl(path)
+        return _load_workbook_openpyxl(
+            path, _limitations=_limitations
+        )
+    if _limitations is not None:
+        _limitations.extend(pending_limitations)
     return result
 
 
-def _try_load_workbook_calamine(path):
+def _try_load_workbook_calamine(path, *, _limitations=None):
     """Return a detached error signal after Calamine exception state unwinds."""
     try:
-        return _load_workbook_calamine(path)
+        return _load_workbook_calamine(
+            path, _limitations=_limitations
+        )
     except Exception:
         return _CALAMINE_READER_ERROR
 
 
-def load_workbook_rows(path):
+def load_workbook_rows(path, *, _limitations=None):
     """Return dict of sheet_name -> Sheet. Uses python-calamine (a fast Rust xlsx
     reader) when installed. OOXML inputs fall back to the openpyxl reference path
     after Calamine errors; legacy inputs remain on Calamine because openpyxl cannot
     read them. Both successful paths produce a byte-identical Sheet."""
     ext = os.path.splitext(path)[1].lower()
     if ext not in {".xlsx", ".xlsm"}:
-        return _load_workbook_calamine(path)
-    result = _try_load_workbook_calamine(path)
+        return _load_workbook_calamine(
+            path, _limitations=_limitations
+        )
+    result = _try_load_workbook_calamine(
+        path, _limitations=_limitations
+    )
     if result is _CALAMINE_READER_ERROR:
-        return _load_workbook_openpyxl(path)
+        if _limitations is None:
+            return _load_workbook_openpyxl(path)
+        return _load_workbook_openpyxl(
+            path, _limitations=_limitations
+        )
     return result
 
 
@@ -580,49 +585,65 @@ def _coerce_cell(s):
         return s
 
 
-def load_csv_rows(path, delimiter):
+def load_csv_rows(path, delimiter, *, _limitations=None):
     """Load a delimited text file as {sheet_name: Sheet|None}, mirroring load_workbook_rows.
     A flat file has no sheets, so it becomes a single sheet named after the file stem.
     Oversized (> _MAX_CELLS) -> {stem: None}; otherwise the rows are wrapped in a Sheet."""
     stem = os.path.splitext(os.path.basename(path))[0]
-    rows = []
-    oversized = False
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
         try:
-            rows = []
-            row_count = 0
-            max_width = 0
-            oversized = False
             with open(path, newline="", encoding=enc) as fh:
-                for r in _csv.reader(fh, delimiter=delimiter):
-                    row_count += 1
-                    max_width = max(max_width, len(r))
-                    if _dense_cells(row_count, max_width) > _MAX_CELLS:
-                        oversized = True
-                        break
-                    rows.append([_coerce_cell(c) for c in r])
+                normalized_rows = (
+                    [_coerce_cell(cell) for cell in row]
+                    for row in _csv.reader(fh, delimiter=delimiter)
+                )
+                fill_kwargs = {}
+                if _limitations is not None:
+                    fill_kwargs = {
+                        "limitation_sink": _limitations,
+                        "sheet_name": stem,
+                    }
+                sheet, _cells = _fill_sheet_from_rows(
+                    normalized_rows,
+                    0,
+                    0,
+                    0,
+                    **fill_kwargs,
+                )
             break
         except UnicodeDecodeError:
             continue
-    if oversized:
-        return {stem: None}
-    return {stem: Sheet.from_rows(rows)}
+    return {stem: sheet}
 
 
-def _load_table_sheets(path):
+def _load_table_sheets(path, *, _limitations=None):
     """Dispatch by extension to a {sheet_name: Sheet|None} loader."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".tsv":
-        return load_csv_rows(path, delimiter="\t")
+        return load_csv_rows(
+            path, delimiter="\t", _limitations=_limitations
+        )
     if ext == ".csv":
-        return load_csv_rows(path, delimiter=",")
+        return load_csv_rows(
+            path, delimiter=",", _limitations=_limitations
+        )
     if ext == ".pdf":
         from ._extract import load_pdf_tables
-        return {k: (None if v is None else Sheet.from_rows(v)) for k, v in load_pdf_tables(path).items()}
+        return load_pdf_tables(
+            path,
+            max_cells=_MAX_CELLS,
+            max_sparse_cells=_MAX_SPARSE_CELLS,
+            max_sparse_bytes=_MAX_SPARSE_BYTES,
+        )
     if ext == ".docx":
         from ._extract import load_docx_tables
-        return {k: (None if v is None else Sheet.from_rows(v)) for k, v in load_docx_tables(path).items()}
-    return load_workbook_rows(path)
+        return load_docx_tables(
+            path,
+            max_cells=_MAX_CELLS,
+            max_sparse_cells=_MAX_SPARSE_CELLS,
+            max_sparse_bytes=_MAX_SPARSE_BYTES,
+        )
+    return load_workbook_rows(path, _limitations=_limitations)
 
 
 def load_table_result(path) -> TableLoadResult:
@@ -637,16 +658,29 @@ def load_table_result(path) -> TableLoadResult:
         extracted = loader(
             path,
             max_cells=_MAX_CELLS,
+            max_sparse_cells=_MAX_SPARSE_CELLS,
+            max_sparse_bytes=_MAX_SPARSE_BYTES,
             with_metadata=True,
         )
         sheets = {
-            name: None if rows is None else Sheet.from_rows(rows)
-            for name, rows in extracted.tables.items()
+            name: (
+                value
+                if value is None or isinstance(value, Sheet)
+                else Sheet.from_rows(
+                    value,
+                    max_cells=_MAX_CELLS,
+                    max_sparse_cells=_MAX_SPARSE_CELLS,
+                    max_sparse_bytes=_MAX_SPARSE_BYTES,
+                )
+            )
+            for name, value in extracted.tables.items()
         }
         limitations = list(extracted.limitations)
     else:
-        sheets = _load_table_sheets(path)
         limitations = []
+        sheets = _load_table_sheets(
+            path, _limitations=limitations
+        )
     for sheet, gap in inspect_ooxml_formula_cache(path).items():
         limitations.append(InputLimitation(
             scope="sheet",
@@ -660,6 +694,24 @@ def load_table_result(path) -> TableLoadResult:
 def load_table(path) -> dict[str, Sheet | None]:
     """Dispatch by extension to a {sheet_name: Sheet|None} loader."""
     return load_table_result(path).sheets
+
+
+def _iter_extracted_sheets(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        from ._extract import iter_pdf_tables
+        loader = iter_pdf_tables
+    elif ext == ".docx":
+        from ._extract import iter_docx_tables
+        loader = iter_docx_tables
+    else:
+        raise ValueError(f"not an extracted-table input: {ext}")
+    yield from loader(
+        path,
+        max_cells=_MAX_CELLS,
+        max_sparse_cells=_MAX_SPARSE_CELLS,
+        max_sparse_bytes=_MAX_SPARSE_BYTES,
+    )
 
 
 def find_numeric_blocks(sheet, min_rows=3, min_cols=1):
@@ -3525,7 +3577,15 @@ def _fraction_reuse_pair_stats(sheet, block_a, block_b):
     )
 
 
-def detect_within_sheet_fraction_reuse(grid_sheets, profile="review", min_cells=10):
+def detect_within_sheet_fraction_reuse(
+    grid_sheets,
+    profile="review",
+    min_cells=10,
+    *,
+    pair_budget=None,
+    cell_budget=None,
+    with_coverage=False,
+):
     """B3 — two numeric blocks in the SAME sheet whose positionally-corresponding cells reproduce
     each other's HIGH-PRECISION decimal fractions while their integer parts differ by whole numbers
     (e.g. two dose-response matrices where every cell shares the 5-decimal fraction but the value
@@ -3533,13 +3593,48 @@ def detect_within_sheet_fraction_reuse(grid_sheets, profile="review", min_cells=
     detect_collisions only compares distinct sheets, so this matrix-to-matrix within-sheet reuse
     has no other detector. The precision + integer-shift + coverage requirements make chance
     coincidence negligible."""
+    pair_limit = max(0, int(
+        _FRACTION_REUSE_PAIR_BUDGET
+        if pair_budget is None
+        else pair_budget
+    ))
+    cell_limit = max(0, int(
+        _FRACTION_REUSE_CELL_BUDGET
+        if cell_budget is None
+        else cell_budget
+    ))
     findings = []
+    limitations = []
     for (fname, sname), sheet in grid_sheets.items():
         blocks = find_numeric_blocks(sheet)
+        total_pairs = len(blocks) * (len(blocks) - 1) // 2
+        pairs_examined = 0
+        cells_examined = 0
+        limits_reached = []
         best = None                                            # keep only the strongest pair per sheet
+        stop = False
         for i in range(len(blocks)):
             for j in range(i + 1, len(blocks)):
                 ba, bb = blocks[i], blocks[j]
+                if pairs_examined >= pair_limit:
+                    limits_reached.append("pair")
+                    stop = True
+                    break
+                potential_cells = (
+                    min(ba[1] - ba[0], bb[1] - bb[0])
+                    * min(ba[3] - ba[2], bb[3] - bb[2])
+                )
+                if (
+                    potential_cells >= min_cells
+                    and cells_examined + potential_cells > cell_limit
+                ):
+                    limits_reached.append("cell")
+                    stop = True
+                    break
+                pairs_examined += 1
+                if potential_cells < min_cells:
+                    continue
+                cells_examined += potential_cells
                 pair = _fraction_reuse_pair_stats(sheet, ba, bb)
                 if pair.common < min_cells:
                     continue
@@ -3559,6 +3654,20 @@ def detect_within_sheet_fraction_reuse(grid_sheets, profile="review", min_cells=
                     )
                 ):
                     best = (pair.shared, ba, bb, pair.common)
+            if stop:
+                break
+        pairs_skipped = total_pairs - pairs_examined
+        if pairs_skipped > 0 and limits_reached:
+            limitations.append({
+                "file": fname,
+                "sheet": sname,
+                "pair_limit": pair_limit,
+                "cell_limit": cell_limit,
+                "pairs_examined": pairs_examined,
+                "cells_examined": cells_examined,
+                "pairs_skipped": pairs_skipped,
+                "limits_reached": limits_reached,
+            })
         if best is not None:
             shared, ba, bb, ncommon = best
             findings.append(dict(
@@ -3579,6 +3688,8 @@ def detect_within_sheet_fraction_reuse(grid_sheets, profile="review", min_cells=
                       f"{shared}/{ncommon} positionally-corresponding cells but differ "
                       f"by whole numbers")))
     apply_profile_to_findings(findings, profile)
+    if with_coverage:
+        return findings, limitations
     return findings
 
 
@@ -3614,6 +3725,17 @@ _MAX_FILE_BYTES = int(_MAX_FILE_MB * 1024 * 1024)
 # budget now bounds far less RAM. Skip a sheet whose cell count exceeds this, checked from
 # the sheet dimensions BEFORE materializing. Default 10M cells ≈ an 80MB numeric array.
 _MAX_CELLS = int(os.environ.get("PAPERCONAN_MAX_CELLS", "10000000"))
+# Sparse cells retain Python payloads and coordinate keys, so they need
+# independent count and payload-byte bounds in addition to dense geometry.
+_MAX_SPARSE_CELLS = int(
+    os.environ.get("PAPERCONAN_MAX_SPARSE_CELLS", "250000")
+)
+_MAX_SPARSE_BYTES = int(
+    os.environ.get(
+        "PAPERCONAN_MAX_SPARSE_BYTES",
+        str(64 * 1024 * 1024),
+    )
+)
 # Exact column distinctness is retained only up to this fixed detector budget.
 # Longer high-cardinality columns are skipped with structured coverage metadata
 # rather than growing Python sets in proportion to accepted sheet size.
@@ -3656,10 +3778,28 @@ _MAX_FINDINGS_PER_BLOCK = int(os.environ.get("PAPERCONAN_MAX_FINDINGS_PER_BLOCK"
 # Directory-wide cap across block and cross-sheet finding families. When trimming is needed,
 # retain higher-severity findings first and preserve stable emission order within ties.
 _MAX_TOTAL_FINDINGS = int(os.environ.get("PAPERCONAN_MAX_TOTAL_FINDINGS", "5000"))
-# Directory-wide recurrence budgets. The vector budget preserves the historical
-# RecurringRowIndex default while giving scan orchestration a stable control point.
-_RECURRING_ROW_VECTOR_BUDGET = 3_000_000
+# Directory-wide recurrence budgets. Window work and retained unique vectors
+# are independent controls so a large corpus cannot trade bounded CPU for
+# unbounded Python state.
+_RECURRING_ROW_VECTOR_BUDGET = int(
+    os.environ.get("PAPERCONAN_RECURRING_ROW_VECTOR_BUDGET", "3000000")
+)
+_RECURRING_ROW_VECTOR_UNIQUE_BUDGET = int(
+    os.environ.get(
+        "PAPERCONAN_RECURRING_ROW_VECTOR_UNIQUE_BUDGET",
+        "100000",
+    )
+)
 _RECURRING_ROW_VECTOR_MAX_FINDINGS = 20
+_FRACTION_REUSE_PAIR_BUDGET = int(
+    os.environ.get("PAPERCONAN_FRACTION_REUSE_PAIR_BUDGET", "10000")
+)
+_FRACTION_REUSE_CELL_BUDGET = int(
+    os.environ.get(
+        "PAPERCONAN_FRACTION_REUSE_CELL_BUDGET",
+        "1000000",
+    )
+)
 
 # Severity rank for deterministic, highest-first truncation when a block is over budget.
 _SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2}
@@ -3838,11 +3978,14 @@ def _attach_deferred_evidence(
                 else None
             )
             try:
-                load_result = load_table_result(path)
-                sheets = load_result.sheets
-                try:
-                    for block in retained_blocks:
-                        sheet_name = block["sheet"]
+                blocks_by_sheet = {}
+                for block in retained_blocks:
+                    blocks_by_sheet.setdefault(
+                        block["sheet"], []
+                    ).append(block)
+
+                def attach_sheet_blocks(sheet_name, sheet):
+                    for block in blocks_by_sheet.get(sheet_name, ()):
                         sheet_stat = (
                             path_runtime["sheets"].get(sheet_name)
                             if path_runtime is not None
@@ -3853,12 +3996,7 @@ def _attach_deferred_evidence(
                             if sheet_stat is not None
                             else None
                         )
-                        sheet = sheets.get(sheet_name)
                         try:
-                            if sheet is None:
-                                continue
-                            if not isinstance(sheet, Sheet):
-                                sheet = Sheet.from_rows(sheet)
                             r0, r1, c0, c1 = (
                                 block["_evidence_context"]
                             )
@@ -3887,10 +4025,52 @@ def _attach_deferred_evidence(
                                 )
                         finally:
                             _add_elapsed_ms(sheet_stat, sheet_start)
+
+                ext = os.path.splitext(path)[1].lower()
+                if ext in {".pdf", ".docx"}:
+                    entry_iterator = iter(_iter_extracted_sheets(path))
+                    while True:
+                        try:
+                            entry = next(entry_iterator)
+                        except StopIteration:
+                            break
+                        sheet_name, sheet, _limitations = entry
+                        if (
+                            sheet is not None
+                            and sheet_name in blocks_by_sheet
+                        ):
+                            attach_sheet_blocks(sheet_name, sheet)
+                        del sheet
+                        del _limitations
+                        del sheet_name
+                        del entry
+                    del entry_iterator
+                else:
+                    load_result = load_table_result(path)
+                    sheets = load_result.sheets
+                    try:
+                        for sheet_name, sheet_blocks in (
+                            blocks_by_sheet.items()
+                        ):
+                            sheet = sheets.get(sheet_name)
+                            if sheet is None:
+                                continue
+                            if not isinstance(sheet, Sheet):
+                                sheet = Sheet.from_rows(
+                                    sheet,
+                                    max_cells=_MAX_CELLS,
+                                    max_sparse_cells=(
+                                        _MAX_SPARSE_CELLS
+                                    ),
+                                    max_sparse_bytes=(
+                                        _MAX_SPARSE_BYTES
+                                    ),
+                                )
+                            attach_sheet_blocks(sheet_name, sheet)
                             del sheet
-                finally:
-                    del sheets
-                    del load_result
+                    finally:
+                        del sheets
+                        del load_result
             finally:
                 _add_elapsed_ms(
                     (
@@ -4110,10 +4290,20 @@ def _process_loaded_sheet(
         state=state,
     )
 
-    within_sheet_findings = detect_within_sheet_fraction_reuse(
+    (
+        within_sheet_findings,
+        fraction_reuse_limitations,
+    ) = detect_within_sheet_fraction_reuse(
         {(file_name, sheet_name): sheet},
         profile=state.profile,
+        with_coverage=True,
     )
+    for limitation in fraction_reuse_limitations:
+        state.coverage.add_limitation(
+            "sheet",
+            "fraction_reuse_work_limit",
+            **limitation,
+        )
 
     label = f"{file_name}::{sheet_name}"
     digit_reports = []
@@ -4224,78 +4414,71 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
         file_stat["elapsed_ms"] = _elapsed_ms(file_start)
         return _empty_file_scan_result(file_stat, errors)
 
-    try:
-        load_result = load_table_result(path)
-    except Exception as exc:
-        print(f"  failed to read {file_name}: {exc}", file=sys.stderr)
-        errors.append({"file": file_name, "error": str(exc)})
-        state.coverage.mark_file_failed(file_name, "parse_error")
-        file_stat["error"] = str(exc)
-        file_stat["elapsed_ms"] = _elapsed_ms(file_start)
-        return _empty_file_scan_result(file_stat, errors)
-
-    state.coverage.mark_file_succeeded()
-    sheets = load_result.sheets
-    deferred_cell_limits = {}
-    for limitation in load_result.limitations:
-        details = limitation.to_dict()
-        scope = details.pop("scope")
-        reason = details.pop("reason")
-        details.pop("file", None)
-        sheet_name = details.get("sheet")
-        if (
-            scope == "sheet"
-            and reason == "cell_limit"
-            and sheet_name in sheets
-            and sheets[sheet_name] is None
-        ):
-            deferred_cell_limits.setdefault(
-                sheet_name,
-                {
-                    key: value
-                    for key, value in details.items()
-                    if key != "sheet"
-                },
-            )
-            continue
-        state.coverage.add_limitation(
-            scope,
-            reason,
-            file=file_name,
-            **details,
-        )
-    file_stat["n_sheets"] = len(sheets)
-
-    for sheet_name, loaded_sheet in sheets.items():
+    def process_sheet_entry(
+        sheet_name, loaded_sheet, input_limitations
+    ):
         sheet_start = (
             time.perf_counter() if state.include_runtime else None
         )
+        rejected_limitation = None
+        for limitation in input_limitations:
+            details = limitation.to_dict()
+            scope = details.pop("scope")
+            reason = details.pop("reason")
+            details.pop("file", None)
+            limitation_sheet = details.pop("sheet", None)
+            if (
+                loaded_sheet is None
+                and scope == "sheet"
+                and limitation_sheet == sheet_name
+                and rejected_limitation is None
+            ):
+                rejected_limitation = (reason, details)
+                continue
+            state.coverage.add_limitation(
+                scope,
+                reason,
+                file=file_name,
+                sheet=limitation_sheet,
+                **details,
+            )
         if loaded_sheet is None:
-            msg = (f"oversized sheet exceeds {_MAX_CELLS} cells "
-                   f"(set PAPERCONAN_MAX_CELLS to raise) — skipped to bound memory")
+            limitation_reason, limitation_details = (
+                rejected_limitation
+                or ("cell_limit", {"max_cells": _MAX_CELLS})
+            )
+            if limitation_reason == "cell_limit":
+                msg = (
+                    f"oversized sheet exceeds {_MAX_CELLS} dense cells "
+                    "(set PAPERCONAN_MAX_CELLS to raise) - "
+                    "skipped to bound memory"
+                )
+            else:
+                msg = (
+                    "sheet exceeds retained sparse-cell budget "
+                    f"({limitation_reason}) - skipped to bound memory"
+                )
             errors.append({
                 "file": file_name,
                 "sheet": sheet_name,
                 "error": msg,
             })
-            limitation_details = deferred_cell_limits.pop(sheet_name, None)
             state.coverage.mark_sheet_skipped(
                 file_name,
                 sheet_name,
-                "cell_limit",
-                **(
-                    limitation_details
-                    if limitation_details is not None
-                    else {"max_cells": _MAX_CELLS}
-                ),
+                limitation_reason,
+                **limitation_details,
             )
-            sheet_stats.append({
+            skipped_stat = {
                 "file": file_name,
                 "sheet": sheet_name,
-                "oversized": True,
+                "skipped": True,
                 "elapsed_ms": _elapsed_ms(sheet_start),
-            })
-            continue
+            }
+            if limitation_reason == "cell_limit":
+                skipped_stat["oversized"] = True
+            sheet_stats.append(skipped_stat)
+            return
 
         sheet = (
             loaded_sheet
@@ -4341,6 +4524,83 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
         )
         sheet_stats.append(sheet_result.stats)
         del sheet_result
+        del sheet
+
+    ext = os.path.splitext(path)[1].lower()
+    extracted_input = ext in {".pdf", ".docx"}
+    try:
+        if extracted_input:
+            entry_iterator = iter(_iter_extracted_sheets(path))
+            sheet_count = 0
+            while True:
+                try:
+                    entry = next(entry_iterator)
+                except StopIteration:
+                    break
+                sheet_name, loaded_sheet, input_limitations = entry
+                sheet_count += 1
+                process_sheet_entry(
+                    sheet_name,
+                    loaded_sheet,
+                    input_limitations,
+                )
+                del loaded_sheet
+                del input_limitations
+                del sheet_name
+                del entry
+            file_stat["n_sheets"] = sheet_count
+            del entry_iterator
+        else:
+            load_result = load_table_result(path)
+            sheets = load_result.sheets
+            rejected_names = {
+                name for name, value in sheets.items()
+                if value is None
+            }
+            deferred = {name: [] for name in rejected_names}
+            global_limitations = []
+            for limitation in load_result.limitations:
+                if (
+                    limitation.scope == "sheet"
+                    and limitation.sheet in rejected_names
+                ):
+                    deferred[limitation.sheet].append(limitation)
+                else:
+                    global_limitations.append(limitation)
+            for limitation in global_limitations:
+                details = limitation.to_dict()
+                scope = details.pop("scope")
+                reason = details.pop("reason")
+                details.pop("file", None)
+                state.coverage.add_limitation(
+                    scope, reason, file=file_name, **details
+                )
+            file_stat["n_sheets"] = len(sheets)
+            for sheet_name, loaded_sheet in sheets.items():
+                process_sheet_entry(
+                    sheet_name,
+                    loaded_sheet,
+                    deferred.get(sheet_name, ()),
+                )
+            del sheets
+            del load_result
+    except Exception as exc:
+        if (
+            isinstance(exc, ValueError)
+            and str(exc).startswith(
+                "details contains reserved key:"
+            )
+        ):
+            raise
+        print(f"  failed to read {file_name}: {exc}", file=sys.stderr)
+        errors.append({"file": file_name, "error": str(exc)})
+        state.coverage.mark_file_failed(file_name, "parse_error")
+        file_stat["error"] = str(exc)
+        file_stat["elapsed_ms"] = _elapsed_ms(file_start)
+        if not sheet_stats:
+            return _empty_file_scan_result(file_stat, errors)
+    else:
+        state.coverage.mark_file_succeeded()
 
     file_stat["elapsed_ms"] = _elapsed_ms(file_start)
     return FileScanResult(
@@ -4372,7 +4632,8 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     state = ScanBudgetState(
         coverage=coverage,
         recurring_index=RecurringRowIndex(
-            budget=_RECURRING_ROW_VECTOR_BUDGET
+            budget=_RECURRING_ROW_VECTOR_BUDGET,
+            unique_budget=_RECURRING_ROW_VECTOR_UNIQUE_BUDGET,
         ),
         profile=profile,
         evidence=evidence,
@@ -4440,6 +4701,20 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         profile=profile,
         max_findings=_RECURRING_ROW_VECTOR_MAX_FINDINGS,
     )
+    unique_meta = state.recurring_index.unique_budget_metadata()
+    if unique_meta["budget_exhausted"]:
+        coverage.add_limitation(
+            "scan",
+            "recurring_row_unique_vector_limit",
+            limit=unique_meta["limit"],
+            vectors_retained=unique_meta["vectors_retained"],
+            skipped_new_vector_windows=unique_meta[
+                "skipped_new_vector_windows"
+            ],
+            skipped_new_vectors_lower_bound=unique_meta[
+                "skipped_new_vectors_lower_bound"
+            ],
+        )
     recurring_omitted = recurring_meta["findings_omitted"]
     if recurring_omitted > 0:
         coverage.add_limitation(

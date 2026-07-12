@@ -1,5 +1,9 @@
 import numpy as np
+import gc
+import weakref
+import paperconan._sheet as sheet_module
 from paperconan._sheet import Sheet
+from paperconan._sheet import SheetBuilder
 
 def test_from_rows_roundtrip_types():
     rows = [["label", 1, 2.5, None],
@@ -88,3 +92,60 @@ def test_wide_adjacent_integers_roundtrip_without_merging():
 def test_wide_integer_cells_remain_numeric_in_mask():
     sheet = Sheet.from_rows([[2**53], [2**53 + 1], [2**53 + 2]])
     assert sheet.numeric_mask()[:, 0].tolist() == [True, True, True]
+
+
+def test_integer_dense_sheet_uses_geometry_bounded_type_mask():
+    sheet = Sheet.from_rows(
+        ([row * 100 + col for col in range(100)] for row in range(100))
+    )
+
+    assert isinstance(sheet._ints, np.ndarray)
+    assert sheet._ints.dtype == np.bool_
+    assert sheet._ints.shape == sheet.numeric.shape == (100, 100)
+    assert int(np.count_nonzero(sheet._ints)) == 10_000
+
+
+def test_from_rows_does_not_retain_consumed_iterator_rows():
+    class WeakRow(list):
+        pass
+
+    prior = []
+
+    def rows():
+        for row_number in range(4):
+            if prior:
+                gc.collect()
+                assert prior[-1]() is None
+            row = WeakRow([row_number, float(row_number)])
+            prior.append(weakref.ref(row))
+            yield row
+            del row
+
+    sheet = Sheet.from_rows(rows())
+
+    assert sheet.nrows == 4
+    assert sheet.cell(3, 0) == 3
+
+
+def test_streaming_builder_grows_dense_capacity_geometrically(
+    monkeypatch,
+):
+    resize_calls = []
+    original_resize = sheet_module._resize_in_place
+
+    def tracked_resize(*args, **kwargs):
+        resize_calls.append((args[1], args[2]))
+        return original_resize(*args, **kwargs)
+
+    monkeypatch.setattr(
+        sheet_module, "_resize_in_place", tracked_resize
+    )
+    builder = SheetBuilder(max_cells=1_024)
+
+    for row in range(1_024):
+        builder.append_row([row])
+    sheet = builder.finish()
+
+    assert sheet.numeric.shape == (1_024, 1)
+    assert len(resize_calls) < 40
+    assert max(cols for _rows, cols in resize_calls) == 1

@@ -345,7 +345,12 @@ def test_oversized_reused_member_preserves_previous_file(
 
     assert managed.read_bytes() == original
     assert result["downloaded"] == []
-    assert result["skipped"] == []
+    assert result["skipped"] == [{
+        "name": "nested/table.csv",
+        "reason": "archive member exceeds per-member cap",
+        "limit": 10,
+        "declared_size": 100,
+    }]
     sidecar = tmp_path / _download.SOURCE_SIDECAR
     assert sidecar.exists()
     assert json.loads(sidecar.read_text(encoding="utf-8"))[
@@ -1207,6 +1212,121 @@ def test_journal_cleanup_error_preserves_successful_sidecar_commit(
     assert not list(tmp_path.glob(".paperconan-output-rollback-*"))
 
 
+def test_persistent_post_commit_backup_cleanup_is_reported_and_recoverable(
+    tmp_path, monkeypatch
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    output = out_dir / "table.csv"
+    output.write_bytes(b"old-output")
+    _write_sidecar(out_dir, ["table.csv"], doi="10.x/old")
+
+    def source_download(url, dest, **kwargs):
+        Path(dest).write_bytes(b"new-output")
+        return {"ok": True, "path": dest, "size": 10}
+
+    real_remove = _download.os.remove
+    attempts = []
+
+    def fail_backup_remove(path):
+        if Path(path).parent.name.startswith(
+            ".paperconan-output-rollback-"
+        ):
+            attempts.append(os.fspath(path))
+            raise PermissionError("persistent backup cleanup failure")
+        return real_remove(path)
+
+    monkeypatch.setattr(_download, "download_file", source_download)
+    monkeypatch.setattr(
+        _download.os, "remove", fail_backup_remove
+    )
+
+    result = _download.download_candidate(
+        _candidate("table.csv", "https://x/table.csv"),
+        str(out_dir),
+    )
+
+    rollback_dirs = list(
+        tmp_path.glob(".paperconan-output-rollback-*")
+    )
+    assert len(attempts) == 2
+    assert len(rollback_dirs) == 1
+    backups = list(rollback_dirs[0].iterdir())
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == b"old-output"
+    assert output.read_bytes() == b"new-output"
+    assert json.loads(
+        (out_dir / _download.SOURCE_SIDECAR).read_text(
+            encoding="utf-8"
+        )
+    )["managed_files"] == ["table.csv"]
+    assert result["downloaded"] == [str(output)]
+    assert result["skipped"] == [{
+        "name": backups[0].name,
+        "reason": "post-commit cleanup pending",
+        "path": str(backups[0]),
+    }]
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_post_commit_directory_cleanup_retries_and_reports_path(
+    tmp_path, monkeypatch, persistent
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    output = out_dir / "table.csv"
+    output.write_bytes(b"old-output")
+    _write_sidecar(out_dir, ["table.csv"], doi="10.x/old")
+
+    def source_download(url, dest, **kwargs):
+        Path(dest).write_bytes(b"new-output")
+        return {"ok": True, "path": dest, "size": 10}
+
+    real_rmdir = _download.os.rmdir
+    attempts = []
+
+    def fail_directory_cleanup(path, *args, **kwargs):
+        if Path(path).name.startswith(
+            ".paperconan-output-rollback-"
+        ) and (persistent or not attempts):
+            attempts.append(os.fspath(path))
+            raise PermissionError("rollback directory cleanup failure")
+        return real_rmdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(_download, "download_file", source_download)
+    monkeypatch.setattr(
+        _download.os, "rmdir", fail_directory_cleanup
+    )
+
+    result = _download.download_candidate(
+        _candidate("table.csv", "https://x/table.csv"),
+        str(out_dir),
+    )
+
+    assert output.read_bytes() == b"new-output"
+    assert json.loads(
+        (out_dir / _download.SOURCE_SIDECAR).read_text(
+            encoding="utf-8"
+        )
+    )["managed_files"] == ["table.csv"]
+    rollback_dirs = list(
+        tmp_path.glob(".paperconan-output-rollback-*")
+    )
+    if persistent:
+        assert len(attempts) == 2
+        assert len(rollback_dirs) == 1
+        assert list(rollback_dirs[0].iterdir()) == []
+        assert result["skipped"] == [{
+            "name": rollback_dirs[0].name,
+            "reason": "post-commit cleanup pending",
+            "path": str(rollback_dirs[0]),
+        }]
+    else:
+        assert len(attempts) == 1
+        assert rollback_dirs == []
+        assert result["skipped"] == []
+
+
 def test_journal_failed_restore_remains_retryable_and_continues(
     tmp_path, monkeypatch
 ):
@@ -1903,6 +2023,29 @@ def _extract_archive(path, archive_kind, out_dir, reusable_names=()):
     )
 
 
+def _extract_archive_managed(
+    path,
+    archive_kind,
+    out_dir,
+    *,
+    max_member_bytes=100,
+    cap_state=None,
+):
+    extract = (
+        _download._extract_tabular_zip_managed
+        if archive_kind == "zip"
+        else _download._extract_tabular_tar_managed
+    )
+    return extract(
+        str(path),
+        str(out_dir),
+        max_member_bytes,
+        reusable_names=(),
+        cap_state=cap_state,
+        archive_name=path.name,
+    )
+
+
 @pytest.mark.parametrize("archive_kind", ["zip", "tar"])
 def test_archive_accepts_exact_fit_then_stops_at_paper_cap(
     tmp_path, monkeypatch, archive_kind
@@ -1980,3 +2123,225 @@ def test_archive_credits_managed_replacement_once(
         replacement if accepted else b"123456"
     )
     assert _download._dir_size(out_dir) == 10
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+def test_archive_output_file_limit_discloses_every_retained_member(
+    tmp_path, monkeypatch, archive_kind
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    archive = tmp_path / f"supp.{archive_kind}"
+    _write_archive(
+        archive,
+        archive_kind,
+        [
+            ("first.csv", b""),
+            ("second.csv", b""),
+            ("third.csv", b""),
+        ],
+    )
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 10)
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_MEMBER_NAME_BYTES", 1_000
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_OUTPUT_FILE_LIMIT", 1
+    )
+
+    extracted, preserved, skipped = _extract_archive_managed(
+        archive, archive_kind, out_dir
+    )
+
+    assert extracted == [str(out_dir / "first.csv")]
+    assert preserved == set()
+    assert skipped == [
+        {
+            "name": "second.csv",
+            "reason": "archive output file limit",
+            "limit": 1,
+        },
+        {
+            "name": "third.csv",
+            "reason": "archive output file limit",
+            "limit": 1,
+        },
+        {
+            "name": archive.name,
+            "reason": "archive output file limit",
+            "limit": 1,
+            "retained_outputs": 1,
+            "omitted_members": 2,
+        },
+    ]
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+@pytest.mark.parametrize("limit_kind", ["member", "output"])
+def test_partial_archive_limit_preserves_unprocessed_managed_outputs(
+    tmp_path, monkeypatch, archive_kind, limit_kind
+):
+    old = tmp_path / "old.csv"
+    old.write_bytes(b"old-complete")
+    _write_sidecar(tmp_path, ["old.csv"], doi="10.x/old")
+    payload = _archive_payload(
+        archive_kind,
+        [
+            ("new.csv", b"new-complete"),
+            ("old.csv", b"replacement"),
+        ],
+    )
+
+    def archive_download(url, dest, **kwargs):
+        Path(dest).write_bytes(payload)
+        return {"ok": True, "path": dest}
+
+    monkeypatch.setattr(_download, "download_file", archive_download)
+    monkeypatch.setattr(
+        _download,
+        "_ARCHIVE_MEMBER_LIMIT",
+        1 if limit_kind == "member" else 10,
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_MEMBER_NAME_BYTES", 1_000
+    )
+    monkeypatch.setattr(
+        _download,
+        "_ARCHIVE_OUTPUT_FILE_LIMIT",
+        1 if limit_kind == "output" else 10,
+    )
+
+    result = _download.download_candidate({
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+        **_archive_fields(archive_kind),
+    }, str(tmp_path))
+
+    assert (tmp_path / "new.csv").read_bytes() == b"new-complete"
+    assert old.read_bytes() == b"old-complete"
+    assert json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(
+            encoding="utf-8"
+        )
+    )["managed_files"] == ["new.csv", "old.csv"]
+    archive_name = (
+        "supp.zip" if archive_kind == "zip" else "supp.tar.gz"
+    )
+    if limit_kind == "member":
+        assert result["skipped"] == [{
+            "name": archive_name,
+            "reason": "archive member count limit",
+            "limit": 1,
+            "retained_members": 1,
+            "omitted_members_lower_bound": 1,
+        }]
+    else:
+        assert result["skipped"] == [
+            {
+                "name": "old.csv",
+                "reason": "archive output file limit",
+                "limit": 1,
+            },
+            {
+                "name": archive_name,
+                "reason": "archive output file limit",
+                "limit": 1,
+                "retained_outputs": 1,
+                "omitted_members": 1,
+            },
+        ]
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+def test_archive_declared_per_paper_rejection_is_disclosed(
+    tmp_path, monkeypatch, archive_kind
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "existing.bin").write_bytes(b"seed")
+    archive = tmp_path / f"supp.{archive_kind}"
+    _write_archive(
+        archive,
+        archive_kind,
+        [("overflow.csv", b"1234567")],
+    )
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", 10)
+    cap_state = {"exceeded": False}
+
+    extracted, preserved, skipped = _extract_archive_managed(
+        archive,
+        archive_kind,
+        out_dir,
+        cap_state=cap_state,
+    )
+
+    assert extracted == []
+    assert preserved == set()
+    assert skipped == [{
+        "name": "overflow.csv",
+        "reason": "archive member exceeds per-paper cap",
+        "limit": 10,
+        "remaining_bytes": 6,
+        "declared_size": 7,
+    }]
+    assert cap_state == {"exceeded": True}
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+@pytest.mark.parametrize("limit_kind", ["member", "paper"])
+def test_archive_streamed_size_rejection_is_disclosed_once(
+    tmp_path, monkeypatch, archive_kind, limit_kind
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    archive = tmp_path / f"supp.{archive_kind}"
+    _write_archive(
+        archive,
+        archive_kind,
+        [("stream.csv", b"x")],
+    )
+    cap_state = {"exceeded": False}
+    if limit_kind == "paper":
+        (out_dir / "existing.bin").write_bytes(b"seed")
+        monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", 10)
+        max_member_bytes = 100
+        expected = {
+            "name": "stream.csv",
+            "reason": (
+                "archive member exceeds per-paper cap while streaming"
+            ),
+            "limit": 10,
+            "remaining_bytes": 6,
+        }
+    else:
+        max_member_bytes = 10
+        expected = {
+            "name": "stream.csv",
+            "reason": (
+                "archive member exceeds per-member cap while streaming"
+            ),
+            "limit": 10,
+        }
+
+    def exceed_stream(_src, _dest, _max_bytes):
+        raise _download._SizeLimitExceeded("injected stream limit")
+
+    monkeypatch.setattr(
+        _download, "_atomic_stream_write", exceed_stream
+    )
+
+    extracted, preserved, skipped = _extract_archive_managed(
+        archive,
+        archive_kind,
+        out_dir,
+        max_member_bytes=max_member_bytes,
+        cap_state=cap_state,
+    )
+
+    assert extracted == []
+    assert preserved == set()
+    assert skipped == [expected]
+    assert cap_state == {
+        "exceeded": limit_kind == "paper"
+    }

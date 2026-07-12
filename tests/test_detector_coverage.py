@@ -262,6 +262,48 @@ def test_column_fingerprint_column_limit_is_disclosed_exactly(
     assert scan["coverage"]["truncated"] is True
 
 
+def test_fraction_reuse_work_limit_is_disclosed_once(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        audit, "_FRACTION_REUSE_PAIR_BUDGET", 1, raising=False
+    )
+    monkeypatch.setattr(
+        audit, "_FRACTION_REUSE_CELL_BUDGET", 100, raising=False
+    )
+    data = tmp_path / "data"
+    data.mkdir()
+    rows = ["value"]
+    for block in range(4):
+        rows.extend(
+            str(block * 100 + row + 0.12345)
+            for row in range(10)
+        )
+        if block < 3:
+            rows.append("")
+    (data / "many.csv").write_text(
+        "\n".join(rows) + "\n", encoding="utf-8"
+    )
+
+    scan = audit.scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    assert _limitations(scan, "fraction_reuse_work_limit") == [{
+        "scope": "sheet",
+        "reason": "fraction_reuse_work_limit",
+        "file": "many.csv",
+        "sheet": "many",
+        "pair_limit": 1,
+        "cell_limit": 100,
+        "pairs_examined": 1,
+        "cells_examined": 10,
+        "pairs_skipped": 5,
+        "limits_reached": ["pair"],
+    }]
+    assert scan["coverage"]["truncated"] is True
+
+
 def test_detector_helpers_expose_coverage_without_changing_default_shapes():
     grid_sheet = Sheet.from_rows([
         ["a", "b"],
