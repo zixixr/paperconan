@@ -530,6 +530,15 @@ def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_row
     return out
 
 
+def _norm_label(s):
+    """Normalize a row label for equality: lowercased, whitespace-collapsed; '' for
+    None or a synthetic 'row N' placeholder (two unlabeled rows are not 'same-named')."""
+    if not s:
+        return ""
+    t = " ".join(str(s).split()).strip().lower()
+    return "" if re.fullmatch(r"row \d+", t) else t
+
+
 def _is_round_power_of_ten(ratio):
     """True if `ratio` is (approximately) 10**k for some non-zero integer k — the
     fingerprint of a unit conversion or a percent/fraction restatement (x10, x100,
@@ -564,12 +573,22 @@ def benign_reason(f):
     if kind == "identical_after_rounding":
         return ("cells share a rounded value but differ at full precision — usually "
                 "display rounding, not duplication")
-    if kind in ("constant_ratio_row", "scaled_row_reuse"):
-        ratio = f.get("ratio")
-        if ratio is not None and _is_round_power_of_ten(float(ratio)):
-            return ("a whole power-of-ten ratio between two rows is usually a unit "
-                    "conversion or percentage-vs-fraction restatement of the same row, "
-                    "not two independent measurements")
+    if kind in ("constant_ratio_row", "scaled_row_reuse", "identical_row_reuse"):
+        # A same-named row reused across two PANELS of one figure (different sheet, same
+        # figure number) is the classic shared control/baseline replot — benign. A
+        # same-sheet cross-block pair (e.g. a DMSO vs MMS arm) or a DIFFERENT-named row
+        # is NOT a shared control and stays unexplained.
+        if (f.get("same_figure") and not f.get("same_sheet")
+                and _norm_label(f.get("row_a")) == _norm_label(f.get("row_b"))
+                and _norm_label(f.get("row_a"))):
+            return ("the same-named row reused across two panels of one figure is usually "
+                    "a shared control/baseline replot — confirm the legend discloses the reuse")
+        if kind != "identical_row_reuse":
+            ratio = f.get("ratio")
+            if ratio is not None and _is_round_power_of_ten(float(ratio)):
+                return ("a whole power-of-ten ratio between two rows is usually a unit "
+                        "conversion or percentage-vs-fraction restatement of the same row, "
+                        "not two independent measurements")
         return None
     if kind in ("cross_sheet_value_overlap", "cross_sheet_position_identical"):
         if f.get("same_figure"):
@@ -848,12 +867,18 @@ _ROW_PAIR_MAX_FINDINGS_PER_BLOCK = 25
 # firing on too few cells to be distinctive.
 _ROW_REL_MAX_ROWS = int(os.environ.get("PAPERCONAN_ROW_REL_MAX_ROWS", "60"))
 _ROW_REL_MIN_COLS = int(os.environ.get("PAPERCONAN_ROW_REL_MIN_COLS", "12"))
-# Ratio-run membership tolerance (relative). Source data is typically stored to ~6
-# significant figures, so a genuine exact scaling reads back as a ratio that wobbles
-# at ~1e-6; a 1e-9 exactness bound (used for un-rounded offset runs) would shatter the
-# run. 1e-5 absorbs 5-6 sig-fig rounding while staying 4+ orders below the ~0.1-0.3
-# spread of ratios between genuinely independent rows, so it cannot manufacture a run.
-_ROW_REL_RTOL = float(os.environ.get("PAPERCONAN_ROW_REL_RTOL", "1e-5"))
+# Ratio-run membership tolerance (relative). A genuine exact scaling read back from
+# stored source data wobbles by ~2x the per-cell rounding: ~1e-6 at 6 sig figs but
+# ~1e-4 for the very common 2-3 sig-fig bench readouts (percent, viability, OD). 1e-3
+# absorbs all of these while staying 2+ orders below the ~0.1-0.3 spread of ratios
+# between genuinely independent rows — at >=12 consecutive columns, random-chance FP
+# is still ~(1e-3/0.3)**11 ≈ 1e-27, so it cannot manufacture a run.
+_ROW_REL_RTOL = float(os.environ.get("PAPERCONAN_ROW_REL_RTOL", "1e-3"))
+# Per-call column-op budget for detect_row_relations. rows are capped, but each row
+# pair runs a pure-Python O(cols) scan, so a very wide block (e.g. 60x160000, still
+# under _MAX_CELLS) would otherwise cost ~minutes. Bound total pair*cols work; a
+# starved run stops early (stderr note) rather than hanging.
+_ROW_REL_BUDGET = int(os.environ.get("PAPERCONAN_ROW_REL_BUDGET", "6000000"))
 
 
 def _row_label(sheet, r, c0):
@@ -1145,8 +1170,10 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header):
     each other cell-for-cell across dozens of columns, is a data-inconsistency
     signal worth an author's explanation — not a verdict.
 
-    Runs on wide/short blocks only (the column detector is skipped there anyway);
-    the row-count cap keeps the O(rows^2) pair loop cheap on tall tables.
+    Called on every block and SELF-GATES on row/col counts (not the `wide` flag), so
+    it covers precisely the wide blocks the column detectors skip. The row-count cap
+    plus a per-call column-op budget keep the O(rows^2 * cols) pure-Python scan bounded
+    even on genome-scale wide blocks.
     """
     findings = []
     n_rows = r1 - r0
@@ -1154,6 +1181,7 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header):
     if n_rows < 2 or n_cols < _ROW_REL_MIN_COLS or n_rows > _ROW_REL_MAX_ROWS:
         return findings
 
+    budget = _ROW_REL_BUDGET
     labels = {r: _row_label(sheet, r, c0) for r in range(r0, r1)}
     for i, ra in enumerate(range(r0, r1)):
         label_a = labels[ra]
@@ -1161,6 +1189,11 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header):
             continue
         a = sheet.numeric[ra, c0:c1]
         for rb in range(ra + 1, r1):
+            budget -= n_cols
+            if budget <= 0:
+                print(f"[paperconan] detect_row_relations: column-op budget exhausted on a "
+                      f"{n_rows}x{n_cols} block — coverage bounded", file=sys.stderr)
+                return findings
             label_b = labels[rb]
             if _AXIS_CONTEXT_LABEL_RE.search(label_b):
                 continue
@@ -1209,9 +1242,10 @@ def _longest_constant_ratio_run(a, b, c0, c1):
     `a`, `b` are the two full row slices (may contain NaN). A column breaks the run
     if either cell is NaN or a[c] is ~0. Membership is anchored to the run's first
     ratio within `_ROW_REL_RTOL` (rounding-tolerant); the returned k is the run MEAN
-    for a clean reported value. Returns (k, run_length, x_values_in_run) for the
-    longest qualifying run, or None (including a near-unity run — that is an identical
-    row, handled separately, not a scaling)."""
+    for a clean reported value. Only NON-unity runs compete for the longest — a
+    near-unity (identical) prefix must not win and mask a shorter genuine scaling
+    suffix (that identical part is caught separately). Returns (k, run_length,
+    x_values_in_run) for the longest qualifying scaling run, or None."""
     best_len, best_start = 0, 0
     cur_len, cur_k, cur_start = 0, None, 0
     for idx in range(c1 - c0):
@@ -1224,7 +1258,9 @@ def _longest_constant_ratio_run(a, b, c0, c1):
             cur_k, cur_len, cur_start = r, 1, idx
         else:
             cur_len += 1
-        if cur_len > best_len:
+        # Only a genuinely-scaled run (ratio distinct from 1) may set the best; a long
+        # identical run is not a scaling and must not shadow a real one elsewhere.
+        if cur_len > best_len and abs(cur_k - 1.0) > _ROW_REL_RTOL:
             best_len, best_start = cur_len, cur_start
     if best_len == 0:
         return None
@@ -2777,7 +2813,7 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
             findings.append(dict(
                 kind=kind,
                 file=fa if same_file else f"{fa} + {fb}",
-                file_a=fa, file_b=fb, same_file=same_file,
+                file_a=fa, file_b=fb, same_file=same_file, same_sheet=same_sheet,
                 sheet_a=sa_name, sheet_b=sb_name,
                 row_a=A["label"], row_b=B["label"],
                 size_a=run_len, size_b=run_len,

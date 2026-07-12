@@ -8,8 +8,10 @@ scalar multiple of each other across many columns) never touches a column pair.
 """
 from __future__ import annotations
 
+import paperconan._audit as _audit
 from paperconan import scan_dir
 from paperconan._audit import benign_reason, detect_row_relations
+from paperconan._profiles import apply_profile_to_findings
 from paperconan._sheet import Sheet
 
 
@@ -64,6 +66,56 @@ def test_detects_partial_contiguous_ratio_run():
     assert abs(f["ratio"] - 1.14) < 1e-9 or abs(f["ratio"] - 1 / 1.14) < 1e-9
     assert f["run_length"] == 40
     assert f["severity"] == "high"
+
+
+def test_ratio_run_survives_low_precision_2_decimals():
+    # Source data stored to 2 decimals still reads back as a constant ratio (rounding
+    # noise ~1e-4 relative); the run must survive, not collapse. Regression for a
+    # too-tight membership tolerance.
+    base = [round(50.0 + ((k * 37 + 11) % 40) + (k + 1) * 0.271, 2) for k in range(40)]
+    scaled = [round(v * 1.14, 2) for v in base]
+    header = ["cond", *[f"m{i}" for i in range(40)]]
+    rows = [header, ["A", *base], ["B", *scaled]]
+    sheet = Sheet.from_rows(rows)
+
+    findings = detect_row_relations(sheet, 1, 3, 1, 41, header[1:])
+    ratio = [f for f in findings if f["kind"] == "constant_ratio_row"]
+    assert ratio and ratio[0]["run_length"] >= 30, f"low-precision ratio run collapsed: {findings}"
+
+
+def test_scaled_run_not_masked_by_identical_prefix():
+    # A pair identical over a long prefix and cleanly scaled over the suffix must still
+    # surface the scaling — the near-unity prefix must not win and abort detection.
+    base = _distinct_highprec(100, 31, 7)
+    row_b = [base[k] if k < 50 else base[k] * 1.05 for k in range(100)]
+    header = ["cond", *[f"m{i}" for i in range(100)]]
+    sheet = Sheet.from_rows([header, ["A", *base], ["B", *row_b]])
+
+    findings = detect_row_relations(sheet, 1, 3, 1, 101, header[1:])
+    ratio = [f for f in findings if f["kind"] == "constant_ratio_row"]
+    assert ratio, f"scaled suffix masked by identical prefix: {findings}"
+    assert abs(ratio[0]["ratio"] - 1.05) < 1e-6 or abs(ratio[0]["ratio"] - 1 / 1.05) < 1e-6
+    assert ratio[0]["run_length"] == 50
+
+
+def test_named_unit_conversion_rows_are_demoted():
+    # Two rows that are a named unit conversion (kg vs lb, ratio ~2.2046) must not stay
+    # a bare HIGH — the derived-relation prefilter should demote them under review.
+    f = {"kind": "constant_ratio_row", "ratio": 2.2046, "severity": "high",
+         "row_a": "Weight (kg)", "row_b": "Weight (lb)", "n": 30}
+    apply_profile_to_findings([f], "review")
+    assert f["profile_action"] in ("demoted", "hidden") or str(f["severity"]).lower() == "low"
+
+
+def test_row_relations_bounded_by_budget(monkeypatch):
+    base = _distinct_highprec(40, 31, 7)
+    header = ["cond", *[f"m{i}" for i in range(40)]]
+    sheet = Sheet.from_rows([header, ["A", *base], ["B", *[v * 1.14 for v in base]]])
+    # default budget: the ratio pair is found
+    assert detect_row_relations(sheet, 1, 3, 1, 41, header[1:])
+    # a starved budget stops before doing the per-pair column scan (cost bound)
+    monkeypatch.setattr(_audit, "_ROW_REL_BUDGET", 1)
+    assert detect_row_relations(sheet, 1, 3, 1, 41, header[1:]) == []
 
 
 def test_no_false_positive_on_independent_rows():
@@ -135,6 +187,27 @@ def test_round_power_of_ten_ratio_is_flagged_likely_benign():
     f2 = {"kind": "constant_ratio_row", "ratio": 1.14,
           "row_a": "shUSP15-2+shPARP1-2", "row_b": "shUSP15-2+pPARP1"}
     assert not benign_reason(f2)
+
+
+def test_row_findings_distill_with_usable_location(tmp_path):
+    # The paperconan-watch review packet must not drop the row finding's location and
+    # value samples just because it names rows (row_a/row_b), not columns.
+    from paperconan.packet import distill_findings_for_review
+    base = _distinct_highprec(30, 31, 7)
+    header = ["cond", *[f"m{i}" for i in range(30)]]
+    rows = [header, ["Control", *_distinct_highprec(30, 53, 17)],
+            ["USP15 KO-1", *base], ["PARP1 KO-1", *[v * 1.042 for v in base]]]
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "s.csv").write_text(
+        "\n".join(",".join(str(v) for v in row) for row in rows) + "\n", encoding="utf-8")
+    scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+
+    distilled = distill_findings_for_review(scan)
+    rr = [d for d in distilled if d.get("kind") == "constant_ratio_row"]
+    assert rr, "row finding was dropped from the review packet"
+    assert rr[0].get("col_a"), "distilled row finding lost its location"
+    assert rr[0].get("top5_a"), "distilled row finding lost its value samples"
 
 
 def test_scan_dir_surfaces_row_relations_and_html(tmp_path):

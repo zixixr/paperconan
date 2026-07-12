@@ -9,8 +9,9 @@ distinct row-bands and sheets. Signal, not verdict — neutral language.
 from __future__ import annotations
 
 from paperconan import scan_dir
-from paperconan._audit import benign_reason, detect_scaled_row_reuse
+from paperconan._audit import _attach_benign, benign_reason, detect_scaled_row_reuse
 from paperconan._sheet import Sheet
+from paperconan.packet import distill_findings_for_review
 
 
 def _distinct_highprec(n, a, b):
@@ -103,6 +104,31 @@ def test_detects_scaled_row_across_two_sheets():
     assert len(scaled) == 1
     assert scaled[0]["same_file"] is False
     assert {scaled[0]["sheet_a"], scaled[0]["sheet_b"]} == {"Fig. 1", "Fig. 2"}
+
+
+def test_shared_control_across_panels_same_figure_is_benign_but_different_label_is_not():
+    vals = _distinct_highprec(40, 31, 7)
+    # same-named control row reused across two PANELS of one figure (5A, 5B → main:5)
+    sa = Sheet.from_rows([["c", *[f"m{i}" for i in range(40)]],
+                          ["shControl", *vals], ["x", *_distinct_highprec(40, 53, 17)]])
+    sb = Sheet.from_rows([["c", *[f"m{i}" for i in range(40)]],
+                          ["shControl", *list(vals)], ["y", *_distinct_highprec(40, 71, 41)]])
+    findings = _attach_benign(detect_scaled_row_reuse(
+        {("M.xlsx", "Extended Data Fig. 5A"): sa, ("M.xlsx", "Extended Data Fig. 5B"): sb}))
+    ident = [f for f in findings if f["kind"] == "identical_row_reuse"]
+    assert len(ident) == 1 and ident[0]["same_figure"] is True and ident[0]["same_sheet"] is False
+    assert ident[0].get("likely_benign"), "same-figure shared control should carry a benign note"
+
+    # DIFFERENT labels across panels of one figure is NOT a shared control → no benign note
+    sc = Sheet.from_rows([["c", *[f"m{i}" for i in range(40)]],
+                          ["Control", *vals], ["z", *_distinct_highprec(40, 53, 17)]])
+    sd = Sheet.from_rows([["c", *[f"m{i}" for i in range(40)]],
+                          ["USP15 KO", *list(vals)], ["w", *_distinct_highprec(40, 71, 41)]])
+    f2 = [f for f in _attach_benign(detect_scaled_row_reuse(
+              {("M.xlsx", "Fig. 4j"): sc, ("M.xlsx", "Fig. 4k"): sd}))
+          if f["kind"] == "identical_row_reuse"]
+    assert len(f2) == 1 and f2[0]["same_figure"] is True
+    assert not f2[0].get("likely_benign"), "different-label identical rows are not a shared control"
 
 
 def test_power_of_ten_scaled_row_is_flagged_likely_benign():

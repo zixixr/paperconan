@@ -158,14 +158,17 @@ def _distill_block_findings(scan: dict[str, Any]) -> list[dict[str, Any]]:
                 if _is_axis_finding(r):
                     continue
                 n = int(r.get("n") or 0)
-                sample = r.get("col_a_sample") or r.get("value_sample") or []
-                # grim/grimmer findings identify their column as mean_col (with n_col/sd_col),
-                # not col/col_a — carry it so the distilled entry has a usable location.
-                col_a = r.get("col") or r.get("col_a") or r.get("mean_col")
+                # grim/grimmer identify their column as mean_col; the row-oriented
+                # detectors (constant_ratio_row/identical_row) locate by row_a/row_b and
+                # sample as row_a_sample — carry those so the distilled entry keeps a
+                # usable location and value peek instead of dropping them.
+                sample = (r.get("col_a_sample") or r.get("value_sample")
+                          or r.get("row_a_sample") or [])
+                col_a = r.get("col") or r.get("col_a") or r.get("mean_col") or r.get("row_a")
                 findings.append({
                     "kind": r.get("kind"),
                     "col_a": col_a,
-                    "col_b": r.get("col_b") or r.get("sd_col"),
+                    "col_b": r.get("col_b") or r.get("sd_col") or r.get("row_b"),
                     "n": n,
                     "rule": r.get("rule"),
                     "top5_a": list(sample)[:5],
