@@ -117,7 +117,7 @@ def _remaining_final_size_allowance(
     )
 
 
-class _SidecarShrinkRollback:
+class _ManagedOutputJournal:
     def __init__(self, out_dir):
         self._parent = os.path.dirname(os.path.abspath(out_dir))
         self._backup_dir = None
@@ -460,7 +460,7 @@ def _extract_archive_members(
     transient_paths=(),
     sidecar_delta_for_names=None,
     cap_state=None,
-    shrink_rollback=None,
+    output_journal=None,
 ):
     extracted = []
     preserved = set()
@@ -492,7 +492,6 @@ def _extract_archive_members(
                 sidecar_delta,
             )
         )
-        uncredited_remaining = remaining + min(sidecar_delta, 0)
         write_limit = min(max_member_bytes, remaining)
         declared_size = member_size(member)
         if (
@@ -507,13 +506,8 @@ def _extract_archive_members(
             if reuses_old and os.path.lexists(dest):
                 preserved.add(name)
             continue
-        depends_on_shrink = (
-            shrink_rollback is not None
-            and sidecar_delta < 0
-            and declared_size > uncredited_remaining
-        )
-        if depends_on_shrink:
-            shrink_rollback.prepare(dest)
+        if output_journal is not None:
+            output_journal.prepare(dest)
         committed = False
         try:
             src = open_member(member)
@@ -525,8 +519,8 @@ def _extract_archive_members(
                 )
                 committed = True
         except _SizeLimitExceeded:
-            if depends_on_shrink:
-                shrink_rollback.restore(dest)
+            if output_journal is not None:
+                output_journal.restore(dest)
             if reuses_old and os.path.lexists(dest):
                 preserved.add(name)
             continue
@@ -543,8 +537,8 @@ def _extract_archive_members(
                     ),
                 })
                 continue
-            if depends_on_shrink:
-                shrink_rollback.restore(dest)
+            if output_journal is not None:
+                output_journal.restore(dest)
             if reuses_old and os.path.lexists(dest):
                 preserved.add(name)
             skipped.append({
@@ -585,7 +579,7 @@ def _extract_tabular_zip_managed(
     reusable_names,
     sidecar_delta_for_names=None,
     cap_state=None,
-    shrink_rollback=None,
+    output_journal=None,
 ):
     with zipfile.ZipFile(zip_path) as zf:
         infos = [
@@ -609,7 +603,7 @@ def _extract_tabular_zip_managed(
             transient_paths=(zip_path,),
             sidecar_delta_for_names=sidecar_delta_for_names,
             cap_state=cap_state,
-            shrink_rollback=shrink_rollback,
+            output_journal=output_journal,
         )
 
 
@@ -640,7 +634,7 @@ def _extract_tabular_tar_managed(
     reusable_names,
     sidecar_delta_for_names=None,
     cap_state=None,
-    shrink_rollback=None,
+    output_journal=None,
 ):
     with tarfile.open(tar_path, "r:gz") as tf:
         members = [
@@ -663,7 +657,7 @@ def _extract_tabular_tar_managed(
             transient_paths=(tar_path,),
             sidecar_delta_for_names=sidecar_delta_for_names,
             cap_state=cap_state,
-            shrink_rollback=shrink_rollback,
+            output_journal=output_journal,
         )
 
 
@@ -687,7 +681,7 @@ def _download_oa_package(
     reusable_names=(),
     sidecar_delta_for_names=None,
     cap_state=None,
-    shrink_rollback=None,
+    output_journal=None,
 ):
     """Download the static PMC OA tar.gz, extract its tabular members, drop the tarball."""
     tmp = _temporary_archive_path(out_dir, ".tar.gz")
@@ -708,7 +702,7 @@ def _download_oa_package(
                     reusable_names=reusable_names,
                     sidecar_delta_for_names=sidecar_delta_for_names,
                     cap_state=cap_state,
-                    shrink_rollback=shrink_rollback,
+                    output_journal=output_journal,
                 )
             )
             skipped.extend(member_skipped)
@@ -732,7 +726,7 @@ def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_byte
                                     reusable_names=(),
                                     sidecar_delta_for_names=None,
                                     cap_state=None,
-                                    shrink_rollback=None):
+                                    output_journal=None):
     """Fetch a supplementary zip (Europe PMC), extract its tabular members, drop the zip.
 
     The archive downloads with the larger ``archive_max`` cap; each extracted table is
@@ -755,7 +749,7 @@ def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_byte
                     reusable_names=reusable_names,
                     sidecar_delta_for_names=sidecar_delta_for_names,
                     cap_state=cap_state,
-                    shrink_rollback=shrink_rollback,
+                    output_journal=output_journal,
                 )
             )
             skipped.extend(member_skipped)
@@ -840,13 +834,19 @@ def _write_source_sidecar(cand, out_dir, managed_files):
                 pass
 
 
-def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
-                       archive_max=_ARCHIVE_MAX):
+def _download_candidate(
+    cand,
+    out_dir,
+    *,
+    tabular_only,
+    max_bytes,
+    archive_max,
+    output_journal,
+):
     if tabular_only:
         files = cand.get("tabular_files", [])
     else:
         files = cand.get("all_files") or cand.get("tabular_files", [])
-    os.makedirs(out_dir, exist_ok=True)
     previous = _read_source_sidecar(out_dir)
     old_managed = set(previous.get("managed_files") or ())
     reusable_names = set(old_managed)
@@ -854,7 +854,6 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
     new_managed = set()
     preserved_managed = set()
     cap_state = {"exceeded": False}
-    shrink_rollback = _SidecarShrinkRollback(out_dir)
     for file_ref in files:
         requested_name = str(file_ref.get("name") or "").strip()
         source_url = str(file_ref.get("download_url") or "")
@@ -882,7 +881,6 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
             reuses_old,
             sidecar_delta,
         )
-        uncredited_remaining = remaining + min(sidecar_delta, 0)
         download_limit = min(max_bytes, remaining)
         if download_limit <= 0:
             cap_state["exceeded"] = True
@@ -893,12 +891,7 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
             if reuses_old:
                 preserved_managed.add(output_name)
             continue
-        may_depend_on_shrink = (
-            sidecar_delta < 0
-            and download_limit > uncredited_remaining
-        )
-        if may_depend_on_shrink:
-            shrink_rollback.prepare(dest)
+        output_journal.prepare(dest)
         try:
             res = download_file(
                 source_url,
@@ -906,24 +899,13 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
                 max_bytes=download_limit,
             )
         except BaseException:
-            if may_depend_on_shrink:
-                shrink_rollback.restore(dest)
+            output_journal.restore(dest)
             raise
         if res.get("ok"):
-            try:
-                accepted_size = os.path.getsize(res["path"])
-            except (KeyError, OSError, TypeError):
-                accepted_size = 0
-            if (
-                may_depend_on_shrink
-                and accepted_size <= uncredited_remaining
-            ):
-                shrink_rollback.discard(dest)
             downloaded.append(res["path"])
             new_managed.add(output_name)
         else:
-            if may_depend_on_shrink:
-                shrink_rollback.restore(dest)
+            output_journal.restore(dest)
             if (
                 remaining < max_bytes
                 and "exceeds max_bytes"
@@ -957,7 +939,7 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
             reusable_names=reusable_names,
             sidecar_delta_for_names=archive_sidecar_delta,
             cap_state=cap_state,
-            shrink_rollback=shrink_rollback,
+            output_journal=output_journal,
         )
         preserved_managed.update(archive_preserved)
         if not archive_ok:
@@ -986,7 +968,7 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
             reusable_names=reusable_names,
             sidecar_delta_for_names=archive_sidecar_delta,
             cap_state=cap_state,
-            shrink_rollback=shrink_rollback,
+            output_journal=output_journal,
         )
         preserved_managed.update(archive_preserved)
         if not archive_ok:
@@ -1013,7 +995,7 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
         and _write_source_sidecar(cand, out_dir, committed_managed)
     )
     if sidecar_committed:
-        shrink_rollback.commit()
+        output_journal.commit()
         failed_removals = set(
             _remove_managed_files(out_dir, stale_managed)
         )
@@ -1026,7 +1008,7 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
         if final_managed != committed_managed:
             _write_source_sidecar(cand, out_dir, final_managed)
     else:
-        rolled_back = shrink_rollback.rollback()
+        rolled_back = output_journal.rollback()
         if rolled_back:
             downloaded[:] = [
                 path for path in downloaded
@@ -1034,3 +1016,21 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
             ]
     return {"cand_id": cand.get("cand_id"), "out_dir": out_dir,
             "downloaded": downloaded, "skipped": skipped}
+
+
+def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
+                       archive_max=_ARCHIVE_MAX):
+    os.makedirs(out_dir, exist_ok=True)
+    output_journal = _ManagedOutputJournal(out_dir)
+    try:
+        return _download_candidate(
+            cand,
+            out_dir,
+            tabular_only=tabular_only,
+            max_bytes=max_bytes,
+            archive_max=archive_max,
+            output_journal=output_journal,
+        )
+    except BaseException:
+        output_journal.rollback()
+        raise

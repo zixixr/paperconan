@@ -354,7 +354,7 @@ def test_oversized_reused_member_preserves_previous_file(
     assert not list(tmp_path.glob(".paperconan-archive-*"))
 
 
-def test_sidecar_commit_failure_does_not_prune_old_managed_files(
+def test_sidecar_commit_failure_rolls_back_new_direct_output(
     tmp_path, monkeypatch
 ):
     old = tmp_path / "old.csv"
@@ -382,8 +382,9 @@ def test_sidecar_commit_failure_does_not_prune_old_managed_files(
         str(tmp_path),
     )
 
-    assert result["downloaded"] == [str(tmp_path / "new.csv")]
+    assert result["downloaded"] == []
     assert old.read_text(encoding="utf-8") == "old"
+    assert not (tmp_path / "new.csv").exists()
     assert (
         tmp_path / _download.SOURCE_SIDECAR
     ).read_bytes() == original_sidecar
@@ -1087,6 +1088,122 @@ def _fail_final_sidecar_commit(monkeypatch):
 
     monkeypatch.setattr(_download.os, "replace", fail_sidecar_replace)
     return failures
+
+
+@pytest.mark.parametrize("channel", ["direct", "zip", "tar"])
+@pytest.mark.parametrize("destination_state", ["replacement", "new"])
+def test_final_sidecar_failure_rolls_back_every_accepted_output(
+    tmp_path, monkeypatch, channel, destination_state
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    stale = out_dir / "stale.csv"
+    stale.write_bytes(b"stale")
+    managed_files = ["stale.csv"]
+    output_name = "table.csv"
+    output = out_dir / output_name
+    if destination_state == "replacement":
+        output.write_bytes(b"old-output")
+        managed_files.append(output_name)
+    _write_sidecar(out_dir, managed_files, doi="10.x/old")
+    sidecar = out_dir / _download.SOURCE_SIDECAR
+    original_sidecar = sidecar.read_bytes()
+    body = b"new-output"
+
+    if channel == "direct":
+        cand = _candidate(output_name, "https://x/table.csv")
+
+        def source_download(url, dest, **kwargs):
+            Path(dest).write_bytes(body)
+            return {"ok": True, "path": dest, "size": len(body)}
+
+    else:
+        payload = _archive_payload(
+            channel, [(f"nested/{output_name}", body)]
+        )
+        cand = {
+            "cand_id": "source:1",
+            "source": "source",
+            "tabular_files": [],
+            **_archive_fields(channel),
+        }
+
+        def source_download(url, dest, **kwargs):
+            Path(dest).write_bytes(payload)
+            return {
+                "ok": True,
+                "path": dest,
+                "size": len(payload),
+            }
+
+    final_managed = sorted(set(managed_files) | {output_name})
+    assert _download._source_sidecar_replacement_delta(
+        cand, str(out_dir), final_managed
+    ) >= 0
+
+    monkeypatch.setattr(_download, "download_file", source_download)
+    failures = _fail_final_sidecar_commit(monkeypatch)
+
+    result = _download.download_candidate(cand, str(out_dir))
+
+    assert len(failures) == 1
+    assert result["downloaded"] == []
+    if destination_state == "replacement":
+        assert output.read_bytes() == b"old-output"
+    else:
+        assert not output.exists()
+    assert stale.read_bytes() == b"stale"
+    assert sidecar.read_bytes() == original_sidecar
+    assert not list(out_dir.glob(".paperconan-output-rollback-*"))
+    assert not list(tmp_path.glob(".paperconan-output-rollback-*"))
+    assert not list(out_dir.glob(".paperconan-archive-*"))
+
+
+def test_later_download_error_rolls_back_earlier_accepted_output(
+    tmp_path, monkeypatch
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    old = out_dir / "old.csv"
+    old.write_bytes(b"old")
+    _write_sidecar(out_dir, ["old.csv"], doi="10.x/old")
+    original_sidecar = (
+        out_dir / _download.SOURCE_SIDECAR
+    ).read_bytes()
+
+    def source_download(url, dest, **kwargs):
+        if url.endswith("/second"):
+            raise RuntimeError("download interrupted")
+        Path(dest).write_bytes(b"first")
+        return {"ok": True, "path": dest, "size": 5}
+
+    cand = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [
+            {
+                "name": "first.csv",
+                "download_url": "https://x/first",
+            },
+            {
+                "name": "second.csv",
+                "download_url": "https://x/second",
+            },
+        ],
+    }
+    monkeypatch.setattr(_download, "download_file", source_download)
+
+    with pytest.raises(RuntimeError, match="download interrupted"):
+        _download.download_candidate(cand, str(out_dir))
+
+    assert old.read_bytes() == b"old"
+    assert not (out_dir / "first.csv").exists()
+    assert not (out_dir / "second.csv").exists()
+    assert (
+        out_dir / _download.SOURCE_SIDECAR
+    ).read_bytes() == original_sidecar
+    assert not list(out_dir.glob(".paperconan-output-rollback-*"))
+    assert not list(tmp_path.glob(".paperconan-output-rollback-*"))
 
 
 def _write_slightly_larger_previous_sidecar(
