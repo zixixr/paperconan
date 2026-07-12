@@ -60,11 +60,16 @@ def test_download_does_not_retry_on_403(tmp_path, monkeypatch):
 def test_extract_tabular_tar(tmp_path):
     import io, tarfile, os
     import paperconan.fetch._download as dl
-    # Build a small tar.gz with one xlsx-named member, one csv, one pdf (ignored)
+    # Build a small tar.gz with scanner-supported inputs and one ignored file.
     tar_path = tmp_path / "pkg.tar.gz"
     with tarfile.open(tar_path, "w:gz") as tf:
-        for name, body in [("PMC1/data1.xlsx", b"x"), ("PMC1/t.csv", b"a,b\n1,2\n"),
-                           ("PMC1/fig.pdf", b"%PDF")]:
+        for name, body in [
+            ("PMC1/data1.xlsx", b"x"),
+            ("PMC1/t.csv", b"a,b\n1,2\n"),
+            ("PMC1/fig.pdf", b"%PDF"),
+            ("PMC1/tables.docx", b"PK-fake-docx-bytes"),
+            ("PMC1/notes.txt", b"notes"),
+        ]:
             data = body
             info = tarfile.TarInfo(name)
             info.size = len(data)
@@ -73,7 +78,7 @@ def test_extract_tabular_tar(tmp_path):
     out.mkdir()
     extracted = dl._extract_tabular_tar(str(tar_path), str(out))
     names = sorted(os.path.basename(p) for p in extracted)
-    assert names == ["data1.xlsx", "t.csv"]      # pdf dropped, paths flattened
+    assert names == ["data1.xlsx", "fig.pdf", "t.csv", "tables.docx"]
     assert (out / "t.csv").read_bytes() == b"a,b\n1,2\n"
 
 

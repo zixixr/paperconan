@@ -1,14 +1,17 @@
 # src/paperconan/fetch/_cli.py
-"""`paperconan fetch` subcommand: search repositories for a paper's data and
-optionally download a chosen candidate's tabular files."""
+"""`paperconan fetch` subcommand: find and download scanner-supported inputs."""
 from __future__ import annotations
 import argparse
 import json
 import sys
 
+from paperconan._input import SUPPORTED_INPUT_EXTS
+
 from . import search_all
 from . import _resolve
 from ._download import download_candidate
+
+_SUPPORTED_INPUT_LABEL = "/".join(f".{ext}" for ext in SUPPORTED_INPUT_EXTS)
 
 
 def _print_table(cands):
@@ -29,12 +32,15 @@ def _print_table(cands):
         print(f"[{c['cand_id']}] {c['source']:8} tabular={ntab}/{c.get('all_files_count','?')} "
               f"{' '.join(flags):20} {c.get('title','')[:60]}")
         if ntab == 0:
-            print("    (no .xlsx/.csv/.tsv files in this dataset)")
+            print(
+                f"    (no scanner-supported inputs "
+                f"({_SUPPORTED_INPUT_LABEL}) in this dataset)"
+            )
 
 
 def fetch_main(argv):
     ap = argparse.ArgumentParser(prog="paperconan fetch",
-                                 description="Find/download a paper's tabular source data")
+                                 description="Find/download a paper's scanner-supported inputs")
     ap.add_argument("query", help="paper DOI or title")
     ap.add_argument("--json", action="store_true", help="print candidates as JSON (listing mode)")
     mode = ap.add_mutually_exclusive_group()
@@ -43,7 +49,11 @@ def fetch_main(argv):
     ap.add_argument("--out", default=None, help="output dir for downloads (--download/--auto only)")
     ap.add_argument("--force", action="store_true",
                     help="download even a candidate with no DOI/title match (--download)")
-    ap.add_argument("--all", action="store_true", help="download non-tabular files too")
+    ap.add_argument(
+        "--all",
+        action="store_true",
+        help="download files that are not scanner-supported inputs too",
+    )
     ap.add_argument("--per-source", type=int, default=5, help="max results per repository (default: 5)")
     args = ap.parse_args(argv)
 

@@ -6,12 +6,14 @@ from __future__ import annotations
 import re
 import urllib.parse as _urlparse
 
+from paperconan._input import is_supported_input
+
 from . import _http
-from ._files import TABULAR_EXTS, make_fileref
+from ._files import make_fileref
 
 
 def _candidate(source, cid, doi, title, authors, published, all_files, related):
-    tabular = [f for f in all_files if f["ext"] in TABULAR_EXTS]
+    tabular = [f for f in all_files if is_supported_input(f.get("name"))]
     return {"cand_id": f"{source}:{cid}", "source": source, "id": str(cid),
             "doi": doi, "title": title or "", "authors": authors or [],
             "published": published, "tabular_files": tabular,

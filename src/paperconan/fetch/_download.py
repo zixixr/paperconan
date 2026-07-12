@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 import zipfile
 
-from ._files import is_tabular
+from paperconan._input import is_supported_input
 
 # Provenance sidecar written next to downloads; read back by scan_dir to stamp scan.json.
 SOURCE_SIDECAR = "paperconan_source.json"
@@ -94,7 +94,7 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
 
 
 def _extract_tabular_zip(zip_bytes, out_dir, max_member_bytes=_DEFAULT_MAX):
-    """Extract only tabular members (.xlsx/.csv/.tsv) from a supplementary zip into
+    """Extract scanner-supported inputs from a supplementary zip into
     out_dir, flattening internal paths to the basename (no path traversal) and
     capping per-member size. Returns the list of extracted file paths."""
     extracted = []
@@ -106,7 +106,11 @@ def _extract_tabular_zip(zip_bytes, out_dir, max_member_bytes=_DEFAULT_MAX):
             if info.is_dir():
                 continue
             name = os.path.basename(info.filename)
-            if not name or not is_tabular(name) or info.file_size > max_member_bytes:
+            if (
+                not name
+                or not is_supported_input(name)
+                or info.file_size > max_member_bytes
+            ):
                 continue
             dest = os.path.join(out_dir, name)
             data = None
@@ -119,7 +123,7 @@ def _extract_tabular_zip(zip_bytes, out_dir, max_member_bytes=_DEFAULT_MAX):
 
 
 def _extract_tabular_tar(tar_path, out_dir, max_member_bytes=_DEFAULT_MAX):
-    """Extract only tabular members (.xlsx/.csv/.tsv) from a .tar.gz into out_dir,
+    """Extract scanner-supported inputs from a .tar.gz into out_dir,
     flattening internal paths to the basename and capping per-member size.
     Returns the list of extracted file paths."""
     extracted = []
@@ -131,7 +135,11 @@ def _extract_tabular_tar(tar_path, out_dir, max_member_bytes=_DEFAULT_MAX):
             if not member.isfile():
                 continue
             name = os.path.basename(member.name)
-            if not name or not is_tabular(name) or member.size > max_member_bytes:
+            if (
+                not name
+                or not is_supported_input(name)
+                or member.size > max_member_bytes
+            ):
                 continue
             src = tf.extractfile(member)
             if src is None:

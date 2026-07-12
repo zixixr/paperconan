@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 import posixpath
 from typing import TYPE_CHECKING, Any
 from xml.etree import ElementTree as ET
@@ -8,6 +9,29 @@ import zipfile
 
 if TYPE_CHECKING:
     from ._sheet import Sheet
+
+
+SUPPORTED_INPUT_EXTS = (
+    "xlsx", "xls", "xlsm", "xlsb",
+    "csv", "tsv", "pdf", "docx",
+)
+
+
+def ext_of(name):
+    return Path(name or "").suffix.lstrip(".").lower()
+
+
+def is_supported_input(name):
+    return ext_of(name) in SUPPORTED_INPUT_EXTS
+
+
+def discover_supported_inputs(in_dir):
+    root = Path(in_dir)
+    return sorted(
+        str(path)
+        for path in root.iterdir()
+        if path.is_file() and is_supported_input(path.name)
+    )
 
 
 _RESERVED_LIMITATION_KEYS = ("scope", "reason", "sheet")

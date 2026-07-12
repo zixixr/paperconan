@@ -28,7 +28,7 @@ def test_search_nature_esm_builds_confident_candidate(monkeypatch):
     assert c["source"] == "nature_esm"
     assert c["match_signals"] == {"doi_in_related": True}
     tab_exts = sorted(f["ext"] for f in c["tabular_files"])
-    assert tab_exts == ["csv", "xlsx"]                     # pdf is not tabular
+    assert tab_exts == ["csv", "pdf", "xlsx"]
 
 
 def test_search_nature_esm_non_doi_returns_empty():

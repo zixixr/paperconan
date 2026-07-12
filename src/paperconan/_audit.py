@@ -24,7 +24,6 @@ import argparse
 import csv as _csv
 import ctypes
 import datetime
-import glob
 import hashlib
 import json
 import math
@@ -41,7 +40,12 @@ import numpy as np
 from scipy import stats
 
 from ._coverage import ScanCoverage
-from ._input import InputLimitation, TableLoadResult, inspect_ooxml_formula_cache
+from ._input import (
+    InputLimitation,
+    TableLoadResult,
+    discover_supported_inputs,
+    inspect_ooxml_formula_cache,
+)
 from ._numeric import integer_shift_close, relation_close
 from ._profiles import apply_profile_to_findings, normalize_profile
 from ._sheet import Sheet, _MAX_EXACT_FLOAT_INT
@@ -3560,9 +3564,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     profile = normalize_profile(profile)
     if write_html:
         evidence = True
-    files = sorted({p for pat in ("*.xlsx", "*.xls", "*.xlsm", "*.xlsb",
-                                  "*.csv", "*.tsv", "*.pdf", "*.docx")
-                    for p in glob.glob(os.path.join(in_dir, pat))})
+    files = discover_supported_inputs(in_dir)
     if not files and not diagnostic_on_empty:
         raise PaperconanInputError(
             f"no .xlsx / .xls / .xlsm / .xlsb / .csv / .tsv / .pdf / .docx files in {in_dir}\n"
