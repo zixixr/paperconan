@@ -44,9 +44,24 @@ SDIST_GENERATED_METADATA = {
     "src/paperconan.egg-info/SOURCES.txt",
 }
 
+
+def _copied_source_build_command(dist):
+    return [
+        sys.executable,
+        "-m",
+        "build",
+        "--no-isolation",
+        "--sdist",
+        "--outdir",
+        str(dist),
+    ]
+
+
 EXPECTED_DEV_GROUP = [
     "pytest>=8",
     "build>=1.2",
+    "setuptools>=77",
+    "wheel",
     "pdfplumber>=0.11",
     "python-docx>=1.1",
     "xlwt>=1.3",
@@ -55,6 +70,8 @@ EXPECTED_DEV_GROUP = [
 EXPECTED_PIP_EXTRA = [
     "pytest>=8",
     "build>=1.2",
+    "setuptools>=77",
+    "wheel",
     "pdfplumber>=0.11",
     "python-docx>=1.1",
     "xlwt>=1.3",
@@ -65,7 +82,9 @@ EXPECTED_LOCK_PIP_EXTRA_DEPENDENCIES = [
     {"name": "pdfplumber"},
     {"name": "pytest"},
     {"name": "python-docx"},
+    {"name": "setuptools"},
     {"name": "tomli", "marker": "python_full_version < '3.11'"},
+    {"name": "wheel"},
     {"name": "xlwt"},
 ]
 EXPECTED_LOCK_DEV_DEPENDENCIES = [
@@ -73,7 +92,9 @@ EXPECTED_LOCK_DEV_DEPENDENCIES = [
     {"name": "pdfplumber"},
     {"name": "pytest"},
     {"name": "python-docx"},
+    {"name": "setuptools"},
     {"name": "tomli", "marker": "python_full_version < '3.11'"},
+    {"name": "wheel"},
     {"name": "xlwt"},
 ]
 EXPECTED_LOCK_DEV_METADATA = [
@@ -81,11 +102,13 @@ EXPECTED_LOCK_DEV_METADATA = [
     {"name": "pdfplumber", "specifier": ">=0.11"},
     {"name": "pytest", "specifier": ">=8"},
     {"name": "python-docx", "specifier": ">=1.1"},
+    {"name": "setuptools", "specifier": ">=77"},
     {
         "name": "tomli",
         "marker": "python_full_version < '3.11'",
         "specifier": ">=2",
     },
+    {"name": "wheel"},
     {"name": "xlwt", "specifier": ">=1.3"},
 ]
 EXPECTED_PYTHON_CLASSIFIERS = {
@@ -278,12 +301,21 @@ def _expected_lock_optional_metadata(extra):
             "specifier": ">=1.1",
         },
         {
+            "name": "setuptools",
+            "marker": f"extra == '{extra}'",
+            "specifier": ">=77",
+        },
+        {
             "name": "tomli",
             "marker": (
                 "python_full_version < '3.11' "
                 f"and extra == '{extra}'"
             ),
             "specifier": ">=2",
+        },
+        {
+            "name": "wheel",
+            "marker": f"extra == '{extra}'",
         },
         {
             "name": "xlwt",
@@ -1289,6 +1321,13 @@ def test_sdist_allowlist_matches_tracked_public_files():
     assert _sdist_allowlist() == tracked_public
 
 
+def test_copied_source_build_command_disables_isolation(tmp_path):
+    command = _copied_source_build_command(tmp_path / "dist")
+
+    assert command[:3] == [sys.executable, "-m", "build"]
+    assert "--no-isolation" in command
+
+
 def test_sdist_contains_test_and_skill_closure(tmp_path):
     dist = tmp_path / "dist"
     probes = [
@@ -1302,14 +1341,7 @@ def test_sdist_contains_test_and_skill_closure(tmp_path):
         for probe in probes:
             probe.write_text("local-only probe\n", encoding="utf-8")
         result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "build",
-                "--sdist",
-                "--outdir",
-                str(dist),
-            ],
+            _copied_source_build_command(dist),
             check=True,
             capture_output=True,
             cwd=ROOT,

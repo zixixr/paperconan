@@ -629,7 +629,9 @@ dev = [
     { name = "pdfplumber" },
     { name = "pytest" },
     { name = "python-docx" },
+    { name = "setuptools" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
+    { name = "wheel" },
     { name = "xlwt" },
 ]
 docx = [
@@ -646,7 +648,9 @@ test = [
     { name = "pdfplumber" },
     { name = "pytest" },
     { name = "python-docx" },
+    { name = "setuptools" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
+    { name = "wheel" },
     { name = "xlwt" },
 ]
 
@@ -656,7 +660,9 @@ dev = [
     { name = "pdfplumber" },
     { name = "pytest" },
     { name = "python-docx" },
+    { name = "setuptools" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
+    { name = "wheel" },
     { name = "xlwt" },
 ]
 
@@ -679,8 +685,12 @@ requires-dist = [
     { name = "python-docx", marker = "extra == 'docx'", specifier = ">=1.1" },
     { name = "python-docx", marker = "extra == 'test'", specifier = ">=1.1" },
     { name = "scipy", specifier = ">=1.10" },
+    { name = "setuptools", marker = "extra == 'dev'", specifier = ">=77" },
+    { name = "setuptools", marker = "extra == 'test'", specifier = ">=77" },
     { name = "tomli", marker = "python_full_version < '3.11' and extra == 'dev'", specifier = ">=2" },
     { name = "tomli", marker = "python_full_version < '3.11' and extra == 'test'", specifier = ">=2" },
+    { name = "wheel", marker = "extra == 'dev'" },
+    { name = "wheel", marker = "extra == 'test'" },
     { name = "xlwt", marker = "extra == 'dev'", specifier = ">=1.3" },
     { name = "xlwt", marker = "extra == 'test'", specifier = ">=1.3" },
 ]
@@ -692,7 +702,9 @@ dev = [
     { name = "pdfplumber", specifier = ">=0.11" },
     { name = "pytest", specifier = ">=8" },
     { name = "python-docx", specifier = ">=1.1" },
+    { name = "setuptools", specifier = ">=77" },
     { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2" },
+    { name = "wheel" },
     { name = "xlwt", specifier = ">=1.3" },
 ]
 
@@ -1149,6 +1161,15 @@ wheels = [
 ]
 
 [[package]]
+name = "setuptools"
+version = "83.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/34/26/f5d29e25ffdb535afef2d35cdb55b325298f96debd670da4c325e08d70f4/setuptools-83.0.0.tar.gz", hash = "sha256:025bccbbf0fa05b6192bc64ae1e7b16e001fd6d6d4d5de03c97b1c1ade523bef", size = 1154254, upload-time = "2026-07-04T15:31:22.699Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5d/40/e1e72872c6354b306daef1703549e8e83b4d43cfea356311bf722a043752/setuptools-83.0.0-py3-none-any.whl", hash = "sha256:29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3", size = 1008090, upload-time = "2026-07-04T15:31:20.885Z" },
+]
+
+[[package]]
 name = "tomli"
 version = "2.4.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1209,6 +1230,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/72/94/1a15dd82efb362ac84269196e94cf00f187f7ed21c242792a923cdb1c61f/typing_extensions-4.15.0.tar.gz", hash = "sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466", size = 109391, upload-time = "2025-08-25T13:49:26.313Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/18/67/36e9267722cc04a6b9f15c7f3441c2363321a3ea07da7ae0c0707beb2a9c/typing_extensions-4.15.0-py3-none-any.whl", hash = "sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548", size = 44614, upload-time = "2025-08-25T13:49:24.86Z" },
+]
+
+[[package]]
+name = "wheel"
+version = "0.47.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "packaging" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/39/62/75f18a0f03b4219c456652c7780e4d749b929eb605c098ce3a5b6b6bc081/wheel-0.47.0.tar.gz", hash = "sha256:cc72bd1009ba0cf63922e28f94d9d83b920aa2bb28f798a31d0691b02fa3c9b3", size = 63854, upload-time = "2026-04-22T15:51:27.727Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/87/1b/9e33c09813d65e248f7f773119148a612516a4bea93e9c6f545f78455b7c/wheel-0.47.0-py3-none-any.whl", hash = "sha256:212281cab4dff978f6cedd499cd893e1f620791ca6ff7107cf270781e587eced", size = 32218, upload-time = "2026-04-22T15:51:26.296Z" },
 ]
 
 [[package]]
