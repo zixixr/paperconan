@@ -4,6 +4,7 @@ import ast
 from collections import Counter
 import json
 from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import shlex
 import subprocess
@@ -166,6 +167,17 @@ SDIST_POST_TEST_STEP = """\
     - name: Publish summary
       run: echo "sdist verification complete"
 """
+SDIST_POST_TEST_COPY_OUT_STEP = """\
+    - name: Copy test result for upload
+      run: cp sdist-root/test-results.xml artifact/test-results.xml
+"""
+SDIST_POST_TEST_ARTIFACT_STEP = """\
+    - name: Upload test result
+      uses: actions/upload-artifact@v4
+      with:
+        name: sdist-test-result
+        path: artifact/test-results.xml
+"""
 EQUIVALENT_SDIST_JOB = (
     "sdist:\n"
     "  runs-on: ubuntu-latest\n"
@@ -178,6 +190,8 @@ EQUIVALENT_SDIST_JOB = (
     + SDIST_INSTALL_STEP
     + SDIST_TEST_STEP
     + SDIST_POST_TEST_STEP
+    + SDIST_POST_TEST_COPY_OUT_STEP
+    + SDIST_POST_TEST_ARTIFACT_STEP
 )
 
 
@@ -456,6 +470,57 @@ def _assert_safe_pretest_command(command):
     )
 
 
+def _targets_sdist_root(path, working_directory=None):
+    workspace_prefixes = (
+        "${{ github.workspace }}/",
+        "$GITHUB_WORKSPACE/",
+        "/github/workspace/",
+    )
+    for prefix in workspace_prefixes:
+        if path.startswith(prefix):
+            path = path[len(prefix):]
+            working_directory = None
+            break
+    path = posixpath.normpath(
+        posixpath.join(working_directory or ".", path)
+    )
+    return path == "sdist-root" or path.startswith("sdist-root/")
+
+
+def _assert_no_copy_into_sdist_root(command, working_directory=None):
+    for segment in re.split(r"\s*(?:;|&&|\|\|)\s*", command):
+        if not segment:
+            continue
+        tokens = _shell_tokens(segment)
+        if tokens[:1] == ["sudo"]:
+            tokens = tokens[1:]
+        if tokens[:1] not in (["cp"], ["rsync"]):
+            continue
+        assert len(tokens) >= 3
+        assert not _targets_sdist_root(tokens[-1], working_directory), (
+            "copy destination inside sdist-root"
+        )
+
+
+def _checkout_path(step):
+    config = step.get("with", {})
+    assert isinstance(config, dict)
+    return config.get("path")
+
+
+def _assert_safe_posttest_step(step):
+    if step.get("uses") == "actions/checkout@v4":
+        path = _checkout_path(step)
+        assert path is None or not _targets_sdist_root(path), (
+            "checkout destination inside sdist-root"
+        )
+    if "run" in step:
+        _assert_no_copy_into_sdist_root(
+            _normalize_shell(step["run"]),
+            step.get("working-directory"),
+        )
+
+
 def _sdist_run_operation(step):
     assert set(step) <= {"run", "working-directory"}
     command = _normalize_shell(step["run"])
@@ -528,6 +593,7 @@ def _assert_sdist_job_invariants(job):
 
     for index, step in enumerate(_workflow_steps(job)):
         if test_complete:
+            _assert_safe_posttest_step(step)
             continue
 
         action = step.get("uses")
@@ -535,7 +601,7 @@ def _assert_sdist_job_invariants(job):
             assert set(step) <= {"uses", "with"}
             config = step.get("with", {})
             if action == "actions/checkout@v4":
-                assert config.get("path") in (None, ".", "./")
+                assert _checkout_path(step) in (None, ".", "./")
                 operation = "checkout"
             elif action == "astral-sh/setup-uv@v6":
                 assert config.get("python-version") == "3.14"
@@ -1042,6 +1108,41 @@ def test_sdist_job_invariants_accept_equivalent_block_commands():
                 SDIST_INSTALL_STEP + SDIST_VENV_STEP,
             ),
         ),
+        (
+            "post-test copy into root",
+            _replace_sdist_job(
+                SDIST_TEST_STEP,
+                (
+                    SDIST_TEST_STEP
+                    + "    - name: Replace unpacked README\n"
+                    + "      run: cp README.md sdist-root/README.md\n"
+                ),
+            ),
+        ),
+        (
+            "post-test rsync into root",
+            _replace_sdist_job(
+                SDIST_TEST_STEP,
+                (
+                    SDIST_TEST_STEP
+                    + "    - name: Sync checkout file into root\n"
+                    + "      run: rsync README.md sdist-root/\n"
+                ),
+            ),
+        ),
+        (
+            "post-test checkout into root",
+            _replace_sdist_job(
+                SDIST_TEST_STEP,
+                (
+                    SDIST_TEST_STEP
+                    + "    - name: Checkout over unpacked root\n"
+                    + "      uses: actions/checkout@v4\n"
+                    + "      with:\n"
+                    + "        path: sdist-root\n"
+                ),
+            ),
+        ),
     ],
     ids=[
         "missing-checkout",
@@ -1063,6 +1164,9 @@ def test_sdist_job_invariants_accept_equivalent_block_commands():
         "wrong-pytest-interpreter",
         "unknown-pre-test-command",
         "operations-out-of-order",
+        "post-test-copy-into-root",
+        "post-test-rsync-into-root",
+        "post-test-checkout-into-root",
     ],
 )
 def test_sdist_job_invariants_reject_contract_mutations(case, job):
