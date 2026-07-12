@@ -19,6 +19,67 @@ _TOKEN_HEX = (
     "e4bcaae980a0",
     "e5ada6e69cafe4b88de7abaf",
 )
+_DETECTOR_COPY_HEX = (
+    "e68c87e7bab9",
+    "e7bc96e980a0",
+    "e980a0e695b0",
+    "e6898be694b9",
+    "e5a48de588b6",
+    "e9878de696b0e6b497e7898c",
+    "e58faae694b9e5898de5afbce695b0e5ad97",
+    "e58f8de59091",
+    "e5a3b0e7a7b0",
+    "e8afafe6a087",
+    "e99a8fe6898be58791e695b0",
+    "e4bcaae7b2bee7a1ae",
+    "e5a19ee8bf9b",
+    "e58585e5bd93",
+    "e68ea8e587bae58fa6e4b880e58897",
+    "e6b4bee7949fe5b08fe5b985e5baa6e689b0e58aa8",
+    "e4b998e4ba86206b20e5808de5908e",
+    "636f6c5f6220e794b120636f6c5f61",
+    "e69c80e5bcbae79a84e4bfa1e58fb7",
+    "e7a1aee5ae9ee69c89e6b4bee7949fe585b3e7b3bb",
+    "e78bace7ab8be5b08fe9bca0e4b88de58fafe883bde59ca8e5a49ae7bb84",
+    "e5a48de794a8e99381e8af81",
+    "e7a1ace4b88be7bb93e8aeba",
+    "e4bfa1e58fb7e69bb4e7a1ac",
+    "e695b0e68daee5a48de794a8",
+    "e69e81e5b091",
+    "e694b9e4b880e6a0bc",
+    "e4bd9ce88085e794a8",
+    "e4bd9ce88085e4bb8e",
+    "e593aae4b8aae69cabe4bd8de8a2abe5818fe59091e4ba86",
+    "e69cace5b0b1e5928ce6ba90e58897e4b8a5e6a0bce79bb8e585b3efbc8ce59088e79086",
+    "e5b19ee5b8b8e68081",
+    "e4b88de7ad89e4ba8e22e6b2a1e997aee9a29822",
+    "e9809ae5b8b8",
+    "e69cace69da5e5b0b1e78bace7ab8be6b58be9878f",
+    "e5a4a9e784b6",
+    "e588bbe6848fe68e92e999a4",
+    "e6bc82e4baae",
+    "e5818fe5a5bd",
+    "e58fb7e7a7b0",
+    "e694b9e4ba86e5b091e9878fe580bc",
+    "e69cace8afa5e78bace7ab8b",
+    "e69c80e69893e8afafe68aa5",
+    "e68aa4e6a08fe69c80e4b8a5",
+    "e59088e79086e79a84e585b1e4baabe5afb9e785a7e7bb84",
+    "e69c80e580bce5be97e8bfbd",
+    "e59088e6b395e5a48de794a8",
+    "e6ada3e5bd93e79086e794b1",
+    "e5b19ee9a284e69c9f",
+    "e79c9fe5ae9ee4ba92e8a1a5e585b3e7b3bb",
+    "e7a1aee69c89e4b8a5e6a0bce7babfe680a7e585b3e7b3bb",
+    "e5908ce4b880e4bbbde695b0e68daee5a49ae59bbee9878de7bb98e5b19ee9a284e69c9f",
+    "e58588e58699e6a682e695b0",
+    "e5a1abe4ba86e4b8a4e6aca1",
+    "e4bb8ee4b880e7bb84206261736520e695b0e68dae",
+)
+_DETECTOR_DOC_PATHS = (
+    "docs/detectors.md",
+    "skills/paperconan/references/detectors.md",
+)
 _TEXT_SUFFIXES = {
     ".py", ".md", ".toml", ".yml", ".yaml",
     ".json", ".html", ".sh", ".txt",
@@ -74,6 +135,13 @@ def _tokens():
     return [
         bytes.fromhex(value).decode("utf-8").casefold()
         for value in _TOKEN_HEX
+    ]
+
+
+def _detector_copy_fragments():
+    return [
+        bytes.fromhex(value).decode("utf-8").casefold()
+        for value in _DETECTOR_COPY_HEX
     ]
 
 
@@ -216,4 +284,26 @@ def test_reviewed_public_copy_is_neutral_and_precise():
     assert not missing, "\n".join(
         f"{path}:C{copy_id}"
         for path, copy_id in missing
+    )
+
+
+def test_detector_docs_use_observed_or_conditional_language():
+    hits = []
+    for relative in _DETECTOR_DOC_PATHS:
+        path = ROOT / relative
+        for line_number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(),
+            1,
+        ):
+            folded = line.casefold()
+            for copy_id, fragment in enumerate(
+                _detector_copy_fragments(),
+                1,
+            ):
+                if fragment in folded:
+                    hits.append((relative, line_number, copy_id))
+
+    assert not hits, "\n".join(
+        f"{path}:{line}:D{copy_id}"
+        for path, line, copy_id in hits
     )
