@@ -1075,6 +1075,125 @@ def _real_sidecar_size(tmp_path, cand, managed_files):
     return (probe / _download.SOURCE_SIDECAR).stat().st_size
 
 
+def _fail_final_sidecar_commit(monkeypatch):
+    replace = _download.os.replace
+    failures = []
+
+    def fail_sidecar_replace(src, dest):
+        if Path(dest).name == _download.SOURCE_SIDECAR:
+            failures.append(dest)
+            raise OSError("sidecar commit failed")
+        return replace(src, dest)
+
+    monkeypatch.setattr(_download.os, "replace", fail_sidecar_replace)
+    return failures
+
+
+def _write_slightly_larger_previous_sidecar(
+    out_dir, final_sidecar_size, max_shrink
+):
+    for title_size in range(1000):
+        old_cand = {
+            "cand_id": "old",
+            "source": "source",
+            "title": "x" * title_size,
+            "tabular_files": [],
+        }
+        payload = _download._source_sidecar_bytes(
+            old_cand, str(out_dir), ["old.csv"]
+        )
+        shrink = len(payload) - final_sidecar_size
+        if 0 < shrink <= max_shrink:
+            assert _download._write_source_sidecar(
+                old_cand, str(out_dir), ["old.csv"]
+            )
+            return payload
+    raise AssertionError("could not construct bounded sidecar shrink")
+
+
+def test_direct_shrink_credit_rolls_back_on_sidecar_commit_failure(
+    tmp_path, monkeypatch
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    old = out_dir / "old.csv"
+    old.write_bytes(b"old")
+    sidecar = out_dir / _download.SOURCE_SIDECAR
+    payload = b"new-data"
+    cand = _candidate("new.csv", "https://x/new")
+    final_sidecar_size = _real_sidecar_size(
+        tmp_path, cand, ["new.csv", "old.csv"]
+    )
+    original_sidecar = _write_slightly_larger_previous_sidecar(
+        out_dir, final_sidecar_size, len(payload)
+    )
+    cap = len(b"old") + len(payload) + final_sidecar_size
+    assert _download._dir_size(out_dir) <= cap
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", cap)
+    calls = []
+    _bounded_download_stub(
+        monkeypatch, {"https://x/new": payload}, calls
+    )
+    failures = _fail_final_sidecar_commit(monkeypatch)
+
+    result = _download.download_candidate(cand, str(out_dir))
+
+    assert calls == [("https://x/new", len(payload))]
+    assert len(failures) == 1
+    assert result["downloaded"] == []
+    assert old.read_bytes() == b"old"
+    assert not (out_dir / "new.csv").exists()
+    assert sidecar.read_bytes() == original_sidecar
+    assert _download._dir_size(out_dir) <= cap
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+def test_archive_shrink_credit_rolls_back_on_sidecar_commit_failure(
+    tmp_path, monkeypatch, archive_kind
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    old = out_dir / "old.csv"
+    old.write_bytes(b"old")
+    sidecar = out_dir / _download.SOURCE_SIDECAR
+    member_body = b"new-data"
+    payload = _archive_payload(
+        archive_kind, [("nested/new.csv", member_body)]
+    )
+
+    def archive_download(url, dest, **kwargs):
+        Path(dest).write_bytes(payload)
+        return {"ok": True, "path": dest, "size": len(payload)}
+
+    cand = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+        **_archive_fields(archive_kind),
+    }
+    final_sidecar_size = _real_sidecar_size(
+        tmp_path, cand, ["new.csv", "old.csv"]
+    )
+    original_sidecar = _write_slightly_larger_previous_sidecar(
+        out_dir, final_sidecar_size, len(member_body)
+    )
+    cap = len(b"old") + len(member_body) + final_sidecar_size
+    assert _download._dir_size(out_dir) <= cap
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", cap)
+    monkeypatch.setattr(_download, "download_file", archive_download)
+    failures = _fail_final_sidecar_commit(monkeypatch)
+
+    result = _download.download_candidate(cand, str(out_dir))
+
+    assert len(failures) == 1
+    assert result["downloaded"] == []
+    assert old.read_bytes() == b"old"
+    assert not (out_dir / "new.csv").exists()
+    assert sidecar.read_bytes() == original_sidecar
+    assert _download._dir_size(out_dir) <= cap
+    assert not list(out_dir.glob(".paperconan-archive-*"))
+
+
 def test_direct_download_accepts_exact_fit_then_stops_at_paper_cap(
     tmp_path, monkeypatch
 ):

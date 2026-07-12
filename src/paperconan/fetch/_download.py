@@ -117,6 +117,75 @@ def _remaining_final_size_allowance(
     )
 
 
+class _SidecarShrinkRollback:
+    def __init__(self, out_dir):
+        self._parent = os.path.dirname(os.path.abspath(out_dir))
+        self._backup_dir = None
+        self._entries = {}
+
+    def prepare(self, dest_path):
+        dest_path = os.path.abspath(dest_path)
+        if dest_path in self._entries:
+            return
+        backup_path = None
+        if os.path.lexists(dest_path):
+            if self._backup_dir is None:
+                self._backup_dir = tempfile.mkdtemp(
+                    prefix=".paperconan-output-rollback-",
+                    dir=self._parent,
+                )
+            backup_path = os.path.join(
+                self._backup_dir, str(len(self._entries))
+            )
+            os.replace(dest_path, backup_path)
+        self._entries[dest_path] = backup_path
+
+    def restore(self, dest_path):
+        dest_path = os.path.abspath(dest_path)
+        if dest_path not in self._entries:
+            return
+        backup_path = self._entries.pop(dest_path)
+        if backup_path is None:
+            try:
+                os.remove(dest_path)
+            except FileNotFoundError:
+                pass
+        else:
+            os.replace(backup_path, dest_path)
+        self._cleanup_backup_dir()
+
+    def discard(self, dest_path):
+        dest_path = os.path.abspath(dest_path)
+        if dest_path not in self._entries:
+            return
+        backup_path = self._entries.pop(dest_path)
+        if backup_path is not None:
+            try:
+                os.remove(backup_path)
+            except FileNotFoundError:
+                pass
+        self._cleanup_backup_dir()
+
+    def rollback(self):
+        paths = set(self._entries)
+        for dest_path in reversed(tuple(self._entries)):
+            self.restore(dest_path)
+        return paths
+
+    def commit(self):
+        for dest_path in tuple(self._entries):
+            self.discard(dest_path)
+
+    def _cleanup_backup_dir(self):
+        if self._entries or self._backup_dir is None:
+            return
+        try:
+            os.rmdir(self._backup_dir)
+        except FileNotFoundError:
+            pass
+        self._backup_dir = None
+
+
 def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
                   retries=3, backoff=2.0):
     """Download to disk with redirects, size cap, HTML sniffing, and retry/backoff.
@@ -391,6 +460,7 @@ def _extract_archive_members(
     transient_paths=(),
     sidecar_delta_for_names=None,
     cap_state=None,
+    shrink_rollback=None,
 ):
     extracted = []
     preserved = set()
@@ -422,10 +492,12 @@ def _extract_archive_members(
                 sidecar_delta,
             )
         )
+        uncredited_remaining = remaining + min(sidecar_delta, 0)
         write_limit = min(max_member_bytes, remaining)
+        declared_size = member_size(member)
         if (
             write_limit <= 0
-            or member_size(member) > write_limit
+            or declared_size > write_limit
         ):
             if (
                 cap_state is not None
@@ -435,6 +507,13 @@ def _extract_archive_members(
             if reuses_old and os.path.lexists(dest):
                 preserved.add(name)
             continue
+        depends_on_shrink = (
+            shrink_rollback is not None
+            and sidecar_delta < 0
+            and declared_size > uncredited_remaining
+        )
+        if depends_on_shrink:
+            shrink_rollback.prepare(dest)
         committed = False
         try:
             src = open_member(member)
@@ -446,6 +525,8 @@ def _extract_archive_members(
                 )
                 committed = True
         except _SizeLimitExceeded:
+            if depends_on_shrink:
+                shrink_rollback.restore(dest)
             if reuses_old and os.path.lexists(dest):
                 preserved.add(name)
             continue
@@ -462,6 +543,8 @@ def _extract_archive_members(
                     ),
                 })
                 continue
+            if depends_on_shrink:
+                shrink_rollback.restore(dest)
             if reuses_old and os.path.lexists(dest):
                 preserved.add(name)
             skipped.append({
@@ -502,6 +585,7 @@ def _extract_tabular_zip_managed(
     reusable_names,
     sidecar_delta_for_names=None,
     cap_state=None,
+    shrink_rollback=None,
 ):
     with zipfile.ZipFile(zip_path) as zf:
         infos = [
@@ -525,6 +609,7 @@ def _extract_tabular_zip_managed(
             transient_paths=(zip_path,),
             sidecar_delta_for_names=sidecar_delta_for_names,
             cap_state=cap_state,
+            shrink_rollback=shrink_rollback,
         )
 
 
@@ -555,6 +640,7 @@ def _extract_tabular_tar_managed(
     reusable_names,
     sidecar_delta_for_names=None,
     cap_state=None,
+    shrink_rollback=None,
 ):
     with tarfile.open(tar_path, "r:gz") as tf:
         members = [
@@ -577,6 +663,7 @@ def _extract_tabular_tar_managed(
             transient_paths=(tar_path,),
             sidecar_delta_for_names=sidecar_delta_for_names,
             cap_state=cap_state,
+            shrink_rollback=shrink_rollback,
         )
 
 
@@ -600,6 +687,7 @@ def _download_oa_package(
     reusable_names=(),
     sidecar_delta_for_names=None,
     cap_state=None,
+    shrink_rollback=None,
 ):
     """Download the static PMC OA tar.gz, extract its tabular members, drop the tarball."""
     tmp = _temporary_archive_path(out_dir, ".tar.gz")
@@ -620,6 +708,7 @@ def _download_oa_package(
                     reusable_names=reusable_names,
                     sidecar_delta_for_names=sidecar_delta_for_names,
                     cap_state=cap_state,
+                    shrink_rollback=shrink_rollback,
                 )
             )
             skipped.extend(member_skipped)
@@ -642,7 +731,8 @@ def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_byte
                                     archive_max=_ARCHIVE_MAX, *,
                                     reusable_names=(),
                                     sidecar_delta_for_names=None,
-                                    cap_state=None):
+                                    cap_state=None,
+                                    shrink_rollback=None):
     """Fetch a supplementary zip (Europe PMC), extract its tabular members, drop the zip.
 
     The archive downloads with the larger ``archive_max`` cap; each extracted table is
@@ -665,6 +755,7 @@ def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_byte
                     reusable_names=reusable_names,
                     sidecar_delta_for_names=sidecar_delta_for_names,
                     cap_state=cap_state,
+                    shrink_rollback=shrink_rollback,
                 )
             )
             skipped.extend(member_skipped)
@@ -763,6 +854,7 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
     new_managed = set()
     preserved_managed = set()
     cap_state = {"exceeded": False}
+    shrink_rollback = _SidecarShrinkRollback(out_dir)
     for file_ref in files:
         requested_name = str(file_ref.get("name") or "").strip()
         source_url = str(file_ref.get("download_url") or "")
@@ -790,6 +882,7 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
             reuses_old,
             sidecar_delta,
         )
+        uncredited_remaining = remaining + min(sidecar_delta, 0)
         download_limit = min(max_bytes, remaining)
         if download_limit <= 0:
             cap_state["exceeded"] = True
@@ -800,15 +893,37 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
             if reuses_old:
                 preserved_managed.add(output_name)
             continue
-        res = download_file(
-            source_url,
-            dest,
-            max_bytes=download_limit,
+        may_depend_on_shrink = (
+            sidecar_delta < 0
+            and download_limit > uncredited_remaining
         )
+        if may_depend_on_shrink:
+            shrink_rollback.prepare(dest)
+        try:
+            res = download_file(
+                source_url,
+                dest,
+                max_bytes=download_limit,
+            )
+        except BaseException:
+            if may_depend_on_shrink:
+                shrink_rollback.restore(dest)
+            raise
         if res.get("ok"):
+            try:
+                accepted_size = os.path.getsize(res["path"])
+            except (KeyError, OSError, TypeError):
+                accepted_size = 0
+            if (
+                may_depend_on_shrink
+                and accepted_size <= uncredited_remaining
+            ):
+                shrink_rollback.discard(dest)
             downloaded.append(res["path"])
             new_managed.add(output_name)
         else:
+            if may_depend_on_shrink:
+                shrink_rollback.restore(dest)
             if (
                 remaining < max_bytes
                 and "exceeds max_bytes"
@@ -842,6 +957,7 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
             reusable_names=reusable_names,
             sidecar_delta_for_names=archive_sidecar_delta,
             cap_state=cap_state,
+            shrink_rollback=shrink_rollback,
         )
         preserved_managed.update(archive_preserved)
         if not archive_ok:
@@ -870,6 +986,7 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
             reusable_names=reusable_names,
             sidecar_delta_for_names=archive_sidecar_delta,
             cap_state=cap_state,
+            shrink_rollback=shrink_rollback,
         )
         preserved_managed.update(archive_preserved)
         if not archive_ok:
@@ -890,11 +1007,13 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
     sidecar_fits = (
         _dir_size(out_dir) + sidecar_delta <= _MAX_PAPER_BYTES
     )
-    if (
+    sidecar_committed = (
         not preserve_previous_refresh
         and sidecar_fits
         and _write_source_sidecar(cand, out_dir, committed_managed)
-    ):
+    )
+    if sidecar_committed:
+        shrink_rollback.commit()
         failed_removals = set(
             _remove_managed_files(out_dir, stale_managed)
         )
@@ -906,5 +1025,12 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
         final_managed = managed_files | failed_removals
         if final_managed != committed_managed:
             _write_source_sidecar(cand, out_dir, final_managed)
+    else:
+        rolled_back = shrink_rollback.rollback()
+        if rolled_back:
+            downloaded[:] = [
+                path for path in downloaded
+                if os.path.abspath(path) not in rolled_back
+            ]
     return {"cand_id": cand.get("cand_id"), "out_dir": out_dir,
             "downloaded": downloaded, "skipped": skipped}
