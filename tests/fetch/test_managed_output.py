@@ -29,6 +29,16 @@ def _write_sidecar(out_dir, managed_files, **extra):
     )
 
 
+def _is_tool_reserved_name(name):
+    folded = Path(name).name.casefold()
+    sidecar = _download.SOURCE_SIDECAR.casefold()
+    return (
+        folded == sidecar
+        or folded.startswith(".paperconan-archive-")
+        or folded.startswith(f".{sidecar}.")
+    )
+
+
 def test_second_fetch_removes_only_previous_managed_files(
     tmp_path, monkeypatch
 ):
@@ -379,6 +389,111 @@ def test_sidecar_commit_failure_does_not_prune_old_managed_files(
     assert not list(tmp_path.glob(f".{_download.SOURCE_SIDECAR}.*.part"))
 
 
+def test_cleanup_failure_keeps_residual_file_owned_and_reports_it(
+    tmp_path, monkeypatch
+):
+    old = tmp_path / "old.csv"
+    old.write_bytes(b"old-complete")
+    _write_sidecar(tmp_path, ["old.csv"], doi="10.x/old")
+
+    def stub_download(url, dest, **kwargs):
+        Path(dest).write_bytes(b"new-complete")
+        return {"ok": True, "path": dest}
+
+    remove = _download.os.remove
+
+    def fail_old_remove(path):
+        if Path(path).name == "old.csv":
+            raise OSError("cleanup blocked")
+        return remove(path)
+
+    monkeypatch.setattr(_download, "download_file", stub_download)
+    monkeypatch.setattr(_download.os, "remove", fail_old_remove)
+    result = _download.download_candidate(
+        _candidate("new.csv", "https://x/new.csv"),
+        str(tmp_path),
+    )
+
+    new = tmp_path / "new.csv"
+    assert new.read_bytes() == b"new-complete"
+    assert old.read_bytes() == b"old-complete"
+    assert result["downloaded"] == [str(new)]
+    assert result["skipped"] == [{
+        "name": "old.csv",
+        "reason": "could not remove managed file",
+    }]
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    assert sidecar.exists()
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == {
+        "cand_id": "source:1",
+        "doi": None,
+        "managed_files": ["new.csv", "old.csv"],
+        "related_dois": [],
+        "source": "source",
+        "title": None,
+    }
+
+
+def test_narrowing_commit_failure_keeps_broad_manifest_ownership(
+    tmp_path, monkeypatch
+):
+    removed = tmp_path / "removed.csv"
+    residual = tmp_path / "residual.csv"
+    removed.write_bytes(b"remove-me")
+    residual.write_bytes(b"keep-owned")
+    _write_sidecar(
+        tmp_path,
+        ["removed.csv", "residual.csv"],
+        doi="10.x/old",
+    )
+
+    def stub_download(url, dest, **kwargs):
+        Path(dest).write_bytes(b"new-complete")
+        return {"ok": True, "path": dest}
+
+    remove = _download.os.remove
+
+    def fail_residual_remove(path):
+        if Path(path).name == "residual.csv":
+            raise OSError("cleanup blocked")
+        return remove(path)
+
+    replace = _download.os.replace
+    sidecar_replaces = 0
+
+    def fail_narrowing_replace(src, dest):
+        nonlocal sidecar_replaces
+        if Path(dest).name == _download.SOURCE_SIDECAR:
+            sidecar_replaces += 1
+            if sidecar_replaces == 2:
+                raise OSError("narrowing commit failed")
+        return replace(src, dest)
+
+    monkeypatch.setattr(_download, "download_file", stub_download)
+    monkeypatch.setattr(_download.os, "remove", fail_residual_remove)
+    monkeypatch.setattr(_download.os, "replace", fail_narrowing_replace)
+    result = _download.download_candidate(
+        _candidate("new.csv", "https://x/new.csv"),
+        str(tmp_path),
+    )
+
+    new = tmp_path / "new.csv"
+    assert new.read_bytes() == b"new-complete"
+    assert not removed.exists()
+    assert residual.read_bytes() == b"keep-owned"
+    assert result["downloaded"] == [str(new)]
+    assert result["skipped"] == [{
+        "name": "residual.csv",
+        "reason": "could not remove managed file",
+    }]
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    assert sidecar.exists()
+    assert json.loads(sidecar.read_text(encoding="utf-8"))[
+        "managed_files"
+    ] == ["new.csv", "removed.csv", "residual.csv"]
+    assert not list(tmp_path.glob(f".{_download.SOURCE_SIDECAR}.*.part"))
+
+
 def test_unmanaged_direct_target_is_preserved(tmp_path, monkeypatch):
     user = tmp_path / "table.csv"
     user.write_text("user", encoding="utf-8")
@@ -421,6 +536,153 @@ def test_unsafe_direct_basename_uses_download_fallback(
 
     assert result["downloaded"] == [str(tmp_path / "download")]
     assert (tmp_path / "download").read_text(encoding="utf-8") == "managed"
+
+
+@pytest.mark.parametrize(
+    "reserved_name",
+    [
+        "paperconan_source.json",
+        "PAPERCONAN_SOURCE.JSON",
+        ".paperconan-archive-user.csv",
+        ".PAPERCONAN-ARCHIVE-user.CSV",
+        ".paperconan_source.json.user.part",
+        ".PAPERCONAN_SOURCE.JSON.user.PART",
+    ],
+)
+def test_reserved_direct_name_uses_safe_destination_and_keeps_metadata(
+    tmp_path, monkeypatch, reserved_name
+):
+    source_bytes = b"source-complete"
+
+    def stub_download(url, dest, **kwargs):
+        Path(dest).write_bytes(source_bytes)
+        return {"ok": True, "path": dest}
+
+    monkeypatch.setattr(_download, "download_file", stub_download)
+    result = _download.download_candidate(
+        _candidate(reserved_name, "https://x/source"),
+        str(tmp_path),
+    )
+
+    assert result["skipped"] == []
+    assert len(result["downloaded"]) == 1
+    downloaded = Path(result["downloaded"][0])
+    assert not _is_tool_reserved_name(downloaded.name)
+    assert downloaded.read_bytes() == source_bytes
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    assert sidecar.exists()
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert payload["cand_id"] == "source:1"
+    assert payload["managed_files"] == [downloaded.name]
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+@pytest.mark.parametrize(
+    "reserved_name",
+    [
+        "paperconan_source.json",
+        "PAPERCONAN_SOURCE.JSON",
+        ".paperconan-archive-member.csv",
+        ".PAPERCONAN-ARCHIVE-member.CSV",
+        ".paperconan_source.json.member.csv",
+        ".PAPERCONAN_SOURCE.JSON.member.CSV",
+    ],
+)
+def test_reserved_archive_member_uses_safe_destination_and_keeps_metadata(
+    tmp_path, monkeypatch, archive_kind, reserved_name
+):
+    source_bytes = b"source-complete"
+    buffer = io.BytesIO()
+    if archive_kind == "zip":
+        with zipfile.ZipFile(buffer, "w") as zf:
+            zf.writestr(f"nested/{reserved_name}", source_bytes)
+        archive_fields = {
+            "supplementary_archive": {
+                "name": "supp.zip",
+                "url": "https://x/supp.zip",
+            },
+        }
+    else:
+        with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
+            info = tarfile.TarInfo(f"nested/{reserved_name}")
+            info.size = len(source_bytes)
+            tf.addfile(info, io.BytesIO(source_bytes))
+        archive_fields = {
+            "oa_package": {
+                "name": "supp.tar.gz",
+                "url": "https://x/supp.tar.gz",
+            },
+        }
+    payload = buffer.getvalue()
+
+    def archive_download(url, dest, **kwargs):
+        Path(dest).write_bytes(payload)
+        return {"ok": True, "path": dest}
+
+    monkeypatch.setattr(_download, "download_file", archive_download)
+    monkeypatch.setattr(
+        _download, "is_supported_input", lambda name: True
+    )
+    result = _download.download_candidate({
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+        **archive_fields,
+    }, str(tmp_path))
+
+    assert result["skipped"] == []
+    assert len(result["downloaded"]) == 1
+    downloaded = Path(result["downloaded"][0])
+    assert not _is_tool_reserved_name(downloaded.name)
+    assert downloaded.read_bytes() == source_bytes
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    assert sidecar.exists()
+    sidecar_payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert sidecar_payload["cand_id"] == "source:1"
+    assert sidecar_payload["managed_files"] == [downloaded.name]
+    assert not list(tmp_path.glob(".paperconan-archive-*"))
+
+
+def test_malicious_manifest_reserved_names_are_not_owned_or_removed(
+    tmp_path,
+):
+    archive_temp = tmp_path / ".PAPERCONAN-ARCHIVE-user.csv"
+    sidecar_temp = (
+        tmp_path / ".PAPERCONAN_SOURCE.JSON.user.PART"
+    )
+    safe = tmp_path / "safe.csv"
+    archive_temp.write_bytes(b"user-archive")
+    sidecar_temp.write_bytes(b"user-sidecar-temp")
+    safe.write_bytes(b"managed")
+    managed_files = [
+        "paperconan_source.json",
+        "PAPERCONAN_SOURCE.JSON",
+        archive_temp.name,
+        ".paperconan-archive-other.csv",
+        sidecar_temp.name,
+        ".paperconan_source.json.other.part",
+        safe.name,
+    ]
+    _write_sidecar(
+        tmp_path,
+        managed_files,
+        doi="10.x/example",
+    )
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    original_sidecar = sidecar.read_bytes()
+
+    assert _download._read_source_sidecar(str(tmp_path)) == {
+        "doi": "10.x/example",
+        "managed_files": ["safe.csv"],
+    }
+    assert _download._remove_managed_files(
+        str(tmp_path), managed_files
+    ) == []
+
+    assert sidecar.read_bytes() == original_sidecar
+    assert archive_temp.read_bytes() == b"user-archive"
+    assert sidecar_temp.read_bytes() == b"user-sidecar-temp"
+    assert not safe.exists()
 
 
 def test_unmanaged_archive_target_is_preserved(tmp_path):
@@ -530,3 +792,124 @@ def test_archive_package_temporary_never_uses_candidate_basename(
     assert len(seen_destinations) == 1
     assert seen_destinations[0] != user
     assert not seen_destinations[0].exists()
+
+
+def test_zip_partial_member_failure_keeps_success_and_reused_owner(
+    tmp_path, monkeypatch
+):
+    old = tmp_path / "old.csv"
+    old.write_bytes(b"old-complete")
+    _write_sidecar(tmp_path, ["old.csv"], doi="10.x/old")
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        zf.writestr("new.csv", b"new-complete")
+        zf.writestr("old.csv", b"replacement")
+    payload = buffer.getvalue()
+
+    def archive_download(url, dest, **kwargs):
+        Path(dest).write_bytes(payload)
+        return {"ok": True, "path": dest}
+
+    atomic_stream_write = _download._atomic_stream_write
+
+    def fail_old_member(src, dest, max_bytes):
+        if Path(dest).name == "old.csv":
+            raise OSError("member write failed")
+        return atomic_stream_write(src, dest, max_bytes)
+
+    monkeypatch.setattr(_download, "download_file", archive_download)
+    monkeypatch.setattr(
+        _download, "_atomic_stream_write", fail_old_member
+    )
+    result = _download.download_candidate({
+        "cand_id": "source:1",
+        "doi": "10.x/new",
+        "tabular_files": [],
+        "supplementary_archive": {
+            "name": "supp.zip",
+            "url": "https://x/supp.zip",
+        },
+    }, str(tmp_path))
+
+    new = tmp_path / "new.csv"
+    assert new.read_bytes() == b"new-complete"
+    assert old.read_bytes() == b"old-complete"
+    assert result["downloaded"] == [str(new)]
+    assert result["skipped"] == [{
+        "name": "old.csv",
+        "reason": "archive member failed: member write failed",
+    }]
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    assert sidecar.exists()
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == {
+        "cand_id": "source:1",
+        "doi": "10.x/new",
+        "managed_files": ["new.csv", "old.csv"],
+        "related_dois": [],
+        "source": None,
+        "title": None,
+    }
+    assert not list(tmp_path.glob(".paperconan-archive-*"))
+
+
+def test_tar_partial_member_failure_keeps_success_and_reused_owner(
+    tmp_path, monkeypatch
+):
+    old = tmp_path / "old.csv"
+    old.write_bytes(b"old-complete")
+    _write_sidecar(tmp_path, ["old.csv"], doi="10.x/old")
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
+        for name, body in (
+            ("new.csv", b"new-complete"),
+            ("old.csv", b"replacement"),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(body)
+            tf.addfile(info, io.BytesIO(body))
+    payload = buffer.getvalue()
+
+    def archive_download(url, dest, **kwargs):
+        Path(dest).write_bytes(payload)
+        return {"ok": True, "path": dest}
+
+    atomic_stream_write = _download._atomic_stream_write
+
+    def fail_old_member(src, dest, max_bytes):
+        if Path(dest).name == "old.csv":
+            raise OSError("member write failed")
+        return atomic_stream_write(src, dest, max_bytes)
+
+    monkeypatch.setattr(_download, "download_file", archive_download)
+    monkeypatch.setattr(
+        _download, "_atomic_stream_write", fail_old_member
+    )
+    result = _download.download_candidate({
+        "cand_id": "source:1",
+        "doi": "10.x/new",
+        "tabular_files": [],
+        "oa_package": {
+            "name": "supp.tar.gz",
+            "url": "https://x/supp.tar.gz",
+        },
+    }, str(tmp_path))
+
+    new = tmp_path / "new.csv"
+    assert new.read_bytes() == b"new-complete"
+    assert old.read_bytes() == b"old-complete"
+    assert result["downloaded"] == [str(new)]
+    assert result["skipped"] == [{
+        "name": "old.csv",
+        "reason": "archive member failed: member write failed",
+    }]
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    assert sidecar.exists()
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == {
+        "cand_id": "source:1",
+        "doi": "10.x/new",
+        "managed_files": ["new.csv", "old.csv"],
+        "related_dois": [],
+        "source": None,
+        "title": None,
+    }
+    assert not list(tmp_path.glob(".paperconan-archive-*"))
