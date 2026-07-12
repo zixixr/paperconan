@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any
 from xml.etree import ElementTree as ET
 import zipfile
 
+from .schema import PaperconanInputError
+
 if TYPE_CHECKING:
     from ._sheet import Sheet
 
@@ -27,11 +29,24 @@ def is_supported_input(name):
 
 def discover_supported_inputs(in_dir):
     root = Path(in_dir)
-    return sorted(
-        str(path)
-        for path in root.iterdir()
-        if path.is_file() and is_supported_input(path.name)
-    )
+    if not root.exists():
+        raise PaperconanInputError(
+            f"input directory does not exist: {root}"
+        )
+    if not root.is_dir():
+        raise PaperconanInputError(
+            f"input path is not a directory: {root}"
+        )
+    try:
+        return sorted(
+            str(path)
+            for path in root.iterdir()
+            if path.is_file() and is_supported_input(path.name)
+        )
+    except OSError as exc:
+        raise PaperconanInputError(
+            f"could not enumerate input directory {root}: {exc}"
+        ) from exc
 
 
 _RESERVED_LIMITATION_KEYS = ("scope", "reason", "sheet")

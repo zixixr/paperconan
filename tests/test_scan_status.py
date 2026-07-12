@@ -2,6 +2,8 @@ import json
 import subprocess
 import sys
 
+import pytest
+
 from paperconan._audit import scan_dir
 
 
@@ -178,6 +180,33 @@ def test_cli_empty_input_writes_failed_scan_then_returns_nonzero(tmp_path):
     scan = json.loads((data / "audit" / "scan.json").read_text())
     assert scan["scan_status"] == "failed"
     assert scan["coverage"]["files_discovered"] == 0
+
+
+@pytest.mark.parametrize(
+    ("path_kind", "diagnostic"),
+    [
+        ("missing", "input directory does not exist"),
+        ("file", "input path is not a directory"),
+    ],
+)
+def test_cli_invalid_input_path_reports_domain_error_without_traceback(
+    tmp_path, path_kind, diagnostic
+):
+    path = tmp_path / path_kind
+    if path_kind == "file":
+        path.write_text("value\n1\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "paperconan", str(path), "--no-html"],
+        text=True,
+        capture_output=True,
+    )
+
+    assert proc.returncode != 0
+    assert diagnostic in proc.stderr
+    assert str(path) in proc.stderr
+    assert "Traceback" not in proc.stderr
+    assert "Traceback" not in proc.stdout
 
 
 def test_cli_help_uses_neutral_signal_language():

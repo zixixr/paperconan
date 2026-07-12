@@ -16,7 +16,7 @@ VALID_PROFILES: tuple[Profile, ...] = ("review", "forensic", "triage")
 
 
 class PaperconanInputError(ValueError):
-    """Raised when the input directory has no supported tabular files."""
+    """Raised when the input path cannot supply supported tabular files."""
 
 
 class Finding(TypedDict, total=False):
@@ -26,4 +26,3 @@ class Finding(TypedDict, total=False):
     profile_action: ProfileAction
     false_positive_context: list[str]
     likely_benign: str
-

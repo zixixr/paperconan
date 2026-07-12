@@ -30,6 +30,18 @@ def test_scan_dir_empty_input_raises_library_error(tmp_path):
         scan_dir(str(tmp_path), str(tmp_path / "out"), write_html=False)
 
 
+@pytest.mark.parametrize("path_kind", ["missing", "file"])
+def test_scan_dir_invalid_path_raises_library_input_error(
+    tmp_path, path_kind
+):
+    path = tmp_path / path_kind
+    if path_kind == "file":
+        path.write_text("value\n1\n", encoding="utf-8")
+
+    with pytest.raises(PaperconanInputError):
+        scan_dir(str(path), str(tmp_path / "out"), write_html=False)
+
+
 def test_review_profile_demotes_boundary_value_duplication(tmp_path):
     data = tmp_path / "d"
     data.mkdir()

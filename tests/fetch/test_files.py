@@ -1,6 +1,11 @@
+from pathlib import Path
+
+import pytest
+
 from paperconan import _input
 from paperconan._input import SUPPORTED_INPUT_EXTS
 from paperconan.fetch import _files
+from paperconan.schema import PaperconanInputError
 
 
 def test_ext_of_lowercases_and_strips_dot():
@@ -34,6 +39,47 @@ def test_discover_supported_inputs_is_sorted_and_case_insensitive(tmp_path):
         str(tmp_path / "a.xlsx"),
         str(tmp_path / "z.PDF"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("path_kind", "message"),
+    [
+        ("missing", "input directory does not exist"),
+        ("file", "input path is not a directory"),
+    ],
+)
+def test_discover_supported_inputs_rejects_invalid_directory_paths(
+    tmp_path, path_kind, message
+):
+    path = tmp_path / path_kind
+    if path_kind == "file":
+        path.write_text("value\n1\n", encoding="utf-8")
+
+    with pytest.raises(PaperconanInputError, match=message):
+        _input.discover_supported_inputs(path)
+
+
+def test_discover_supported_inputs_translates_enumeration_error(
+    tmp_path, monkeypatch
+):
+    error = PermissionError("enumeration denied")
+    original_iterdir = Path.iterdir
+
+    def fail_iterdir(path):
+        if path == tmp_path:
+            raise error
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", fail_iterdir)
+
+    with pytest.raises(
+        PaperconanInputError,
+        match="could not enumerate input directory",
+    ) as caught:
+        _input.discover_supported_inputs(tmp_path)
+
+    assert str(tmp_path) in str(caught.value)
+    assert caught.value.__cause__ is error
 
 
 def test_make_fileref():
