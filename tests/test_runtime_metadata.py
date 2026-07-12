@@ -145,3 +145,25 @@ def test_reports_hide_null_runtime_and_render_archived_values(tmp_path):
         in archived_md_text
     )
     assert "- Elapsed: `12.5 ms`" in archived_md_text
+
+
+def test_reports_render_zero_elapsed_runtime(tmp_path):
+    data = _data(tmp_path)
+    scan = scan_dir(
+        str(data),
+        str(tmp_path / "scan"),
+        write_html=False,
+    )
+    scan["scanned_at"] = None
+    scan["scan_stats"]["elapsed_ms"] = 0
+
+    html_path = tmp_path / "zero.html"
+    markdown_path = tmp_path / "zero.md"
+    write_html_report(scan, str(html_path))
+    write_markdown_report(scan, str(markdown_path))
+
+    html = html_path.read_text(encoding="utf-8")
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert "elapsed: <code>0 ms</code>" in html
+    assert "- Elapsed: `0 ms`" in markdown
+    assert "Scanned at:" not in markdown
