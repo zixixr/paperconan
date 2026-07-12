@@ -314,6 +314,34 @@ def _render_decimal_section(scan: dict) -> str:
     )
 
 
+def _render_tail_cluster_section(scan: dict) -> str:
+    items = scan.get("decimal_tail_clusters") or []
+    if not items:
+        return ""
+    rows = []
+    for d in items[:30]:
+        top = ", ".join(f".…{t}×{c}" for t, c in (d.get("top") or [])[:6])
+        comp = d.get("complementary_pairs") or 0
+        rows.append(
+            f'<tr><td class="loc">{_esc(d.get("label"))}</td>'
+            f'<td>{_esc(d.get("n"))}</td>'
+            f'<td>{_esc(round(100 * (d.get("top_share") or 0)))}%</td>'
+            f'<td>{_esc(comp)}</td>'
+            f'<td class="ends">{_esc(top)}</td></tr>'
+        )
+    return (
+        f'<section id="sec-tail-cluster" class="section">'
+        f'<h2>Clustered high-precision fractional tails ({len(items)} sheets)</h2>'
+        f'<p class="hint">少数几个多位小数尾数在大量不同数值中高度集中，'
+        f'与独立测量的均匀尾数分布不符，属待解释异常。</p>'
+        f'<div class="ev-wrap"><table class="ev meta-table">'
+        '<thead><tr><th>sheet</th><th>hi-prec n</th><th>top-6 share</th>'
+        '<th>compl. pairs</th><th>top tails</th></tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody></table></div>'
+        '</section>'
+    )
+
+
 # ---------- top-level template ----------
 
 _CSS = """
@@ -519,6 +547,7 @@ def write_html_report(scan: dict, out_path: str) -> None:
         section("Low-severity findings", low, "sec-low"),
         _render_digit_section(scan),
         _render_decimal_section(scan),
+        _render_tail_cluster_section(scan),
     ])
     if not sections:
         sections = '<p class="empty">no findings — nothing flagged in this dataset.</p>'
