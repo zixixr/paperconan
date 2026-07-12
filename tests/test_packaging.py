@@ -119,12 +119,15 @@ pytest:
 SDIST_CHECKOUT_STEP = """\
     - name: Checkout source
       uses: actions/checkout@v4
+      with:
+        fetch-depth: "1"
 """
 SDIST_SETUP_STEP = """\
     - name: Configure uv
       uses: astral-sh/setup-uv@v6
       with:
         python-version: "3.14"
+        enable-cache: "true"
 """
 SDIST_BUILD_STEP = """\
     - name: Build source distribution
@@ -530,9 +533,12 @@ def _assert_sdist_job_invariants(job):
         action = step.get("uses")
         if action is not None:
             assert set(step) <= {"uses", "with"}
+            config = step.get("with", {})
             if action == "actions/checkout@v4":
+                assert config.get("path") in (None, ".", "./")
                 operation = "checkout"
             elif action == "astral-sh/setup-uv@v6":
+                assert config.get("python-version") == "3.14"
                 operation = "setup"
             else:
                 raise AssertionError("unknown action before pytest")
@@ -930,6 +936,30 @@ def test_sdist_job_invariants_accept_equivalent_block_commands():
     [
         ("missing checkout", _replace_sdist_job(SDIST_CHECKOUT_STEP)),
         ("missing setup", _replace_sdist_job(SDIST_SETUP_STEP)),
+        (
+            "checkout into sdist root",
+            _replace_sdist_job(
+                '        fetch-depth: "1"\n',
+                (
+                    '        fetch-depth: "1"\n'
+                    "        path: sdist-root\n"
+                ),
+            ),
+        ),
+        (
+            "setup missing python version",
+            _replace_sdist_job(
+                '        python-version: "3.14"\n',
+                "",
+            ),
+        ),
+        (
+            "setup wrong python version",
+            _replace_sdist_job(
+                '        python-version: "3.14"\n',
+                '        python-version: "3.13"\n',
+            ),
+        ),
         ("missing build", _replace_sdist_job(SDIST_BUILD_STEP)),
         ("missing extraction", _replace_sdist_job(SDIST_EXTRACT_STEP)),
         ("missing venv", _replace_sdist_job(SDIST_VENV_STEP)),
@@ -1016,6 +1046,9 @@ def test_sdist_job_invariants_accept_equivalent_block_commands():
     ids=[
         "missing-checkout",
         "missing-setup",
+        "checkout-into-sdist-root",
+        "setup-missing-python-version",
+        "setup-wrong-python-version",
         "missing-build",
         "missing-extraction",
         "missing-venv",
