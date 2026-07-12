@@ -178,6 +178,17 @@ SDIST_POST_TEST_ARTIFACT_STEP = """\
         name: sdist-test-result
         path: artifact/test-results.xml
 """
+SDIST_POST_TEST_WORKSPACE_COPY_OUT_STEP = """\
+    - name: Copy workspace-relative result for upload
+      working-directory: ${{ github.workspace }}
+      run: cp sdist-root/test-results.xml artifact/workspace-test-results.xml
+"""
+SDIST_POST_TEST_OTHER_CHECKOUT_STEP = """\
+    - name: Checkout artifact metadata
+      uses: actions/checkout@v3
+      with:
+        path: artifact-source
+"""
 EQUIVALENT_SDIST_JOB = (
     "sdist:\n"
     "  runs-on: ubuntu-latest\n"
@@ -192,6 +203,8 @@ EQUIVALENT_SDIST_JOB = (
     + SDIST_POST_TEST_STEP
     + SDIST_POST_TEST_COPY_OUT_STEP
     + SDIST_POST_TEST_ARTIFACT_STEP
+    + SDIST_POST_TEST_WORKSPACE_COPY_OUT_STEP
+    + SDIST_POST_TEST_OTHER_CHECKOUT_STEP
 )
 
 
@@ -470,19 +483,31 @@ def _assert_safe_pretest_command(command):
     )
 
 
-def _targets_sdist_root(path, working_directory=None):
-    workspace_prefixes = (
-        "${{ github.workspace }}/",
-        "$GITHUB_WORKSPACE/",
-        "/github/workspace/",
+def _workspace_relative_path(path):
+    workspace_roots = (
+        "${{ github.workspace }}",
+        "$GITHUB_WORKSPACE",
+        "/github/workspace",
     )
-    for prefix in workspace_prefixes:
+    for root in workspace_roots:
+        if path in (root, f"{root}/"):
+            return ".", True
+        prefix = f"{root}/"
         if path.startswith(prefix):
-            path = path[len(prefix):]
-            working_directory = None
-            break
+            return path[len(prefix):], True
+    return path, False
+
+
+def _targets_sdist_root(path, working_directory=None):
+    working_directory, _ = _workspace_relative_path(
+        working_directory or "."
+    )
+    path, workspace_relative = _workspace_relative_path(path)
     path = posixpath.normpath(
-        posixpath.join(working_directory or ".", path)
+        posixpath.join(
+            "." if workspace_relative else working_directory,
+            path,
+        )
     )
     return path == "sdist-root" or path.startswith("sdist-root/")
 
@@ -509,7 +534,8 @@ def _checkout_path(step):
 
 
 def _assert_safe_posttest_step(step):
-    if step.get("uses") == "actions/checkout@v4":
+    action = step.get("uses", "")
+    if action.startswith("actions/checkout@"):
         path = _checkout_path(step)
         assert path is None or not _targets_sdist_root(path), (
             "checkout destination inside sdist-root"
@@ -1143,6 +1169,55 @@ def test_sdist_job_invariants_accept_equivalent_block_commands():
                 ),
             ),
         ),
+        (
+            "post-test expression workspace copy into root",
+            _replace_sdist_job(
+                SDIST_TEST_STEP,
+                (
+                    SDIST_TEST_STEP
+                    + "    - name: Copy from expression workspace\n"
+                    + "      working-directory: ${{ github.workspace }}\n"
+                    + "      run: cp README.md sdist-root/README.md\n"
+                ),
+            ),
+        ),
+        (
+            "post-test environment workspace copy into root",
+            _replace_sdist_job(
+                SDIST_TEST_STEP,
+                (
+                    SDIST_TEST_STEP
+                    + "    - name: Copy from environment workspace\n"
+                    + "      working-directory: $GITHUB_WORKSPACE\n"
+                    + "      run: cp README.md sdist-root/README.md\n"
+                ),
+            ),
+        ),
+        (
+            "post-test runner workspace copy into root",
+            _replace_sdist_job(
+                SDIST_TEST_STEP,
+                (
+                    SDIST_TEST_STEP
+                    + "    - name: Copy from runner workspace\n"
+                    + "      working-directory: /github/workspace\n"
+                    + "      run: cp README.md sdist-root/README.md\n"
+                ),
+            ),
+        ),
+        (
+            "post-test checkout v3 into root",
+            _replace_sdist_job(
+                SDIST_TEST_STEP,
+                (
+                    SDIST_TEST_STEP
+                    + "    - name: Checkout v3 over unpacked root\n"
+                    + "      uses: actions/checkout@v3\n"
+                    + "      with:\n"
+                    + "        path: sdist-root\n"
+                ),
+            ),
+        ),
     ],
     ids=[
         "missing-checkout",
@@ -1167,6 +1242,10 @@ def test_sdist_job_invariants_accept_equivalent_block_commands():
         "post-test-copy-into-root",
         "post-test-rsync-into-root",
         "post-test-checkout-into-root",
+        "post-test-expression-workspace-copy-into-root",
+        "post-test-environment-workspace-copy-into-root",
+        "post-test-runner-workspace-copy-into-root",
+        "post-test-checkout-v3-into-root",
     ],
 )
 def test_sdist_job_invariants_reject_contract_mutations(case, job):
