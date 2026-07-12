@@ -120,6 +120,23 @@ def test_fetch_list_flags_unmatched_candidate(monkeypatch, capsys):
     assert "no DOI/title match" in capsys.readouterr().out
 
 
+def test_fetch_list_labels_scanner_supported_inputs(monkeypatch, capsys):
+    cands = [{
+        "cand_id": "zenodo:1",
+        "source": "zenodo",
+        "title": "Dataset",
+        "all_files_count": 2,
+        "match_signals": {"doi_in_related": True},
+        "tabular_files": [{"name": "supplement.pdf"}],
+    }]
+    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: cands)
+
+    assert _cli.fetch_main(["10.x/paper"]) == 0
+    out = capsys.readouterr().out
+    assert "inputs=1/2" in out
+    assert "tabular=" not in out
+
+
 def test_fetch_download_and_auto_mutually_exclusive():
     import pytest
     with pytest.raises(SystemExit):

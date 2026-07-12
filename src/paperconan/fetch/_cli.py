@@ -28,10 +28,10 @@ def _print_table(cands):
             flags.append(f"title~{sig['title_overlap']}")
         if not _resolve.is_confident_match(c):
             flags.append("⚠ no DOI/title match")
-        ntab = len(c.get("tabular_files", []))
-        print(f"[{c['cand_id']}] {c['source']:8} tabular={ntab}/{c.get('all_files_count','?')} "
+        ninputs = len(c.get("tabular_files", []))
+        print(f"[{c['cand_id']}] {c['source']:8} inputs={ninputs}/{c.get('all_files_count','?')} "
               f"{' '.join(flags):20} {c.get('title','')[:60]}")
-        if ntab == 0:
+        if ninputs == 0:
             print(
                 f"    (no scanner-supported inputs "
                 f"({_SUPPORTED_INPUT_LABEL}) in this dataset)"
