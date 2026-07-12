@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
+import shutil
+import subprocess
+import zipfile
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +24,57 @@ PUBLIC_REFS = [
     "batch-workflow.md",
     "case-patterns.md",
 ]
+
+WORKED_EXAMPLE_FILES = [
+    "make_demo_data.py",
+    "report-preview.png",
+    "README.md",
+    "demo_paper/ED_Fig2_tumor_volume.xlsx",
+    "demo_paper/ED_Fig4_qPCR.xlsx",
+    "demo_paper/audit/report.html",
+    "demo_paper/audit/scan.json",
+]
+
+
+def _local_markdown_links(text: str | None = None) -> list[str]:
+    if text is None:
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+    links = set()
+    for match in re.finditer(r"\[[^\]]+\]\(([^)]+)\)", text):
+        target = match.group(1).strip()
+        parsed = urlsplit(target)
+        if parsed.scheme or parsed.netloc or not parsed.path.endswith(".md"):
+            continue
+        links.add(parsed.path)
+    return sorted(links)
+
+
+def _is_forbidden_zip_member(name: str) -> bool:
+    path = PurePosixPath(name)
+    return (
+        path.is_absolute()
+        or ".." in path.parts
+        or "__pycache__" in path.parts
+        or any(part == ".cache" for part in path.parts)
+        or any(part.startswith(".") and part.endswith("_cache") for part in path.parts)
+        or bool(re.search(r"\.py[cod]$", name))
+        or path.name == ".DS_Store"
+    )
+
+
+def test_local_markdown_links_strip_suffixes_and_skip_external_urls() -> None:
+    text = """
+    [local](references/local.md#section)
+    [query](references/query.md?mode=full#section)
+    [external](https://example.test/reference.md)
+    [protocol-relative](//example.test/reference.md)
+    [anchor](#section)
+    """
+
+    assert _local_markdown_links(text) == [
+        "references/local.md",
+        "references/query.md",
+    ]
 
 
 def test_skill_routes_all_public_references() -> None:
@@ -68,3 +123,90 @@ def test_readme_points_to_public_adjudication_docs() -> None:
         assert f"skills/paperconan/references/{name}" in readme
 
     assert "不是研究完整性问题概率" in readme
+
+
+def test_skill_zip_contains_complete_path_safe_skill_tree(tmp_path) -> None:
+    caller_cwd = tmp_path / "caller cwd"
+    caller_cwd.mkdir()
+    out = tmp_path / "nested output" / "with spaces" / "paperconan skill.zip"
+
+    subprocess.run(
+        [str(ROOT / "build_skill_zip.sh"), str(out.resolve())],
+        cwd=caller_cwd,
+        check=True,
+    )
+
+    assert out.is_file()
+    assert list(tmp_path.rglob("*.zip")) == [out]
+
+    with zipfile.ZipFile(out) as zf:
+        names = set(zf.namelist())
+
+    local_links = _local_markdown_links()
+    for relative in local_links:
+        assert (SKILL_DIR / relative).is_file(), (
+            f"missing local Markdown reference: {relative}"
+        )
+        assert f"paperconan/{relative}" in names
+
+    skill_files = {
+        f"paperconan/{path.relative_to(SKILL_DIR).as_posix()}"
+        for path in SKILL_DIR.rglob("*")
+        if path.is_file()
+    }
+    assert skill_files <= names
+
+    worked_examples = {
+        f"paperconan/examples/{relative}"
+        for relative in WORKED_EXAMPLE_FILES
+    }
+    assert worked_examples <= names
+
+    forbidden = {
+        name
+        for name in names
+        if _is_forbidden_zip_member(name)
+    }
+    assert not forbidden
+    assert all(name == "paperconan/" or name.startswith("paperconan/") for name in names)
+
+
+def test_skill_zip_replaces_stale_output_inside_copied_skill_tree(tmp_path) -> None:
+    project = tmp_path / "copied project"
+    project.mkdir()
+    shutil.copy2(ROOT / "build_skill_zip.sh", project / "build_skill_zip.sh")
+    shutil.copytree(SKILL_DIR, project / "skills" / "paperconan")
+    for relative in WORKED_EXAMPLE_FILES:
+        source = ROOT / "examples" / relative
+        destination = project / "examples" / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+    cache_dir = project / "skills" / "paperconan" / ".pytest_cache"
+    cache_dir.mkdir()
+    (cache_dir / "state").write_text("cache", encoding="utf-8")
+    generic_cache_dir = project / "skills" / "paperconan" / ".cache"
+    generic_cache_dir.mkdir()
+    (generic_cache_dir / "state").write_text("cache", encoding="utf-8")
+    bytecode_dir = project / "skills" / "paperconan" / "__pycache__"
+    bytecode_dir.mkdir()
+    (bytecode_dir / "module.pyc").write_bytes(b"bytecode")
+    (project / "skills" / "paperconan" / ".DS_Store").write_bytes(b"metadata")
+
+    out = project / "skills" / "paperconan" / "stale output.zip"
+    with zipfile.ZipFile(out, "w") as zf:
+        zf.writestr("stale-marker.txt", "old archive")
+
+    subprocess.run(
+        [str(project / "build_skill_zip.sh"), str(out)],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    with zipfile.ZipFile(out) as zf:
+        names = set(zf.namelist())
+
+    assert "stale-marker.txt" not in names
+    assert "paperconan/stale output.zip" not in names
+    assert "paperconan/SKILL.md" in names
+    assert not {name for name in names if _is_forbidden_zip_member(name)}
