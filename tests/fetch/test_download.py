@@ -1,6 +1,10 @@
 import io
+import tarfile
+import warnings
+import zipfile
 from pathlib import Path
 
+from paperconan._input import SUPPORTED_INPUT_EXTS
 from paperconan.fetch import _download
 
 
@@ -276,3 +280,150 @@ def test_body_limit_preserves_existing_destination(monkeypatch, tmp_path):
     assert result["ok"] is False
     assert dest.read_bytes() == b"old-complete"
     assert not list(tmp_path.glob("*.part"))
+
+
+def test_zip_duplicate_basenames_are_both_preserved(tmp_path):
+    archive = tmp_path / "supp.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("a/table.csv", b"a\n1\n")
+        zf.writestr("b/table.csv", b"a\n2\n")
+    out = tmp_path / "out"
+    out.mkdir()
+
+    paths = _download._extract_tabular_zip(str(archive), str(out))
+
+    names = sorted(Path(path).name for path in paths)
+    assert len(names) == 2
+    assert names[0] != names[1]
+    assert all(name.startswith("table--") for name in names)
+    assert {Path(path).read_bytes() for path in paths} == {
+        b"a\n1\n",
+        b"a\n2\n",
+    }
+
+
+def test_tar_duplicate_basenames_are_both_preserved(tmp_path):
+    archive = tmp_path / "supp.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        for name, body in (
+            ("a/table.csv", b"a\n1\n"),
+            ("b/table.csv", b"a\n2\n"),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(body)
+            tf.addfile(info, io.BytesIO(body))
+    out = tmp_path / "out"
+    out.mkdir()
+
+    paths = _download._extract_tabular_tar(str(archive), str(out))
+
+    assert len({Path(path).name for path in paths}) == 2
+    assert {Path(path).read_bytes() for path in paths} == {
+        b"a\n1\n",
+        b"a\n2\n",
+    }
+
+
+def test_zip_duplicate_member_occurrences_are_all_preserved(tmp_path):
+    archive = tmp_path / "supp.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("nested/table.csv", b"a\n1\n")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            zf.writestr("nested/table.csv", b"a\n2\n")
+    out = tmp_path / "out"
+    out.mkdir()
+
+    first_paths = _download._extract_tabular_zip(str(archive), str(out))
+    first_names = [Path(path).name for path in first_paths]
+
+    second_out = tmp_path / "out-again"
+    second_out.mkdir()
+    second_paths = _download._extract_tabular_zip(str(archive), str(second_out))
+
+    assert len(first_names) == 2
+    assert len(set(first_names)) == 2
+    assert first_names == [Path(path).name for path in second_paths]
+    assert {Path(path).read_bytes() for path in first_paths} == {
+        b"a\n1\n",
+        b"a\n2\n",
+    }
+
+
+def test_tar_duplicate_member_occurrences_are_all_preserved(tmp_path):
+    archive = tmp_path / "supp.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        for body in (b"a\n1\n", b"a\n2\n"):
+            info = tarfile.TarInfo("nested/table.csv")
+            info.size = len(body)
+            tf.addfile(info, io.BytesIO(body))
+    out = tmp_path / "out"
+    out.mkdir()
+
+    paths = _download._extract_tabular_tar(str(archive), str(out))
+
+    assert len(paths) == 2
+    assert len({Path(path).name for path in paths}) == 2
+    assert {Path(path).read_bytes() for path in paths} == {
+        b"a\n1\n",
+        b"a\n2\n",
+    }
+
+
+def test_tar_members_use_atomic_stream_write(monkeypatch, tmp_path):
+    archive = tmp_path / "supp.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        body = b"a\n1\n"
+        info = tarfile.TarInfo("nested/table.csv")
+        info.size = len(body)
+        tf.addfile(info, io.BytesIO(body))
+    out = tmp_path / "out"
+    out.mkdir()
+    calls = []
+    atomic_stream_write = _download._atomic_stream_write
+
+    def record_atomic_write(src, dest_path, max_bytes):
+        calls.append((Path(dest_path).name, max_bytes))
+        return atomic_stream_write(src, dest_path, max_bytes)
+
+    monkeypatch.setattr(
+        _download,
+        "_atomic_stream_write",
+        record_atomic_write,
+    )
+
+    paths = _download._extract_tabular_tar(
+        str(archive),
+        str(out),
+        max_member_bytes=10,
+    )
+
+    assert calls == [("table.csv", 10)]
+    assert [Path(path).read_bytes() for path in paths] == [body]
+
+
+def test_archive_output_names_are_deterministic_for_colliding_paths():
+    members = ["b/table.CSV", "a/table.csv"]
+
+    first = _download._archive_output_names(members)
+    second = _download._archive_output_names(reversed(members))
+
+    assert first == second
+    assert len(set(first.values())) == 2
+    assert all(name.startswith("table--") for name in first.values())
+    assert all(name.endswith(".csv") for name in first.values())
+
+
+def test_archive_extracts_every_scanner_extension(tmp_path):
+    archive = tmp_path / "supp.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        for ext in SUPPORTED_INPUT_EXTS:
+            zf.writestr(f"nested/source.{ext}", b"x")
+    out = tmp_path / "out"
+    out.mkdir()
+
+    paths = _download._extract_tabular_zip(str(archive), str(out))
+
+    assert {Path(path).suffix.lstrip(".") for path in paths} == set(
+        SUPPORTED_INPUT_EXTS
+    )

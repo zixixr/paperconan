@@ -1,7 +1,8 @@
 """Defensive file download: redirects (urllib default), timeout, size cap,
 content-type sniffing so an HTML error page is never saved as data."""
 from __future__ import annotations
-import io
+from collections import Counter
+import hashlib
 import json
 import os
 import tarfile
@@ -124,31 +125,67 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
     return {"ok": False, "path": dest_path, "skipped_reason": last_reason}
 
 
-def _extract_tabular_zip(zip_bytes, out_dir, max_member_bytes=_DEFAULT_MAX):
+def _archive_output_names(member_names):
+    eligible = sorted(member_names)
+    counts = Counter(
+        os.path.basename(name).casefold()
+        for name in eligible
+    )
+    out = {}
+    for member in eligible:
+        base = os.path.basename(member)
+        if counts[base.casefold()] == 1:
+            out[member] = base
+            continue
+        stem, suffix = os.path.splitext(base)
+        digest = hashlib.sha256(member.encode("utf-8")).hexdigest()[:10]
+        out[member] = f"{stem}--{digest}{suffix.lower()}"
+    return out
+
+
+def _archive_occurrence_output_names(member_names):
+    member_names = list(member_names)
+    output_names = _archive_output_names(member_names)
+    totals = Counter(member_names)
+    seen = Counter()
+    out = []
+    for member in member_names:
+        name = output_names[member]
+        if totals[member] == 1:
+            out.append(name)
+            continue
+        seen[member] += 1
+        stem, suffix = os.path.splitext(name)
+        out.append(f"{stem}--{seen[member]}{suffix}")
+    return out
+
+
+def _extract_tabular_zip(zip_path, out_dir, max_member_bytes=_DEFAULT_MAX):
     """Extract scanner-supported inputs from a supplementary zip into
     out_dir, flattening internal paths to the basename (no path traversal) and
     capping per-member size. Returns the list of extracted file paths."""
     extracted = []
     written = _dir_size(out_dir)
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        for info in zf.infolist():
+    with zipfile.ZipFile(zip_path) as zf:
+        infos = [
+            info for info in zf.infolist()
+            if not info.is_dir() and is_supported_input(info.filename)
+        ]
+        names = _archive_occurrence_output_names(
+            info.filename for info in infos
+        )
+        for info, name in zip(infos, names):
             if written > _MAX_PAPER_BYTES:        # per-paper budget reached; stop extracting
                 break
-            if info.is_dir():
-                continue
-            name = os.path.basename(info.filename)
-            if (
-                not name
-                or not is_supported_input(name)
-                or info.file_size > max_member_bytes
-            ):
+            if not name or info.file_size > max_member_bytes:
                 continue
             dest = os.path.join(out_dir, name)
-            data = None
-            with zf.open(info) as src, open(dest, "wb") as fh:
-                data = src.read(max_member_bytes + 1)[:max_member_bytes]
-                fh.write(data)
-            written += len(data)
+            with zf.open(info) as src:
+                try:
+                    size = _atomic_stream_write(src, dest, max_member_bytes)
+                except _SizeLimitExceeded:
+                    continue
+            written += size
             extracted.append(dest)
     return extracted
 
@@ -160,26 +197,28 @@ def _extract_tabular_tar(tar_path, out_dir, max_member_bytes=_DEFAULT_MAX):
     extracted = []
     written = _dir_size(out_dir)
     with tarfile.open(tar_path, "r:gz") as tf:
-        for member in tf.getmembers():
+        members = [
+            member for member in tf.getmembers()
+            if member.isfile() and is_supported_input(member.name)
+        ]
+        names = _archive_occurrence_output_names(
+            member.name for member in members
+        )
+        for member, name in zip(members, names):
             if written > _MAX_PAPER_BYTES:        # per-paper budget reached; stop extracting
                 break
-            if not member.isfile():
-                continue
-            name = os.path.basename(member.name)
-            if (
-                not name
-                or not is_supported_input(name)
-                or member.size > max_member_bytes
-            ):
+            if not name or member.size > max_member_bytes:
                 continue
             src = tf.extractfile(member)
             if src is None:
                 continue
             dest = os.path.join(out_dir, name)
-            data = src.read(max_member_bytes + 1)[:max_member_bytes]
-            with open(dest, "wb") as fh:
-                fh.write(data)
-            written += len(data)
+            with src:
+                try:
+                    size = _atomic_stream_write(src, dest, max_member_bytes)
+                except _SizeLimitExceeded:
+                    continue
+            written += size
             extracted.append(dest)
     return extracted
 
@@ -214,8 +253,7 @@ def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_byte
         skipped.append({"name": arch.get("name"), "reason": res.get("skipped_reason")})
         return
     try:
-        with open(tmp_zip, "rb") as fh:
-            downloaded.extend(_extract_tabular_zip(fh.read(), out_dir, max_bytes))
+        downloaded.extend(_extract_tabular_zip(tmp_zip, out_dir, max_bytes))
     except zipfile.BadZipFile:
         skipped.append({"name": arch.get("name"), "reason": "not a valid zip archive"})
     finally:
