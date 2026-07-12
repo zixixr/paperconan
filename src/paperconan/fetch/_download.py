@@ -29,6 +29,10 @@ _MAX_PAPER_MB = float(os.environ.get("PAPERCONAN_MAX_PAPER_MB", "1500"))
 _MAX_PAPER_BYTES = int(_MAX_PAPER_MB * 1024 * 1024)
 
 
+class _SizeLimitExceeded(ValueError):
+    pass
+
+
 def _dir_size(path):
     total = 0
     for dp, _, fs in os.walk(path):
@@ -48,7 +52,7 @@ def _copy_limited(src, dest, max_bytes):
             return total
         total += len(chunk)
         if total > max_bytes:
-            raise ValueError(f"file exceeds max_bytes ({max_bytes})")
+            raise _SizeLimitExceeded(f"file exceeds max_bytes ({max_bytes})")
         dest.write(chunk)
 
 
@@ -98,7 +102,7 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
                             "skipped_reason": f"file exceeds max_bytes ({max_bytes})"}
                 try:
                     size = _atomic_stream_write(resp, dest_path, max_bytes)
-                except ValueError as e:
+                except _SizeLimitExceeded as e:
                     return {"ok": False, "path": dest_path,
                             "skipped_reason": str(e)}
                 return {"ok": True, "path": dest_path, "size": size}

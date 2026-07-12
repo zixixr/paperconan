@@ -233,6 +233,35 @@ def test_stream_failure_preserves_existing_destination(monkeypatch, tmp_path):
     assert not list(tmp_path.glob("*.part"))
 
 
+def test_value_error_from_stream_retries_then_succeeds(monkeypatch, tmp_path):
+    class TransientValueError(_Resp):
+        def read(self, size=-1):
+            if self.tell() >= 4:
+                raise ValueError("transient stream failure")
+            return super().read(4)
+
+    attempts = {"count": 0}
+    payload = b"complete-data"
+
+    def urlopen(req, timeout=None):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            return TransientValueError(b"partial-data", "text/csv")
+        return _Resp(payload, "text/csv")
+
+    monkeypatch.setattr(_download.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(_download.time, "sleep", lambda *_: None)
+    dest = tmp_path / "t.csv"
+    result = _download.download_file(
+        "https://x/t.csv", str(dest), retries=2, backoff=0.0
+    )
+
+    assert attempts["count"] == 2
+    assert result == {"ok": True, "path": str(dest), "size": len(payload)}
+    assert dest.read_bytes() == payload
+    assert not list(tmp_path.glob("*.part"))
+
+
 def test_body_limit_preserves_existing_destination(monkeypatch, tmp_path):
     dest = tmp_path / "t.csv"
     dest.write_bytes(b"old-complete")
