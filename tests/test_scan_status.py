@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 
@@ -205,6 +206,52 @@ def test_cli_invalid_input_path_reports_domain_error_without_traceback(
     assert proc.returncode != 0
     assert diagnostic in proc.stderr
     assert str(path) in proc.stderr
+    assert "Traceback" not in proc.stderr
+    assert "Traceback" not in proc.stdout
+
+
+def test_cli_enumeration_error_reports_domain_error_without_traceback(
+    tmp_path,
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    hook_dir = tmp_path / "hook"
+    hook_dir.mkdir()
+    (hook_dir / "sitecustomize.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "\n"
+        "_target = os.path.abspath(\n"
+        "    os.environ['PAPERCONAN_TEST_ITERDIR_FAILURE']\n"
+        ")\n"
+        "_original_iterdir = Path.iterdir\n"
+        "\n"
+        "def _fail_target_iterdir(path):\n"
+        "    if os.path.abspath(path) == _target:\n"
+        "        raise PermissionError('injected enumeration failure')\n"
+        "    return _original_iterdir(path)\n"
+        "\n"
+        "Path.iterdir = _fail_target_iterdir\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PAPERCONAN_TEST_ITERDIR_FAILURE"] = str(data)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [
+        str(hook_dir),
+        env.get("PYTHONPATH"),
+    ]))
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "paperconan", str(data), "--no-html"],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert proc.returncode != 0
+    assert "could not enumerate input directory" in proc.stderr
+    assert str(data) in proc.stderr
+    assert "injected enumeration failure" in proc.stderr
     assert "Traceback" not in proc.stderr
     assert "Traceback" not in proc.stdout
 
