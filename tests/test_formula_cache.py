@@ -84,7 +84,15 @@ def test_formula_without_cached_value_is_reported(tmp_path, suffix):
 def test_formula_gap_marks_scan_partial_without_counting_failures(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
-    _write_formula_book(data / "formula.xlsx")
+    path = data / "formula.xlsx"
+    _write_formula_book(path)
+    wb = openpyxl.load_workbook(path)
+    ws = wb["Stats"]
+    ws["B1"] = 11
+    ws["B2"] = 12
+    ws["B3"] = 13
+    wb.save(path)
+    wb.close()
 
     scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
 

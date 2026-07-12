@@ -318,7 +318,7 @@ def test_scan_counts_extracted_cell_limit_once(tmp_path, monkeypatch):
         calls.append((called_path, max_cells, with_metadata))
         return ExtractedTableResult(
             tables={
-                "tables!p1_t1": [["value"], ["1"], ["2"], ["3"]],
+                "tables!p1_t1": [["value"], [1], [2], [3]],
                 "tables!p1_t2": None,
             },
             limitations=[
