@@ -10,7 +10,7 @@ essentials; this file is the complete reference (it travels in the skill bundle)
   "schema_version": 2,
   "tool": "paperconan",
   "tool_version": "0.8.2",        // matches the pyproject version; provenance for archived reports
-  "scanned_at": "2026-05-29T02:08:53+00:00",
+  "scanned_at": null,             // deterministic default; timestamp only when runtime metadata is requested
   "profile": "review",            // which FP profile ran (review|forensic|triage) — severities are post-filter unless "forensic"
   "input_dir": "...",
   "paper": {"doi": "10.1038/...", "title": "..."},  // provenance, or null (see below)
@@ -31,8 +31,8 @@ essentials; this file is the complete reference (it travels in the skill bundle)
   "scan_errors": [                // files that failed to parse — surface these, don't imply a clean scan
     {"file": "broken.xlsx", "error": "..."}
   ],
-  "scan_stats": {                 // per-file / per-sheet sizing + timing (files[], sheets[], elapsed_ms)
-    "files": [...], "sheets": [...], "elapsed_ms": 412.5
+  "scan_stats": {                 // per-file / per-sheet sizing + optional timing
+    "files": [...], "sheets": [...], "elapsed_ms": null
   },
   "relations_blocks": [
     {
@@ -57,6 +57,16 @@ essentials; this file is the complete reference (it travels in the skill bundle)
   "cross_sheet_findings": [...]
 }
 ```
+
+Default scans are deterministic: repeated scans of identical input write
+byte-identical `scan.json` files. The existing runtime keys remain present, but
+`scanned_at` and every scan/file/sheet `elapsed_ms` value are `null`. File
+entries under `scan_stats.files` use paths relative to `input_dir`.
+
+Runtime metadata is opt-in through library
+`scan_dir(..., include_runtime=True)` or CLI `--runtime-metadata`. Archived
+scans containing timestamp and elapsed values remain valid and renderable.
+HTML and Markdown reports omit runtime metadata when the values are `null`.
 
 ## Scan completion and coverage
 

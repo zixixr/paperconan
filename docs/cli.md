@@ -21,8 +21,14 @@ paperconan path/to/dir/ --md                        # 额外生成 REPORT.md
 paperconan path/to/dir/ --no-html
 paperconan path/to/dir/ --profile forensic
 paperconan path/to/dir/ --doi "10.xxxx/..." --title "Paper title"
+paperconan path/to/dir/ --runtime-metadata        # 显式记录扫描时间与耗时
 python -m paperconan path/to/dir/                   # 等价 module 形式
 ```
+
+默认 `scan.json` 是确定性的：相同输入重复扫描会产生逐字节一致的 JSON。
+为保持 schema 兼容，`scanned_at` 以及 scan/file/sheet 层级的
+`elapsed_ms` 键仍然存在，但默认值为 `null`。`scan_stats.files[].path`
+相对于输入目录。只有显式传入 `--runtime-metadata` 才记录时间戳和耗时。
 
 ## 拉取开放源数据
 
@@ -51,11 +57,14 @@ scan = audit_dir(
     write_html=False,   # 不生成 HTML
     write_json=False,   # 只拿返回 dict，不落盘
     evidence=False,     # 跳过 evidence blob，适合批处理只要 metadata
+    include_runtime=True,  # 可选：记录时间戳和 scan/file/sheet 耗时
     # profile="forensic",
 )
 ```
 
 `write_html=True` 需要 evidence，会强制打开。CLI 入口是 `paperconan._audit:main`，库入口推荐 `paperconan.audit_dir()`。
+默认不记录运行时元数据；直接调用 `scan_dir()` 时也可使用同名
+`include_runtime=True` 参数。已有时间戳或耗时值的归档扫描仍可正常渲染。
 
 判定后报告也能直接从库里渲染（等价于 `paperconan report` 子命令）：
 

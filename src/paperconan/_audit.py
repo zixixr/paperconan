@@ -3063,6 +3063,7 @@ class ScanBudgetState:
     findings_kept: int = 0
     findings_omitted: int = 0
     report_blocks_kept: int = 0
+    include_runtime: bool = True
 
 
 @dataclass
@@ -3096,6 +3097,12 @@ def _empty_file_scan_result(file_stat, errors):
         stats={"files": [file_stat], "sheets": []},
         errors=errors,
     )
+
+
+def _elapsed_ms(start) -> float | None:
+    if start is None:
+        return None
+    return round((time.perf_counter() - start) * 1000, 3)
 
 
 def _cap_block_findings(groups, cap):
@@ -3319,7 +3326,9 @@ def _process_loaded_sheet(
     sheet, *, file_name, sheet_name, sheet_start, state
 ):
     blocks = find_numeric_blocks(sheet)
-    block_analysis_start = time.perf_counter()
+    block_analysis_start = (
+        time.perf_counter() if sheet_start is not None else None
+    )
     report_blocks = _analyze_numeric_blocks(
         sheet,
         file_name=file_name,
@@ -3329,6 +3338,8 @@ def _process_loaded_sheet(
     )
     block_analysis_elapsed = (
         time.perf_counter() - block_analysis_start
+        if block_analysis_start is not None
+        else 0.0
     )
 
     within_sheet_findings = detect_within_sheet_fraction_reuse(
@@ -3393,17 +3404,10 @@ def _process_loaded_sheet(
         "n_cols": sheet.ncols,
         "numeric_cells": len(sheet_numbers),
         "n_blocks": len(blocks),
-        "elapsed_ms": round(
-            max(
-                0.0,
-                (
-                    time.perf_counter()
-                    - sheet_start
-                    - block_analysis_elapsed
-                ),
-            )
-            * 1000,
-            3,
+        "elapsed_ms": _elapsed_ms(
+            None
+            if sheet_start is None
+            else sheet_start + block_analysis_elapsed
         ),
     }
     del sheet_numbers
@@ -3430,9 +3434,14 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
     within_sheet_findings = []
     errors = []
     sheet_stats = []
-    file_start = time.perf_counter()
+    file_start = (
+        time.perf_counter() if state.include_runtime else None
+    )
     file_name = os.path.basename(path)
-    file_stat = {"file": file_name, "path": path}
+    file_stat = {
+        "file": file_name,
+        "path": os.path.relpath(path, start=input_dir),
+    }
 
     try:
         fsize = os.path.getsize(path)
@@ -3448,9 +3457,7 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
         )
         file_stat["error"] = msg
         file_stat["oversized"] = True
-        file_stat["elapsed_ms"] = round(
-            (time.perf_counter() - file_start) * 1000, 3
-        )
+        file_stat["elapsed_ms"] = _elapsed_ms(file_start)
         return _empty_file_scan_result(file_stat, errors)
 
     try:
@@ -3460,9 +3467,7 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
         errors.append({"file": file_name, "error": str(exc)})
         state.coverage.mark_file_failed(file_name, "parse_error")
         file_stat["error"] = str(exc)
-        file_stat["elapsed_ms"] = round(
-            (time.perf_counter() - file_start) * 1000, 3
-        )
+        file_stat["elapsed_ms"] = _elapsed_ms(file_start)
         return _empty_file_scan_result(file_stat, errors)
 
     state.coverage.mark_file_succeeded()
@@ -3496,12 +3501,12 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
             **details,
         )
     file_stat["n_sheets"] = len(sheets)
-    file_stat["elapsed_ms"] = round(
-        (time.perf_counter() - file_start) * 1000, 3
-    )
+    file_stat["elapsed_ms"] = _elapsed_ms(file_start)
 
     for sheet_name, loaded_sheet in sheets.items():
-        sheet_start = time.perf_counter()
+        sheet_start = (
+            time.perf_counter() if state.include_runtime else None
+        )
         if loaded_sheet is None:
             msg = (f"oversized sheet exceeds {_MAX_CELLS} cells "
                    f"(set PAPERCONAN_MAX_CELLS to raise) — skipped to bound memory")
@@ -3525,9 +3530,7 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
                 "file": file_name,
                 "sheet": sheet_name,
                 "oversized": True,
-                "elapsed_ms": round(
-                    (time.perf_counter() - sheet_start) * 1000, 3
-                ),
+                "elapsed_ms": _elapsed_ms(sheet_start),
             })
             continue
 
@@ -3567,7 +3570,7 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
 
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
              profile="review", write_json=True, evidence=True,
-             diagnostic_on_empty=False):
+             diagnostic_on_empty=False, include_runtime=False):
     profile = normalize_profile(profile)
     if write_html:
         evidence = True
@@ -3587,6 +3590,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         ),
         profile=profile,
         evidence=evidence,
+        include_runtime=include_runtime,
     )
     report_blocks = []
     digit_reports = []
@@ -3595,7 +3599,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     within_sheet_fraction_findings = []
     scan_errors = []
     scan_stats = {"files": [], "sheets": []}
-    scan_start = time.perf_counter()
+    scan_start = time.perf_counter() if include_runtime else None
 
     for path in files:
         result = _process_file(path, input_dir=in_dir, state=state)
@@ -3666,7 +3670,13 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                coverage=coverage_output,
                tool="paperconan",
                tool_version=_version(),
-               scanned_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+               scanned_at=(
+                   datetime.datetime.now(
+                       datetime.timezone.utc
+                   ).isoformat(timespec="seconds")
+                   if include_runtime
+                   else None
+               ),
                profile=profile,
                input_dir=in_dir,
                paper=_load_provenance(in_dir, paper),
@@ -3675,7 +3685,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                findings_omitted=state.findings_omitted,
                scan_errors=scan_errors,
                scan_stats={**scan_stats,
-                           "elapsed_ms": round((time.perf_counter() - scan_start) * 1000, 3)},
+                           "elapsed_ms": _elapsed_ms(scan_start)},
                relations_blocks=report_blocks,
                digit_distribution=digit_reports,
                decimal_endings=decimal_reports,
@@ -3813,6 +3823,16 @@ def write_markdown_report(out, path):
     )
     lines = ["# Paper data audit report\n"]
     lines.extend(_markdown_scan_status(out))
+    scanned_at = out.get("scanned_at")
+    elapsed_ms = (out.get("scan_stats") or {}).get("elapsed_ms")
+    if scanned_at is not None:
+        lines.append(
+            f"- Scanned at: {_markdown_inline_code(scanned_at)}"
+        )
+    if elapsed_ms is not None:
+        lines.append(
+            f"- Elapsed: {_markdown_inline_code(f'{elapsed_ms} ms')}"
+        )
     lines.extend([
         f"- Input: `{out['input_dir']}`",
         f"- Files scanned: {out['n_files']}",
@@ -3966,6 +3986,11 @@ def main():
     ap.add_argument("--profile", choices=("review", "forensic", "triage"),
                     default="review",
                     help="False-positive handling profile: review (default), forensic, or triage")
+    ap.add_argument(
+        "--runtime-metadata",
+        action="store_true",
+        help="Record wall-clock timestamp and elapsed times",
+    )
     ap.add_argument("--version", action="version", version=f"paperconan {_version()}")
     args = ap.parse_args()
     out_dir = args.out or os.path.join(args.in_dir, "audit")
@@ -3975,7 +4000,8 @@ def main():
         paper = {"doi": args.doi, "title": args.title}
     try:
         res = scan_dir(args.in_dir, out_dir, write_md=args.md, write_html=write_html,
-                       paper=paper, profile=args.profile, diagnostic_on_empty=True)
+                       paper=paper, profile=args.profile, diagnostic_on_empty=True,
+                       include_runtime=args.runtime_metadata)
     except PaperconanInputError as e:
         sys.exit(str(e))
     if res["scan_status"] == "failed":

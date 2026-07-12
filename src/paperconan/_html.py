@@ -698,10 +698,16 @@ def write_html_report(scan: dict, out_path: str) -> None:
         )
 
     ver = scan.get("tool_version", "")
-    ts = scan.get("scanned_at", "")
+    ts = scan.get("scanned_at")
+    elapsed_ms = (scan.get("scan_stats") or {}).get("elapsed_ms")
     prov = " · ".join(p for p in [
         f'paperconan v{_esc(ver)}' if ver else "paperconan",
-        _esc(ts) if ts else "",
+        _esc(ts) if ts is not None else "",
+        (
+            f'elapsed: <code>{_esc(elapsed_ms)} ms</code>'
+            if elapsed_ms is not None
+            else ""
+        ),
         f'input: <code>{_esc(scan.get("input_dir", ""))}</code>',
     ] if p)
     footer = (
