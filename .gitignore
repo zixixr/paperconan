@@ -1,3 +1,29 @@
+# Local source inputs (portable case-insensitive extension matching)
+*.[xX][lL][sS][xX]
+*.[xX][lL][sS]
+*.[xX][lL][sS][mM]
+*.[xX][lL][sS][bB]
+*.[cC][sS][vV]
+*.[tT][sS][vV]
+*.[pP][dD][fF]
+*.[dD][oO][cC][xX]
+
+# Local scan and review outputs
+audit/
+scan.json
+verdict.json
+review.json
+REPORT.md
+report.html
+*adjudicated*.html
+adjudication.html
+[pP][aA][pP][eE][rR][cC][oO][nN][aA][nN]_[sS][oO][uU][rR][cC][eE].[jJ][sS][oO][nN]
+.[pP][aA][pP][eE][rR][cC][oO][nN][aA][nN]_[sS][oO][uU][rR][cC][eE].[jJ][sS][oO][nN].*
+
+# Explicit public source and report exceptions
+!tests/**
+!examples/**
+
 # Python
 __pycache__/
 *.py[cod]
@@ -24,18 +50,6 @@ env/
 .vscode/
 .DS_Store
 Thumbs.db
-
-# Local test outputs / sample data
-audit/
-*.xlsx
-scan.json
-REPORT.md
-
-# …but the committed demo example is exempt (must come after the rules above)
-!examples/demo_paper/audit/
-!examples/**/*.xlsx
-!examples/**/scan.json
-!examples/**/report.html
 
 # Local-only audit working dirs — NEVER commit (contain paper DOIs, judgments, dossiers, source data)
 /recheck/
