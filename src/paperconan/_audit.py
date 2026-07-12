@@ -54,6 +54,7 @@ from ._sheet import (
     SheetBuildLimit,
     _MAX_EXACT_FLOAT_INT,
 )
+from ._source_sidecar import SidecarLimitError, read_sidecar
 from ._summaries import (
     ColumnFingerprint,
     CrossSheetSummary,
@@ -3701,17 +3702,28 @@ def _load_provenance(in_dir, paper):
     sidecar = os.path.join(in_dir, "paperconan_source.json")
     if os.path.isfile(sidecar):
         try:
-            with open(sidecar, encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
+            data = read_sidecar(
+                sidecar,
+                byte_limit=int(os.environ.get(
+                    "PAPERCONAN_SOURCE_SIDECAR_MAX_BYTES",
+                    str(2 * 1024 * 1024),
+                )),
+                entry_limit=int(os.environ.get(
+                    "PAPERCONAN_SOURCE_SIDECAR_ENTRY_LIMIT",
+                    "10000",
+                )),
+                name_byte_limit=int(os.environ.get(
+                    "PAPERCONAN_SOURCE_SIDECAR_NAME_BYTES",
+                    str(1024 * 1024),
+                )),
+                normalize_name=lambda value: value,
+                retain_managed_names=False,
+            )
+        except SidecarLimitError:
             return None
         if not isinstance(data, dict):
             return None
-        return {
-            key: value
-            for key, value in data.items()
-            if key != "managed_files"
-        }
+        return data
     return None
 
 

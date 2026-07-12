@@ -180,6 +180,51 @@ def test_skill_routes_all_public_references() -> None:
         assert f"references/{name}" in skill, f"SKILL.md does not route {name}"
 
 
+def test_complete_output_schema_documents_recurring_lower_bounds() -> None:
+    text = (REF_DIR / "output-schema.md").read_text(
+        encoding="utf-8"
+    )
+    required_fields = {
+        "findings_omitted_is_lower_bound",
+        "recurring_row_vector_finalization_limit",
+        "candidate_limit",
+        "pair_limit",
+        "cell_limit",
+        "qualifying_candidates",
+        "candidates_retained",
+        "candidates_omitted",
+        "candidates_processed",
+        "pair_comparisons",
+        "cell_references_retained",
+        "limits_reached",
+        "omitted_findings_lower_bound",
+    }
+
+    missing = {
+        field for field in required_fields if field not in text
+    }
+    assert not missing
+    assert re.search(
+        r"lower[- ]bound.+(?:not|never).+exact",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+
+
+def test_cli_documents_fetch_state_and_work_controls() -> None:
+    text = (ROOT / "docs" / "cli.md").read_text(
+        encoding="utf-8"
+    )
+
+    for name in [
+        "PAPERCONAN_ARCHIVE_SPARSE_ENTRY_LIMIT",
+        "PAPERCONAN_ARCHIVE_TAR_TRAVERSAL_BYTES",
+        "PAPERCONAN_MANAGED_OUTPUT_NAME_BYTES",
+        "PAPERCONAN_MANAGED_OUTPUT_COLLISION_PROBE_LIMIT",
+    ]:
+        assert name in text
+
+
 def test_new_judgment_docs_keep_signal_not_verdict_boundary() -> None:
     docs = [
         REF_DIR / "adjudication-tiers.md",

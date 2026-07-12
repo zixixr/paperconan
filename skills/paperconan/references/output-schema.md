@@ -28,6 +28,9 @@ essentials; this file is the complete reference (it travels in the skill bundle)
   },
   "n_files": 3,
   "n_blocks_with_findings": 8,
+  "findings_omitted": 0,
+  // present and true when findings_omitted is only a proved lower bound
+  "findings_omitted_is_lower_bound": true,
   "scan_errors": [                // files that failed to parse — surface these, don't imply a clean scan
     {"file": "broken.xlsx", "error": "..."}
   ],
@@ -112,6 +115,39 @@ Other optional fields include `count`, `limit`, `omitted_findings`,
 list these limitations before findings. A partial report keeps all retained
 findings; a failed report never presents an empty finding list as a completed
 scan.
+
+When recurring-row-vector finalization exhausts a retained-state or work
+budget, `coverage.limitations` contains this complete shape:
+
+```json
+{
+  "scope": "scan",
+  "reason": "recurring_row_vector_finalization_limit",
+  "candidate_limit": 10000,
+  "pair_limit": 200000,
+  "cell_limit": 1000000,
+  "qualifying_candidates": 12000,
+  "candidates_retained": 10000,
+  "candidates_omitted": 2000,
+  "candidates_processed": 8500,
+  "pair_comparisons": 200000,
+  "cell_references_retained": 740000,
+  "limits_reached": ["pair"],
+  "omitted_findings_lower_bound": 0
+}
+```
+
+`candidate_limit`, `pair_limit`, and `cell_limit` are configured limits.
+`candidates_processed`, `pair_comparisons`, and
+`cell_references_retained` are the corresponding completed work/state
+counters. `qualifying_candidates`, `candidates_retained`, and
+`candidates_omitted` describe candidate coverage.
+
+When this limitation is present, top-level
+`findings_omitted_is_lower_bound` is `true`. Neither
+`findings_omitted` nor `omitted_findings_lower_bound` may be interpreted as an
+exact omitted total: a lower-bound value proves only that at least that many
+findings were omitted, and additional omissions may be unknown.
 
 Archived schema-version-1 scans may omit `schema_version`, `scan_status`, and
 `coverage`. Both HTML and Markdown renderers accept that shape and label it as a

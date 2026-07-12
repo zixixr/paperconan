@@ -626,6 +626,779 @@ def _first_tar_header(path):
         )
 
 
+def _pax_record(key, value):
+    body = key + b"=" + value + b"\n"
+    length = len(body) + 2
+    while True:
+        encoded = str(length).encode("ascii") + b" " + body
+        if len(encoded) == length:
+            return encoded
+        length = len(encoded)
+
+
+def _raw_tar_member(name, type_, payload):
+    info = tarfile.TarInfo(name)
+    info.type = type_
+    info.size = len(payload)
+    header = info.tobuf(
+        format=tarfile.GNU_FORMAT,
+        encoding="utf-8",
+        errors="surrogateescape",
+    )
+    padding = (-len(payload)) % tarfile.BLOCKSIZE
+    return header + payload + (b"\0" * padding)
+
+
+def _write_raw_tar(path, members):
+    payload = b"".join(
+        _raw_tar_member(name, type_, body)
+        for name, type_, body in members
+    )
+    payload += b"\0" * (tarfile.BLOCKSIZE * 2)
+    with gzip.open(path, "wb") as stream:
+        stream.write(payload)
+
+
+def _bounded_tar_names(path, tmp_path, monkeypatch, name_limit):
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 20)
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_METADATA_BYTES", 100_000, raising=False
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_MEMBER_NAME_BYTES", name_limit
+    )
+    try:
+        archive = _download._BoundedTarFile.open(
+            path,
+            "r:gz",
+            tarinfo=_download._BoundedTarInfo,
+        )
+    except _download._TarArchiveLimit as error:
+        return [], set(), [error.record(path.name)]
+    with archive:
+        members, skipped = _download._collect_bounded_tar_members(
+            archive, path.name
+        )
+    return [member.name for member in members], set(), skipped
+
+
+def test_tar_pax_uses_last_effective_utf8_path_at_exact_boundary(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "pax-repeated.tar.gz"
+    final_name = "nested/\N{LATIN SMALL LETTER E WITH ACUTE}.csv"
+    pax = (
+        _pax_record(b"path", b"x" * 1_000 + b".csv")
+        + _pax_record(b"path", final_name.encode("utf-8"))
+    )
+    _write_raw_tar(
+        archive,
+        [
+            ("pax", tarfile.XHDTYPE, pax),
+            ("placeholder", tarfile.REGTYPE, b"a\n1\n"),
+        ],
+    )
+    exact = len(final_name.encode("utf-8"))
+
+    names, preserved, skipped = _bounded_tar_names(
+        archive, tmp_path, monkeypatch, exact
+    )
+
+    assert names == [final_name]
+    assert preserved == set()
+    assert skipped == []
+
+    names, preserved, skipped = _bounded_tar_names(
+        archive, tmp_path, monkeypatch, exact - 1
+    )
+
+    assert names == []
+    assert preserved == set()
+    assert skipped[0]["reason"] == "archive member name byte limit"
+    assert skipped[0]["retained_name_bytes"] == 0
+
+
+def test_tar_pax_binary_counts_surrogateescape_expansion_before_decode(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "pax-binary.tar.gz"
+    raw_name = b"nested/\xff.csv"
+    pax = (
+        _pax_record(b"hdrcharset", b"BINARY")
+        + _pax_record(b"path", raw_name)
+    )
+    _write_raw_tar(
+        archive,
+        [
+            ("pax", tarfile.XHDTYPE, pax),
+            ("placeholder", tarfile.REGTYPE, b"a\n1\n"),
+        ],
+    )
+    decoded = raw_name.decode("utf-8", "surrogateescape")
+    exact = len(decoded.encode("utf-8", "surrogatepass"))
+
+    names, preserved, skipped = _bounded_tar_names(
+        archive, tmp_path, monkeypatch, exact
+    )
+
+    assert len(names) == 1
+    assert names[0].endswith(".csv")
+    assert preserved == set()
+    assert skipped == []
+
+    original_decode = tarfile.TarInfo._decode_pax_field
+
+    def reject_full_path_decode(info, value, *args):
+        if value == raw_name:
+            raise AssertionError(
+                "over-budget PAX path must not be fully decoded"
+            )
+        return original_decode(info, value, *args)
+
+    monkeypatch.setattr(
+        tarfile.TarInfo,
+        "_decode_pax_field",
+        reject_full_path_decode,
+    )
+    names, preserved, skipped = _bounded_tar_names(
+        archive, tmp_path, monkeypatch, exact - 1
+    )
+
+    assert names == []
+    assert preserved == set()
+    assert skipped[0]["reason"] == "archive member name byte limit"
+
+
+def test_tar_gnu_longname_uses_first_nul_at_exact_boundary(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "gnu-first-nul.tar.gz"
+    final_name = "nested/table.csv"
+    long_payload = (
+        final_name.encode("utf-8")
+        + b"\0ignored"
+        + (b"x" * 1_000)
+        + b"\0"
+    )
+    _write_raw_tar(
+        archive,
+        [
+            ("long", tarfile.GNUTYPE_LONGNAME, long_payload),
+            ("placeholder", tarfile.REGTYPE, b"a\n1\n"),
+        ],
+    )
+    exact = len(final_name.encode("utf-8"))
+
+    names, preserved, skipped = _bounded_tar_names(
+        archive, tmp_path, monkeypatch, exact
+    )
+
+    assert names == [final_name]
+    assert preserved == set()
+    assert skipped == []
+
+    names, preserved, skipped = _bounded_tar_names(
+        archive, tmp_path, monkeypatch, exact - 1
+    )
+
+    assert names == []
+    assert preserved == set()
+    assert skipped[0]["reason"] == "archive member name byte limit"
+
+
+def test_tar_gnu_longname_without_nul_checks_before_decode(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "gnu-no-nul.tar.gz"
+    final_name = "nested/" + ("a" * 501) + ".csv"
+    assert len(final_name.encode("utf-8")) == tarfile.BLOCKSIZE
+    _write_raw_tar(
+        archive,
+        [
+            (
+                "long",
+                tarfile.GNUTYPE_LONGNAME,
+                final_name.encode("utf-8"),
+            ),
+            ("placeholder", tarfile.REGTYPE, b"a\n1\n"),
+        ],
+    )
+    exact = len(final_name.encode("utf-8"))
+
+    names, preserved, skipped = _bounded_tar_names(
+        archive, tmp_path, monkeypatch, exact
+    )
+
+    assert names == [final_name]
+    assert preserved == set()
+    assert skipped == []
+
+    original_nts = tarfile.nts
+
+    def reject_full_name_decode(value, *args):
+        if value.startswith(final_name.encode("utf-8")):
+            raise AssertionError(
+                "over-budget GNU name must not be fully decoded"
+            )
+        return original_nts(value, *args)
+
+    monkeypatch.setattr(tarfile, "nts", reject_full_name_decode)
+    names, preserved, skipped = _bounded_tar_names(
+        archive, tmp_path, monkeypatch, exact - 1
+    )
+
+    assert names == []
+    assert preserved == set()
+    assert skipped[0]["reason"] == "archive member name byte limit"
+
+
+def test_tar_global_pax_path_can_be_overridden_before_retention(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "pax-global-override.tar.gz"
+    final_name = "nested/final.csv"
+    _write_raw_tar(
+        archive,
+        [
+            (
+                "global",
+                tarfile.XGLTYPE,
+                _pax_record(b"path", b"x" * 1_000 + b".csv"),
+            ),
+            (
+                "extended",
+                tarfile.XHDTYPE,
+                _pax_record(b"path", final_name.encode("utf-8")),
+            ),
+            ("placeholder", tarfile.REGTYPE, b"a\n1\n"),
+        ],
+    )
+    exact = len(final_name.encode("utf-8"))
+
+    names, preserved, skipped = _bounded_tar_names(
+        archive, tmp_path, monkeypatch, exact
+    )
+
+    assert names == [final_name]
+    assert preserved == set()
+    assert skipped == []
+
+    names, preserved, skipped = _bounded_tar_names(
+        archive, tmp_path, monkeypatch, exact - 1
+    )
+
+    assert names == []
+    assert preserved == set()
+    assert skipped[0]["reason"] == "archive member name byte limit"
+
+
+def _tar_header_with_checksum(header):
+    header = bytearray(header)
+    header[148:156] = b" " * 8
+    header[148:156] = tarfile.itn(
+        sum(header), 8, tarfile.GNU_FORMAT
+    )
+    return bytes(header)
+
+
+def _legacy_sparse_header(name, initial_entries, *, extended):
+    info = tarfile.TarInfo(name)
+    info.type = tarfile.GNUTYPE_SPARSE
+    info.size = 0
+    header = bytearray(info.tobuf(format=tarfile.GNU_FORMAT))
+    for index, (offset, size) in enumerate(initial_entries):
+        position = 386 + index * 24
+        header[position:position + 12] = tarfile.itn(
+            offset, 12, tarfile.GNU_FORMAT
+        )
+        header[position + 12:position + 24] = tarfile.itn(
+            size, 12, tarfile.GNU_FORMAT
+        )
+    header[482] = int(extended)
+    header[483:495] = tarfile.itn(
+        10_000, 12, tarfile.GNU_FORMAT
+    )
+    return _tar_header_with_checksum(header)
+
+
+def _legacy_sparse_extension(entries, *, extended):
+    block = bytearray(tarfile.BLOCKSIZE)
+    for index, (offset, size) in enumerate(entries):
+        position = index * 24
+        block[position:position + 12] = tarfile.itn(
+            offset, 12, tarfile.GNU_FORMAT
+        )
+        block[position + 12:position + 24] = tarfile.itn(
+            size, 12, tarfile.GNU_FORMAT
+        )
+    block[504] = int(extended)
+    return bytes(block)
+
+
+def _write_raw_tar_bytes(path, payload):
+    payload += b"\0" * (tarfile.BLOCKSIZE * 2)
+    with gzip.open(path, "wb") as stream:
+        stream.write(payload)
+
+
+def _open_sparse_member(path):
+    try:
+        archive = _download._BoundedTarFile.open(
+            path,
+            "r:gz",
+            tarinfo=_download._BoundedTarInfo,
+        )
+    except _download._TarArchiveLimit as error:
+        return None, error.record(path.name)
+    with archive:
+        return archive.next(), None
+
+
+def _write_pax_sparse_archive(path, version, entries):
+    if version == "0.0":
+        records = [_pax_record(b"GNU.sparse.size", b"10000")]
+        for offset, size in entries:
+            records.append(
+                _pax_record(
+                    b"GNU.sparse.offset",
+                    str(offset).encode("ascii"),
+                )
+            )
+            records.append(
+                _pax_record(
+                    b"GNU.sparse.numbytes",
+                    str(size).encode("ascii"),
+                )
+            )
+        body = b""
+    elif version == "0.1":
+        sparse_map = ",".join(
+            str(value)
+            for entry in entries
+            for value in entry
+        ).encode("ascii")
+        records = [
+            _pax_record(b"GNU.sparse.map", sparse_map),
+        ]
+        body = b""
+    else:
+        records = [
+            _pax_record(b"GNU.sparse.major", b"1"),
+            _pax_record(b"GNU.sparse.minor", b"0"),
+            _pax_record(b"GNU.sparse.realsize", b"10000"),
+        ]
+        fields = [str(len(entries)).encode("ascii")]
+        for offset, size in entries:
+            fields.extend([
+                str(offset).encode("ascii"),
+                str(size).encode("ascii"),
+            ])
+        raw_fields = b"\n".join(fields) + b"\n"
+        body = raw_fields + (
+            b"\0" * ((-len(raw_fields)) % tarfile.BLOCKSIZE)
+        )
+    _write_raw_tar(
+        path,
+        [
+            ("pax", tarfile.XHDTYPE, b"".join(records)),
+            ("table.csv", tarfile.REGTYPE, body),
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("version", "processor_name"),
+    [
+        ("0.0", "_proc_gnusparse_00"),
+        ("0.1", "_proc_gnusparse_01"),
+        ("1.0", "_proc_gnusparse_10"),
+    ],
+)
+def test_tar_pax_sparse_entry_limit_precedes_stdlib_list_growth(
+    tmp_path, monkeypatch, version, processor_name
+):
+    archive = tmp_path / f"sparse-{version}.tar.gz"
+    entries = [(index * 2, 1) for index in range(20)]
+    _write_pax_sparse_archive(archive, version, entries)
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_SPARSE_ENTRY_LIMIT", 3, raising=False
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_METADATA_BYTES", 100_000, raising=False
+    )
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 20)
+    monkeypatch.setattr(
+        tarfile.TarInfo,
+        processor_name,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "sparse limit must precede stdlib list growth"
+            )
+        ),
+    )
+
+    member, limitation = _open_sparse_member(archive)
+
+    assert member is None
+    assert limitation["reason"] == "archive sparse entry limit"
+    assert limitation["limit"] == 3
+    assert limitation["sparse_entries_retained"] <= 3
+    assert limitation["omitted_sparse_entries"] == len(entries)
+
+
+def test_tar_legacy_sparse_limit_stops_after_first_extension_block(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "legacy-sparse.tar.gz"
+    initial = [(index * 2, 1) for index in range(4)]
+    first_extension = [(10 + index * 2, 1) for index in range(21)]
+    later_extension = [(100 + index * 2, 1) for index in range(21)]
+    payload = (
+        _legacy_sparse_header(
+            "table.csv", initial, extended=True
+        )
+        + _legacy_sparse_extension(
+            first_extension, extended=True
+        )
+        + _legacy_sparse_extension(
+            later_extension, extended=False
+        )
+    )
+    _write_raw_tar_bytes(archive, payload)
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_SPARSE_ENTRY_LIMIT", 4, raising=False
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_METADATA_BYTES", 100_000, raising=False
+    )
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 20)
+    monkeypatch.setattr(
+        tarfile.TarInfo,
+        "_proc_sparse",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "legacy sparse limit must precede stdlib list growth"
+            )
+        ),
+    )
+
+    member, limitation = _open_sparse_member(archive)
+
+    assert member is None
+    assert limitation["reason"] == "archive sparse entry limit"
+    assert limitation["sparse_entries_retained"] == 4
+    assert limitation["sparse_extension_blocks_processed"] == 1
+    assert limitation["metadata_bytes_processed"] == tarfile.BLOCKSIZE
+    assert limitation["omitted_sparse_entries_lower_bound"] >= 1
+
+
+@pytest.mark.parametrize("version", ["0.0", "0.1", "1.0"])
+def test_tar_pax_sparse_entries_within_budget_are_preserved(
+    tmp_path, monkeypatch, version
+):
+    archive = tmp_path / f"sparse-ok-{version}.tar.gz"
+    entries = [(0, 1), (4, 2)]
+    _write_pax_sparse_archive(archive, version, entries)
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_SPARSE_ENTRY_LIMIT", len(entries),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_METADATA_BYTES", 100_000, raising=False
+    )
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 20)
+
+    member, limitation = _open_sparse_member(archive)
+
+    assert limitation is None
+    assert member.sparse == entries
+
+
+def test_tar_pax_sparse_00_ignores_unpaired_offset_state(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "sparse-00-unpaired.tar.gz"
+    records = [
+        _pax_record(b"GNU.sparse.size", b"10000"),
+        _pax_record(b"GNU.sparse.offset", b"0"),
+        _pax_record(b"GNU.sparse.numbytes", b"1"),
+        _pax_record(
+            b"GNU.sparse.offset",
+            b"unpaired-value-must-not-be-parsed",
+        ),
+    ]
+    _write_raw_tar(
+        archive,
+        [
+            ("pax", tarfile.XHDTYPE, b"".join(records)),
+            ("table.csv", tarfile.REGTYPE, b""),
+        ],
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_SPARSE_ENTRY_LIMIT", 1, raising=False
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_METADATA_BYTES", 100_000, raising=False
+    )
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 20)
+
+    member, limitation = _open_sparse_member(archive)
+
+    assert limitation is None
+    assert member.sparse == [(0, 1)]
+
+
+def test_tar_pax_sparse_01_preserves_empty_map(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "sparse-01-empty.tar.gz"
+    _write_raw_tar(
+        archive,
+        [
+            (
+                "pax",
+                tarfile.XHDTYPE,
+                _pax_record(b"GNU.sparse.map", b""),
+            ),
+            ("table.csv", tarfile.REGTYPE, b""),
+        ],
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_SPARSE_ENTRY_LIMIT", 0, raising=False
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_METADATA_BYTES", 100_000, raising=False
+    )
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 20)
+
+    member, limitation = _open_sparse_member(archive)
+
+    assert limitation is None
+    assert member.sparse == []
+
+
+def _guard_gzip_seek_beyond(monkeypatch, max_offset):
+    original_seek = gzip.GzipFile.seek
+    blocked = []
+
+    def guarded_seek(stream, offset, whence=0):
+        if whence == 0 and offset > max_offset:
+            blocked.append(offset)
+            raise AssertionError(
+                "TAR traversal must be budgeted before gzip seek"
+            )
+        return original_seek(stream, offset, whence)
+
+    monkeypatch.setattr(gzip.GzipFile, "seek", guarded_seek)
+    return blocked
+
+
+def test_tar_traversal_records_actual_short_forward_seek():
+    class ShortSeek:
+        def __init__(self):
+            self.position = 0
+
+        def tell(self):
+            return self.position
+
+        def seek(self, offset, whence=0):
+            assert whence == 0
+            self.position = min(offset, 10)
+            return self.position
+
+    state = {
+        "traversal_byte_limit": 100,
+        "decompressed_bytes_traversed": 0,
+    }
+    stream = _download._TarTraversalFile(ShortSeek(), state)
+
+    assert stream.seek(50) == 10
+    assert state["decompressed_bytes_traversed"] == 10
+
+
+def test_tar_member_cap_does_not_inflate_large_member_for_lookahead(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "large-lookahead.tar.gz"
+    _write_bounded_archive(
+        archive,
+        "tar",
+        [
+            ("image.bin", b"x" * 1_000_000),
+            ("second.csv", b"y"),
+        ],
+    )
+    traversal_limit = 4_096
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 1)
+    monkeypatch.setattr(
+        _download,
+        "_ARCHIVE_TAR_TRAVERSAL_BYTES",
+        traversal_limit,
+        raising=False,
+    )
+    blocked = _guard_gzip_seek_beyond(
+        monkeypatch, traversal_limit
+    )
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    extracted, preserved, skipped = _extract_bounded_archive(
+        archive, "tar", out_dir
+    )
+
+    assert blocked == []
+    assert extracted == []
+    assert preserved == set()
+    assert skipped[0]["reason"] == (
+        "archive decompressed traversal limit"
+    )
+    assert skipped[0]["limit"] == traversal_limit
+    assert skipped[0]["decompressed_bytes_traversed"] <= traversal_limit
+    assert skipped[0]["requested_traversal_bytes"] > traversal_limit
+    assert skipped[0]["omitted_members_lower_bound"] == 0
+
+
+def test_tar_normal_advancement_checks_large_skip_before_gzip_seek(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "large-skip.tar.gz"
+    _write_bounded_archive(
+        archive,
+        "tar",
+        [
+            ("image.bin", b"x" * 1_000_000),
+            ("table.csv", b"a\n1\n"),
+        ],
+    )
+    traversal_limit = 4_096
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 10)
+    monkeypatch.setattr(
+        _download,
+        "_ARCHIVE_TAR_TRAVERSAL_BYTES",
+        traversal_limit,
+        raising=False,
+    )
+    blocked = _guard_gzip_seek_beyond(
+        monkeypatch, traversal_limit
+    )
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    extracted, preserved, skipped = _extract_bounded_archive(
+        archive, "tar", out_dir
+    )
+
+    assert blocked == []
+    assert extracted == []
+    assert preserved == set()
+    assert skipped[0]["reason"] == (
+        "archive decompressed traversal limit"
+    )
+    assert skipped[0]["decompressed_bytes_traversed"] <= traversal_limit
+    assert skipped[0]["requested_traversal_bytes"] > traversal_limit
+    assert skipped[0]["omitted_members_lower_bound"] == 0
+
+
+def test_tar_traversal_budget_counts_backward_extraction_replay(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "replayed-traversal.tar.gz"
+    first_body = b"a\n1\n"
+    large_body = b"x" * 1_000_000
+    _write_bounded_archive(
+        archive,
+        "tar",
+        [
+            ("first.csv", first_body),
+            ("image.bin", large_body),
+        ],
+    )
+    large_padded = (
+        (len(large_body) + tarfile.BLOCKSIZE - 1)
+        // tarfile.BLOCKSIZE
+        * tarfile.BLOCKSIZE
+    )
+    forward_scan_bytes = (
+        tarfile.BLOCKSIZE
+        + tarfile.BLOCKSIZE
+        + tarfile.BLOCKSIZE
+        + large_padded
+        + tarfile.BLOCKSIZE
+    )
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 10)
+    monkeypatch.setattr(
+        _download,
+        "_ARCHIVE_TAR_TRAVERSAL_BYTES",
+        forward_scan_bytes,
+        raising=False,
+    )
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    extracted, preserved, skipped = _extract_bounded_archive(
+        archive, "tar", out_dir
+    )
+
+    assert extracted == []
+    assert preserved == set()
+    assert skipped[-1]["reason"] == (
+        "archive decompressed traversal limit"
+    )
+    assert skipped[-1]["decompressed_bytes_traversed"] == (
+        forward_scan_bytes
+    )
+    assert skipped[-1]["requested_traversal_bytes"] > 0
+    assert skipped[-1]["omitted_members_lower_bound"] == 1
+
+
+@pytest.mark.parametrize(
+    ("members", "expected_reason", "omitted_lower_bound"),
+    [
+        ([("only.csv", b"")], None, None),
+        (
+            [("first.csv", b""), ("second.csv", b"")],
+            "archive member count limit",
+            1,
+        ),
+    ],
+)
+def test_tar_member_cap_uses_only_budgeted_end_marker_lookahead(
+    tmp_path,
+    monkeypatch,
+    members,
+    expected_reason,
+    omitted_lower_bound,
+):
+    archive = tmp_path / "member-cap-end.tar.gz"
+    _write_bounded_archive(archive, "tar", members)
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 1)
+    monkeypatch.setattr(
+        _download,
+        "_ARCHIVE_TAR_TRAVERSAL_BYTES",
+        2_048,
+        raising=False,
+    )
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    extracted, preserved, skipped = _extract_bounded_archive(
+        archive, "tar", out_dir
+    )
+
+    expected_names = (
+        ["first.csv"] if len(members) > 1 else ["only.csv"]
+    )
+    assert [Path(path).name for path in extracted] == expected_names
+    assert preserved == set()
+    if expected_reason is None:
+        assert skipped == []
+    else:
+        assert skipped[0]["reason"] == expected_reason
+        assert skipped[0]["omitted_members_lower_bound"] == (
+            omitted_lower_bound
+        )
+
+
 @pytest.mark.parametrize(
     ("extension_kind", "processor_name"),
     [

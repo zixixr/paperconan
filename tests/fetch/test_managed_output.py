@@ -245,6 +245,7 @@ def test_oversized_sidecar_rejects_before_json_load_and_preserves_state(
         "reason": "source sidecar byte limit",
         "limit": len(payload) - 1,
         "observed_bytes": len(payload),
+        "observed_bytes_is_lower_bound": True,
         "ownership_preserved": True,
     }]
     assert download_calls == []
@@ -356,6 +357,239 @@ def test_sidecar_name_byte_limit_rejects_before_retaining_long_name(
     assert sidecar.read_bytes() == original_sidecar
 
 
+def test_sidecar_entry_limit_streams_without_json_load(
+    tmp_path, monkeypatch
+):
+    managed_files = [f"{index}.csv" for index in range(20_000)]
+    _write_sidecar(
+        tmp_path,
+        managed_files,
+        doi="10.x/old",
+    )
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", 2_000_000,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_ENTRY_LIMIT", 3,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_NAME_BYTES", 10_000,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download.json,
+        "load",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "managed_files must not be materialized by json.load"
+            )
+        ),
+    )
+
+    with pytest.raises(_download._SourceSidecarLimit) as error:
+        _download._read_source_sidecar(str(tmp_path))
+
+    assert error.value.record["reason"] == (
+        "source sidecar managed entry limit"
+    )
+    assert error.value.record["managed_entries_inspected"] == 3
+    assert error.value.record["managed_entries_retained"] == 3
+
+
+def test_sidecar_reader_stops_at_limit_plus_one_when_stat_underreports(
+    tmp_path, monkeypatch
+):
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    payload = json.dumps({
+        "doi": "10.x/example",
+        "title": "x" * 1_000,
+    }).encode("utf-8")
+    sidecar.write_bytes(payload)
+    byte_limit = 64
+    real_getsize = _download.os.path.getsize
+    real_open = open
+    read_sizes = []
+
+    def stale_getsize(path):
+        if Path(path) == sidecar:
+            return byte_limit
+        return real_getsize(path)
+
+    class GuardedReader:
+        def __init__(self, stream):
+            self._stream = stream
+
+        def read(self, size=-1):
+            read_sizes.append(size)
+            assert 0 <= size <= byte_limit + 1
+            return self._stream.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self._stream.close()
+
+        def __getattr__(self, name):
+            return getattr(self._stream, name)
+
+    def guarded_open(path, *args, **kwargs):
+        stream = real_open(path, *args, **kwargs)
+        if Path(path) == sidecar:
+            return GuardedReader(stream)
+        return stream
+
+    monkeypatch.setattr(_download.os.path, "getsize", stale_getsize)
+    monkeypatch.setattr("builtins.open", guarded_open)
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", byte_limit,
+        raising=False,
+    )
+
+    with pytest.raises(_download._SourceSidecarLimit) as error:
+        _download._read_source_sidecar(str(tmp_path))
+
+    assert read_sizes == [byte_limit + 1]
+    assert error.value.record == {
+        "name": _download.SOURCE_SIDECAR,
+        "reason": "source sidecar byte limit",
+        "limit": byte_limit,
+        "observed_bytes": byte_limit + 1,
+        "observed_bytes_is_lower_bound": True,
+        "ownership_preserved": True,
+    }
+
+
+def test_source_sidecar_encoding_stops_large_related_doi_iteration(
+    tmp_path, monkeypatch
+):
+    class CountingList(list):
+        def __init__(self, values):
+            super().__init__(values)
+            self.items_yielded = 0
+
+        def __iter__(self):
+            for value in super().__iter__():
+                self.items_yielded += 1
+                yield value
+
+    related = CountingList(
+        f"10.x/{index}" for index in range(20_000)
+    )
+    cand = {
+        "doi": "10.x/example",
+        "title": "Example",
+        "source": "source",
+        "cand_id": "source:1",
+        "related_dois": related,
+    }
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", 256,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download.json,
+        "dumps",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "bounded sidecar encoding must not call json.dumps"
+            )
+        ),
+    )
+
+    with pytest.raises(_download._SourceSidecarLimit) as error:
+        _download._source_sidecar_bytes(
+            cand, str(tmp_path), []
+        )
+
+    assert error.value.record["reason"] == "source sidecar byte limit"
+    assert related.items_yielded < len(related)
+
+
+def test_source_sidecar_encoding_rejects_large_title_before_json_escape(
+    tmp_path, monkeypatch
+):
+    title = "\N{LATIN SMALL LETTER E WITH ACUTE}" * 10_000
+    cand = {
+        "doi": "10.x/example",
+        "title": title,
+        "source": "source",
+        "cand_id": "source:1",
+        "related_dois": [],
+    }
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", 256,
+        raising=False,
+    )
+    original_encoder = json.encoder.encode_basestring_ascii
+
+    def reject_large_scalar(value):
+        if value == title:
+            raise AssertionError(
+                "oversized title must be bounded before JSON escaping"
+            )
+        return original_encoder(value)
+
+    monkeypatch.setattr(
+        json.encoder,
+        "encode_basestring_ascii",
+        reject_large_scalar,
+    )
+
+    with pytest.raises(_download._SourceSidecarLimit) as error:
+        _download._source_sidecar_bytes(
+            cand, str(tmp_path), []
+        )
+
+    assert error.value.record["reason"] == "source sidecar byte limit"
+    assert error.value.record["observed_bytes_is_lower_bound"] is True
+
+
+def test_source_sidecar_encoding_accepts_exact_limit_and_rejects_one_over(
+    tmp_path, monkeypatch
+):
+    cand = {
+        "doi": "10.x/example",
+        "title": "Example",
+        "source": "source",
+        "cand_id": "source:1",
+        "related_dois": ["10.x/related"],
+    }
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", 10_000,
+        raising=False,
+    )
+    payload = _download._source_sidecar_bytes(
+        cand, str(tmp_path), ["table.csv"]
+    )
+    monkeypatch.setattr(
+        _download,
+        "_SOURCE_SIDECAR_MAX_BYTES",
+        len(payload),
+        raising=False,
+    )
+
+    assert _download._source_sidecar_bytes(
+        cand, str(tmp_path), ["table.csv"]
+    ) == payload
+
+    monkeypatch.setattr(
+        _download,
+        "_SOURCE_SIDECAR_MAX_BYTES",
+        len(payload) - 1,
+        raising=False,
+    )
+    with pytest.raises(_download._SourceSidecarLimit) as error:
+        _download._source_sidecar_bytes(
+            cand, str(tmp_path), ["table.csv"]
+        )
+
+    assert error.value.record["reason"] == "source sidecar byte limit"
+    assert error.value.record["observed_bytes"] == len(payload)
+
+
 def test_managed_output_name_uses_membership_without_copying_reusable_names(
     tmp_path,
 ):
@@ -372,6 +606,195 @@ def test_managed_output_name_uses_membership_without_copying_reusable_names(
         "nested/table.csv",
         MembershipOnly(),
     ) == "table.csv"
+
+
+def test_direct_name_limit_precedes_hash_probe_and_sidecar_change(
+    tmp_path, monkeypatch
+):
+    requested_name = "x" * 10_000 + ".csv"
+    hash_calls = []
+    probe_calls = []
+    download_calls = []
+    monkeypatch.setattr(
+        _download, "_MANAGED_OUTPUT_NAME_BYTES", 64, raising=False
+    )
+    monkeypatch.setattr(
+        _download.hashlib,
+        "sha256",
+        lambda *_args, **_kwargs: hash_calls.append(True),
+    )
+    monkeypatch.setattr(
+        _download.os.path,
+        "lexists",
+        lambda *_args, **_kwargs: probe_calls.append(True),
+    )
+    monkeypatch.setattr(
+        _download,
+        "download_file",
+        lambda *_args, **_kwargs: download_calls.append(True),
+    )
+
+    result = _download.download_candidate(
+        _candidate(requested_name, "https://x/source"),
+        str(tmp_path),
+    )
+
+    assert result["downloaded"] == []
+    assert result["skipped"] == [{
+        "name": "managed output",
+        "reason": "managed output name byte limit",
+        "limit": 64,
+        "field": "requested",
+        "observed_name_bytes_lower_bound": 65,
+        "ownership_preserved": True,
+    }]
+    assert hash_calls == []
+    assert probe_calls == []
+    assert download_calls == []
+    assert not (tmp_path / _download.SOURCE_SIDECAR).exists()
+
+
+def test_direct_collision_probe_limit_preserves_authoritative_state(
+    tmp_path, monkeypatch
+):
+    managed = tmp_path / "old.csv"
+    managed.write_bytes(b"old")
+    _write_sidecar(tmp_path, ["old.csv"], doi="10.x/old")
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    original_sidecar = sidecar.read_bytes()
+    probe_limit = 3
+    probes = []
+    real_lexists = _download.os.path.lexists
+
+    def occupied(path):
+        probes.append(Path(path).name)
+        if len(probes) > probe_limit:
+            raise AssertionError(
+                "collision limit must precede filesystem probe"
+            )
+        return True
+
+    monkeypatch.setattr(
+        _download, "_MANAGED_OUTPUT_COLLISION_PROBE_LIMIT",
+        probe_limit,
+        raising=False,
+    )
+    monkeypatch.setattr(_download.os.path, "lexists", occupied)
+    monkeypatch.setattr(
+        _download,
+        "download_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("collision exhaustion must not download")
+        ),
+    )
+
+    result = _download.download_candidate(
+        _candidate("table.csv", "https://x/table.csv"),
+        str(tmp_path),
+    )
+
+    assert result["downloaded"] == []
+    assert result["skipped"] == [{
+        "name": "table.csv",
+        "reason": "managed output collision probe limit",
+        "limit": probe_limit,
+        "collision_probes": probe_limit,
+        "ownership_preserved": True,
+    }]
+    assert len(probes) == probe_limit
+    assert managed.read_bytes() == b"old"
+    assert sidecar.read_bytes() == original_sidecar
+    monkeypatch.setattr(_download.os.path, "lexists", real_lexists)
+
+
+def test_archive_collision_probe_limit_uses_shared_allocator(
+    tmp_path, monkeypatch
+):
+    user = tmp_path / "table.csv"
+    user.write_bytes(b"user")
+    archive = tmp_path / "supp.zip"
+    _write_archive(
+        archive,
+        "zip",
+        [("nested/table.csv", b"a\n1\n")],
+    )
+    probes = []
+
+    def occupied(path):
+        probes.append(Path(path).name)
+        if len(probes) > 1:
+            raise AssertionError(
+                "archive collision limit must precede next probe"
+            )
+        return True
+
+    monkeypatch.setattr(
+        _download, "_MANAGED_OUTPUT_COLLISION_PROBE_LIMIT", 1,
+        raising=False,
+    )
+    monkeypatch.setattr(_download.os.path, "lexists", occupied)
+
+    extracted, preserved, skipped = _extract_archive_managed(
+        archive,
+        "zip",
+        tmp_path,
+    )
+
+    assert extracted == []
+    assert preserved == set()
+    assert skipped == [{
+        "name": "table.csv",
+        "reason": "managed output collision probe limit",
+        "limit": 1,
+        "collision_probes": 1,
+    }]
+    assert probes == ["table.csv"]
+    assert user.read_bytes() == b"user"
+
+
+def test_archive_occurrence_name_limit_precedes_final_allocation(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        _download, "_MANAGED_OUTPUT_NAME_BYTES", 17, raising=False
+    )
+    monkeypatch.setattr(
+        _download,
+        "_allocate_archive_output_names",
+        lambda _names: (_ for _ in ()).throw(
+            AssertionError(
+                "occurrence name limit must precede allocation"
+            )
+        ),
+    )
+
+    with pytest.raises(
+        _download._ManagedOutputNameLimit
+    ) as error:
+        _download._archive_occurrence_output_names(
+            ["a.csv", "a.csv"]
+        )
+
+    assert error.value.reason == "managed output name byte limit"
+    assert error.value.field == "candidate"
+
+
+def test_archive_casefold_collision_name_limit_precedes_candidate(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        _download, "_MANAGED_OUTPUT_NAME_BYTES", 5, raising=False
+    )
+
+    with pytest.raises(
+        _download._ManagedOutputNameLimit
+    ) as error:
+        _download._allocate_archive_output_names(
+            ["a.csv", "A.csv"]
+        )
+
+    assert error.value.reason == "managed output name byte limit"
+    assert error.value.field == "candidate"
 
 
 @pytest.mark.parametrize("channel", ["direct", "zip", "tar"])

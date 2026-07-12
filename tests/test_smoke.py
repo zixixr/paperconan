@@ -12,6 +12,7 @@ import pytest
 from tests.build_fixture import build
 
 from paperconan import scan_dir, write_html_report
+from paperconan import _audit
 
 
 @pytest.fixture(scope="module")
@@ -222,6 +223,40 @@ def test_managed_files_do_not_enter_scan_paper_metadata(tmp_path):
         "cand_id": "source:1",
         "related_dois": ["10.x/related"],
     }
+
+
+def test_scan_provenance_rejects_large_managed_array_without_json_load(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "t.csv").write_text("x\n1\n2\n3\n", encoding="utf-8")
+    (data / "paperconan_source.json").write_text(
+        json.dumps({
+            "doi": "10.x/example",
+            "managed_files": [
+                f"{index}.csv" for index in range(20_000)
+            ],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        _audit.json,
+        "load",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "scan provenance must use the bounded sidecar parser"
+            )
+        ),
+    )
+
+    scan = scan_dir(
+        str(data),
+        str(tmp_path / "out"),
+        write_html=False,
+    )
+
+    assert scan["paper"] is None
 
 
 def test_scan_without_provenance_has_null_paper(tmp_path):

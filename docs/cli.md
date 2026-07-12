@@ -102,7 +102,11 @@ write_adjudicated_report(scan, verdict, "adjudication.html")  # scan/verdict 均
 | `PAPERCONAN_ARCHIVE_MEMBER_LIMIT` | `10000` | 单个 ZIP/TAR 最多检查的 member 元数据数（包括非表格 member）；超限记录遗漏下界 |
 | `PAPERCONAN_ARCHIVE_MEMBER_NAME_BYTES` | `8388608` | 单个 ZIP/TAR 已检查 member 名称的累计 UTF-8 字节预算 |
 | `PAPERCONAN_ARCHIVE_METADATA_BYTES` | `8388608` | 单个 TAR 的 PAX、GNU long-name / long-link 等扩展元数据累计字节预算；在读取或解码超限 payload 前停止 |
+| `PAPERCONAN_ARCHIVE_SPARSE_ENTRY_LIMIT` | `100000` | 单个 TAR 最多保留的 GNU sparse tuple 数；legacy、PAX 0.0/0.1/1.0 共用此累计预算 |
+| `PAPERCONAN_ARCHIVE_TAR_TRAVERSAL_BYTES` | `1073741824` | 单个 TAR 最多遍历的解压后字节数，包括 header、padding、跳过的 member data、扩展元数据及 sparse field block；已知前向距离在 gzip seek/read 前检查 |
 | `PAPERCONAN_ARCHIVE_OUTPUT_FILE_LIMIT` | `5000` | 单个 ZIP/TAR 最多写出的可扫描文件数；每个被此预算跳过的已保留 member 都会列入 `skipped` |
-| `PAPERCONAN_SOURCE_SIDECAR_MAX_BYTES` | `2097152` | 已有 `paperconan_source.json` 在解析前允许的最大文件字节数；超限时保留原 sidecar 与既有 managed outputs |
+| `PAPERCONAN_SOURCE_SIDECAR_MAX_BYTES` | `2097152` | `paperconan_source.json` 的读取及增量编码字节上限；读取最多到 `limit + 1`，超限时保留原 sidecar 与既有 managed outputs |
 | `PAPERCONAN_SOURCE_SIDECAR_ENTRY_LIMIT` | `10000` | provenance sidecar 允许检查及新写入的 managed-name 条目上限 |
 | `PAPERCONAN_SOURCE_SIDECAR_NAME_BYTES` | `1048576` | provenance sidecar 保留的唯一 managed-name 累计 UTF-8 字节预算 |
+| `PAPERCONAN_MANAGED_OUTPUT_NAME_BYTES` | `4096` | 单个 requested/source/base/candidate 输出名称的 UTF-8 字节上限；在 hash、路径 probe 或候选名称分配前检查 |
+| `PAPERCONAN_MANAGED_OUTPUT_COLLISION_PROBE_LIMIT` | `128` | 单个 direct/archive 输出名称最多执行的 filesystem collision probe 数；包括 digest 与 numeric fallback |

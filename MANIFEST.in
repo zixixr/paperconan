@@ -62,6 +62,7 @@ include src/paperconan/_numeric.py
 include src/paperconan/_prefilter.py
 include src/paperconan/_profiles.py
 include src/paperconan/_sheet.py
+include src/paperconan/_source_sidecar.py
 include src/paperconan/_summaries.py
 include src/paperconan/collisions.py
 include src/paperconan/detectors.py

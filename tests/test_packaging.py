@@ -1321,6 +1321,13 @@ def test_sdist_allowlist_matches_tracked_public_files():
     assert _sdist_allowlist() == tracked_public
 
 
+def test_sdist_includes_shared_sidecar_module():
+    assert (
+        "src/paperconan/_source_sidecar.py"
+        in _sdist_allowlist()
+    )
+
+
 def test_copied_source_build_command_disables_isolation(tmp_path):
     command = _copied_source_build_command(tmp_path / "dist")
 
