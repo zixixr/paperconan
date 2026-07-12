@@ -77,8 +77,9 @@ shared control? If not, this warrants a question on PubPeer.
 ```
 
 In `ED_Fig2_tumor_volume.xlsx`, the "treated" group is exactly the control group plus
-a constant, and a third column is a verbatim duplicate of the control. Real treatment
-effects are not a fixed offset on every single animal.
+a constant, and a third column is a verbatim duplicate of the control. If these columns
+represent independent animal measurements, those exact relationships are data
+inconsistencies that need clarification.
 
 ### 3. Within-column fingerprints in qPCR
 
@@ -89,10 +90,11 @@ effects are not a fixed offset on every single animal.
 ```
 
 `rel_expr` reuses the exact value `1.0837` in two-thirds of "independent" samples, and
-every `ct_value` lands on a 0/0.5 grid. Real measurements don't pile onto one value or
-snap perfectly to a grid. The repeated-value finding is demoted in the default profile
-because `rel_expr` looks like a normalized / fold-change column; rerun with
-`--profile forensic` if you want the raw detector severity.
+every `ct_value` lands on a 0/0.5 grid. These patterns are statistically unusual for
+columns presented as independent measurements, but rounding, instrument settings,
+normalization, or other processing may explain them. The repeated-value finding is
+demoted in the default profile because `rel_expr` looks like a normalized / fold-change
+column; rerun with `--profile forensic` if you want the raw detector severity.
 
 ### 4. Medium and low findings — useful, but read with care
 

@@ -383,7 +383,7 @@ def _render_digit_section(scan: dict) -> str:
     return (
         f'<section id="sec-digit" class="section">'
         f'<h2>Last-digit χ² anomalies ({len(items)} sheets, BH-FDR q ≤ 0.05)</h2>'
-        f'<p class="hint">真实测量末位数字应近似均匀分布；偏离表示数字可能是人工构造。</p>'
+        f'<p class="hint">末位数字分布偏离均匀性是统计信号，需要结合测量精度、取整规则和数据来源核查。</p>'
         f'{"".join(cards)}</section>'
     )
 
@@ -404,7 +404,7 @@ def _render_decimal_section(scan: dict) -> str:
     return (
         f'<section id="sec-decimal" class="section">'
         f'<h2>Over-represented two-decimal endings ({len(items)} sheets)</h2>'
-        f'<p class="hint">某些末两位异常频繁出现，可能是编造数字的指纹。</p>'
+        f'<p class="hint">某些末两位出现频率较高，是需要结合测量精度和数据处理流程核查的统计信号。</p>'
         f'<div class="ev-wrap"><table class="ev meta-table">'
         '<thead><tr><th>sheet</th><th>n</th><th>unique endings</th>'
         '<th>top endings</th></tr></thead>'

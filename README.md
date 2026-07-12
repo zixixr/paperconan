@@ -186,7 +186,7 @@ open demo_paper/audit/report.html
 
 ## 诞生背景
 
-这个工具最早是为做一期 YouTube / 抖音 / B 站视频造的：用公开 source data 扫 Nature 及子刊论文，定位可疑数值模式。开源给所有人，希望它能帮认真做实验的人减少被编造数据挤占空间的概率。
+这个工具最早服务于一期 YouTube / 抖音 / B 站视频：用公开 source data 扫 Nature 及子刊论文，定位值得复核的数值模式。开源给所有人，希望它帮助认真做实验的人更高效地识别和澄清数据不一致。
 
 ## License
 
