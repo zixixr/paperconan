@@ -148,6 +148,46 @@ def test_collision_row_limit_is_disclosed(tmp_path):
     }]
 
 
+def test_column_fingerprint_distinct_limit_is_disclosed_exactly(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        audit,
+        "_COLUMN_FINGERPRINT_DISTINCT_LIMIT",
+        7,
+        raising=False,
+    )
+    data = tmp_path / "data"
+    data.mkdir()
+    rows = ["value"] + [
+        str(row + (row % 7) * 0.1234)
+        for row in range(40)
+    ]
+    (data / "large.csv").write_text(
+        "\n".join(rows) + "\n",
+        encoding="utf-8",
+    )
+
+    scan = audit.scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    assert _limitations(
+        scan, "column_fingerprint_distinct_limit"
+    ) == [{
+        "scope": "sheet",
+        "reason": "column_fingerprint_distinct_limit",
+        "file": "large.csv",
+        "sheet": "large",
+        "detector": "cross_sheet_column_duplicate",
+        "column": 1,
+        "rows": "2-41",
+        "numeric_cells": 40,
+        "limit": 7,
+    }]
+    assert scan["coverage"]["truncated"] is True
+
+
 def test_detector_helpers_expose_coverage_without_changing_default_shapes():
     grid_sheet = Sheet.from_rows([
         ["a", "b"],

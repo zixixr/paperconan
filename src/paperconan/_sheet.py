@@ -88,12 +88,14 @@ class Sheet:
         value = self.cell(r, c)
         return value if _is_num(value) else None
 
-    def numeric_values(self):
-        """Row-major list of all numeric cell values with exact integer fidelity."""
-        values = []
+    def iter_numeric_values(self):
+        """Yield numeric cell values row-major with exact integer fidelity."""
         for r in range(self.nrows):
             for c in range(self.ncols):
                 value = self.exact_numeric(r, c)
                 if value is not None:
-                    values.append(value)
-        return values
+                    yield value
+
+    def numeric_values(self):
+        """Row-major list compatibility wrapper for callers that need materialization."""
+        return list(self.iter_numeric_values())

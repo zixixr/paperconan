@@ -209,3 +209,50 @@ def test_process_file_runs_fraction_reuse_while_sheet_is_live(
 
     assert seen == [(4, 1)]
     assert result.within_sheet_findings == [marker]
+
+
+def test_fraction_reuse_streams_large_block_pairs_with_bounded_state(
+    monkeypatch,
+):
+    rows_per_block = 20_000
+    fractions = (0.0625, 0.1875, 0.3125, 0.4375, 0.5625)
+
+    class VirtualSheet:
+        nrows = rows_per_block * 2
+        ncols = 1
+
+        def exact_numeric(self, row, col):
+            assert col == 0
+            offset = row % rows_per_block
+            value = offset + fractions[offset % len(fractions)]
+            if row >= rows_per_block:
+                value += 1 + offset % 3
+            return value
+
+    sheet = VirtualSheet()
+    block_a = (0, rows_per_block, 0, 1)
+    block_b = (rows_per_block, rows_per_block * 2, 0, 1)
+    original = audit._fraction_reuse_pair_stats
+    captured = []
+
+    def capture(*args, **kwargs):
+        stats = original(*args, **kwargs)
+        captured.append(stats)
+        return stats
+
+    monkeypatch.setattr(audit, "_fraction_reuse_pair_stats", capture)
+    monkeypatch.setattr(
+        audit, "find_numeric_blocks", lambda _sheet: [block_a, block_b]
+    )
+
+    findings = detect_within_sheet_fraction_reuse({
+        ("large.csv", "Figure 1"): sheet,
+    })
+
+    assert findings
+    assert len(captured) == 1
+    stats = captured[0]
+    assert stats.common == rows_per_block
+    assert stats.shared == rows_per_block
+    assert len(stats.fraction_representatives) <= 5
+    assert len(stats.difference_representatives) <= 2

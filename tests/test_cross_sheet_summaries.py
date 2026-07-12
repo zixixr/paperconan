@@ -9,6 +9,7 @@ from paperconan._audit import (
     build_cross_sheet_summary,
     detect_cross_sheet_column_duplicates,
 )
+from paperconan._input import InputLimitation
 from paperconan._sheet import Sheet
 from paperconan._summaries import (
     CrossSheetSummary,
@@ -159,6 +160,54 @@ def test_exact_fingerprints_do_not_merge_values_that_only_round_equal():
 
     assert summaries[0].columns[0].digest != summaries[1].columns[0].digest
     assert detect_cross_sheet_column_duplicates(summaries) == []
+
+
+def test_column_fingerprint_distinct_aggregation_is_bounded_and_disclosed(
+    monkeypatch,
+):
+    limit = 7
+    maximum_sizes = []
+    original = audit._BoundedDistinctValues
+
+    class TrackingDistinctValues(original):
+        def add(self, value):
+            result = super().add(value)
+            maximum_sizes.append(len(self.values))
+            return result
+
+    monkeypatch.setattr(
+        audit, "_BoundedDistinctValues", TrackingDistinctValues
+    )
+    monkeypatch.setattr(
+        audit, "_COLUMN_FINGERPRINT_DISTINCT_LIMIT", limit
+    )
+    values = [
+        row + (row % 7) * 0.1234
+        for row in range(40)
+    ]
+    source = Sheet.from_rows([["value"]] + [[value] for value in values])
+
+    summary, limitations = build_cross_sheet_summary(
+        "large.csv",
+        "Figure 1",
+        source,
+    )
+
+    assert summary.columns == ()
+    assert maximum_sizes
+    assert max(maximum_sizes) <= limit
+    assert limitations == [InputLimitation(
+        scope="sheet",
+        reason="column_fingerprint_distinct_limit",
+        sheet="Figure 1",
+        details={
+            "detector": "cross_sheet_column_duplicate",
+            "column": 1,
+            "rows": "2-41",
+            "numeric_cells": 40,
+            "limit": limit,
+        },
+    )]
 
 
 def test_float_convertible_wide_integers_use_exact_qualification():

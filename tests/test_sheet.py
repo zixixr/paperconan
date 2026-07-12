@@ -38,6 +38,23 @@ def test_block_and_numeric_values():
     vals = sorted(s.numeric_values())
     assert vals == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
 
+
+def test_iter_numeric_values_is_row_major_and_preserves_exact_types():
+    wide = 2**53 + 1
+    sheet = Sheet.from_rows([
+        ["label", 1, 2.5],
+        [wide, None, 4.0],
+    ])
+
+    values = list(sheet.iter_numeric_values())
+
+    assert values == [1, 2.5, wide, 4.0]
+    assert type(values[0]) is int
+    assert type(values[1]) is float
+    assert type(values[2]) is int
+    assert sheet.numeric_values() == values
+
+
 def test_ragged_rows_padded():
     s = Sheet.from_rows([[1], [2, 3, 4], [5, 6]])
     assert s.ncols == 3

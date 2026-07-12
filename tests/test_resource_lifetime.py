@@ -69,19 +69,14 @@ def _assert_compact(*roots):
     return retained
 
 
-def test_previous_file_sheet_is_released_before_next_load(tmp_path, monkeypatch):
+def test_scan_streams_numeric_values_and_releases_previous_sheet(
+    tmp_path, monkeypatch
+):
     data = tmp_path / "data"
     data.mkdir()
     (data / "a.csv").write_text("x\n1\n2\n3\n", encoding="utf-8")
     (data / "b.csv").write_text("x\n4\n5\n6\n", encoding="utf-8")
     records = []
-    records_by_sheet_id = {}
-    original_numeric_values = Sheet.numeric_values
-
-    def tracked_numeric_values(sheet):
-        values = _WeakNumericList(original_numeric_values(sheet))
-        records_by_sheet_id[id(sheet)]["values"] = weakref.ref(values)
-        return values
 
     def stub_load(path):
         if records:
@@ -89,24 +84,95 @@ def test_previous_file_sheet_is_released_before_next_load(tmp_path, monkeypatch)
             prior = records[-1]
             assert prior["sheet"]() is None
             assert prior["numeric"]() is None
-            assert prior["values"] is not None
-            assert prior["values"]() is None
         sheet = _WeakSheet.from_rows([["x"], [1.1], [2.2], [3.3]])
         record = {
             "sheet": weakref.ref(sheet),
             "numeric": weakref.ref(sheet.numeric),
-            "values": None,
         }
         records.append(record)
-        records_by_sheet_id[id(sheet)] = record
         return TableLoadResult({path: sheet})
 
-    monkeypatch.setattr(Sheet, "numeric_values", tracked_numeric_values)
+    def fail_numeric_values(_sheet):
+        raise AssertionError("scan path must stream numeric values")
+
+    monkeypatch.setattr(Sheet, "numeric_values", fail_numeric_values)
     monkeypatch.setattr(audit, "load_table_result", stub_load)
     scan = audit.scan_dir(
         str(data), str(tmp_path / "out"), write_html=False
     )
     assert scan["coverage"]["files_succeeded"] == 2
+
+
+def test_large_single_column_sheet_keeps_retained_state_bounded(
+    monkeypatch,
+):
+    row_count = 100_000
+    row_numbers = np.arange(row_count, dtype=float)
+    numeric = (
+        row_numbers + (row_numbers % 7) * 0.1234
+    ).reshape(row_count, 1)
+    sheet = Sheet(
+        row_count,
+        1,
+        numeric,
+        {},
+        set(),
+    )
+
+    def fail_numeric_values(_sheet):
+        raise AssertionError("scan path must stream numeric values")
+
+    class NoopRecurringIndex:
+        initial_budget = 0
+
+        def add_sheet(self, *args, **kwargs):
+            return {
+                "budget_exhausted": False,
+                "windows_skipped": 0,
+            }
+
+    monkeypatch.setattr(Sheet, "numeric_values", fail_numeric_values)
+    monkeypatch.setattr(
+        audit, "_analyze_numeric_blocks", lambda *args, **kwargs: []
+    )
+    monkeypatch.setattr(
+        audit,
+        "_COLUMN_FINGERPRINT_DISTINCT_LIMIT",
+        16,
+        raising=False,
+    )
+    state = audit.ScanBudgetState(
+        coverage=ScanCoverage(files_discovered=1),
+        recurring_index=NoopRecurringIndex(),
+        profile="review",
+        evidence=False,
+    )
+
+    result = audit._process_loaded_sheet(
+        sheet,
+        file_name="large.csv",
+        sheet_name="large",
+        sheet_start=None,
+        state=state,
+    )
+
+    assert result.stats["numeric_cells"] == row_count
+    assert [
+        item
+        for item in state.coverage.limitations
+        if item["reason"] == "column_fingerprint_distinct_limit"
+    ] == [{
+        "scope": "sheet",
+        "reason": "column_fingerprint_distinct_limit",
+        "file": "large.csv",
+        "sheet": "large",
+        "detector": "cross_sheet_column_duplicate",
+        "column": 1,
+        "rows": f"1-{row_count}",
+        "numeric_cells": row_count,
+        "limit": 16,
+    }]
+    _assert_compact(result, state)
 
 
 def test_deferred_reload_releases_each_source_before_next_load(

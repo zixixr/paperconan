@@ -1993,10 +1993,16 @@ def detect_grim_grimmer(sheet, r0, r1, c0, c1, header):
 
 
 def detect_last_digit(values, label):
-    digits = [int(d) for d in (last_significant_digit(v) for v in values) if d is not None and d != "0"]
-    if len(digits) < 40:
+    counts = Counter()
+    n = 0
+    for value in values:
+        digit = last_significant_digit(value)
+        if digit is None or digit == "0":
+            continue
+        counts[int(digit)] += 1
+        n += 1
+    if n < 40:
         return None
-    counts = Counter(digits)
     obs = np.array([counts.get(d, 0) for d in range(1, 10)], dtype=float)
     expected = np.full(9, obs.sum() / 9.0)
     chi2 = ((obs - expected) ** 2 / expected).sum()
@@ -2008,12 +2014,16 @@ def detect_last_digit(values, label):
 
 
 def detect_repeated_decimals(values, label):
-    endings = [trailing_decimal_digits(v, 2) for v in values]
-    endings = [e for e in endings if e is not None]
-    if len(endings) < 60:
+    counts = Counter()
+    n = 0
+    for value in values:
+        ending = trailing_decimal_digits(value, 2)
+        if ending is None:
+            continue
+        counts[ending] += 1
+        n += 1
+    if n < 60:
         return None
-    counts = Counter(endings)
-    n = len(endings)
     flags = [(e, c) for e, c in counts.most_common(15) if c >= max(5, 5 * n / 100)]
     return dict(label=label, n=n, n_unique=len(counts), top=flags)
 
@@ -2842,98 +2852,283 @@ def _numeric_ratio(value):
     return float(value).as_integer_ratio()
 
 
-def _fingerprint_values(values):
-    digest = hashlib.blake2b(digest_size=20)
-    for value in values:
-        numerator, denominator = _numeric_ratio(value)
-        token = f"{numerator}/{denominator};".encode("ascii")
-        digest.update(token)
-    return digest.hexdigest()
-
-
 def _fingerprint_example_value(value):
     if isinstance(value, int) and abs(value) > _MAX_EXACT_FLOAT_INT:
         return value
     return float(value)
 
 
-def _exact_column_axis_like(exact_values):
-    if len(set(exact_values)) <= 1:
-        return True
-    fractions = [
-        Fraction(numerator, denominator)
-        for numerator, denominator in exact_values
-    ]
-    differences = [
-        fractions[idx + 1] - fractions[idx]
-        for idx in range(len(fractions) - 1)
-    ]
-    if differences and differences[0] != 0 and all(
-        value == differences[0] for value in differences
-    ):
-        return True
-    if all(value != 0 for value in fractions):
-        ratios = [
-            fractions[idx + 1] / fractions[idx]
-            for idx in range(len(fractions) - 1)
-        ]
-        if ratios and ratios[0] != 1 and all(
-            value == ratios[0] for value in ratios
-        ):
-            return True
-    return False
+class _BoundedDistinctValues:
+    def __init__(self, limit):
+        self.limit = max(0, int(limit))
+        self.values = set()
+        self.overflowed = False
+
+    def add(self, value):
+        if value in self.values:
+            return
+        if len(self.values) >= self.limit:
+            self.overflowed = True
+            return
+        self.values.add(value)
 
 
-def _column_fingerprints(file, sheet, source, blocks, min_column_length):
+def _pattern_error(left, right):
+    if left == right:
+        return 0.0
+    error = abs(left - right)
+    return error if math.isfinite(error) else math.inf
+
+
+def _stream_column_fingerprint(
+    file,
+    sheet,
+    source,
+    *,
+    r0,
+    r1,
+    col_idx,
+    label,
+    min_column_length,
+    distinct_limit,
+):
+    digest = hashlib.blake2b(digest_size=20)
+    exact_distinct = _BoundedDistinctValues(distinct_limit)
+    rounded_distinct = _BoundedDistinctValues(distinct_limit)
+    sample = []
+    length = 0
+    all_int = True
+    requires_exact_qualification = False
+
+    exact_constant = True
+    exact_first = None
+    exact_previous = None
+    exact_first_difference = None
+    exact_arithmetic = True
+    exact_all_nonzero = True
+    exact_first_ratio = None
+    exact_geometric = True
+
+    float_constant = True
+    float_first_rounded = None
+    float_previous = None
+    float_first_difference = None
+    float_difference_error = 0.0
+    float_all_nonzero = True
+    float_first_ratio = None
+    float_ratio_error = 0.0
+    float_scale = 1e-300
+
+    for row_idx in range(r0, r1):
+        value = source.exact_numeric(row_idx, col_idx)
+        if value is None:
+            continue
+        length += 1
+        if len(sample) < 5:
+            sample.append(value)
+        numerator, denominator = _numeric_ratio(value)
+        exact_value = (numerator, denominator)
+        exact_distinct.add(exact_value)
+        digest.update(
+            f"{numerator}/{denominator};".encode("ascii")
+        )
+        all_int = all_int and denominator == 1
+        is_wide_integer = (
+            isinstance(value, int)
+            and abs(value) > _MAX_EXACT_FLOAT_INT
+        )
+        requires_exact_qualification = (
+            requires_exact_qualification
+            or is_wide_integer
+        )
+
+        fraction = Fraction(numerator, denominator)
+        if exact_first is None:
+            exact_first = fraction
+        elif fraction != exact_first:
+            exact_constant = False
+        if fraction == 0:
+            exact_all_nonzero = False
+        if exact_previous is not None:
+            difference = fraction - exact_previous
+            if exact_first_difference is None:
+                exact_first_difference = difference
+            elif difference != exact_first_difference:
+                exact_arithmetic = False
+            if exact_previous != 0 and fraction != 0:
+                ratio = fraction / exact_previous
+                if exact_first_ratio is None:
+                    exact_first_ratio = ratio
+                elif ratio != exact_first_ratio:
+                    exact_geometric = False
+        exact_previous = fraction
+
+        if not requires_exact_qualification:
+            numeric = float(value)
+            rounded_value = round(numeric, 9)
+            rounded_distinct.add(rounded_value)
+            float_scale = max(float_scale, abs(numeric))
+            if float_first_rounded is None:
+                float_first_rounded = rounded_value
+            elif rounded_value != float_first_rounded:
+                float_constant = False
+            if abs(numeric) <= 1e-12:
+                float_all_nonzero = False
+            if float_previous is not None:
+                difference = numeric - float_previous
+                if float_first_difference is None:
+                    float_first_difference = difference
+                else:
+                    float_difference_error = max(
+                        float_difference_error,
+                        _pattern_error(
+                            difference, float_first_difference
+                        ),
+                    )
+                if (
+                    abs(float_previous) > 1e-12
+                    and abs(numeric) > 1e-12
+                ):
+                    ratio = numeric / float_previous
+                    if float_first_ratio is None:
+                        float_first_ratio = ratio
+                    else:
+                        float_ratio_error = max(
+                            float_ratio_error,
+                            _pattern_error(
+                                ratio, float_first_ratio
+                            ),
+                        )
+            float_previous = numeric
+
+    if length < min_column_length:
+        return None, None
+
+    if requires_exact_qualification:
+        axis_like = (
+            length < 2
+            or exact_constant
+            or (
+                exact_first_difference is not None
+                and exact_first_difference != 0
+                and exact_arithmetic
+            )
+            or (
+                exact_all_nonzero
+                and exact_first_ratio is not None
+                and exact_first_ratio != 1
+                and exact_geometric
+            )
+        )
+        qualification_distinct = exact_distinct
+    else:
+        difference_tolerance = 1e-9 * float_scale
+        arithmetic = (
+            float_first_difference is not None
+            and abs(float_first_difference) > difference_tolerance
+            and float_difference_error
+            <= (
+                difference_tolerance
+                + 1e-9 * abs(float_first_difference)
+            )
+        )
+        geometric = (
+            float_all_nonzero
+            and float_first_ratio is not None
+            and abs(float_first_ratio - 1) > 1e-9
+            and float_ratio_error
+            <= 1e-9 + 1e-9 * abs(float_first_ratio)
+        )
+        axis_like = (
+            length < 2
+            or float_constant
+            or arithmetic
+            or geometric
+        )
+        qualification_distinct = rounded_distinct
+    if axis_like:
+        return None, None
+
+    required_distinct = max(6, length // 2)
+    if qualification_distinct.overflowed:
+        return None, InputLimitation(
+            scope="sheet",
+            reason="column_fingerprint_distinct_limit",
+            sheet=sheet,
+            details={
+                "detector": "cross_sheet_column_duplicate",
+                "column": col_idx + 1,
+                "rows": f"{r0 + 1}-{r1}",
+                "numeric_cells": length,
+                "limit": max(0, int(distinct_limit)),
+            },
+        )
+    if len(qualification_distinct.values) < required_distinct:
+        return None, None
+    if exact_distinct.overflowed:
+        return None, InputLimitation(
+            scope="sheet",
+            reason="column_fingerprint_distinct_limit",
+            sheet=sheet,
+            details={
+                "detector": "cross_sheet_column_duplicate",
+                "column": col_idx + 1,
+                "rows": f"{r0 + 1}-{r1}",
+                "numeric_cells": length,
+                "limit": max(0, int(distinct_limit)),
+            },
+        )
+
+    return ColumnFingerprint(
+        file=file,
+        sheet=sheet,
+        col_idx=col_idx,
+        label=label,
+        length=length,
+        digest=digest.hexdigest(),
+        all_int=all_int,
+        distinct=len(exact_distinct.values),
+        sample=tuple(sample),
+    ), None
+
+
+def _column_fingerprints(
+    file,
+    sheet,
+    source,
+    blocks,
+    min_column_length,
+    distinct_limit=None,
+):
+    if distinct_limit is None:
+        distinct_limit = _COLUMN_FINGERPRINT_DISTINCT_LIMIT
     best = {}
+    limitations = []
     for r0, r1, c0, c1 in blocks:
         header = header_for(source, r0, c0, c1)
         for col_idx in range(c0, c1):
-            values = [
-                source.exact_numeric(row_idx, col_idx)
-                for row_idx in range(r0, r1)
-            ]
-            values = [value for value in values if value is not None]
-            if len(values) < min_column_length:
-                continue
-            exact_values = [_numeric_ratio(value) for value in values]
-            requires_exact_qualification = any(
-                isinstance(value, int)
-                and abs(value) > _MAX_EXACT_FLOAT_INT
-                for value in values
-            )
-            if requires_exact_qualification:
-                axis_like = _exact_column_axis_like(exact_values)
-                rounded_distinct = len(set(exact_values))
-            else:
-                qualified = np.asarray(
-                    [float(value) for value in values],
-                    dtype=float,
-                )
-                axis_like = _column_axis_like(qualified)
-                rounded_distinct = len({
-                    round(float(value), 9)
-                    for value in values
-                })
-            if axis_like:
-                continue
-            if rounded_distinct < max(6, len(values) // 2):
-                continue
-            fingerprint = ColumnFingerprint(
+            fingerprint, limitation = _stream_column_fingerprint(
                 file=file,
                 sheet=sheet,
+                source=source,
+                r0=r0,
+                r1=r1,
                 col_idx=col_idx,
                 label=header[col_idx - c0],
-                length=len(values),
-                digest=_fingerprint_values(values),
-                all_int=all(denominator == 1 for _numerator, denominator in exact_values),
-                distinct=len(set(exact_values)),
-                sample=tuple(values[:5]),
+                min_column_length=min_column_length,
+                distinct_limit=distinct_limit,
             )
+            if limitation is not None:
+                limitations.append(limitation)
+            if fingerprint is None:
+                continue
             current = best.get(col_idx)
             if current is None or fingerprint.length > current.length:
                 best[col_idx] = fingerprint
-    return tuple(best[col_idx] for col_idx in sorted(best))
+    return (
+        tuple(best[col_idx] for col_idx in sorted(best)),
+        limitations,
+    )
 
 
 def build_cross_sheet_summary(
@@ -2964,20 +3159,21 @@ def build_cross_sheet_summary(
             if row_idx < label_row_limit and isinstance(value, str)
         },
     )
+    columns, column_limitations = _column_fingerprints(
+        file,
+        sheet,
+        source,
+        blocks,
+        min_column_length,
+    )
     summary = CrossSheetSummary(
         file=file,
         sheet=sheet,
         grid=grid,
         labels=labels,
-        columns=_column_fingerprints(
-            file,
-            sheet,
-            source,
-            blocks,
-            min_column_length,
-        ),
+        columns=columns,
     )
-    limitations = []
+    limitations = list(column_limitations)
     if grid_meta["row_limited"]:
         limitations.append(InputLimitation(
             scope="sheet",
@@ -3118,6 +3314,68 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
     return findings
 
 
+@dataclass(frozen=True)
+class _FractionReusePairStats:
+    common: int
+    shared: int
+    integer_differences: int
+    high_precision: int
+    fraction_representatives: tuple[float, ...]
+    difference_representatives: tuple[int, ...]
+
+
+def _add_bounded_representative(values, value, limit):
+    if len(values) < limit:
+        values.add(value)
+
+
+def _fraction_reuse_pair_stats(sheet, block_a, block_b):
+    ar0, ar1, ac0, ac1 = block_a
+    br0, br1, bc0, bc1 = block_b
+    row_count = min(ar1 - ar0, br1 - br0)
+    col_count = min(ac1 - ac0, bc1 - bc0)
+    common = shared = integer_differences = high_precision = 0
+    fractions = set()
+    differences = set()
+    for row_offset in range(row_count):
+        for col_offset in range(col_count):
+            left = sheet.exact_numeric(
+                ar0 + row_offset, ac0 + col_offset
+            )
+            right = sheet.exact_numeric(
+                br0 + row_offset, bc0 + col_offset
+            )
+            if left is None or right is None:
+                continue
+            common += 1
+            x = float(left)
+            y = float(right)
+            if not bool(integer_shift_close((x,), (y,))[0]):
+                continue
+            shared += 1
+            rounded_difference = round(y - x)
+            if abs(rounded_difference) >= 1:
+                integer_differences += 1
+                _add_bounded_representative(
+                    differences, rounded_difference, 2
+                )
+            if _sig_frac_digits(x) >= 3:
+                high_precision += 1
+                _add_bounded_representative(
+                    fractions,
+                    round(x - round(x), 6),
+                    5,
+                )
+    return _FractionReusePairStats(
+        common=common,
+        shared=shared,
+        integer_differences=integer_differences,
+        high_precision=high_precision,
+        fraction_representatives=tuple(fractions),
+        difference_representatives=tuple(differences),
+    )
+
+
 def detect_within_sheet_fraction_reuse(grid_sheets, profile="review", min_cells=10):
     """B3 — two numeric blocks in the SAME sheet whose positionally-corresponding cells reproduce
     each other's HIGH-PRECISION decimal fractions while their integer parts differ by whole numbers
@@ -3128,42 +3386,30 @@ def detect_within_sheet_fraction_reuse(grid_sheets, profile="review", min_cells=
     coincidence negligible."""
     findings = []
     for (fname, sname), sheet in grid_sheets.items():
-        grids = []
-        for (r0, r1, c0, c1) in find_numeric_blocks(sheet):
-            cells = {}
-            for r in range(r0, r1):
-                for c in range(c0, c1):
-                    v = sheet.cell(r, c)
-                    if isinstance(v, (int, float)) and not isinstance(v, bool):
-                        cells[(r - r0, c - c0)] = float(v)
-            if len(cells) >= min_cells:
-                grids.append(((r0, r1, c0, c1), cells))
+        blocks = find_numeric_blocks(sheet)
         best = None                                            # keep only the strongest pair per sheet
-        for i in range(len(grids)):
-            for j in range(i + 1, len(grids)):
-                (ba, ca), (bb, cb) = grids[i], grids[j]
-                common = [k for k in ca if k in cb]
-                if len(common) < min_cells:
+        for i in range(len(blocks)):
+            for j in range(i + 1, len(blocks)):
+                ba, bb = blocks[i], blocks[j]
+                pair = _fraction_reuse_pair_stats(sheet, ba, bb)
+                if pair.common < min_cells:
                     continue
-                shared = int_diffs = hp = 0
-                fracs, diffset = set(), set()
-                for k in common:
-                    x, y = ca[k], cb[k]
-                    same_fraction = bool(integer_shift_close([x], [y])[0])
-                    if same_fraction:
-                        shared += 1
-                        rounded_diff = round(y - x)
-                        if abs(rounded_diff) >= 1:
-                            int_diffs += 1
-                            diffset.add(rounded_diff)
-                        if _sig_frac_digits(x) >= 3:
-                            hp += 1
-                            fracs.add(round(x - round(x), 6))
-                if (shared >= max(min_cells, int(round(0.8 * len(common))))
-                        and hp >= max(6, int(round(0.5 * len(common))))
-                        and int_diffs >= 3 and len(diffset) >= 2 and len(fracs) >= 5
-                        and (best is None or shared > best[0])):
-                    best = (shared, ba, bb, len(common))
+                if (
+                    pair.shared >= max(
+                        min_cells, int(round(0.8 * pair.common))
+                    )
+                    and pair.high_precision >= max(
+                        6, int(round(0.5 * pair.common))
+                    )
+                    and pair.integer_differences >= 3
+                    and len(pair.difference_representatives) >= 2
+                    and len(pair.fraction_representatives) >= 5
+                    and (
+                        best is None
+                        or pair.shared > best[0]
+                    )
+                ):
+                    best = (pair.shared, ba, bb, pair.common)
         if best is not None:
             shared, ba, bb, ncommon = best
             findings.append(dict(
@@ -3219,6 +3465,15 @@ _MAX_FILE_BYTES = int(_MAX_FILE_MB * 1024 * 1024)
 # budget now bounds far less RAM. Skip a sheet whose cell count exceeds this, checked from
 # the sheet dimensions BEFORE materializing. Default 10M cells ≈ an 80MB numeric array.
 _MAX_CELLS = int(os.environ.get("PAPERCONAN_MAX_CELLS", "10000000"))
+# Exact column distinctness is retained only up to this fixed detector budget.
+# Longer high-cardinality columns are skipped with structured coverage metadata
+# rather than growing Python sets in proportion to accepted sheet size.
+_COLUMN_FINGERPRINT_DISTINCT_LIMIT = int(
+    os.environ.get(
+        "PAPERCONAN_COLUMN_FINGERPRINT_DISTINCT_LIMIT",
+        "50000",
+    )
+)
 # Wide blocks (dense correlation matrices) can make relation, equal-pair, and row-pair
 # coupling detector paths expensive in compute time and output size. Skip those three paths
 # above this width while the column-wise detectors still run. 0 disables the skip.
@@ -3693,15 +3948,16 @@ def _process_loaded_sheet(
         profile=state.profile,
     )
 
-    sheet_numbers = sheet.numeric_values()
     label = f"{file_name}::{sheet_name}"
     digit_reports = []
-    digit_report = detect_last_digit(sheet_numbers, label=label)
+    digit_report = detect_last_digit(
+        sheet.iter_numeric_values(), label=label
+    )
     if digit_report:
         digit_reports.append(digit_report)
     decimal_reports = []
     decimal_report = detect_repeated_decimals(
-        sheet_numbers, label=label
+        sheet.iter_numeric_values(), label=label
     )
     if decimal_report:
         decimal_reports.append(decimal_report)
@@ -3748,11 +4004,10 @@ def _process_loaded_sheet(
         "sheet": sheet_name,
         "n_rows": sheet.nrows,
         "n_cols": sheet.ncols,
-        "numeric_cells": len(sheet_numbers),
+        "numeric_cells": sum(1 for _ in sheet.iter_numeric_values()),
         "n_blocks": len(blocks),
         "elapsed_ms": _elapsed_ms(sheet_start),
     }
-    del sheet_numbers
     return _SheetScanResult(
         report_blocks=report_blocks,
         digit_reports=digit_reports,
