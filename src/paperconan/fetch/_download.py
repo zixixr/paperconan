@@ -242,8 +242,7 @@ def _remove_managed_files(out_dir, managed_files):
         except FileNotFoundError:
             pass
         except OSError:
-            if os.path.lexists(path):
-                failed.append(relative)
+            failed.append(relative)
     return failed
 
 
@@ -352,6 +351,7 @@ def _extract_archive_members(
     member_name,
     member_size,
     open_member,
+    member_errors,
 ):
     extracted = []
     preserved = set()
@@ -376,6 +376,7 @@ def _extract_archive_members(
             if reuses_old and os.path.lexists(dest):
                 preserved.add(name)
             continue
+        committed = False
         try:
             src = open_member(member)
             if src is None:
@@ -384,11 +385,23 @@ def _extract_archive_members(
                 size = _atomic_stream_write(
                     src, dest, max_member_bytes
                 )
+                committed = True
         except _SizeLimitExceeded:
             if reuses_old and os.path.lexists(dest):
                 preserved.add(name)
             continue
-        except Exception as e:
+        except member_errors as e:
+            if committed:
+                written += size
+                extracted.append(dest)
+                skipped.append({
+                    "name": source_name,
+                    "reason": (
+                        "archive member close failed after commit: "
+                        f"{e}"
+                    ),
+                })
+                continue
             if reuses_old and os.path.lexists(dest):
                 preserved.add(name)
             skipped.append({
@@ -440,6 +453,12 @@ def _extract_tabular_zip_managed(
             member_name=lambda info: info.filename,
             member_size=lambda info: info.file_size,
             open_member=zf.open,
+            member_errors=(
+                OSError,
+                EOFError,
+                RuntimeError,
+                zipfile.BadZipFile,
+            ),
         )
 
 
@@ -482,6 +501,11 @@ def _extract_tabular_tar_managed(
             member_name=lambda member: member.name,
             member_size=lambda member: member.size,
             open_member=tf.extractfile,
+            member_errors=(
+                OSError,
+                EOFError,
+                tarfile.TarError,
+            ),
         )
 
 

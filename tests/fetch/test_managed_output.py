@@ -10,6 +10,10 @@ import pytest
 from paperconan.fetch import _download
 
 
+class _UnexpectedArchiveSignal(BaseException):
+    pass
+
+
 def _candidate(name, url):
     return {
         "cand_id": "source:1",
@@ -37,6 +41,37 @@ def _is_tool_reserved_name(name):
         or folded.startswith(".paperconan-archive-")
         or folded.startswith(f".{sidecar}.")
     )
+
+
+def _archive_payload(archive_kind, members):
+    buffer = io.BytesIO()
+    if archive_kind == "zip":
+        with zipfile.ZipFile(buffer, "w") as zf:
+            for name, body in members:
+                zf.writestr(name, body)
+    else:
+        with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
+            for name, body in members:
+                info = tarfile.TarInfo(name)
+                info.size = len(body)
+                tf.addfile(info, io.BytesIO(body))
+    return buffer.getvalue()
+
+
+def _archive_fields(archive_kind):
+    if archive_kind == "zip":
+        return {
+            "supplementary_archive": {
+                "name": "supp.zip",
+                "url": "https://x/supp.zip",
+            },
+        }
+    return {
+        "oa_package": {
+            "name": "supp.tar.gz",
+            "url": "https://x/supp.tar.gz",
+        },
+    }
 
 
 def test_second_fetch_removes_only_previous_managed_files(
@@ -284,17 +319,18 @@ def test_failed_archive_refresh_preserves_previous_managed_files(
     )["managed_files"] == ["table.csv"]
 
 
-def test_oversized_reused_archive_member_preserves_previous_file(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+def test_oversized_reused_member_preserves_previous_file(
+    tmp_path, monkeypatch, archive_kind
 ):
     managed = tmp_path / "table.csv"
     original = b"old-complete"
     managed.write_bytes(original)
     _write_sidecar(tmp_path, ["table.csv"])
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as zf:
-        zf.writestr("nested/table.csv", b"x" * 100)
-    payload = buffer.getvalue()
+    payload = _archive_payload(
+        archive_kind,
+        [("nested/table.csv", b"x" * 100)],
+    )
 
     def archive_download(url, dest, **kwargs):
         Path(dest).write_bytes(payload)
@@ -304,53 +340,18 @@ def test_oversized_reused_archive_member_preserves_previous_file(
     result = _download.download_candidate({
         "cand_id": "source:1",
         "tabular_files": [],
-        "supplementary_archive": {
-            "name": "supp.zip",
-            "url": "https://x/supp.zip",
-        },
+        **_archive_fields(archive_kind),
     }, str(tmp_path), max_bytes=10)
 
     assert managed.read_bytes() == original
     assert result["downloaded"] == []
-    assert json.loads(
-        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
-    )["managed_files"] == ["table.csv"]
-
-
-def test_oversized_reused_tar_member_preserves_previous_file(
-    tmp_path, monkeypatch
-):
-    managed = tmp_path / "table.csv"
-    original = b"old-complete"
-    managed.write_bytes(original)
-    _write_sidecar(tmp_path, ["table.csv"])
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
-        body = b"x" * 100
-        info = tarfile.TarInfo("nested/table.csv")
-        info.size = len(body)
-        tf.addfile(info, io.BytesIO(body))
-    payload = buffer.getvalue()
-
-    def archive_download(url, dest, **kwargs):
-        Path(dest).write_bytes(payload)
-        return {"ok": True, "path": dest}
-
-    monkeypatch.setattr(_download, "download_file", archive_download)
-    result = _download.download_candidate({
-        "cand_id": "source:1",
-        "tabular_files": [],
-        "oa_package": {
-            "name": "supp.tar.gz",
-            "url": "https://x/supp.tar.gz",
-        },
-    }, str(tmp_path), max_bytes=10)
-
-    assert managed.read_bytes() == original
-    assert result["downloaded"] == []
-    assert json.loads(
-        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
-    )["managed_files"] == ["table.csv"]
+    assert result["skipped"] == []
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    assert sidecar.exists()
+    assert json.loads(sidecar.read_text(encoding="utf-8"))[
+        "managed_files"
+    ] == ["table.csv"]
+    assert not list(tmp_path.glob(".paperconan-archive-*"))
 
 
 def test_sidecar_commit_failure_does_not_prune_old_managed_files(
@@ -432,6 +433,59 @@ def test_cleanup_failure_keeps_residual_file_owned_and_reports_it(
         "source": "source",
         "title": None,
     }
+
+
+@pytest.mark.parametrize("probe_mode", ["false", "unavailable"])
+def test_cleanup_failure_retains_ownership_without_existence_probe(
+    tmp_path, monkeypatch, probe_mode
+):
+    old = tmp_path / "old.csv"
+    old.write_bytes(b"old-complete")
+    _write_sidecar(tmp_path, ["old.csv"], doi="10.x/old")
+
+    def stub_download(url, dest, **kwargs):
+        Path(dest).write_bytes(b"new-complete")
+        return {"ok": True, "path": dest}
+
+    remove = _download.os.remove
+
+    def fail_old_remove(path):
+        if Path(path).name == "old.csv":
+            raise OSError("cleanup blocked")
+        return remove(path)
+
+    lexists = _download.os.path.lexists
+
+    def unreliable_lexists(path):
+        if Path(path).name != "old.csv":
+            return lexists(path)
+        if probe_mode == "false":
+            return False
+        raise OSError("existence probe unavailable")
+
+    monkeypatch.setattr(_download, "download_file", stub_download)
+    monkeypatch.setattr(_download.os, "remove", fail_old_remove)
+    monkeypatch.setattr(
+        _download.os.path, "lexists", unreliable_lexists
+    )
+    result = _download.download_candidate(
+        _candidate("new.csv", "https://x/new.csv"),
+        str(tmp_path),
+    )
+
+    new = tmp_path / "new.csv"
+    assert new.read_bytes() == b"new-complete"
+    assert old.read_bytes() == b"old-complete"
+    assert result["downloaded"] == [str(new)]
+    assert result["skipped"] == [{
+        "name": "old.csv",
+        "reason": "could not remove managed file",
+    }]
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    assert sidecar.exists()
+    assert json.loads(sidecar.read_text(encoding="utf-8"))[
+        "managed_files"
+    ] == ["new.csv", "old.csv"]
 
 
 def test_narrowing_commit_failure_keeps_broad_manifest_ownership(
@@ -794,17 +848,20 @@ def test_archive_package_temporary_never_uses_candidate_basename(
     assert not seen_destinations[0].exists()
 
 
-def test_zip_partial_member_failure_keeps_success_and_reused_owner(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+def test_partial_member_failure_keeps_success_and_reused_owner(
+    tmp_path, monkeypatch, archive_kind
 ):
     old = tmp_path / "old.csv"
     old.write_bytes(b"old-complete")
     _write_sidecar(tmp_path, ["old.csv"], doi="10.x/old")
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as zf:
-        zf.writestr("new.csv", b"new-complete")
-        zf.writestr("old.csv", b"replacement")
-    payload = buffer.getvalue()
+    payload = _archive_payload(
+        archive_kind,
+        [
+            ("new.csv", b"new-complete"),
+            ("old.csv", b"replacement"),
+        ],
+    )
 
     def archive_download(url, dest, **kwargs):
         Path(dest).write_bytes(payload)
@@ -825,10 +882,7 @@ def test_zip_partial_member_failure_keeps_success_and_reused_owner(
         "cand_id": "source:1",
         "doi": "10.x/new",
         "tabular_files": [],
-        "supplementary_archive": {
-            "name": "supp.zip",
-            "url": "https://x/supp.zip",
-        },
+        **_archive_fields(archive_kind),
     }, str(tmp_path))
 
     new = tmp_path / "new.csv"
@@ -852,64 +906,140 @@ def test_zip_partial_member_failure_keeps_success_and_reused_owner(
     assert not list(tmp_path.glob(".paperconan-archive-*"))
 
 
-def test_tar_partial_member_failure_keeps_success_and_reused_owner(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+def test_member_close_failure_after_commit_stays_downloaded(
+    tmp_path, monkeypatch, archive_kind
 ):
-    old = tmp_path / "old.csv"
-    old.write_bytes(b"old-complete")
-    _write_sidecar(tmp_path, ["old.csv"], doi="10.x/old")
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
-        for name, body in (
-            ("new.csv", b"new-complete"),
-            ("old.csv", b"replacement"),
-        ):
-            info = tarfile.TarInfo(name)
-            info.size = len(body)
-            tf.addfile(info, io.BytesIO(body))
-    payload = buffer.getvalue()
+    managed = tmp_path / "table.csv"
+    managed.write_bytes(b"old-complete")
+    _write_sidecar(tmp_path, ["table.csv"], doi="10.x/old")
+    payload = _archive_payload(
+        archive_kind,
+        [("table.csv", b"new-complete")],
+    )
 
     def archive_download(url, dest, **kwargs):
         Path(dest).write_bytes(payload)
         return {"ok": True, "path": dest}
 
-    atomic_stream_write = _download._atomic_stream_write
+    class CloseFailureStream:
+        def __init__(self, inner):
+            self._inner = inner
 
-    def fail_old_member(src, dest, max_bytes):
-        if Path(dest).name == "old.csv":
-            raise OSError("member write failed")
-        return atomic_stream_write(src, dest, max_bytes)
+        def read(self, size=-1):
+            return self._inner.read(size)
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self._inner.__exit__(exc_type, exc_value, traceback)
+            raise OSError("member close failed")
 
     monkeypatch.setattr(_download, "download_file", archive_download)
-    monkeypatch.setattr(
-        _download, "_atomic_stream_write", fail_old_member
-    )
+    if archive_kind == "zip":
+        open_member = _download.zipfile.ZipFile.open
+
+        def open_with_close_failure(archive, member, *args, **kwargs):
+            return CloseFailureStream(
+                open_member(archive, member, *args, **kwargs)
+            )
+
+        monkeypatch.setattr(
+            _download.zipfile.ZipFile,
+            "open",
+            open_with_close_failure,
+        )
+    else:
+        open_member = _download.tarfile.TarFile.extractfile
+
+        def open_with_close_failure(archive, member, *args, **kwargs):
+            return CloseFailureStream(
+                open_member(archive, member, *args, **kwargs)
+            )
+
+        monkeypatch.setattr(
+            _download.tarfile.TarFile,
+            "extractfile",
+            open_with_close_failure,
+        )
+
     result = _download.download_candidate({
         "cand_id": "source:1",
         "doi": "10.x/new",
         "tabular_files": [],
-        "oa_package": {
-            "name": "supp.tar.gz",
-            "url": "https://x/supp.tar.gz",
-        },
+        **_archive_fields(archive_kind),
     }, str(tmp_path))
 
-    new = tmp_path / "new.csv"
-    assert new.read_bytes() == b"new-complete"
-    assert old.read_bytes() == b"old-complete"
-    assert result["downloaded"] == [str(new)]
+    assert managed.read_bytes() == b"new-complete"
+    assert result["downloaded"] == [str(managed)]
     assert result["skipped"] == [{
-        "name": "old.csv",
-        "reason": "archive member failed: member write failed",
+        "name": "table.csv",
+        "reason": (
+            "archive member close failed after commit: "
+            "member close failed"
+        ),
     }]
     sidecar = tmp_path / _download.SOURCE_SIDECAR
     assert sidecar.exists()
     assert json.loads(sidecar.read_text(encoding="utf-8")) == {
         "cand_id": "source:1",
         "doi": "10.x/new",
-        "managed_files": ["new.csv", "old.csv"],
+        "managed_files": ["table.csv"],
         "related_dois": [],
         "source": None,
         "title": None,
+    }
+    assert not list(tmp_path.glob(".paperconan-archive-*"))
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+@pytest.mark.parametrize(
+    ("error_type", "message"),
+    [
+        (MemoryError, "resource exhausted"),
+        (ValueError, "unexpected value"),
+        (_UnexpectedArchiveSignal, "unexpected signal"),
+    ],
+)
+def test_unexpected_member_failure_propagates(
+    tmp_path, monkeypatch, archive_kind, error_type, message
+):
+    managed = tmp_path / "table.csv"
+    managed.write_bytes(b"old-complete")
+    _write_sidecar(tmp_path, ["table.csv"], doi="10.x/old")
+    payload = _archive_payload(
+        archive_kind,
+        [("table.csv", b"new-complete")],
+    )
+
+    def archive_download(url, dest, **kwargs):
+        Path(dest).write_bytes(payload)
+        return {"ok": True, "path": dest}
+
+    def fail_unexpectedly(src, dest, max_bytes):
+        raise error_type(message)
+
+    monkeypatch.setattr(_download, "download_file", archive_download)
+    monkeypatch.setattr(
+        _download, "_atomic_stream_write", fail_unexpectedly
+    )
+
+    with pytest.raises(error_type, match=message):
+        _download.download_candidate({
+            "cand_id": "source:1",
+            "tabular_files": [],
+            **_archive_fields(archive_kind),
+        }, str(tmp_path))
+
+    assert managed.read_bytes() == b"old-complete"
+    assert json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(
+            encoding="utf-8"
+        )
+    ) == {
+        "managed_files": ["table.csv"],
+        "doi": "10.x/old",
     }
     assert not list(tmp_path.glob(".paperconan-archive-*"))
