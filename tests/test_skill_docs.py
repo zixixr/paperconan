@@ -62,6 +62,17 @@ def _is_forbidden_zip_member(name: str) -> bool:
     )
 
 
+def _publishable_skill_files(skill_dir: Path) -> set[str]:
+    files = set()
+    for path in skill_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        archive_name = f"paperconan/{path.relative_to(skill_dir).as_posix()}"
+        if not _is_forbidden_zip_member(archive_name):
+            files.add(archive_name)
+    return files
+
+
 def test_local_markdown_links_strip_suffixes_and_skip_external_urls() -> None:
     text = """
     [local](references/local.md#section)
@@ -75,6 +86,25 @@ def test_local_markdown_links_strip_suffixes_and_skip_external_urls() -> None:
         "references/local.md",
         "references/query.md",
     ]
+
+
+def test_publishable_skill_files_exclude_generated_files(tmp_path) -> None:
+    skill_dir = tmp_path / "paperconan"
+    files = {
+        "guide.md": "publishable",
+        ".pytest_cache/state": "cache",
+        ".cache/state": "cache",
+        ".tool_cache/state": "cache",
+        "__pycache__/module.pyc": "bytecode",
+        "module.pyo": "bytecode",
+        ".DS_Store": "metadata",
+    }
+    for relative, contents in files.items():
+        path = skill_dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents, encoding="utf-8")
+
+    assert _publishable_skill_files(skill_dir) == {"paperconan/guide.md"}
 
 
 def test_skill_routes_all_public_references() -> None:
@@ -149,11 +179,7 @@ def test_skill_zip_contains_complete_path_safe_skill_tree(tmp_path) -> None:
         )
         assert f"paperconan/{relative}" in names
 
-    skill_files = {
-        f"paperconan/{path.relative_to(SKILL_DIR).as_posix()}"
-        for path in SKILL_DIR.rglob("*")
-        if path.is_file()
-    }
+    skill_files = _publishable_skill_files(SKILL_DIR)
     assert skill_files <= names
 
     worked_examples = {
@@ -183,13 +209,13 @@ def test_skill_zip_replaces_stale_output_inside_copied_skill_tree(tmp_path) -> N
         shutil.copy2(source, destination)
 
     cache_dir = project / "skills" / "paperconan" / ".pytest_cache"
-    cache_dir.mkdir()
+    cache_dir.mkdir(exist_ok=True)
     (cache_dir / "state").write_text("cache", encoding="utf-8")
     generic_cache_dir = project / "skills" / "paperconan" / ".cache"
-    generic_cache_dir.mkdir()
+    generic_cache_dir.mkdir(exist_ok=True)
     (generic_cache_dir / "state").write_text("cache", encoding="utf-8")
     bytecode_dir = project / "skills" / "paperconan" / "__pycache__"
-    bytecode_dir.mkdir()
+    bytecode_dir.mkdir(exist_ok=True)
     (bytecode_dir / "module.pyc").write_bytes(b"bytecode")
     (project / "skills" / "paperconan" / ".DS_Store").write_bytes(b"metadata")
 
