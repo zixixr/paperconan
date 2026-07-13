@@ -497,6 +497,77 @@ def test_dense_detector_declared_state_bounds_cover_actual_live_arrays(
     assert expected_states <= tracker.seen_names
 
 
+@pytest.mark.parametrize(
+    "values",
+    [
+        [1000.1234 + row * 0.7317 for row in range(120)],
+        [7.125] * 90
+        + [1000.1234 + row * 0.7317 for row in range(30)],
+    ],
+    ids=["all-distinct", "high-duplication"],
+)
+def test_within_column_declared_state_covers_actual_live_arrays(values):
+    sheet = Sheet.from_rows(
+        [["value"]] + [[value] for value in values]
+    )
+    bounds = (1, sheet.nrows, 0, 1, ["value"])
+    baseline = audit.detect_within_column_patterns(sheet, *bounds)
+    tracker = audit._DenseStateTracker()
+
+    instrumented = audit.detect_within_column_patterns(
+        sheet, *bounds, _state_tracker=tracker
+    )
+
+    requirement = next(
+        item
+        for item in audit._dense_detector_requirements(
+            len(values), 1
+        )
+        if item["family"] == "within_column"
+    )
+    assert instrumented == baseline
+    assert tracker.live_units == 0
+    assert tracker.peak_units <= requirement["state_required"]
+    assert requirement["state_required"] > 4 * len(values)
+    assert {
+        "column",
+        "numeric_mask",
+        "values",
+        "rounded",
+        "unique",
+        "counts",
+        "order",
+    } <= tracker.seen_names
+
+
+def test_within_column_state_admission_boundary_is_deterministic(
+    monkeypatch,
+):
+    row_count = 120
+    requirement = next(
+        item
+        for item in audit._dense_detector_requirements(row_count, 1)
+        if item["family"] == "within_column"
+    )
+    state_required = requirement["state_required"]
+
+    monkeypatch.setattr(
+        audit,
+        "_DENSE_BLOCK_STATE_CELL_LIMIT",
+        state_required - 1,
+    )
+    rejected, _ = audit._dense_detector_admission(row_count, 1)
+    monkeypatch.setattr(
+        audit,
+        "_DENSE_BLOCK_STATE_CELL_LIMIT",
+        state_required,
+    )
+    admitted, _ = audit._dense_detector_admission(row_count, 1)
+
+    assert rejected["within_column"] is False
+    assert admitted["within_column"] is True
+
+
 def test_very_wide_column_fingerprints_touch_only_fixed_budget(
     monkeypatch,
 ):

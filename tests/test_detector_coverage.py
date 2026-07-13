@@ -154,16 +154,127 @@ def test_wide_integer_block_counts_use_one_near_linear_sheet_sweep():
         for r0, r1, c0, c1 in blocks
     ]
 
+    state_limit = 100_000
     counts, metadata = audit._wide_integer_counts_by_block(
-        sheet, blocks, with_coverage=True
+        sheet,
+        blocks,
+        state_limit=state_limit,
+        with_coverage=True,
     )
 
-    assert counts == expected
+    assert counts.tolist() == expected
     assert metadata["coordinates_total"] == len(sheet._wide_ints)
     assert metadata["coordinate_visits"] <= 2 * len(sheet._wide_ints)
-    assert metadata["event_records"] == 2 * len(blocks)
+    assert metadata["event_cells"] == 4 * len(blocks)
+    assert metadata["python_event_records"] == 0
     assert metadata["column_index_cells"] <= col_count
     assert metadata["coordinate_copy_cells"] == 0
+    assert metadata["state_exhausted"] is False
+    assert metadata["peak_state_units"] <= state_limit
+
+
+def test_wide_integer_block_index_exhaustion_skips_before_state_grows(
+    monkeypatch,
+):
+    sheet = Sheet.from_rows([
+        [10**100 if row == 0 else row + 0.125]
+        for row in range(60)
+    ])
+    blocks = [
+        (row, row + 3, 0, 1)
+        for row in range(0, 60, 3)
+    ]
+    counts, bounded_meta = audit._wide_integer_counts_by_block(
+        sheet,
+        blocks,
+        state_limit=1_000,
+        with_coverage=True,
+    )
+    assert counts.tolist() == [1] + [0] * (len(blocks) - 1)
+    assert bounded_meta["state_exhausted"] is False
+    assert (
+        bounded_meta["peak_state_units"]
+        <= bounded_meta["state_units_required"]
+        <= 1_000
+    )
+    assert bounded_meta["python_event_records"] == 0
+
+    called = []
+
+    def fail_if_called(name):
+        def detector(*_args, **_kwargs):
+            called.append(name)
+            return []
+        return detector
+
+    for name in (
+        "detect_relations",
+        "detect_arithmetic_progression",
+        "detect_equal_pairs",
+        "detect_within_column_patterns",
+        "detect_dispersed_repeats",
+        "detect_identical_after_rounding",
+        "detect_grim_grimmer",
+    ):
+        monkeypatch.setattr(audit, name, fail_if_called(name))
+    monkeypatch.setattr(
+        audit,
+        "detect_row_pair_digit_coupling",
+        lambda *_args, **_kwargs: ([], {"findings_omitted": 0}),
+    )
+    monkeypatch.setattr(
+        audit, "_DENSE_BLOCK_STATE_CELL_LIMIT", 10
+    )
+    state = audit.ScanBudgetState(
+        coverage=ScanCoverage(files_discovered=1),
+        recurring_index=RecurringRowIndex(),
+        profile="review",
+        evidence=False,
+    )
+
+    audit._analyze_numeric_blocks(
+        sheet,
+        file_name="fragmented.csv",
+        sheet_name="fragmented",
+        blocks=blocks,
+        state=state,
+    )
+
+    assert called == []
+    limitations = [
+        item for item in state.coverage.limitations
+        if item["reason"] == "wide_integer_block_index_limit"
+    ]
+    assert len(limitations) == 1
+    limitation = limitations[0]
+    state_required = audit._wide_integer_index_state_required(
+        len(blocks), 1, ordered=True
+    )
+    assert limitation == {
+        "scope": "sheet",
+        "reason": "wide_integer_block_index_limit",
+        "file": "fragmented.csv",
+        "sheet": "fragmented",
+        "state_unit_limit": 10,
+        "state_units_required": state_required,
+        "peak_state_units": 0,
+        "blocks_total": len(blocks),
+        "detector_blocks_skipped": len(blocks),
+        "wide_integer_cells": 1,
+        "affected_blocks_lower_bound": 0,
+        "detectors": [
+            "relations",
+            "equal_pairs",
+            "row_pairs",
+            "arithmetic_progression",
+            "within_column",
+            "dispersed_repeats",
+            "identical_after_rounding",
+            "grim_grimmer",
+        ],
+    }
+    assert state_required > 10
+    assert state.findings_omitted_is_lower_bound is True
 
 
 def test_dense_detector_limits_preflight_every_named_family(

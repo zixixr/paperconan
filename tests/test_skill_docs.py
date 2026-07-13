@@ -292,6 +292,18 @@ def test_cli_documents_wave4_detector_and_cross_table_budgets() -> None:
     assert "稳定输入顺序" in text
     assert "超过预算前停止" in text
     assert "完整候选" in text
+    assert "wide_integer_block_index_limit" in text
+    assert "positional/value family 对 A、B 各扫描 1 次" in text
+
+
+def test_output_schema_documents_consolidated_wave4_resource_units() -> None:
+    text = (REF_DIR / "output-schema.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "wide_integer_block_index_limit" in text
+    assert "one source-grid pass per side" in text
+    assert "impossible detector families are excluded" in text
 
 
 def test_agent_schema_describes_generic_cross_table_signal_family() -> None:

@@ -155,6 +155,11 @@ limitations:
 
 - `dense_block_detector_limit`: one block-level object listing detector
   families whose complete candidate work or compact retained state did not fit.
+- `wide_integer_block_index_limit`: one sheet-level object emitted before
+  detector allocation when the compact wide-integer block range index cannot
+  fit the same 8-byte state-unit limit. It reports the required/available
+  units, zero peak retained state on rejection, skipped detector blocks, wide
+  integer cells, and an explicit affected-block lower bound.
 - `cross_sheet_summary_count_limit`, `cross_sheet_grid_cell_limit`,
   `cross_sheet_label_cell_limit`, `cross_sheet_label_byte_limit`, and
   `cross_sheet_column_fingerprint_limit`: one scan-level object per exhausted
@@ -163,9 +168,13 @@ limitations:
 - `cross_sheet_work_limit`: one scan-level object for shared pair, value,
   decimal-tail tuple, and pre-cap finding budgets. It reports work performed,
   known skipped work/findings, and `limits_reached`. Detector-family pairs are
-  counted independently. `bucket_findings_skipped` reports exact omissions
-  after the stable first ten column-duplicate findings in one fingerprint
-  bucket; those omissions are included once in `findings_skipped`.
+  counted independently, impossible detector families are excluded before
+  admission, and positional/value work is one source-grid pass per side.
+  Remaining feasible family counts and value visits use linear-size aggregate
+  totals rather than an all-pairs prepass. `bucket_findings_skipped` reports
+  exact omissions after the stable first ten column-duplicate findings in one
+  fingerprint bucket; those omissions are included once in
+  `findings_skipped`.
 
 Selection follows stable input order and stops before a configured limit is
 exceeded. A rejected detector candidate or summary is not treated as complete.

@@ -1871,7 +1871,17 @@ class _DenseStateTracker:
         self.live_units = 0
 
 
-def detect_within_column_patterns(sheet, r0, r1, c0, c1, header, min_n=6):
+def detect_within_column_patterns(
+    sheet,
+    r0,
+    r1,
+    c0,
+    c1,
+    header,
+    min_n=6,
+    *,
+    _state_tracker=None,
+):
     """Detect within-column anomalies:
        - many identical values in one column (Su Jiacao: '13 中 8 个相同')
        - many values sharing same last-2 decimals (Su Jiacao: '13 中 11 个末两位相同')
@@ -1879,87 +1889,164 @@ def detect_within_column_patterns(sheet, r0, r1, c0, c1, header, min_n=6):
        - missing last digits (Su Jiacao: '70 个数据中末位完全没有 3 或 7')
     """
     findings = []
-    for c in range(c0, c1):
-        a = col_array(sheet, r0, r1, c)
-        a_clean = a[~np.isnan(a)]
-        n = len(a_clean)
-        if n < min_n:
-            continue
-        col_name = header[c - c0] if c - c0 < len(header) else f"col{c}"
+    tracker = _state_tracker or _DenseStateTracker()
 
-        # Cheap column descriptors shared by the within-col detectors below, so a
-        # downstream prefilter can decide precisely (categorical/integer column,
-        # low-cardinality, value peek) instead of guessing from the column name alone.
-        vals_rounded = np.round(a_clean, 4)
-        unique, value_counts, value_order = _numpy_frequency_summary(
-            vals_rounded
-        )
-        n_distinct = int(len(unique))
-        all_integer = bool(np.all(np.abs(a_clean - np.round(a_clean)) < 1e-9))
-        value_sample = [
-            float(unique[index]) for index in value_order[:8]
-        ]
-        enrich = dict(n_distinct=n_distinct, all_integer=all_integer, value_sample=value_sample)
-
-        # 1) duplicate values within the column
-        top_index = int(value_order[0])
-        top_val = unique[top_index]
-        top_count = int(value_counts[top_index])
-        if top_count >= max(4, n // 2) and n - top_count >= 1:
-            findings.append(dict(kind="within_col_value_duplication",
-                                 col=col_name, col_idx=c, n=n,
-                                 dup_value=float(top_val), dup_count=int(top_count),
-                                 frac_repeat=top_count / n, **enrich,
-                                 severity="high",
-                                 rule=f"col[{c}] has value {top_val} repeated {top_count}/{n} times"))
-
-        # 2) last-2-decimal repetition within column
-        ec = Counter()
-        ending_count = 0
-        for value in a_clean:
-            ending = trailing_decimal_digits(value, 2)
-            if ending is not None:
-                ec[ending] += 1
-                ending_count += 1
-        if ending_count >= max(min_n, 8):
-            top_end, top_end_count = ec.most_common(1)[0]
-            if top_end_count >= max(5, 2 * ending_count // 3):
-                findings.append(dict(kind="within_col_decimal_repetition",
-                                     col=col_name, col_idx=c, n=ending_count,
-                                     ending=top_end, count=int(top_end_count),
-                                     frac_repeat=top_end_count / ending_count, **enrich,
-                                     severity="high",
-                                     rule=f"col[{c}]: {top_end_count}/{ending_count} values share last-2 decimals '.{top_end}'"))
-
-        # 3) too many .0 / .5 last decimal (rounded to half/int)
-        last_digit_counts = Counter()
-        last_digit_count = 0
-        for value in a_clean:
-            digit = last_significant_digit(value)
-            if digit is not None:
-                last_digit_counts[digit] += 1
-                last_digit_count += 1
-        if last_digit_count >= max(min_n, 10):
-            zeros_fives = (
-                last_digit_counts["0"] + last_digit_counts["5"]
+    def detect_column(c):
+        column_findings = []
+        try:
+            column = col_array(sheet, r0, r1, c)
+            tracker.retain("column", column)
+            numeric_mask = ~np.isnan(column)
+            tracker.retain("numeric_mask", numeric_mask)
+            values = column[numeric_mask]
+            tracker.retain("values", values)
+            del column, numeric_mask
+            tracker.release("column", "numeric_mask")
+            n = len(values)
+            if n < min_n:
+                return column_findings
+            col_name = (
+                header[c - c0]
+                if c - c0 < len(header)
+                else f"col{c}"
             )
-            if zeros_fives >= max(7, 0.7 * last_digit_count):
-                findings.append(dict(kind="rounded_to_half_or_int",
-                                     col=col_name, col_idx=c, n=last_digit_count,
-                                     count_05=int(zeros_fives),
-                                     severity="medium",
-                                     rule=f"col[{c}]: {zeros_fives}/{last_digit_count} values end in 0 or 5"))
 
-        # 4) missing last-digit (3 or 7 completely absent in a large column)
-        if last_digit_count >= 20:
-            present = set(last_digit_counts)
-            missing = [d for d in "123456789" if d not in present]
-            if missing and len(present) <= 6:
-                findings.append(dict(kind="missing_last_digits",
-                                     col=col_name, col_idx=c, n=last_digit_count,
-                                     missing=missing,
-                                     severity="medium",
-                                     rule=f"col[{c}]: last digits {missing} never appear in {last_digit_count} values"))
+            rounded = np.round(values, 4)
+            tracker.retain("rounded", rounded)
+            tracker.retain_units("frequency_workspace", 8 * n)
+            unique, value_counts, value_order = (
+                _numpy_frequency_summary(rounded)
+            )
+            tracker.retain("unique", unique)
+            tracker.retain("counts", value_counts)
+            tracker.retain("order", value_order)
+            tracker.release("frequency_workspace")
+            n_distinct = int(len(unique))
+
+            tracker.retain_units("integer_workspace", 3 * n)
+            all_integer = bool(
+                np.all(
+                    np.abs(values - np.round(values)) < 1e-9
+                )
+            )
+            tracker.release("integer_workspace")
+            value_sample = [
+                float(unique[index]) for index in value_order[:8]
+            ]
+            enrich = dict(
+                n_distinct=n_distinct,
+                all_integer=all_integer,
+                value_sample=value_sample,
+            )
+
+            top_index = int(value_order[0])
+            top_val = unique[top_index]
+            top_count = int(value_counts[top_index])
+            if (
+                top_count >= max(4, n // 2)
+                and n - top_count >= 1
+            ):
+                column_findings.append(dict(
+                    kind="within_col_value_duplication",
+                    col=col_name,
+                    col_idx=c,
+                    n=n,
+                    dup_value=float(top_val),
+                    dup_count=int(top_count),
+                    frac_repeat=top_count / n,
+                    **enrich,
+                    severity="high",
+                    rule=(
+                        f"col[{c}] has value {top_val} repeated "
+                        f"{top_count}/{n} times"
+                    ),
+                ))
+
+            ec = Counter()
+            ending_count = 0
+            for value in values:
+                ending = trailing_decimal_digits(value, 2)
+                if ending is not None:
+                    ec[ending] += 1
+                    ending_count += 1
+            if ending_count >= max(min_n, 8):
+                top_end, top_end_count = ec.most_common(1)[0]
+                if top_end_count >= max(
+                    5, 2 * ending_count // 3
+                ):
+                    column_findings.append(dict(
+                        kind="within_col_decimal_repetition",
+                        col=col_name,
+                        col_idx=c,
+                        n=ending_count,
+                        ending=top_end,
+                        count=int(top_end_count),
+                        frac_repeat=(
+                            top_end_count / ending_count
+                        ),
+                        **enrich,
+                        severity="high",
+                        rule=(
+                            f"col[{c}]: {top_end_count}/{ending_count} "
+                            "values share last-2 decimals "
+                            f"'.{top_end}'"
+                        ),
+                    ))
+
+            last_digit_counts = Counter()
+            last_digit_count = 0
+            for value in values:
+                digit = last_significant_digit(value)
+                if digit is not None:
+                    last_digit_counts[digit] += 1
+                    last_digit_count += 1
+            if last_digit_count >= max(min_n, 10):
+                zeros_fives = (
+                    last_digit_counts["0"]
+                    + last_digit_counts["5"]
+                )
+                if zeros_fives >= max(
+                    7, 0.7 * last_digit_count
+                ):
+                    column_findings.append(dict(
+                        kind="rounded_to_half_or_int",
+                        col=col_name,
+                        col_idx=c,
+                        n=last_digit_count,
+                        count_05=int(zeros_fives),
+                        severity="medium",
+                        rule=(
+                            f"col[{c}]: {zeros_fives}/"
+                            f"{last_digit_count} values end in 0 or 5"
+                        ),
+                    ))
+
+            if last_digit_count >= 20:
+                present = set(last_digit_counts)
+                missing = [
+                    digit
+                    for digit in "123456789"
+                    if digit not in present
+                ]
+                if missing and len(present) <= 6:
+                    column_findings.append(dict(
+                        kind="missing_last_digits",
+                        col=col_name,
+                        col_idx=c,
+                        n=last_digit_count,
+                        missing=missing,
+                        severity="medium",
+                        rule=(
+                            f"col[{c}]: last digits {missing} never "
+                            f"appear in {last_digit_count} values"
+                        ),
+                    ))
+            return column_findings
+        finally:
+            tracker.release_all()
+
+    for c in range(c0, c1):
+        findings.extend(detect_column(c))
     return findings
 
 
@@ -2018,10 +2105,10 @@ def detect_dispersed_repeats(
             unique_all, counts_all, order_all = _numpy_frequency_summary(
                 rounded
             )
-            tracker.release("frequency_workspace")
             tracker.retain("unique_all", unique_all)
             tracker.retain("counts_all", counts_all)
             tracker.retain("order_all", order_all)
+            tracker.release("frequency_workspace")
             top_index = int(order_all[0])
             top_v = unique_all[top_index]
             top_c = int(counts_all[top_index])
@@ -2078,11 +2165,11 @@ def detect_dispersed_repeats(
                 return_inverse=True,
                 return_counts=True,
             )
-            tracker.release("unique_workspace")
             tracker.retain("unique_core", unique_core)
             tracker.retain("first_core", first_core)
             tracker.retain("inverse", inverse_core)
             tracker.retain("counts", counts_core)
+            tracker.release("unique_workspace")
             distinct = int(len(unique_core))
             if distinct < 50 or distinct / m < 0.3:
                 return None
@@ -2108,8 +2195,8 @@ def detect_dispersed_repeats(
             sorted_positions = np.argsort(
                 inverse_core, kind="stable"
             )
-            tracker.release("sort_workspace")
             tracker.retain("sorted_positions", sorted_positions)
+            tracker.release("sort_workspace")
             tracker.retain_units(
                 "group_start_workspace", 2 * len(counts_core)
             )
@@ -2119,8 +2206,8 @@ def detect_dispersed_repeats(
                     counts_core[:-1],
                 ))
             )
-            tracker.release("group_start_workspace")
             tracker.retain("group_starts", group_starts)
+            tracker.release("group_start_workspace")
             top_groups = []
             dispersed_count = 0
             dup_cells = 0
@@ -2196,10 +2283,10 @@ def detect_dispersed_repeats(
                 sample_counts,
                 sample_order,
             ) = _numpy_frequency_summary(sample_rounded)
-            tracker.release("sample_frequency_workspace")
             tracker.retain("sample_unique", sample_unique)
             tracker.retain("sample_counts", sample_counts)
             tracker.retain("sample_order", sample_order)
+            tracker.release("sample_frequency_workspace")
             return dict(
                 kind="within_col_dispersed_repeats",
                 col=col_name,
@@ -2281,15 +2368,15 @@ def detect_identical_after_rounding(
             return_inverse=True,
             return_counts=True,
         )
-        tracker.release("unique_workspace")
         tracker.retain("rounded_values", rounded_values)
         tracker.retain("first_indices", first_indices)
         tracker.retain("inverse", inverse)
         tracker.retain("counts", counts)
+        tracker.release("unique_workspace")
         tracker.retain_units("sort_workspace", 3 * value_count)
         sorted_positions = np.argsort(inverse, kind="stable")
-        tracker.release("sort_workspace")
         tracker.retain("sorted_positions", sorted_positions)
+        tracker.release("sort_workspace")
         tracker.retain_units(
             "group_start_workspace", 2 * len(counts)
         )
@@ -2299,8 +2386,8 @@ def detect_identical_after_rounding(
                 counts[:-1],
             ))
         )
-        tracker.release("group_start_workspace")
         tracker.retain("group_starts", group_starts)
+        tracker.release("group_start_workspace")
 
         # Find buckets where multiple DIFFERENT (>1e-4 apart) values map to the same rounded value
         rounding_groups = []
@@ -2319,8 +2406,8 @@ def detect_identical_after_rounding(
                 "precise_unique_workspace", 4 * count
             )
             precise_values = np.unique(precise_rounded)
-            tracker.release("precise_unique_workspace")
             tracker.retain("precise_values", precise_values)
+            tracker.release("precise_unique_workspace")
             if len(precise_values) >= 3:
                 rounding_groups.append((
                     count,
@@ -2639,12 +2726,17 @@ class _CrossSheetPairStats:
     delta: dict
 
 
-def _cross_sheet_pair_stats(ga, gb, *, shared_cell_limit=40):
-    counts_a = Counter()
-    for value in ga.values():
-        counts_a[value] += 1
+def _cross_sheet_pair_stats(
+    ga,
+    gb,
+    *,
+    shared_cell_limit=40,
+    with_coverage=False,
+):
+    value_visits = 0
     counts_b = Counter()
     for value in gb.values():
+        value_visits += 1
         counts_b[value] += 1
 
     same_position = 0
@@ -2652,22 +2744,39 @@ def _cross_sheet_pair_stats(ga, gb, *, shared_cell_limit=40):
     same_position_columns = Counter()
     shared_cells = []
     shared_limit = max(0, int(shared_cell_limit))
+    matched_counts = Counter()
+    shared_values = 0
+    shared_value_count = 0
+    shared_example_heap = []
+    missing = object()
     for key, value in ga.items():
-        if key not in gb:
-            continue
-        other = gb[key]
-        if other == value:
-            same_position += 1
-            same_position_columns[key[1]] += 1
-            if len(shared_cells) < shared_limit:
-                shared_cells.append((key, value))
-        else:
-            modified += 1
+        value_visits += 1
+        other = gb.get(key, missing)
+        if other is not missing:
+            if other == value:
+                same_position += 1
+                same_position_columns[key[1]] += 1
+                if len(shared_cells) < shared_limit:
+                    shared_cells.append((key, value))
+            else:
+                modified += 1
 
-    shared_values = sum(
-        min(count, counts_b.get(value, 0))
-        for value, count in counts_a.items()
-    )
+        matched = matched_counts.get(value, 0)
+        if matched >= counts_b.get(value, 0):
+            continue
+        matched_counts[value] = matched + 1
+        shared_values += 1
+        if matched:
+            continue
+        shared_value_count += 1
+        numeric_value = float(value)
+        if len(shared_example_heap) < 5:
+            heapq.heappush(shared_example_heap, -numeric_value)
+        elif numeric_value < -shared_example_heap[0]:
+            heapq.heapreplace(
+                shared_example_heap, -numeric_value
+            )
+
     only_a = len(ga) - shared_values
     only_b = len(gb) - shared_values
     if only_a == 0 and only_b == 0:
@@ -2679,22 +2788,14 @@ def _cross_sheet_pair_stats(ga, gb, *, shared_cell_limit=40):
     else:
         pattern = "value_divergent"
 
-    shared_value_count = sum(
-        1 for value in counts_a if value in counts_b
-    )
-    shared_value_examples = tuple(heapq.nsmallest(
-        5,
-        (
-            value for value in counts_a
-            if value in counts_b
-        ),
-    ))
-    return _CrossSheetPairStats(
+    result = _CrossSheetPairStats(
         same_position_count=same_position,
         same_position_columns=dict(same_position_columns),
         shared_cells=tuple(shared_cells),
         shared_value_count=shared_value_count,
-        shared_value_examples=shared_value_examples,
+        shared_value_examples=tuple(sorted(
+            -value for value in shared_example_heap
+        )),
         delta={
             "pattern": pattern,
             "modified_cells": modified,
@@ -2703,6 +2804,13 @@ def _cross_sheet_pair_stats(ga, gb, *, shared_cell_limit=40):
             "only_in_b": only_b,
         },
     )
+    coverage = {
+        "value_visits": value_visits,
+        "retained_value_counts": (
+            len(counts_b) + len(matched_counts)
+        ),
+    }
+    return (result, coverage) if with_coverage else result
 
 
 def _value_delta(ga, gb):
@@ -2878,6 +2986,55 @@ class CrossSheetWorkBudget:
                 self.findings_skipped
             ),
         }
+
+
+_POSITION_VALUE_MIN_CELLS = 6
+_DECIMAL_TAIL_MIN_CELLS = 8
+
+
+@dataclass
+class _CrossSheetCandidateLedger:
+    pairs_total: int
+    values_total: int
+    pairs_resolved: int = 0
+    values_resolved: int = 0
+
+    @classmethod
+    def from_sizes(cls, sizes):
+        pairs_total = 0
+        values_total = 0
+        for minimum in (
+            _POSITION_VALUE_MIN_CELLS,
+            _DECIMAL_TAIL_MIN_CELLS,
+        ):
+            eligible_count = 0
+            eligible_size_sum = 0
+            for size in sizes:
+                if size < minimum:
+                    continue
+                eligible_count += 1
+                eligible_size_sum += size
+            pairs_total += (
+                eligible_count * (eligible_count - 1) // 2
+            )
+            if eligible_count > 1:
+                values_total += (
+                    (eligible_count - 1) * eligible_size_sum
+                )
+        return cls(
+            pairs_total=pairs_total,
+            values_total=values_total,
+        )
+
+    def resolve(self, value_count):
+        self.pairs_resolved += 1
+        self.values_resolved += max(0, int(value_count))
+
+    def remaining(self):
+        return (
+            self.pairs_total - self.pairs_resolved,
+            self.values_total - self.values_resolved,
+        )
 
 
 def _decimal_tail_signature(v, min_tail_digits=5, skip_decimal_digits=1):
@@ -3409,25 +3566,31 @@ def detect_collisions(
     Cross-figure overlaps that survive both checks keep their base severity.
     """
     findings = []
-    axis_value_count = 4 * sum(
-        len(grid) for grid in grids.values()
+    keys = [
+        key
+        for key in grids
+        if len(grids[key]) >= _POSITION_VALUE_MIN_CELLS
+    ]
+    sizes = tuple(len(grids[key]) for key in keys)
+    candidate_ledger = _CrossSheetCandidateLedger.from_sizes(
+        sizes
     )
-    if budget is None or budget.consume_values(axis_value_count):
+    if len(keys) >= 2:
+        axis_value_count = 4 * sum(
+            len(grid) for grid in grids.values()
+        )
+    else:
+        axis_value_count = 0
+    if (
+        axis_value_count
+        and (
+            budget is None
+            or budget.consume_values(axis_value_count)
+        )
+    ):
         axis_cols = _axis_columns(grids)
     else:
         axis_cols = {key: set() for key in grids}
-    keys = [
-        key for key in grids
-        if len(grids[key]) >= 5
-    ]
-    total_summary_pairs = len(keys) * (len(keys) - 1) // 2
-    total_family_pairs = 2 * total_summary_pairs
-    total_pair_value_work = sum(
-        3 * len(grids[key_a]) + 2 * len(grids[key_b])
-        for key_a, key_b in combinations(keys, 2)
-    )
-    resolved_family_pairs = 0
-    resolved_pair_value_work = 0
 
     def emit(finding):
         if budget is None or budget.retain_finding():
@@ -3438,24 +3601,30 @@ def detect_collisions(
         ga, gb = grids[key_a], grids[key_b]
         size_a, size_b = len(ga), len(gb)
         smaller = min(size_a, size_b)
-        collision_value_work = 2 * size_a + size_b
+        collision_value_work = size_a + size_b
         if (
             budget is not None
             and not budget.begin_pair(collision_value_work)
         ):
+            pairs_remaining, values_remaining = (
+                candidate_ledger.remaining()
+            )
             budget.skip_pairs(
-                total_family_pairs - resolved_family_pairs,
-                values=(
-                    total_pair_value_work
-                    - resolved_pair_value_work
-                ),
+                pairs_remaining,
+                values=values_remaining,
             )
             break
-        resolved_family_pairs += 1
-        pair_stats = _cross_sheet_pair_stats(ga, gb)
+        pair_stats, pair_coverage = _cross_sheet_pair_stats(
+            ga, gb, with_coverage=True
+        )
+        pair_value_visits = pair_coverage["value_visits"]
+        if pair_value_visits != collision_value_work:
+            raise AssertionError(
+                "cross-sheet pair work diverged from its plan"
+            )
         if budget is not None:
-            budget.record_values(collision_value_work)
-        resolved_pair_value_work += collision_value_work
+            budget.record_values(pair_value_visits)
+        candidate_ledger.resolve(collision_value_work)
 
         same_file = fa == fb
         # label_a / label_b disambiguate sheets when the pair spans two files
@@ -3585,20 +3754,22 @@ def detect_collisions(
                 ),
             ))
 
+        if smaller < _DECIMAL_TAIL_MIN_CELLS:
+            continue
+
         tail_value_work = size_a + size_b
         if (
             budget is not None
             and not budget.begin_pair(tail_value_work)
         ):
+            pairs_remaining, values_remaining = (
+                candidate_ledger.remaining()
+            )
             budget.skip_pairs(
-                total_family_pairs - resolved_family_pairs,
-                values=(
-                    total_pair_value_work
-                    - resolved_pair_value_work
-                ),
+                pairs_remaining,
+                values=values_remaining,
             )
             break
-        resolved_family_pairs += 1
         tail_min_matches = max(
             8, min(20, math.ceil(smaller * 0.03))
         )
@@ -3617,7 +3788,7 @@ def detect_collisions(
             budget.skip_values(
                 tail_value_work - tail_value_visits
             )
-        resolved_pair_value_work += tail_value_work
+        candidate_ledger.resolve(tail_value_work)
         if tail_reuse:
             pairs = tail_reuse["pairs"]
             context_pairs = pairs[:40]
@@ -4980,8 +5151,9 @@ _CROSS_SHEET_FINDING_BUDGET = int(
 _MAX_BLOCK_COLS = int(os.environ.get("PAPERCONAN_MAX_BLOCK_COLS", "120"))
 # Dense detector paths are admitted only when a complete detector candidate
 # fits all three bounds. Work is counted as logical numeric-cell visits;
-# retained state is counted as compact numeric elements, not Python object
-# bytes. Skipped families are disclosed before any candidate work starts.
+# retained state uses float64-equivalent 8-byte units and also admits the
+# per-sheet wide-integer block index. Rejections are disclosed before
+# proportional state or candidate work starts.
 _DENSE_BLOCK_MAX_ROWS = int(
     os.environ.get("PAPERCONAN_DENSE_BLOCK_MAX_ROWS", "100000")
 )
@@ -5358,82 +5530,197 @@ _WIDE_INTEGER_BLOCK_DETECTORS = [
 ]
 
 
+def _wide_integer_index_state_required(
+    block_count, coordinate_count, *, ordered
+):
+    block_count = max(0, int(block_count))
+    coordinate_count = max(0, int(coordinate_count))
+    coordinate_units = (
+        6 * coordinate_count
+        if ordered
+        else 10 * coordinate_count
+    )
+    return 12 * block_count + coordinate_units + 2
+
+
 def _wide_integer_counts_by_block(
-    sheet, blocks, *, with_coverage=False
+    sheet,
+    blocks,
+    *,
+    state_limit=None,
+    with_coverage=False,
+    _state_tracker=None,
 ):
     coordinates = sheet._wide_ints
-    block_counts = [0] * len(blocks)
-    events = []
-    for block_index, (r0, r1, c0, c1) in enumerate(blocks):
-        events.append((r0, block_index, -1, c0, c1))
-        events.append((r1, block_index, 1, c0, c1))
-    events.sort(key=lambda item: (item[0], item[1], item[2]))
-
-    unique_columns = set()
+    block_count = len(blocks)
+    coordinate_count = len(coordinates)
+    limit = max(0, int(
+        _DENSE_BLOCK_STATE_CELL_LIMIT
+        if state_limit is None
+        else state_limit
+    ))
     previous = None
     ordered = True
     coordinate_visits = 0
     for coordinate in coordinates:
         coordinate_visits += 1
-        unique_columns.add(coordinate[1])
         if previous is not None and coordinate < previous:
             ordered = False
         previous = coordinate
-    columns = sorted(unique_columns)
-    tree = [0] * (len(columns) + 1)
-
-    coordinate_copy_cells = 0
-    if ordered:
-        coordinate_iterator = iter(coordinates)
-    else:
-        ordered_coordinates = sorted(coordinates)
-        coordinate_copy_cells = len(ordered_coordinates)
-        coordinate_iterator = iter(ordered_coordinates)
-    current = next(coordinate_iterator, None)
-
-    def add(column):
-        index = bisect_left(columns, column) + 1
-        while index < len(tree):
-            tree[index] += 1
-            index += index & -index
-
-    def prefix(index):
-        total = 0
-        while index > 0:
-            total += tree[index]
-            index -= index & -index
-        return total
-
-    for row, block_index, sign, c0, c1 in events:
-        while current is not None and current[0] < row:
-            coordinate_visits += 1
-            add(current[1])
-            current = next(coordinate_iterator, None)
-        left = bisect_left(columns, c0)
-        right = bisect_left(columns, c1)
-        block_counts[block_index] += sign * (
-            prefix(right) - prefix(left)
-        )
-
-    metadata = {
-        "coordinates_total": len(coordinates),
-        "coordinate_visits": coordinate_visits,
-        "event_records": len(events),
-        "block_count_cells": len(block_counts),
-        "column_index_cells": len(columns),
-        "fenwick_cells": len(tree),
-        "coordinate_copy_cells": coordinate_copy_cells,
-    }
-    return (
-        (block_counts, metadata)
-        if with_coverage
-        else block_counts
+    state_required = _wide_integer_index_state_required(
+        block_count,
+        coordinate_count,
+        ordered=ordered,
     )
+    if state_required > limit:
+        metadata = {
+            "coordinates_total": coordinate_count,
+            "coordinate_visits": coordinate_visits,
+            "event_cells": 0,
+            "python_event_records": 0,
+            "block_count_cells": 0,
+            "column_index_cells": 0,
+            "fenwick_cells": 0,
+            "coordinate_copy_cells": 0,
+            "state_unit_limit": limit,
+            "state_units_required": state_required,
+            "peak_state_units": 0,
+            "state_exhausted": True,
+        }
+        return (None, metadata) if with_coverage else None
+
+    tracker = _state_tracker or _DenseStateTracker()
+    try:
+        block_counts = np.zeros(block_count, dtype=np.int64)
+        tracker.retain("block_counts", block_counts)
+
+        column_values = np.fromiter(
+            (col for _row, col in coordinates),
+            dtype=np.int64,
+            count=coordinate_count,
+        )
+        tracker.retain("coordinate_columns", column_values)
+        tracker.retain_units(
+            "column_unique_workspace", 4 * coordinate_count
+        )
+        columns = np.unique(column_values)
+        tracker.retain("columns", columns)
+        tracker.release("column_unique_workspace")
+        del column_values
+        tracker.release("coordinate_columns")
+
+        tree = np.zeros(len(columns) + 1, dtype=np.int64)
+        tracker.retain("fenwick", tree)
+        events = np.empty((2 * block_count, 2), dtype=np.int64)
+        tracker.retain("events", events)
+        for block_index, (r0, r1, _c0, _c1) in enumerate(
+            blocks
+        ):
+            events[2 * block_index] = (r0, -block_index - 1)
+            events[2 * block_index + 1] = (
+                r1,
+                block_index + 1,
+            )
+        tracker.retain_units(
+            "event_sort_workspace", 4 * block_count
+        )
+        event_order = np.lexsort((events[:, 1], events[:, 0]))
+        tracker.retain("event_order", event_order)
+        tracker.release("event_sort_workspace")
+
+        coordinate_copy_cells = 0
+        if ordered:
+            coordinate_iterator = iter(coordinates)
+        else:
+            coordinate_array = np.empty(
+                (coordinate_count, 2), dtype=np.int64
+            )
+            for index, coordinate in enumerate(coordinates):
+                coordinate_array[index] = coordinate
+            tracker.retain(
+                "coordinate_copy", coordinate_array
+            )
+            tracker.retain_units(
+                "coordinate_sort_workspace",
+                4 * coordinate_count,
+            )
+            coordinate_order = np.lexsort((
+                coordinate_array[:, 1],
+                coordinate_array[:, 0],
+            ))
+            tracker.retain(
+                "coordinate_order", coordinate_order
+            )
+            tracker.release("coordinate_sort_workspace")
+            coordinate_copy_cells = int(coordinate_array.size)
+            coordinate_iterator = (
+                (
+                    int(coordinate_array[position, 0]),
+                    int(coordinate_array[position, 1]),
+                )
+                for position in coordinate_order
+            )
+        current = next(coordinate_iterator, None)
+
+        def add(column):
+            index = bisect_left(columns, column) + 1
+            while index < len(tree):
+                tree[index] += 1
+                index += index & -index
+
+        def prefix(index):
+            total = 0
+            while index > 0:
+                total += int(tree[index])
+                index -= index & -index
+            return total
+
+        for event_position in event_order:
+            row = int(events[event_position, 0])
+            token = int(events[event_position, 1])
+            if token < 0:
+                block_index = -token - 1
+                sign = -1
+            else:
+                block_index = token - 1
+                sign = 1
+            _r0, _r1, c0, c1 = blocks[block_index]
+            while current is not None and current[0] < row:
+                coordinate_visits += 1
+                add(current[1])
+                current = next(coordinate_iterator, None)
+            left = bisect_left(columns, c0)
+            right = bisect_left(columns, c1)
+            block_counts[block_index] += sign * (
+                prefix(right) - prefix(left)
+            )
+
+        metadata = {
+            "coordinates_total": coordinate_count,
+            "coordinate_visits": coordinate_visits,
+            "event_cells": int(events.size),
+            "python_event_records": 0,
+            "block_count_cells": int(block_counts.size),
+            "column_index_cells": int(columns.size),
+            "fenwick_cells": int(tree.size),
+            "coordinate_copy_cells": coordinate_copy_cells,
+            "state_unit_limit": limit,
+            "state_units_required": state_required,
+            "peak_state_units": tracker.peak_units,
+            "state_exhausted": False,
+        }
+        return (
+            (block_counts, metadata)
+            if with_coverage
+            else block_counts
+        )
+    finally:
+        tracker.release_all()
 
 
 def _dense_detector_requirements(row_count, col_count):
-    # State is measured in float64-equivalent 8-byte units. The two larger
-    # bounds include every named live array plus conservative reserves for
+    # State is measured in float64-equivalent 8-byte units. Instrumented
+    # families include every named live array plus conservative reserves for
     # NumPy sort/unique/partition workspaces before those operations run.
     pair_count = col_count * (col_count - 1) // 2
     cell_count = row_count * col_count
@@ -5460,7 +5747,7 @@ def _dense_detector_requirements(row_count, col_count):
             "family": "within_column",
             "candidates_total": col_count,
             "work_required": cell_count,
-            "state_required": 4 * row_count,
+            "state_required": 16 * row_count,
         },
         {
             "family": "dispersed_repeats",
@@ -5513,9 +5800,45 @@ def _analyze_numeric_blocks(
     sheet, *, file_name, sheet_name, blocks, state
 ):
     report_blocks = []
-    wide_integer_counts = _wide_integer_counts_by_block(
-        sheet, blocks
-    )
+    wide_integer_counts = None
+    wide_integer_index_exhausted = False
+    if sheet._wide_ints:
+        (
+            wide_integer_counts,
+            wide_integer_index_meta,
+        ) = _wide_integer_counts_by_block(
+            sheet,
+            blocks,
+            state_limit=max(
+                0, _DENSE_BLOCK_STATE_CELL_LIMIT
+            ),
+            with_coverage=True,
+        )
+        wide_integer_index_exhausted = (
+            wide_integer_counts is None
+        )
+        if wide_integer_index_exhausted:
+            state.coverage.add_limitation(
+                "sheet",
+                "wide_integer_block_index_limit",
+                file=file_name,
+                sheet=sheet_name,
+                state_unit_limit=wide_integer_index_meta[
+                    "state_unit_limit"
+                ],
+                state_units_required=wide_integer_index_meta[
+                    "state_units_required"
+                ],
+                peak_state_units=wide_integer_index_meta[
+                    "peak_state_units"
+                ],
+                blocks_total=len(blocks),
+                detector_blocks_skipped=len(blocks),
+                wide_integer_cells=len(sheet._wide_ints),
+                affected_blocks_lower_bound=0,
+                detectors=_WIDE_INTEGER_BLOCK_DETECTORS,
+            )
+            state.findings_omitted_is_lower_bound = True
     for block_index, (r0, r1, c0, c1) in enumerate(blocks):
         if state.report_blocks_kept >= _MAX_REPORT_BLOCKS:
             state.coverage.mark_blocks_skipped(
@@ -5542,7 +5865,15 @@ def _analyze_numeric_blocks(
                 detectors=["relations", "equal_pairs", "row_pairs"],
                 max_cols=_MAX_BLOCK_COLS,
             )
-        wide_integer_count = wide_integer_counts[block_index]
+        wide_integer_count = (
+            int(wide_integer_counts[block_index])
+            if wide_integer_counts is not None
+            else 0
+        )
+        wide_integer_limited = (
+            wide_integer_index_exhausted
+            or wide_integer_count > 0
+        )
         if wide_integer_count:
             state.coverage.add_limitation(
                 "block",
@@ -5558,7 +5889,7 @@ def _analyze_numeric_blocks(
         dense_allowed, dense_skipped = _dense_detector_admission(
             r1 - r0, c1 - c0
         )
-        if dense_skipped and not wide_integer_count:
+        if dense_skipped and not wide_integer_limited:
             state.coverage.add_limitation(
                 "block",
                 "dense_block_detector_limit",
@@ -5598,7 +5929,7 @@ def _analyze_numeric_blocks(
             detect_relations(sheet, r0, r1, c0, c1, header)
             if (
                 not wide_block
-                and not wide_integer_count
+                and not wide_integer_limited
                 and dense_allowed["relations"]
             )
             else []
@@ -5608,7 +5939,7 @@ def _analyze_numeric_blocks(
                 sheet, r0, r1, c0, c1, header
             )
             if (
-                not wide_integer_count
+                not wide_integer_limited
                 and dense_allowed["arithmetic_progression"]
             )
             else []
@@ -5617,7 +5948,7 @@ def _analyze_numeric_blocks(
             detect_equal_pairs(sheet, r0, r1, c0, c1, header)
             if (
                 not wide_block
-                and not wide_integer_count
+                and not wide_integer_limited
                 and dense_allowed["equal_pairs"]
             )
             else []
@@ -5625,7 +5956,7 @@ def _analyze_numeric_blocks(
         row_pair_meta = {"findings_omitted": 0}
         if (
             wide_block
-            or wide_integer_count
+            or wide_integer_limited
             or row_pair_dimension_limited
         ):
             rp = []
@@ -5663,13 +5994,13 @@ def _analyze_numeric_blocks(
                 sheet, r0, r1, c0, c1, header
             )
             if (
-                not wide_integer_count
+                not wide_integer_limited
                 and dense_allowed["within_column"]
             )
             else []
         )
         if (
-            not wide_integer_count
+            not wide_integer_limited
             and dense_allowed["dispersed_repeats"]
         ):
             wc += detect_dispersed_repeats(
@@ -5680,7 +6011,7 @@ def _analyze_numeric_blocks(
                 sheet, r0, r1, c0, c1, header
             )
             if (
-                not wide_integer_count
+                not wide_integer_limited
                 and dense_allowed["identical_after_rounding"]
             )
             else []
@@ -5689,7 +6020,7 @@ def _analyze_numeric_blocks(
             detect_grim_grimmer(
                 sheet, r0, r1, c0, c1, header
             )
-            if not wide_integer_count
+            if not wide_integer_limited
             else []
         )
         if not (

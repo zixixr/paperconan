@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from itertools import combinations
 
+import pytest
+
 from paperconan import _audit as audit
 from paperconan._audit import (
     CrossSheetWorkBudget,
@@ -172,16 +174,63 @@ def _sized_grid(size, offset=0.0):
     }
 
 
-def test_cross_sheet_value_work_counts_known_passes_exactly():
+class _VisitGrid(dict):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.value_visits = 0
+
+    def values(self):
+        for value in super().values():
+            self.value_visits += 1
+            yield value
+
+    def items(self):
+        for item in super().items():
+            self.value_visits += 1
+            yield item
+
+
+@pytest.mark.parametrize("distinct", [False, True])
+def test_pair_stats_use_one_exact_source_pass_per_grid(distinct):
+    if distinct:
+        left = _VisitGrid(_sized_grid(12))
+        right = _VisitGrid(_sized_grid(9))
+    else:
+        left = _VisitGrid({
+            (row, 0): float(row % 2) + 0.125
+            for row in range(12)
+        })
+        right = _VisitGrid({
+            (row, 0): float(row % 2) + 0.125
+            for row in range(9)
+        })
+
+    _stats, coverage = audit._cross_sheet_pair_stats(
+        left, right, with_coverage=True
+    )
+
+    assert coverage["value_visits"] == len(left) + len(right)
+    assert left.value_visits == len(left)
+    assert right.value_visits == len(right)
+
+
+def test_cross_sheet_value_work_counts_known_passes_exactly(
+    monkeypatch,
+):
     grids = {
-        ("a.xlsx", "Figure 1"): _sized_grid(6),
-        ("b.xlsx", "Figure 2"): _sized_grid(5),
+        ("a.xlsx", "Figure 1"): _sized_grid(9),
+        ("b.xlsx", "Figure 2"): _sized_grid(8),
     }
     budget = CrossSheetWorkBudget(
         pair_limit=2,
         value_limit=100_000,
         tail_match_limit=100_000,
         finding_limit=100,
+    )
+    monkeypatch.setattr(
+        audit,
+        "_axis_columns",
+        lambda source: {key: set() for key in source},
     )
 
     detect_collisions(grids, budget=budget)
@@ -190,18 +239,54 @@ def test_cross_sheet_value_work_counts_known_passes_exactly():
     assert metadata["pairs_examined"] == 2
     assert metadata["pairs_skipped"] == 0
     assert metadata["values_examined"] == (
-        4 * (6 + 5)
-        + (6 + 5 + 6)
-        + (6 + 5)
+        4 * (9 + 8)
+        + (9 + 8)
+        + (9 + 8)
     )
     assert metadata["values_skipped"] == 0
 
 
-def test_pair_stop_reports_exact_remaining_family_and_value_work():
+def test_pair_value_budget_stops_before_any_uncharged_pass(
+    monkeypatch,
+):
+    left = _VisitGrid(_sized_grid(10))
+    right = _VisitGrid(_sized_grid(8))
     grids = {
-        ("a.xlsx", "Figure 1"): _sized_grid(5, 0),
-        ("b.xlsx", "Figure 2"): _sized_grid(6, 100),
-        ("c.xlsx", "Figure 3"): _sized_grid(7, 200),
+        ("a.xlsx", "Figure 1"): left,
+        ("b.xlsx", "Figure 2"): right,
+    }
+    monkeypatch.setattr(
+        audit,
+        "_axis_columns",
+        lambda source: {key: set() for key in source},
+    )
+    axis_work = 4 * (len(left) + len(right))
+    family_work = len(left) + len(right)
+    rejected = CrossSheetWorkBudget(
+        pair_limit=2,
+        value_limit=axis_work + family_work - 1,
+        tail_match_limit=100_000,
+        finding_limit=100,
+    )
+
+    detect_collisions(grids, budget=rejected)
+
+    rejected_meta = rejected.limitation_metadata()
+    assert left.value_visits == 0
+    assert right.value_visits == 0
+    assert rejected_meta["pairs_examined"] == 0
+    assert rejected_meta["pairs_skipped"] == 2
+    assert rejected_meta["values_examined"] == axis_work
+    assert rejected_meta["values_skipped"] == 2 * family_work
+
+
+def test_pair_stop_reports_exact_remaining_family_and_value_work(
+    monkeypatch,
+):
+    grids = {
+        ("a.xlsx", "Figure 1"): _sized_grid(6, 0),
+        ("b.xlsx", "Figure 2"): _sized_grid(8, 100),
+        ("c.xlsx", "Figure 3"): _sized_grid(9, 200),
     }
     budget = CrossSheetWorkBudget(
         pair_limit=1,
@@ -209,15 +294,104 @@ def test_pair_stop_reports_exact_remaining_family_and_value_work():
         tail_match_limit=100_000,
         finding_limit=100,
     )
+    monkeypatch.setattr(
+        audit,
+        "_axis_columns",
+        lambda source: {key: set() for key in source},
+    )
 
     detect_collisions(grids, budget=budget)
 
     metadata = budget.limitation_metadata()
     assert metadata["pairs_examined"] == 1
-    assert metadata["pairs_skipped"] == 5
-    assert metadata["values_examined"] == 4 * 18 + 16
-    assert metadata["values_skipped"] == 72
+    assert metadata["pairs_skipped"] == 3
+    assert metadata["values_examined"] == 4 * 23 + 14
+    assert metadata["values_skipped"] == 49
     assert metadata["limits_reached"] == ["pair"]
+
+
+def test_impossible_families_do_not_displace_later_viable_pair(
+    monkeypatch,
+):
+    viable = _sized_grid(8)
+    grids = {
+        ("a.xlsx", "Figure 1"): _sized_grid(5, 100),
+        ("b.xlsx", "Figure 2"): _sized_grid(5, 200),
+        ("c.xlsx", "Figure 3"): dict(viable),
+        ("d.xlsx", "Figure 4"): dict(viable),
+    }
+    budget = CrossSheetWorkBudget(
+        pair_limit=1,
+        value_limit=100_000,
+        tail_match_limit=100_000,
+        finding_limit=100,
+    )
+    monkeypatch.setattr(
+        audit,
+        "_axis_columns",
+        lambda source: {key: set() for key in source},
+    )
+
+    findings = detect_collisions(grids, budget=budget)
+
+    assert _find(findings, "cross_sheet_position_identical")
+    metadata = budget.limitation_metadata()
+    assert metadata["pairs_examined"] == 1
+    assert metadata["pairs_skipped"] == 1
+    assert metadata["values_examined"] == 4 * 26 + 16
+    assert metadata["values_skipped"] == 16
+    assert metadata["limits_reached"] == ["pair"]
+
+
+@pytest.mark.parametrize("pair_limit", [0, 1])
+def test_pair_setup_is_linear_and_remaining_work_is_exact(
+    monkeypatch, pair_limit
+):
+    summary_count = 200
+    grid_size = 8
+    grids = {
+        (f"{number}.xlsx", f"Figure {number}"): _sized_grid(
+            grid_size, number * 100
+        )
+        for number in range(summary_count)
+    }
+    advances = 0
+    original_combinations = combinations
+
+    def tracked_combinations(iterable, size):
+        nonlocal advances
+        for pair in original_combinations(iterable, size):
+            advances += 1
+            yield pair
+
+    monkeypatch.setattr(audit, "combinations", tracked_combinations)
+    monkeypatch.setattr(
+        audit,
+        "_axis_columns",
+        lambda source: {key: set() for key in source},
+    )
+    budget = CrossSheetWorkBudget(
+        pair_limit=pair_limit,
+        value_limit=10_000_000,
+        tail_match_limit=100_000,
+        finding_limit=100,
+    )
+
+    detect_collisions(grids, budget=budget)
+
+    family_pairs = summary_count * (summary_count - 1)
+    family_value_work = family_pairs * (2 * grid_size)
+    examined_work = pair_limit * (2 * grid_size)
+    metadata = budget.limitation_metadata()
+    assert advances == 1
+    assert metadata["pairs_examined"] == pair_limit
+    assert metadata["pairs_skipped"] == family_pairs - pair_limit
+    assert metadata["values_examined"] == (
+        4 * summary_count * grid_size + examined_work
+    )
+    assert metadata["values_skipped"] == (
+        family_value_work - examined_work
+    )
 
 
 def test_collision_context_uses_a_bounded_shared_cell_sample(monkeypatch):
