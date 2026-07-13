@@ -497,6 +497,56 @@ def _encoded_json_string_size(value, maximum, work_budget):
     return total
 
 
+_LOG10_2_DENOMINATOR = 4096
+_LOG10_2_LOWER_NUMERATOR = 1233
+_LOG10_2_UPPER_NUMERATOR = 1234
+
+
+def _bounded_json_integer_bytes(value, maximum):
+    canonical = (
+        value
+        if type(value) is int
+        else int.__int__(value)
+    )
+    if maximum < 1:
+        return None
+    if canonical == 0:
+        return b"0"
+
+    negative = canonical < 0
+    digit_capacity = maximum - int(negative)
+    if digit_capacity < 1:
+        return None
+
+    bit_length = canonical.bit_length()
+    # 1233/4096 < log10(2) < 1234/4096.
+    minimum_digits = (
+        (bit_length - 1) * _LOG10_2_LOWER_NUMERATOR
+        // _LOG10_2_DENOMINATOR
+        + 1
+    )
+    if minimum_digits > digit_capacity:
+        return None
+    maximum_digits = (
+        bit_length * _LOG10_2_UPPER_NUMERATOR
+        + _LOG10_2_DENOMINATOR
+        - 1
+    ) // _LOG10_2_DENOMINATOR
+    if maximum_digits > digit_capacity:
+        boundary = 10**digit_capacity
+        if (
+            canonical >= boundary
+            if not negative
+            else canonical <= -boundary
+        ):
+            return None
+
+    encoded = str(canonical).encode("ascii")
+    if len(encoded) > maximum:
+        return None
+    return encoded
+
+
 def _minimum_json_value_size(value, maximum, work_budget):
     if value is None:
         return _saturated_size(4, maximum)
@@ -519,12 +569,11 @@ def _minimum_json_value_size(value, maximum, work_budget):
     if isinstance(value, int):
         if not work_budget.consume():
             return maximum + 1
-        canonical = (
-            value
-            if type(value) is int
-            else int.__int__(value)
+        encoded = _bounded_json_integer_bytes(
+            value,
+            maximum,
         )
-        return _saturated_size(len(str(canonical)), maximum)
+        return maximum + 1 if encoded is None else len(encoded)
     if isinstance(value, float):
         if not work_budget.consume():
             return maximum + 1
@@ -791,9 +840,25 @@ class _BoundedJsonWriter:
                     b"\n" if count == 0 else b",\n"
                 )
                 self._write_indent(level + 1)
-                self._write_value(
-                    item, level + 1, item_tail_size
-                )
+                try:
+                    self._write_value(
+                        item, level + 1, item_tail_size
+                    )
+                except SidecarLimitError as error:
+                    if (
+                        known_count is not None
+                        and "iterable_entries_retained"
+                        not in error.details
+                        and "iterable_entries_remaining"
+                        not in error.details
+                    ):
+                        error.details[
+                            "iterable_entries_retained"
+                        ] = count
+                        error.details[
+                            "iterable_entries_remaining"
+                        ] = known_count - count
+                    raise
                 count += 1
             if count:
                 self._write(b"\n")
@@ -817,12 +882,17 @@ class _BoundedJsonWriter:
             )
             self._write_string(canonical)
         elif isinstance(value, int):
-            canonical = (
-                value
-                if type(value) is int
-                else int.__int__(value)
+            encoded = _bounded_json_integer_bytes(
+                value,
+                self.byte_limit
+                - len(self.output)
+                - tail_size,
             )
-            self._write(str(canonical).encode("ascii"))
+            if encoded is None:
+                self._raise_preflight_limit(
+                    self.byte_limit - len(self.output) + 1
+                )
+            self._write(encoded)
         elif isinstance(value, float):
             canonical = (
                 value

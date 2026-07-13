@@ -2,7 +2,9 @@ import io
 import json
 import os
 from pathlib import Path
+import sys
 import tarfile
+import tracemalloc
 import zipfile
 
 import pytest
@@ -907,6 +909,78 @@ def test_source_sidecar_nested_known_iterable_reports_exact_remaining(
     assert error.value.record["iterable_entries_remaining"] == 2
 
 
+@pytest.mark.parametrize(
+    (
+        "value",
+        "byte_limit",
+        "retained",
+        "remaining",
+    ),
+    [
+        (["x" * 100], 8, 0, 1),
+        ([0, "x" * 100, 0], 13, 1, 2),
+    ],
+    ids=["first-item", "mid-list"],
+)
+def test_source_sidecar_known_iterable_item_failure_reports_exact_counts(
+    value,
+    byte_limit,
+    retained,
+    remaining,
+):
+    with pytest.raises(_source_sidecar.SidecarLimitError) as error:
+        _source_sidecar.encode_sidecar(
+            value,
+            byte_limit=byte_limit,
+        )
+
+    assert error.value.reason == "source sidecar byte limit"
+    assert error.value.details["observed_bytes"] > byte_limit
+    assert error.value.details["observed_bytes_is_lower_bound"] is True
+    assert (
+        "iterator_exhaustion_unverified"
+        not in error.value.details
+    )
+    assert error.value.details["iterable_entries_retained"] == retained
+    assert error.value.details["iterable_entries_remaining"] == remaining
+
+
+def test_source_sidecar_nested_item_failure_keeps_inner_exact_counts():
+    with pytest.raises(_source_sidecar.SidecarLimitError) as error:
+        _source_sidecar.encode_sidecar(
+            [[0, "x" * 100], 0],
+            byte_limit=26,
+        )
+
+    assert error.value.reason == "source sidecar byte limit"
+    assert error.value.details["observed_bytes"] > 26
+    assert error.value.details["observed_bytes_is_lower_bound"] is True
+    assert (
+        "iterator_exhaustion_unverified"
+        not in error.value.details
+    )
+    assert error.value.details["iterable_entries_retained"] == 1
+    assert error.value.details["iterable_entries_remaining"] == 1
+
+
+def test_source_sidecar_unknown_iterable_item_failure_has_no_exact_counts():
+    class UnknownIterable:
+        def __iter__(self):
+            yield "x" * 100
+
+    with pytest.raises(_source_sidecar.SidecarLimitError) as error:
+        _source_sidecar.encode_sidecar(
+            UnknownIterable(),
+            byte_limit=8,
+        )
+
+    assert error.value.reason == "source sidecar byte limit"
+    assert error.value.details["observed_bytes"] > 8
+    assert error.value.details["observed_bytes_is_lower_bound"] is True
+    assert "iterable_entries_retained" not in error.value.details
+    assert "iterable_entries_remaining" not in error.value.details
+
+
 def test_source_sidecar_encoding_rejects_large_title_before_json_escape(
     tmp_path, monkeypatch
 ):
@@ -1217,6 +1291,98 @@ def test_source_sidecar_canonicalizes_scalar_subclasses_without_hooks():
     assert _source_sidecar.encode_sidecar(
         value, byte_limit=len(expected)
     ) == expected
+
+
+@pytest.mark.parametrize("negative", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+def test_source_sidecar_rejects_huge_integer_before_decimal_materialization(
+    negative,
+    nested,
+):
+    value = 1 << 166_100
+    if negative:
+        value = -value
+    payload = {"value": value} if nested else value
+    byte_limit = 32 if nested else 16
+    setter = getattr(sys, "set_int_max_str_digits", None)
+    getter = getattr(sys, "get_int_max_str_digits", None)
+    previous_limit = getter() if getter is not None else None
+    error = None
+
+    if setter is not None:
+        setter(0)
+    try:
+        tracemalloc.start()
+        try:
+            _source_sidecar.encode_sidecar(
+                payload,
+                byte_limit=byte_limit,
+            )
+        except _source_sidecar.SidecarLimitError as exc:
+            error = exc
+        finally:
+            _, peak_bytes = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+    finally:
+        if setter is not None:
+            setter(previous_limit)
+
+    assert error is not None
+    assert error.reason == "source sidecar byte limit"
+    assert error.details["observed_bytes"] > byte_limit
+    assert error.details["observed_bytes_is_lower_bound"] is True
+    assert peak_bytes < 100_000
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        0,
+        -1,
+        10**99,
+        -(10**98),
+    ],
+    ids=["zero", "negative-small", "positive-boundary", "negative-boundary"],
+)
+def test_source_sidecar_integer_exact_boundary_matches_json(value):
+    expected = (
+        json.dumps(value, indent=2, sort_keys=True) + "\n"
+    ).encode("ascii")
+
+    assert _source_sidecar.encode_sidecar(
+        value,
+        byte_limit=len(expected),
+    ) == expected
+
+    with pytest.raises(_source_sidecar.SidecarLimitError):
+        _source_sidecar.encode_sidecar(
+            value,
+            byte_limit=len(expected) - 1,
+        )
+
+
+def test_source_sidecar_preserves_runtime_integer_string_limit():
+    value = 10**700
+    setter = getattr(sys, "set_int_max_str_digits", None)
+    getter = getattr(sys, "get_int_max_str_digits", None)
+    if setter is None or getter is None:
+        expected = (str(value) + "\n").encode("ascii")
+        assert _source_sidecar.encode_sidecar(
+            value,
+            byte_limit=len(expected),
+        ) == expected
+        return
+
+    previous_limit = getter()
+    setter(640)
+    try:
+        with pytest.raises(ValueError, match="Exceeds the limit"):
+            _source_sidecar.encode_sidecar(
+                value,
+                byte_limit=1_000,
+            )
+    finally:
+        setter(previous_limit)
 
 
 def test_fetch_classifies_scalar_subclasses_before_iterator_probe(
