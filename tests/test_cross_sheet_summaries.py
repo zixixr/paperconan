@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from paperconan import _audit as audit
 from paperconan import _summaries as summaries_module
@@ -97,6 +98,103 @@ def test_summary_grid_and_label_context_are_bounded():
     )
     assert cell_limit.details["cells_used"] == 3
     assert cell_limit.details["max_cells"] == 3
+
+
+@pytest.mark.parametrize(
+    ("dimension", "limit_overrides"),
+    [
+        ("summaries", {"summary_limit": 1}),
+        ("grid_cells", {"grid_cell_limit": 28}),
+        ("label_cells", {"label_cell_limit": 17}),
+        ("label_bytes", {"label_byte_limit": 39}),
+        ("column_fingerprints", {"column_fingerprint_limit": 2}),
+    ],
+)
+def test_scan_summary_budget_rejects_whole_later_summary(
+    dimension, limit_overrides
+):
+    limits = {
+        "summary_limit": 100,
+        "grid_cell_limit": 100_000,
+        "label_cell_limit": 100_000,
+        "label_byte_limit": 100_000,
+        "column_fingerprint_limit": 100_000,
+    }
+    limits.update(limit_overrides)
+    budget = audit.CrossSheetSummaryBudget(**limits)
+
+    first, first_limitations = build_cross_sheet_summary(
+        "a.xlsx",
+        "Figure 1",
+        _sheet(),
+        budget=budget,
+    )
+    retained_after_first = budget.retained_metadata()
+    second, second_limitations = build_cross_sheet_summary(
+        "b.xlsx",
+        "Figure 2",
+        _sheet(),
+        budget=budget,
+    )
+
+    assert first is not None
+    assert first_limitations == []
+    assert second is None
+    assert second_limitations == []
+    assert budget.retained_metadata() == retained_after_first
+    metadata = budget.limitation_metadata()
+    assert metadata["summaries_considered"] == 2
+    assert metadata["summaries_retained"] == 1
+    assert metadata["summaries_skipped"] == 1
+    assert metadata["summary_pairs_unavailable"] == 1
+    assert metadata["exhausted_dimensions"] == [dimension]
+    exhausted = metadata["dimensions"][dimension]
+    assert exhausted["retained"] <= exhausted["limit"]
+    assert exhausted["skipped_sheets"] == 1
+    assert exhausted["skipped_items"] >= 1
+
+
+def test_scan_summary_budget_selection_is_deterministic_and_bounded():
+    def run():
+        budget = audit.CrossSheetSummaryBudget(
+            summary_limit=2,
+            grid_cell_limit=56,
+            label_cell_limit=34,
+            label_byte_limit=78,
+            column_fingerprint_limit=4,
+        )
+        retained = []
+        for number in range(5):
+            summary, _ = build_cross_sheet_summary(
+                f"{number}.xlsx",
+                f"Figure {number}",
+                _sheet(offset=number * 0.001),
+                budget=budget,
+            )
+            if summary is not None:
+                retained.append((summary.file, summary.sheet))
+        return retained, budget.retained_metadata(), (
+            budget.limitation_metadata()
+        )
+
+    first = run()
+    second = run()
+
+    assert first == second
+    retained, retained_metadata, limitation = first
+    assert retained == [
+        ("0.xlsx", "Figure 0"),
+        ("1.xlsx", "Figure 1"),
+    ]
+    assert retained_metadata == {
+        "summaries": 2,
+        "grid_cells": 56,
+        "label_cells": 34,
+        "label_bytes": 78,
+        "column_fingerprints": 4,
+    }
+    assert limitation["summaries_skipped"] == 3
+    assert limitation["summary_pairs_unavailable"] == 9
 
 
 def test_column_fingerprint_uses_exact_values_and_preserves_wide_integer():
@@ -726,13 +824,29 @@ def test_scan_uses_compact_cross_sheet_state(tmp_path, monkeypatch):
     original_columns = audit.detect_cross_sheet_column_duplicates
     original_within = audit.detect_within_sheet_fraction_reuse
 
-    def capture_collisions(grids, profile="review", sheets=None):
+    def capture_collisions(
+        grids, profile="review", sheets=None, budget=None
+    ):
         captured["labels"] = sheets
-        return original_collisions(grids, profile=profile, sheets=sheets)
+        captured["collision_budget"] = budget
+        return original_collisions(
+            grids,
+            profile=profile,
+            sheets=sheets,
+            budget=budget,
+        )
 
-    def capture_columns(summaries, profile="review", min_len=12):
+    def capture_columns(
+        summaries, profile="review", min_len=12, budget=None
+    ):
         captured["summaries"] = summaries
-        return original_columns(summaries, profile=profile, min_len=min_len)
+        captured["column_budget"] = budget
+        return original_columns(
+            summaries,
+            profile=profile,
+            min_len=min_len,
+            budget=budget,
+        )
 
     within_sizes = []
 
@@ -790,6 +904,10 @@ def test_scan_uses_compact_cross_sheet_state(tmp_path, monkeypatch):
         isinstance(labels, SparseLabelContext)
         for labels in captured["labels"].values()
     )
+    assert isinstance(
+        captured["collision_budget"], audit.CrossSheetWorkBudget
+    )
+    assert captured["column_budget"] is captured["collision_budget"]
     assert len(indexes) == 1
     assert len(captured["recurring_sources"]) == 2
     assert within_sizes == [1, 1]

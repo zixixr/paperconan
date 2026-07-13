@@ -225,6 +225,92 @@ def test_cli_documents_fetch_state_and_work_controls() -> None:
         assert name in text
 
 
+def test_cli_documents_wave4_detector_and_cross_table_budgets() -> None:
+    text = (ROOT / "docs" / "cli.md").read_text(
+        encoding="utf-8"
+    )
+    controls = {
+        "PAPERCONAN_DENSE_BLOCK_MAX_ROWS": (
+            "100000",
+            "dense_block_detector_limit",
+        ),
+        "PAPERCONAN_DENSE_BLOCK_CELL_WORK_LIMIT": (
+            "10000000",
+            "dense_block_detector_limit",
+        ),
+        "PAPERCONAN_DENSE_BLOCK_STATE_CELL_LIMIT": (
+            "2000000",
+            "dense_block_detector_limit",
+        ),
+        "PAPERCONAN_CROSS_SHEET_SUMMARY_LIMIT": (
+            "2000",
+            "cross_sheet_summary_count_limit",
+        ),
+        "PAPERCONAN_CROSS_SHEET_GRID_CELL_LIMIT": (
+            "2000000",
+            "cross_sheet_grid_cell_limit",
+        ),
+        "PAPERCONAN_CROSS_SHEET_LABEL_CELL_LIMIT": (
+            "500000",
+            "cross_sheet_label_cell_limit",
+        ),
+        "PAPERCONAN_CROSS_SHEET_LABEL_BYTE_LIMIT": (
+            "33554432",
+            "cross_sheet_label_byte_limit",
+        ),
+        "PAPERCONAN_CROSS_SHEET_COLUMN_FINGERPRINT_LIMIT": (
+            "200000",
+            "cross_sheet_column_fingerprint_limit",
+        ),
+        "PAPERCONAN_CROSS_SHEET_PAIR_BUDGET": (
+            "1000000",
+            "cross_sheet_work_limit",
+        ),
+        "PAPERCONAN_CROSS_SHEET_VALUE_BUDGET": (
+            "50000000",
+            "cross_sheet_work_limit",
+        ),
+        "PAPERCONAN_CROSS_SHEET_TAIL_MATCH_BUDGET": (
+            "1000000",
+            "cross_sheet_work_limit",
+        ),
+        "PAPERCONAN_CROSS_SHEET_FINDING_BUDGET": (
+            "10000",
+            "cross_sheet_work_limit",
+        ),
+    }
+
+    for name, (default, reason) in controls.items():
+        row = re.search(
+            rf"^\| `{re.escape(name)}` \| `{default}` \| (?P<body>.+) \|$",
+            text,
+            re.MULTILINE,
+        )
+        assert row is not None, f"missing documented control: {name}"
+        assert f"`{reason}`" in row.group("body")
+
+    assert "稳定输入顺序" in text
+    assert "超过预算前停止" in text
+    assert "完整候选" in text
+
+
+def test_agent_schema_describes_generic_cross_table_signal_family() -> None:
+    text = (REF_DIR / "output-schema.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "cross-table statistical signals" in text
+    assert "bit-identical / value-overlap across sheets" not in text
+    for kind in [
+        "cross_sheet_position_identical",
+        "cross_sheet_decimal_tail_reuse",
+        "cross_sheet_column_duplicate",
+        "recurring_row_vector",
+        "within_table_fraction_reuse",
+    ]:
+        assert kind in text
+
+
 def test_new_judgment_docs_keep_signal_not_verdict_boundary() -> None:
     docs = [
         REF_DIR / "adjudication-tiers.md",

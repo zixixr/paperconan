@@ -34,6 +34,7 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from fractions import Fraction
+from itertools import combinations
 
 import openpyxl
 import numpy as np
@@ -790,20 +791,22 @@ def _cell_value(v):
 
 
 def _bounded_evidence_indices(start, end, highlights, limit):
-    all_indices = list(range(start, end))
-    if len(all_indices) <= limit:
-        return all_indices
     if limit <= 0:
         return []
+    logical_count = max(0, end - start)
+    if logical_count <= limit:
+        return list(range(start, end))
     selected = sorted({
         index for index in highlights
         if start <= index < end
     })[:limit]
-    for index in all_indices:
+    selected_set = set(selected)
+    for index in range(start, end):
         if len(selected) >= limit:
             break
-        if index not in selected:
+        if index not in selected_set:
             selected.append(index)
+            selected_set.add(index)
     return sorted(selected)
 
 
@@ -861,8 +864,8 @@ def _block_evidence(
     highlighted-column cross-product. Small blocks retain the legacy shape."""
     r_start = max(0, r0 - 1)
     r_end = min(sheet.nrows, r1 + 1)
-    all_rows = list(range(r_start, r_end))
-    all_cols = list(range(c0, c1))
+    all_rows = range(r_start, r_end)
+    all_cols = range(c0, c1)
     highlight_rows = list(highlight_rows or [])
     normalized_rows = sorted({
         row_number - 1
@@ -1143,14 +1146,74 @@ def _allclose_rowwise(actual, expected, rtol=1e-10):
     return bool(np.all(_isclose_rowwise(actual, expected, rtol=rtol)))
 
 
-def _numeric_pairs(sheet, r0, r1, ca, cb):
-    pairs = []
+@dataclass(frozen=True)
+class _NumericPairStats:
+    n: int
+    equal: int
+    all_equal: bool
+    all_int: bool
+    constant_offset: int | None
+    has_wide_integer: bool
+    sample_a: tuple[int | float, ...]
+    sample_b: tuple[int | float, ...]
+
+
+def _numeric_pair_stats(sheet, r0, r1, ca, cb):
+    n = 0
+    equal = 0
+    all_int = True
+    offset = None
+    offset_is_constant = True
+    has_wide_integer = False
+    sample_a = []
+    sample_b = []
     for row in range(r0, r1):
         left = sheet.exact_numeric(row, ca)
         right = sheet.exact_numeric(row, cb)
-        if left is not None and right is not None:
-            pairs.append((row, left, right))
-    return pairs
+        if left is None or right is None:
+            continue
+        n += 1
+        if left == right:
+            equal += 1
+        if len(sample_a) < 8:
+            sample_a.append(left)
+            sample_b.append(right)
+        pair_is_int = (
+            isinstance(left, int)
+            and not isinstance(left, bool)
+            and isinstance(right, int)
+            and not isinstance(right, bool)
+        )
+        all_int = all_int and pair_is_int
+        if pair_is_int:
+            current_offset = right - left
+            if offset is None:
+                offset = current_offset
+            elif current_offset != offset:
+                offset_is_constant = False
+        else:
+            offset_is_constant = False
+        has_wide_integer = has_wide_integer or (
+            isinstance(left, int)
+            and abs(left) > _MAX_EXACT_FLOAT_INT
+        ) or (
+            isinstance(right, int)
+            and abs(right) > _MAX_EXACT_FLOAT_INT
+        )
+    return _NumericPairStats(
+        n=n,
+        equal=equal,
+        all_equal=n > 0 and equal == n,
+        all_int=all_int,
+        constant_offset=(
+            offset
+            if all_int and offset_is_constant
+            else None
+        ),
+        has_wide_integer=has_wide_integer,
+        sample_a=tuple(sample_a),
+        sample_b=tuple(sample_b),
+    )
 
 
 def _sample_exact(values, k=8):
@@ -1237,48 +1300,50 @@ def _grim_column_groups(header):
 
 def detect_relations(sheet, r0, r1, c0, c1, header):
     findings = []
-    cols = [(c, col_array(sheet, r0, r1, c)) for c in range(c0, c1)]
-    for i in range(len(cols)):
-        for j in range(i + 1, len(cols)):
-            ci, ai = cols[i]
-            cj, aj = cols[j]
-            pairs = _numeric_pairs(sheet, r0, r1, ci, cj)
-            if len(pairs) < 4:
+    for ci in range(c0, c1):
+        ai = sheet.numeric[r0:r1, ci]
+        for cj in range(ci + 1, c1):
+            aj = sheet.numeric[r0:r1, cj]
+            pair_stats = _numeric_pair_stats(
+                sheet, r0, r1, ci, cj
+            )
+            if pair_stats.n < 4:
                 continue
-            exact_x = [pair[1] for pair in pairs]
-            exact_y = [pair[2] for pair in pairs]
-            if all(a == b for a, b in zip(exact_x, exact_y)):
+            if pair_stats.all_equal:
                 findings.append(dict(
                     kind="identical_column",
                     col_a=header[ci - c0],
                     col_b=header[cj - c0],
                     col_a_idx=ci,
                     col_b_idx=cj,
-                    n=len(pairs),
+                    n=pair_stats.n,
                     severity="high",
-                    col_a_sample=_sample_exact(exact_x),
-                    col_b_sample=_sample_exact(exact_y),
+                    col_a_sample=_sample_exact(pair_stats.sample_a),
+                    col_b_sample=_sample_exact(pair_stats.sample_b),
                     rule=f"col[{cj}] == col[{ci}]",
                 ))
                 continue
-            if all(isinstance(value, int) for value in exact_x + exact_y):
-                offsets = {b - a for a, b in zip(exact_x, exact_y)}
-                if len(offsets) == 1 and next(iter(offsets)) != 0:
-                    offset = next(iter(offsets))
-                    findings.append(dict(
-                        kind="constant_offset",
-                        col_a=header[ci - c0],
-                        col_b=header[cj - c0],
-                        col_a_idx=ci,
-                        col_b_idx=cj,
-                        n=len(pairs),
-                        offset=offset,
-                        severity="high",
-                        col_a_sample=_sample_exact(exact_x),
-                        col_b_sample=_sample_exact(exact_y),
-                        rule=f"col[{cj}] = col[{ci}] + {offset}",
-                    ))
-                    continue
+            if (
+                pair_stats.all_int
+                and pair_stats.constant_offset not in (None, 0)
+            ):
+                offset = pair_stats.constant_offset
+                findings.append(dict(
+                    kind="constant_offset",
+                    col_a=header[ci - c0],
+                    col_b=header[cj - c0],
+                    col_a_idx=ci,
+                    col_b_idx=cj,
+                    n=pair_stats.n,
+                    offset=offset,
+                    severity="high",
+                    col_a_sample=_sample_exact(pair_stats.sample_a),
+                    col_b_sample=_sample_exact(pair_stats.sample_b),
+                    rule=f"col[{cj}] = col[{ci}] + {offset}",
+                ))
+                continue
+            if pair_stats.has_wide_integer:
+                continue
             mask = ~np.isnan(ai) & ~np.isnan(aj)
             n = int(mask.sum())
             if n < 4:
@@ -1762,6 +1827,16 @@ def detect_arithmetic_progression(sheet, r0, r1, c0, c1, header):
     return findings
 
 
+def _numpy_frequency_summary(values):
+    unique, first_indices, counts = np.unique(
+        values,
+        return_index=True,
+        return_counts=True,
+    )
+    order = np.lexsort((first_indices, -counts))
+    return unique, counts, order
+
+
 def detect_within_column_patterns(sheet, r0, r1, c0, c1, header, min_n=6):
     """Detect within-column anomalies:
        - many identical values in one column (Su Jiacao: '13 中 8 个相同')
@@ -1782,14 +1857,20 @@ def detect_within_column_patterns(sheet, r0, r1, c0, c1, header, min_n=6):
         # downstream prefilter can decide precisely (categorical/integer column,
         # low-cardinality, value peek) instead of guessing from the column name alone.
         vals_rounded = np.round(a_clean, 4)
-        counts = Counter(vals_rounded.tolist())
-        n_distinct = int(len(counts))
+        unique, value_counts, value_order = _numpy_frequency_summary(
+            vals_rounded
+        )
+        n_distinct = int(len(unique))
         all_integer = bool(np.all(np.abs(a_clean - np.round(a_clean)) < 1e-9))
-        value_sample = [float(v) for v, _ in counts.most_common(8)]
+        value_sample = [
+            float(unique[index]) for index in value_order[:8]
+        ]
         enrich = dict(n_distinct=n_distinct, all_integer=all_integer, value_sample=value_sample)
 
         # 1) duplicate values within the column
-        top_val, top_count = counts.most_common(1)[0]
+        top_index = int(value_order[0])
+        top_val = unique[top_index]
+        top_count = int(value_counts[top_index])
         if top_count >= max(4, n // 2) and n - top_count >= 1:
             findings.append(dict(kind="within_col_value_duplication",
                                  col=col_name, col_idx=c, n=n,
@@ -1799,41 +1880,52 @@ def detect_within_column_patterns(sheet, r0, r1, c0, c1, header, min_n=6):
                                  rule=f"col[{c}] has value {top_val} repeated {top_count}/{n} times"))
 
         # 2) last-2-decimal repetition within column
-        endings = [trailing_decimal_digits(v, 2) for v in a_clean]
-        endings = [e for e in endings if e is not None]
-        if len(endings) >= max(min_n, 8):
-            ec = Counter(endings)
+        ec = Counter()
+        ending_count = 0
+        for value in a_clean:
+            ending = trailing_decimal_digits(value, 2)
+            if ending is not None:
+                ec[ending] += 1
+                ending_count += 1
+        if ending_count >= max(min_n, 8):
             top_end, top_end_count = ec.most_common(1)[0]
-            if top_end_count >= max(5, 2 * len(endings) // 3):
+            if top_end_count >= max(5, 2 * ending_count // 3):
                 findings.append(dict(kind="within_col_decimal_repetition",
-                                     col=col_name, col_idx=c, n=len(endings),
+                                     col=col_name, col_idx=c, n=ending_count,
                                      ending=top_end, count=int(top_end_count),
-                                     frac_repeat=top_end_count / len(endings), **enrich,
+                                     frac_repeat=top_end_count / ending_count, **enrich,
                                      severity="high",
-                                     rule=f"col[{c}]: {top_end_count}/{len(endings)} values share last-2 decimals '.{top_end}'"))
+                                     rule=f"col[{c}]: {top_end_count}/{ending_count} values share last-2 decimals '.{top_end}'"))
 
         # 3) too many .0 / .5 last decimal (rounded to half/int)
-        last1 = [last_significant_digit(v) for v in a_clean]
-        last1 = [d for d in last1 if d is not None]
-        if len(last1) >= max(min_n, 10):
-            zeros_fives = sum(1 for d in last1 if d in ("0", "5"))
-            if zeros_fives >= max(7, 0.7 * len(last1)):
+        last_digit_counts = Counter()
+        last_digit_count = 0
+        for value in a_clean:
+            digit = last_significant_digit(value)
+            if digit is not None:
+                last_digit_counts[digit] += 1
+                last_digit_count += 1
+        if last_digit_count >= max(min_n, 10):
+            zeros_fives = (
+                last_digit_counts["0"] + last_digit_counts["5"]
+            )
+            if zeros_fives >= max(7, 0.7 * last_digit_count):
                 findings.append(dict(kind="rounded_to_half_or_int",
-                                     col=col_name, col_idx=c, n=len(last1),
+                                     col=col_name, col_idx=c, n=last_digit_count,
                                      count_05=int(zeros_fives),
                                      severity="medium",
-                                     rule=f"col[{c}]: {zeros_fives}/{len(last1)} values end in 0 or 5"))
+                                     rule=f"col[{c}]: {zeros_fives}/{last_digit_count} values end in 0 or 5"))
 
         # 4) missing last-digit (3 or 7 completely absent in a large column)
-        if len(last1) >= 20:
-            present = set(last1)
+        if last_digit_count >= 20:
+            present = set(last_digit_counts)
             missing = [d for d in "123456789" if d not in present]
             if missing and len(present) <= 6:
                 findings.append(dict(kind="missing_last_digits",
-                                     col=col_name, col_idx=c, n=len(last1),
+                                     col=col_name, col_idx=c, n=last_digit_count,
                                      missing=missing,
                                      severity="medium",
-                                     rule=f"col[{c}]: last digits {missing} never appear in {len(last1)} values"))
+                                     rule=f"col[{c}]: last digits {missing} never appear in {last_digit_count} values"))
     return findings
 
 
@@ -1853,37 +1945,61 @@ def detect_dispersed_repeats(sheet, r0, r1, c0, c1, header, min_n=30):
         return len(s.split(".")[1]) if "." in s else 0
 
     for c in range(c0, c1):
-        rows_vals = []
-        for r in range(r0, r1):
-            v = sheet.cell(r, c)
-            if is_num(v) and not (isinstance(v, float) and np.isnan(v)):
-                rows_vals.append((r, float(v)))
-        n = len(rows_vals)
+        column = sheet.numeric[r0:r1, c]
+        numeric_mask = ~np.isnan(column)
+        rows = np.flatnonzero(numeric_mask) + r0
+        vals = column[numeric_mask]
+        n = int(len(vals))
         if n < min_n:
             continue
-        vals = [v for _, v in rows_vals]
 
         # quick reject: pure-integer columns (counts / codes)
-        if all(abs(v - round(v)) < 1e-9 for v in vals):
+        if bool(np.all(np.abs(vals - np.round(vals)) < 1e-9)):
             continue
 
         # Strip a dominant boundary/censor value FIRST (e.g. 600s ceiling), so it
         # neither drags down the precision fraction nor counts as a "repeat".
-        cnt_all = Counter(round(v, 6) for v in vals)
-        top_v, top_c = cnt_all.most_common(1)[0]
+        rounded = np.round(vals, 6)
+        unique_all, counts_all, order_all = _numpy_frequency_summary(
+            rounded
+        )
+        top_index = int(order_all[0])
+        top_v = unique_all[top_index]
+        top_c = int(counts_all[top_index])
         boundary = top_v if top_c > 0.25 * n else None
-        core = [(r, v) for (r, v) in rows_vals
-                if boundary is None or round(v, 6) != boundary]
-        m = len(core)
+        core_mask = (
+            np.ones(n, dtype=np.bool_)
+            if boundary is None
+            else rounded != boundary
+        )
+        core_rows = rows[core_mask]
+        core_vals = vals[core_mask]
+        m = int(len(core_vals))
         if m < min_n:
             continue
-        core_vals = [v for _, v in core]
 
         # Gate 1 — continuity / high precision (computed on core)
-        frac_hi_prec = sum(1 for v in core_vals if _dec_places(v) >= 2) / m
+        decimal_places = np.fromiter(
+            (_dec_places(value) for value in core_vals),
+            dtype=np.uint8,
+            count=m,
+        )
+        frac_hi_prec = float(np.count_nonzero(decimal_places >= 2)) / m
         if frac_hi_prec < 0.6:
             continue
-        distinct = len({round(v, 6) for v in core_vals})
+        rounded_core = np.round(core_vals, 6)
+        (
+            unique_core,
+            first_core,
+            inverse_core,
+            counts_core,
+        ) = np.unique(
+            rounded_core,
+            return_index=True,
+            return_inverse=True,
+            return_counts=True,
+        )
+        distinct = int(len(unique_core))
         if distinct < 50 or distinct / m < 0.3:
             continue
 
@@ -1891,88 +2007,156 @@ def detect_dispersed_repeats(sheet, r0, r1, c0, c1, header, min_n=30):
         # be fine ENOUGH relative to the value range that exact collisions are
         # near-zero-expected. A coarse column (e.g. 2 decimals over [0,1] -> only
         # ~100 possible values) collides naturally and must NOT fire.
-        dps = sorted(_dec_places(v) for v in core_vals)
-        med_dp = dps[len(dps) // 2]
-        support = (max(core_vals) - min(core_vals)) * (10 ** med_dp)
+        med_dp = int(np.partition(
+            decimal_places, len(decimal_places) // 2
+        )[len(decimal_places) // 2])
+        support = (
+            float(np.max(core_vals)) - float(np.min(core_vals))
+        ) * (10 ** med_dp)
         if support < 20 * m:
             continue
 
         # Gate 2 + 3 — dispersed exact-duplicate groups
-        positions = defaultdict(list)
-        for r, v in core:
-            positions[round(v, 6)].append(r)
         block_h = r1 - r0
-        dispersed = []
+        sorted_positions = np.argsort(inverse_core, kind="stable")
+        group_starts = np.cumsum(
+            np.concatenate((
+                np.array([0], dtype=np.int64),
+                counts_core[:-1],
+            ))
+        )
+        top_groups = []
+        dispersed_count = 0
         dup_cells = 0
-        for val, rs in positions.items():
-            if len(rs) < 2:
+        for group_index, group_count in enumerate(counts_core):
+            group_count = int(group_count)
+            if group_count < 2:
                 continue
-            rs_sorted = sorted(rs)
-            span = rs_sorted[-1] - rs_sorted[0]
-            non_adjacent = any(b - a > 1 for a, b in zip(rs_sorted, rs_sorted[1:]))
+            start = int(group_starts[group_index])
+            stop = start + group_count
+            group_rows = core_rows[
+                sorted_positions[start:stop]
+            ]
+            span = int(group_rows[-1] - group_rows[0])
+            non_adjacent = bool(np.any(np.diff(group_rows) > 1))
             if span >= 0.5 * block_h and non_adjacent:
-                dispersed.append((val, rs_sorted))
-                dup_cells += len(rs_sorted)
+                dispersed_count += 1
+                dup_cells += group_count
+                top_groups.append((
+                    group_count,
+                    int(first_core[group_index]),
+                    tuple(
+                        int(row)
+                        for row in group_rows[:8]
+                    ),
+                ))
+                top_groups.sort(key=lambda item: (-item[0], item[1]))
+                del top_groups[3:]
 
-        if len(dispersed) >= 10 and dup_cells >= 0.15 * m:
-            dispersed.sort(key=lambda kv: -len(kv[1]))
+        if dispersed_count >= 10 and dup_cells >= 0.15 * m:
             example_cells = []
-            for _, rs in dispersed[:3]:
-                for rr in rs[:8]:
+            for _, _, group_rows in top_groups:
+                for rr in group_rows:
                     example_cells.append((rr + 1, c + 1))
             col_name = header[c - c0] if c - c0 < len(header) else f"col{c}"
-            core_arr = np.round(np.array([v for _, v in core]), 4)
-            counts = Counter(core_arr.tolist())
+            sample_unique, _, sample_order = _numpy_frequency_summary(
+                np.round(core_vals, 4)
+            )
             findings.append(dict(
                 kind="within_col_dispersed_repeats",
                 col=col_name, col_idx=c, n=m,
-                n_repeat_groups=len(dispersed), dup_cells=dup_cells,
+                n_repeat_groups=dispersed_count, dup_cells=dup_cells,
                 frac_repeat=dup_cells / m,
-                n_distinct=int(len(counts)), all_integer=False,
-                value_sample=[float(v) for v, _ in counts.most_common(8)],
+                n_distinct=int(len(sample_unique)), all_integer=False,
+                value_sample=[
+                    float(sample_unique[index])
+                    for index in sample_order[:8]
+                ],
                 example_cells=example_cells,
                 severity="medium",
-                rule=(f"col[{c}]: {len(dispersed)} distinct high-precision values "
+                rule=(f"col[{c}]: {dispersed_count} distinct high-precision values "
                       f"each recur across dispersed rows ({dup_cells}/{m} cells)")))
     return findings
 
 
 def detect_identical_after_rounding(sheet, r0, r1, c0, c1, header):
     """Detect pairs/groups of cells that differ at higher precision but match at lower (e.g.
-       4.2735 vs 4.2812 — both round to 4.3). Kang Tiebang ED6h/6j signal."""
+    4.2735 vs 4.2812 — both round to 4.3). Kang Tiebang ED6h/6j signal."""
     findings = []
-    cells = []
-    for r in range(r0, r1):
-        for c in range(c0, c1):
-            v = sheet.cell(r, c)
-            if is_num(v) and abs(v) > 1e-9:
-                cells.append((r, c, float(v)))
-    if len(cells) < 20:
+    block = sheet.numeric[r0:r1, c0:c1]
+    candidate_mask = ~np.isnan(block) & (np.abs(block) > 1e-9)
+    if int(np.count_nonzero(candidate_mask)) < 20:
         return findings
-    # Bucket cells by 1-decimal rounded value
-    from collections import defaultdict
-    buckets = defaultdict(list)
-    for r, c, v in cells:
-        if abs(v) < 100:  # only meaningful for measurement-scale numbers
-            buckets[round(v, 1)].append((r, c, v))
+    bucket_mask = candidate_mask & (np.abs(block) < 100)
+    flat_indices = np.flatnonzero(bucket_mask)
+    if len(flat_indices) < 4:
+        return findings
+    values = block.ravel()[flat_indices]
+    rounded = np.round(values, 1)
+    (
+        rounded_values,
+        first_indices,
+        inverse,
+        counts,
+    ) = np.unique(
+        rounded,
+        return_index=True,
+        return_inverse=True,
+        return_counts=True,
+    )
+    sorted_positions = np.argsort(inverse, kind="stable")
+    group_starts = np.cumsum(
+        np.concatenate((
+            np.array([0], dtype=np.int64),
+            counts[:-1],
+        ))
+    )
+
     # Find buckets where multiple DIFFERENT (>1e-4 apart) values map to the same rounded value
     rounding_groups = []
-    for k, lst in buckets.items():
-        if len(lst) >= 4:
-            uniq = set(round(v, 4) for _, _, v in lst)
-            if len(uniq) >= 3:
-                rounding_groups.append((k, lst))
-    rounding_groups.sort(key=lambda kv: -len(kv[1]))
+    for group_index, count in enumerate(counts):
+        count = int(count)
+        if count < 4:
+            continue
+        start = int(group_starts[group_index])
+        stop = start + count
+        positions = sorted_positions[start:stop]
+        precise_values = np.unique(np.round(values[positions], 4))
+        if len(precise_values) < 3:
+            continue
+        rounding_groups.append((
+            count,
+            int(first_indices[group_index]),
+            float(rounded_values[group_index]),
+            positions[:6].copy(),
+            precise_values[:6].copy(),
+            int(len(precise_values)),
+        ))
+        rounding_groups.sort(key=lambda item: (-item[0], item[1]))
+        del rounding_groups[5:]
     if rounding_groups:
-        top = rounding_groups[:5]
-        for k, lst in top:
-            uniq = sorted(set(round(v, 4) for _, _, v in lst))
+        width = c1 - c0
+        for (
+            count,
+            _first_index,
+            rounded_value,
+            positions,
+            example_values,
+            unique_count,
+        ) in rounding_groups:
+            example_cells = []
+            for position in positions:
+                flat_index = int(flat_indices[int(position)])
+                row_offset, col_offset = divmod(flat_index, width)
+                example_cells.append(
+                    (r0 + row_offset + 1, c0 + col_offset + 1)
+                )
             findings.append(dict(kind="identical_after_rounding",
-                                 rounded_to=float(k), n_cells=len(lst), n_unique=len(uniq),
-                                 example_values=uniq[:6],
-                                 example_cells=[(r + 1, c + 1) for r, c, _ in lst[:6]],
+                                 rounded_to=rounded_value, n_cells=count, n_unique=unique_count,
+                                 example_values=[float(value) for value in example_values],
+                                 example_cells=example_cells,
                                  severity="medium",
-                                 rule=f"{len(lst)} cells share rounded value {k} but have {len(uniq)} distinct precise values"))
+                                 rule=f"{count} cells share rounded value {rounded_value} but have {unique_count} distinct precise values"))
     return findings
 
 
@@ -2107,21 +2291,20 @@ def detect_equal_pairs(sheet, r0, r1, c0, c1, header):
     findings = []
     for i in range(c1 - c0):
         for j in range(i + 1, c1 - c0):
-            pairs = _numeric_pairs(sheet, r0, r1, c0 + i, c0 + j)
-            n = len(pairs)
+            pair_stats = _numeric_pair_stats(
+                sheet, r0, r1, c0 + i, c0 + j
+            )
+            n = pair_stats.n
             if n < 6:
                 continue
-            exact_a = [pair[1] for pair in pairs]
-            exact_b = [pair[2] for pair in pairs]
-            equal_rows = [row for row, left, right in pairs if left == right]
-            eq = len(equal_rows)
-            all_equal = eq == n
+            eq = pair_stats.equal
+            all_equal = pair_stats.all_equal
             if eq >= max(6, n // 2) and eq / n >= 0.5 and not all_equal:
                 findings.append(dict(kind="many_equal_pairs", col_a=header[i], col_b=header[j],
                                      col_a_idx=c0 + i, col_b_idx=c0 + j, n=n, equal=eq,
                                      severity="medium" if eq < n else "high",
-                                     col_a_sample=_sample_exact(exact_a),
-                                     col_b_sample=_sample_exact(exact_b),
+                                     col_a_sample=_sample_exact(pair_stats.sample_a),
+                                     col_b_sample=_sample_exact(pair_stats.sample_b),
                                      rule=f"col[{c0+i}] == col[{c0+j}] in {eq}/{n} rows"))
     return findings
 
@@ -2264,6 +2447,102 @@ def value_tweak_subtype(delta: dict | None) -> str | None:
     return "block_edit"
 
 
+@dataclass
+class CrossSheetWorkBudget:
+    pair_limit: int
+    value_limit: int
+    tail_match_limit: int
+    finding_limit: int
+    pairs_examined: int = 0
+    pairs_skipped: int = 0
+    values_examined: int = 0
+    values_skipped: int = 0
+    tail_matches_retained: int = 0
+    tail_matches_skipped_lower_bound: int = 0
+    findings_retained: int = 0
+    findings_skipped: int = 0
+    _limits_reached: set = None
+
+    def __post_init__(self):
+        self.pair_limit = max(0, int(self.pair_limit))
+        self.value_limit = max(0, int(self.value_limit))
+        self.tail_match_limit = max(
+            0, int(self.tail_match_limit)
+        )
+        self.finding_limit = max(0, int(self.finding_limit))
+        if self._limits_reached is None:
+            self._limits_reached = set()
+
+    def consume_values(self, count):
+        count = max(0, int(count))
+        if self.values_examined + count > self.value_limit:
+            self._limits_reached.add("value")
+            self.values_skipped += count
+            return False
+        self.values_examined += count
+        return True
+
+    def consume_pair(self, value_count):
+        if self.pairs_examined >= self.pair_limit:
+            self._limits_reached.add("pair")
+            return False
+        if not self.consume_values(value_count):
+            return False
+        self.pairs_examined += 1
+        return True
+
+    def skip_pairs(self, count, *, values=0):
+        self.pairs_skipped += max(0, int(count))
+        self.values_skipped += max(0, int(values))
+
+    def retain_tail_match(self):
+        if (
+            self.tail_matches_retained
+            >= self.tail_match_limit
+        ):
+            self._limits_reached.add("tail_match")
+            self.tail_matches_skipped_lower_bound += 1
+            return False
+        self.tail_matches_retained += 1
+        return True
+
+    def retain_finding(self):
+        if self.findings_retained >= self.finding_limit:
+            self._limits_reached.add("finding")
+            self.findings_skipped += 1
+            return False
+        self.findings_retained += 1
+        return True
+
+    def limitation_metadata(self):
+        order = ("pair", "value", "tail_match", "finding")
+        return {
+            "pair_limit": self.pair_limit,
+            "value_limit": self.value_limit,
+            "tail_match_limit": self.tail_match_limit,
+            "finding_limit": self.finding_limit,
+            "pairs_examined": self.pairs_examined,
+            "pairs_skipped": self.pairs_skipped,
+            "values_examined": self.values_examined,
+            "values_skipped": self.values_skipped,
+            "tail_matches_retained": (
+                self.tail_matches_retained
+            ),
+            "tail_matches_skipped_lower_bound": (
+                self.tail_matches_skipped_lower_bound
+            ),
+            "findings_retained": self.findings_retained,
+            "findings_skipped": self.findings_skipped,
+            "limits_reached": [
+                name for name in order
+                if name in self._limits_reached
+            ],
+            "omitted_findings_lower_bound": (
+                self.findings_skipped
+            ),
+        }
+
+
 def _decimal_tail_signature(v, min_tail_digits=5, skip_decimal_digits=1):
     """Return a low-order decimal fingerprint for copy-then-edit detection.
 
@@ -2299,6 +2578,7 @@ def _detect_decimal_tail_reuse_for_pair(
     min_tail_digits=5,
     skip_decimal_digits=1,
     min_matches=8,
+    budget=None,
 ):
     """Find one aligned block where values differ but decimal tails are reused.
 
@@ -2333,6 +2613,8 @@ def _detect_decimal_tail_reuse_for_pair(
         for kb, vb in matches:
             if math.isclose(float(va), float(vb), rel_tol=1e-9, abs_tol=1e-12):
                 continue
+            if budget is not None and not budget.retain_tail_match():
+                return None
             off = (kb[0] - ka[0], kb[1] - ka[1])
             by_offset.setdefault(off, []).append((ka, kb, float(va), float(vb), sig))
 
@@ -2678,7 +2960,9 @@ def _shared_cross_sheet_context(ctx_a, ctx_b, pattern, fraction):
     }
 
 
-def detect_collisions(grids, profile="review", sheets=None):
+def detect_collisions(
+    grids, profile="review", sheets=None, budget=None
+):
     """Find pairs of tables (sheets and/or flat files) with many bit-identical decimal
     values at the SAME (row, col), including repeated tables with changed cells in another
     sheet of the same workbook or in a separate file.
@@ -2700,16 +2984,35 @@ def detect_collisions(grids, profile="review", sheets=None):
     Cross-figure overlaps that survive both checks keep their base severity.
     """
     findings = []
-    keys = list(grids.keys())
-    axis_cols = _axis_columns(grids)
-    for i in range(len(keys)):
-        for j in range(i + 1, len(keys)):
-            (fa, sa), (fb, sb) = keys[i], keys[j]
-            ga, gb = grids[keys[i]], grids[keys[j]]
+    axis_value_count = sum(len(grid) for grid in grids.values())
+    if budget is None or budget.consume_values(axis_value_count):
+        axis_cols = _axis_columns(grids)
+    else:
+        axis_cols = {key: set() for key in grids}
+    keys = [
+        key for key in grids
+        if len(grids[key]) >= 5
+    ]
+    total_pairs = len(keys) * (len(keys) - 1) // 2
+
+    def emit(finding):
+        if budget is None or budget.retain_finding():
+            findings.append(finding)
+
+    for pair_index, (key_a, key_b) in enumerate(
+        combinations(keys, 2)
+    ):
+            (fa, sa), (fb, sb) = key_a, key_b
+            ga, gb = grids[key_a], grids[key_b]
             size_a, size_b = len(ga), len(gb)
             smaller = min(size_a, size_b)
-            if smaller < 5:
-                continue
+            pair_value_work = size_a + size_b + smaller
+            if (
+                budget is not None
+                and not budget.consume_pair(pair_value_work)
+            ):
+                budget.skip_pairs(total_pairs - pair_index)
+                break
             same_file = fa == fb
             # label_a / label_b disambiguate sheets when the pair spans two files
             la = sa if same_file else f"{fa}::{sa}"
@@ -2736,8 +3039,8 @@ def detect_collisions(grids, profile="review", sheets=None):
             if same_pos >= max(6, smaller * 0.15):
                 shared = [(k, v) for k, v in ga.items() if k in gb and gb[k] == v]
                 examples = shared[:5]
-                label_context_a = _label_context_for_matches((sheets or {}).get(keys[i]), shared)
-                label_context_b = _label_context_for_matches((sheets or {}).get(keys[j]), shared)
+                label_context_a = _label_context_for_matches((sheets or {}).get(key_a), shared)
+                label_context_b = _label_context_for_matches((sheets or {}).get(key_b), shared)
                 fraction_of_smaller = same_pos / smaller
                 shared_context = _shared_cross_sheet_context(
                     label_context_a,
@@ -2749,7 +3052,7 @@ def detect_collisions(grids, profile="review", sheets=None):
                 # column that is a swept/recurring axis AND the rest diverges, this is a
                 # shared x-axis, not cross-experiment reuse. A perfect_dup spans every
                 # column (incl. measurements), so it is excluded and stays high.
-                pair_axis = axis_cols.get(keys[i], set()) | axis_cols.get(keys[j], set())
+                pair_axis = axis_cols.get(key_a, set()) | axis_cols.get(key_b, set())
                 on_axis = sum(1 for (_, c), _ in shared if c in pair_axis)
                 non_axis_shared = len(shared) - on_axis
                 # Downgrade only when the overlap is essentially confined to axis
@@ -2775,7 +3078,7 @@ def detect_collisions(grids, profile="review", sheets=None):
                     sev = "low"
                 else:
                     sev = "high"
-                findings.append(dict(
+                emit(dict(
                     kind="cross_sheet_position_identical",
                     file=fa if same_file else f"{fa} + {fb}",
                     file_a=fa, file_b=fb, same_file=same_file,
@@ -2793,7 +3096,7 @@ def detect_collisions(grids, profile="review", sheets=None):
                 ))
             elif same_val >= max(8, smaller * 0.4):
                 examples = sorted(list(vals_a & vals_b))[:5]
-                findings.append(dict(
+                emit(dict(
                     kind="cross_sheet_value_overlap",
                     file=fa if same_file else f"{fa} + {fb}",
                     file_a=fa, file_b=fb, same_file=same_file,
@@ -2812,13 +3115,14 @@ def detect_collisions(grids, profile="review", sheets=None):
                 ga,
                 gb,
                 min_matches=tail_min_matches,
+                budget=budget,
             )
             if tail_reuse:
                 pairs = tail_reuse["pairs"]
                 cells_a = [(ka, va) for ka, _kb, va, _vb, _sig in pairs]
                 cells_b = [(kb, vb) for _ka, kb, _va, vb, _sig in pairs]
-                label_context_a = _label_context_for_matches((sheets or {}).get(keys[i]), cells_a)
-                label_context_b = _label_context_for_matches((sheets or {}).get(keys[j]), cells_b)
+                label_context_a = _label_context_for_matches((sheets or {}).get(key_a), cells_a)
+                label_context_b = _label_context_for_matches((sheets or {}).get(key_b), cells_b)
                 fraction_of_smaller = tail_reuse["tail_match_count"] / smaller
                 off_r, off_c = tail_reuse["offset"]
                 low_reason = None if same_figure else _decimal_tail_low_reason(pairs)
@@ -2853,7 +3157,7 @@ def detect_collisions(grids, profile="review", sheets=None):
                 tail_benign_reason = low_reason or note_reason
                 if tail_benign_reason:
                     tail_fields["tail_benign_reason"] = tail_benign_reason
-                findings.append(dict(
+                emit(dict(
                     kind="cross_sheet_decimal_tail_reuse",
                     file=fa if same_file else f"{fa} + {fb}",
                     file_a=fa, file_b=fb, same_file=same_file,
@@ -3333,6 +3637,157 @@ def _column_fingerprints(
     )
 
 
+_SUMMARY_DIMENSIONS = (
+    "summaries",
+    "grid_cells",
+    "label_cells",
+    "label_bytes",
+    "column_fingerprints",
+)
+
+
+@dataclass
+class CrossSheetSummaryBudget:
+    summary_limit: int
+    grid_cell_limit: int
+    label_cell_limit: int
+    label_byte_limit: int
+    column_fingerprint_limit: int
+    summaries_considered: int = 0
+    summaries_retained: int = 0
+    grid_cells_retained: int = 0
+    label_cells_retained: int = 0
+    label_bytes_retained: int = 0
+    column_fingerprints_retained: int = 0
+    summaries_skipped: int = 0
+    _exhausted: dict = None
+
+    def __post_init__(self):
+        self.summary_limit = max(0, int(self.summary_limit))
+        self.grid_cell_limit = max(0, int(self.grid_cell_limit))
+        self.label_cell_limit = max(0, int(self.label_cell_limit))
+        self.label_byte_limit = max(0, int(self.label_byte_limit))
+        self.column_fingerprint_limit = max(
+            0, int(self.column_fingerprint_limit)
+        )
+        if self._exhausted is None:
+            self._exhausted = {}
+
+    def _limits(self):
+        return {
+            "summaries": self.summary_limit,
+            "grid_cells": self.grid_cell_limit,
+            "label_cells": self.label_cell_limit,
+            "label_bytes": self.label_byte_limit,
+            "column_fingerprints": (
+                self.column_fingerprint_limit
+            ),
+        }
+
+    def retained_metadata(self):
+        return {
+            "summaries": self.summaries_retained,
+            "grid_cells": self.grid_cells_retained,
+            "label_cells": self.label_cells_retained,
+            "label_bytes": self.label_bytes_retained,
+            "column_fingerprints": (
+                self.column_fingerprints_retained
+            ),
+        }
+
+    def _record_rejection(self, dimensions):
+        self.summaries_skipped += 1
+        retained = self.retained_metadata()
+        limits = self._limits()
+        for dimension, skipped_items in dimensions.items():
+            item = self._exhausted.setdefault(dimension, {
+                "limit": limits[dimension],
+                "retained": retained[dimension],
+                "skipped_sheets": 0,
+                "skipped_items": 0,
+            })
+            item["retained"] = retained[dimension]
+            item["skipped_sheets"] += 1
+            item["skipped_items"] += max(1, int(skipped_items))
+
+    def begin_summary(self):
+        self.summaries_considered += 1
+        if self.summaries_retained >= self.summary_limit:
+            self._record_rejection({"summaries": 1})
+            return False
+        return True
+
+    def try_retain(self, metrics):
+        retained = self.retained_metadata()
+        limits = self._limits()
+        exceeded = {
+            dimension: metrics[dimension]
+            for dimension in _SUMMARY_DIMENSIONS[1:]
+            if retained[dimension] + metrics[dimension]
+            > limits[dimension]
+        }
+        if exceeded:
+            self._record_rejection(exceeded)
+            return False
+        self.summaries_retained += 1
+        self.grid_cells_retained += metrics["grid_cells"]
+        self.label_cells_retained += metrics["label_cells"]
+        self.label_bytes_retained += metrics["label_bytes"]
+        self.column_fingerprints_retained += metrics[
+            "column_fingerprints"
+        ]
+        return True
+
+    def limitation_metadata(self):
+        unavailable_pairs = (
+            self.summaries_considered
+            * (self.summaries_considered - 1)
+            // 2
+            - self.summaries_retained
+            * (self.summaries_retained - 1)
+            // 2
+        )
+        return {
+            "summaries_considered": self.summaries_considered,
+            "summaries_retained": self.summaries_retained,
+            "summaries_skipped": self.summaries_skipped,
+            "summary_pairs_unavailable": unavailable_pairs,
+            "exhausted_dimensions": [
+                dimension for dimension in _SUMMARY_DIMENSIONS
+                if dimension in self._exhausted
+            ],
+            "dimensions": {
+                dimension: dict(self._exhausted[dimension])
+                for dimension in _SUMMARY_DIMENSIONS
+                if dimension in self._exhausted
+            },
+        }
+
+    def coverage_limitations(self):
+        reasons = {
+            "summaries": "cross_sheet_summary_count_limit",
+            "grid_cells": "cross_sheet_grid_cell_limit",
+            "label_cells": "cross_sheet_label_cell_limit",
+            "label_bytes": "cross_sheet_label_byte_limit",
+            "column_fingerprints": (
+                "cross_sheet_column_fingerprint_limit"
+            ),
+        }
+        metadata = self.limitation_metadata()
+        return [
+            {
+                "reason": reasons[dimension],
+                "dimension": dimension,
+                **metadata["dimensions"][dimension],
+                "summary_pairs_unavailable": metadata[
+                    "summary_pairs_unavailable"
+                ],
+                "omitted_findings_lower_bound": 0,
+            }
+            for dimension in metadata["exhausted_dimensions"]
+        ]
+
+
 def build_cross_sheet_summary(
     file,
     sheet,
@@ -3342,7 +3797,10 @@ def build_cross_sheet_summary(
     collision_max_rows=200,
     collision_max_cells=200000,
     min_column_length=12,
-) -> tuple[CrossSheetSummary, list[InputLimitation]]:
+    budget=None,
+) -> tuple[CrossSheetSummary | None, list[InputLimitation]]:
+    if budget is not None and not budget.begin_summary():
+        return None, []
     if blocks is None:
         blocks = find_numeric_blocks(source)
     grid, grid_meta = _grid_from_rows(
@@ -3375,6 +3833,18 @@ def build_cross_sheet_summary(
         labels=labels,
         columns=columns,
     )
+    if budget is not None:
+        metrics = {
+            "grid_cells": len(grid),
+            "label_cells": len(labels.text),
+            "label_bytes": sum(
+                len(value.encode("utf-8"))
+                for value in labels.text.values()
+            ),
+            "column_fingerprints": len(columns),
+        }
+        if not budget.try_retain(metrics):
+            return None, []
     limitations = list(column_limitations)
     if grid_meta["row_limited"]:
         limitations.append(InputLimitation(
@@ -3399,7 +3869,9 @@ def build_cross_sheet_summary(
     return summary, limitations
 
 
-def detect_cross_sheet_column_duplicates(grid_sheets, profile="review", min_len=12):
+def detect_cross_sheet_column_duplicates(
+    grid_sheets, profile="review", min_len=12, budget=None
+):
     """B1 — full-column duplication ACROSS different (file, sheet) panels, including the
     integer / 1-decimal columns that `detect_collisions` misses (it grids only >=3-decimal
     values). Two panels that should be independent measurements carrying a byte-identical
@@ -3429,6 +3901,30 @@ def detect_cross_sheet_column_duplicates(grid_sheets, profile="review", min_len=
                 buckets.setdefault(key, []).append(column)
 
     findings = []
+    total_pairs = 0
+    for group in buckets.values():
+        if not group:
+            continue
+        first = group[0]
+        if first.all_int and (
+            first.length < 25
+            or first.distinct < max(
+                12, int(0.7 * first.length)
+            )
+        ):
+            continue
+        panel_counts = Counter(
+            (column.file, column.sheet) for column in group
+        )
+        total_pairs += (
+            len(group) * (len(group) - 1) // 2
+            - sum(
+                count * (count - 1) // 2
+                for count in panel_counts.values()
+            )
+        )
+    candidate_index = 0
+    stopped = False
     for group in buckets.values():
         panels = {(column.file, column.sheet) for column in group}
         if len(panels) < 2:
@@ -3442,7 +3938,6 @@ def detect_cross_sheet_column_duplicates(grid_sheets, profile="review", min_len=
             or first.distinct < max(12, int(0.7 * n))
         ):
             continue
-        emitted = 0
         for i in range(len(group)):
             for j in range(i + 1, len(group)):
                 left = group[i]
@@ -3451,12 +3946,22 @@ def detect_cross_sheet_column_duplicates(grid_sheets, profile="review", min_len=
                 fb, sb_name, lb = right.file, right.sheet, right.label
                 if (fa, sa_name) == (fb, sb_name):
                     continue                          # different columns, same sheet → identical_column
+                if (
+                    budget is not None
+                    and not budget.consume_pair(0)
+                ):
+                    budget.skip_pairs(
+                        total_pairs - candidate_index
+                    )
+                    stopped = True
+                    break
+                candidate_index += 1
                 fig_a, fig_b = figure_key(sa_name), figure_key(sb_name)
                 same_figure = fig_a is not None and fig_a == fig_b
                 same_file = fa == fb
                 scope = "sheets" if same_file else "files"
                 sev = "low" if (same_figure or all_int) else "high"
-                findings.append(dict(
+                finding = dict(
                     kind="cross_sheet_column_duplicate",
                     file=fa if same_file else f"{fa} + {fb}",
                     file_a=fa, file_b=fb, same_file=same_file,
@@ -3474,12 +3979,13 @@ def detect_cross_sheet_column_duplicates(grid_sheets, profile="review", min_len=
                     severity=sev,
                     rule=(f"column '{la}' ({sa_name}) and column '{lb}' ({sb_name}) match to 6 decimal "
                           f"places over all {n} values across 2 {scope}"),
-                ))
-                emitted += 1
-                if emitted >= 10:                     # cap per bucket
-                    break
-            if emitted >= 10:
+                )
+                if budget is None or budget.retain_finding():
+                    findings.append(finding)
+            if stopped:
                 break
+        if stopped:
+            break
     apply_profile_to_findings(findings, profile)
     return findings
 
@@ -3766,10 +4272,81 @@ _COLUMN_FINGERPRINT_MAX_COLUMNS = int(
     )
 )
 _COLUMN_FINGERPRINT_EXAMPLE_LIMIT = 5
+# Scan-wide retained cross-sheet summary state. A later sheet is retained only
+# when its complete summary fits every remaining dimension.
+_CROSS_SHEET_SUMMARY_LIMIT = int(
+    os.environ.get("PAPERCONAN_CROSS_SHEET_SUMMARY_LIMIT", "2000")
+)
+_CROSS_SHEET_GRID_CELL_LIMIT = int(
+    os.environ.get(
+        "PAPERCONAN_CROSS_SHEET_GRID_CELL_LIMIT",
+        "2000000",
+    )
+)
+_CROSS_SHEET_LABEL_CELL_LIMIT = int(
+    os.environ.get(
+        "PAPERCONAN_CROSS_SHEET_LABEL_CELL_LIMIT",
+        "500000",
+    )
+)
+_CROSS_SHEET_LABEL_BYTE_LIMIT = int(
+    os.environ.get(
+        "PAPERCONAN_CROSS_SHEET_LABEL_BYTE_LIMIT",
+        str(32 * 1024 * 1024),
+    )
+)
+_CROSS_SHEET_COLUMN_FINGERPRINT_LIMIT = int(
+    os.environ.get(
+        "PAPERCONAN_CROSS_SHEET_COLUMN_FINGERPRINT_LIMIT",
+        "200000",
+    )
+)
+# Scan-wide cross-sheet comparison work. Candidate pairs count separately for
+# each detector family; value work counts logical grid-value examinations.
+_CROSS_SHEET_PAIR_BUDGET = int(
+    os.environ.get("PAPERCONAN_CROSS_SHEET_PAIR_BUDGET", "1000000")
+)
+_CROSS_SHEET_VALUE_BUDGET = int(
+    os.environ.get(
+        "PAPERCONAN_CROSS_SHEET_VALUE_BUDGET",
+        "50000000",
+    )
+)
+_CROSS_SHEET_TAIL_MATCH_BUDGET = int(
+    os.environ.get(
+        "PAPERCONAN_CROSS_SHEET_TAIL_MATCH_BUDGET",
+        "1000000",
+    )
+)
+_CROSS_SHEET_FINDING_BUDGET = int(
+    os.environ.get(
+        "PAPERCONAN_CROSS_SHEET_FINDING_BUDGET",
+        "10000",
+    )
+)
 # Wide blocks (dense correlation matrices) can make relation, equal-pair, and row-pair
 # coupling detector paths expensive in compute time and output size. Skip those three paths
 # above this width while the column-wise detectors still run. 0 disables the skip.
 _MAX_BLOCK_COLS = int(os.environ.get("PAPERCONAN_MAX_BLOCK_COLS", "120"))
+# Dense detector paths are admitted only when a complete detector candidate
+# fits all three bounds. Work is counted as logical numeric-cell visits;
+# retained state is counted as compact numeric elements, not Python object
+# bytes. Skipped families are disclosed before any candidate work starts.
+_DENSE_BLOCK_MAX_ROWS = int(
+    os.environ.get("PAPERCONAN_DENSE_BLOCK_MAX_ROWS", "100000")
+)
+_DENSE_BLOCK_CELL_WORK_LIMIT = int(
+    os.environ.get(
+        "PAPERCONAN_DENSE_BLOCK_CELL_WORK_LIMIT",
+        "10000000",
+    )
+)
+_DENSE_BLOCK_STATE_CELL_LIMIT = int(
+    os.environ.get(
+        "PAPERCONAN_DENSE_BLOCK_STATE_CELL_LIMIT",
+        "2000000",
+    )
+)
 # Output cap: each finding embeds a table-snippet as evidence, so a paper with thousands of
 # findings balloons scan.json to many GB. Stop collecting blocks once this many have findings.
 _MAX_REPORT_BLOCKS = int(os.environ.get("PAPERCONAN_MAX_REPORT_BLOCKS", "2000"))
@@ -3841,6 +4418,8 @@ class ScanBudgetState:
     recurring_index: RecurringRowIndex
     profile: str
     evidence: bool
+    cross_sheet_summary_budget: CrossSheetSummaryBudget | None = None
+    cross_sheet_work_budget: CrossSheetWorkBudget | None = None
     findings_kept: int = 0
     findings_omitted: int = 0
     findings_omitted_is_lower_bound: bool = False
@@ -4117,6 +4696,101 @@ def _attach_deferred_evidence(
             block.pop("_evidence_context", None)
 
 
+_WIDE_INTEGER_BLOCK_DETECTORS = [
+    "relations",
+    "equal_pairs",
+    "row_pairs",
+    "arithmetic_progression",
+    "within_column",
+    "dispersed_repeats",
+    "identical_after_rounding",
+    "grim_grimmer",
+]
+
+
+def _block_wide_integer_count(sheet, r0, r1, c0, c1):
+    return sum(
+        1
+        for row, col in sheet._wide_ints
+        if r0 <= row < r1 and c0 <= col < c1
+    )
+
+
+def _dense_detector_requirements(row_count, col_count):
+    pair_count = col_count * (col_count - 1) // 2
+    cell_count = row_count * col_count
+    return [
+        {
+            "family": "relations",
+            "candidates_total": pair_count,
+            "work_required": 2 * row_count * pair_count,
+            "state_required": 4 * row_count,
+        },
+        {
+            "family": "equal_pairs",
+            "candidates_total": pair_count,
+            "work_required": 2 * row_count * pair_count,
+            "state_required": 3 * row_count,
+        },
+        {
+            "family": "arithmetic_progression",
+            "candidates_total": col_count,
+            "work_required": cell_count,
+            "state_required": 3 * row_count,
+        },
+        {
+            "family": "within_column",
+            "candidates_total": col_count,
+            "work_required": cell_count,
+            "state_required": 4 * row_count,
+        },
+        {
+            "family": "dispersed_repeats",
+            "candidates_total": col_count,
+            "work_required": cell_count,
+            "state_required": 8 * row_count,
+        },
+        {
+            "family": "identical_after_rounding",
+            "candidates_total": 1,
+            "work_required": cell_count,
+            "state_required": 4 * cell_count,
+        },
+    ]
+
+
+def _dense_detector_admission(row_count, col_count):
+    allowed = {}
+    skipped = []
+    max_rows = max(0, _DENSE_BLOCK_MAX_ROWS)
+    work_limit = max(0, _DENSE_BLOCK_CELL_WORK_LIMIT)
+    state_limit = max(0, _DENSE_BLOCK_STATE_CELL_LIMIT)
+    for requirement in _dense_detector_requirements(
+        row_count, col_count
+    ):
+        limits_reached = []
+        if row_count > max_rows:
+            limits_reached.append("row")
+        if requirement["work_required"] > work_limit:
+            limits_reached.append("work")
+        if requirement["state_required"] > state_limit:
+            limits_reached.append("state")
+        family = requirement["family"]
+        allowed[family] = not limits_reached
+        if limits_reached:
+            skipped.append({
+                **requirement,
+                "candidates_examined": 0,
+                "candidates_skipped": requirement[
+                    "candidates_total"
+                ],
+                "work_examined": 0,
+                "work_skipped": requirement["work_required"],
+                "limits_reached": limits_reached,
+            })
+    return allowed, skipped
+
+
 def _analyze_numeric_blocks(
     sheet, *, file_name, sheet_name, blocks, state
 ):
@@ -4133,8 +4807,10 @@ def _analyze_numeric_blocks(
             break
         state.coverage.mark_block_analyzed()
         header = header_for(sheet, r0, c0, c1)
-        wide = _MAX_BLOCK_COLS and (c1 - c0) > _MAX_BLOCK_COLS
-        if wide:
+        wide_block = (
+            _MAX_BLOCK_COLS and (c1 - c0) > _MAX_BLOCK_COLS
+        )
+        if wide_block:
             state.coverage.add_limitation(
                 "block",
                 "wide_block_detector_limit",
@@ -4145,8 +4821,44 @@ def _analyze_numeric_blocks(
                 detectors=["relations", "equal_pairs", "row_pairs"],
                 max_cols=_MAX_BLOCK_COLS,
             )
+        wide_integer_count = _block_wide_integer_count(
+            sheet, r0, r1, c0, c1
+        )
+        if wide_integer_count:
+            state.coverage.add_limitation(
+                "block",
+                "wide_integer_detector_limit",
+                file=file_name,
+                sheet=sheet_name,
+                rows=f"{r0 + 1}-{r1}",
+                cols=f"{c0 + 1}-{c1}",
+                affected_cells=wide_integer_count,
+                detectors=_WIDE_INTEGER_BLOCK_DETECTORS,
+            )
+            state.findings_omitted_is_lower_bound = True
+        dense_allowed, dense_skipped = _dense_detector_admission(
+            r1 - r0, c1 - c0
+        )
+        if dense_skipped and not wide_integer_count:
+            state.coverage.add_limitation(
+                "block",
+                "dense_block_detector_limit",
+                file=file_name,
+                sheet=sheet_name,
+                rows=f"{r0 + 1}-{r1}",
+                cols=f"{c0 + 1}-{c1}",
+                max_rows=max(0, _DENSE_BLOCK_MAX_ROWS),
+                cell_work_limit=max(
+                    0, _DENSE_BLOCK_CELL_WORK_LIMIT
+                ),
+                state_cell_limit=max(
+                    0, _DENSE_BLOCK_STATE_CELL_LIMIT
+                ),
+                detectors=dense_skipped,
+            )
+            state.findings_omitted_is_lower_bound = True
         row_pair_dimension_limited = (
-            not wide
+            not wide_block
             and (
                 (r1 - r0) > _ROW_PAIR_MAX_ROWS
                 or (c1 - c0) > _ROW_PAIR_MAX_COLS
@@ -4163,17 +4875,40 @@ def _analyze_numeric_blocks(
                 max_rows=_ROW_PAIR_MAX_ROWS,
                 max_cols=_ROW_PAIR_MAX_COLS,
             )
-        rel = [] if wide else detect_relations(
-            sheet, r0, r1, c0, c1, header
+        rel = (
+            detect_relations(sheet, r0, r1, c0, c1, header)
+            if (
+                not wide_block
+                and not wide_integer_count
+                and dense_allowed["relations"]
+            )
+            else []
         )
-        ap = detect_arithmetic_progression(
-            sheet, r0, r1, c0, c1, header
+        ap = (
+            detect_arithmetic_progression(
+                sheet, r0, r1, c0, c1, header
+            )
+            if (
+                not wide_integer_count
+                and dense_allowed["arithmetic_progression"]
+            )
+            else []
         )
-        eq = [] if wide else detect_equal_pairs(
-            sheet, r0, r1, c0, c1, header
+        eq = (
+            detect_equal_pairs(sheet, r0, r1, c0, c1, header)
+            if (
+                not wide_block
+                and not wide_integer_count
+                and dense_allowed["equal_pairs"]
+            )
+            else []
         )
         row_pair_meta = {"findings_omitted": 0}
-        if wide or row_pair_dimension_limited:
+        if (
+            wide_block
+            or wide_integer_count
+            or row_pair_dimension_limited
+        ):
             rp = []
         else:
             row_pair_result = detect_row_pair_digit_coupling(
@@ -4204,17 +4939,39 @@ def _analyze_numeric_blocks(
                 omitted_findings=row_pair_omitted,
             )
             state.findings_omitted += row_pair_omitted
-        wc = detect_within_column_patterns(
-            sheet, r0, r1, c0, c1, header
+        wc = (
+            detect_within_column_patterns(
+                sheet, r0, r1, c0, c1, header
+            )
+            if (
+                not wide_integer_count
+                and dense_allowed["within_column"]
+            )
+            else []
         )
-        wc += detect_dispersed_repeats(
-            sheet, r0, r1, c0, c1, header
+        if (
+            not wide_integer_count
+            and dense_allowed["dispersed_repeats"]
+        ):
+            wc += detect_dispersed_repeats(
+                sheet, r0, r1, c0, c1, header
+            )
+        iar = (
+            detect_identical_after_rounding(
+                sheet, r0, r1, c0, c1, header
+            )
+            if (
+                not wide_integer_count
+                and dense_allowed["identical_after_rounding"]
+            )
+            else []
         )
-        iar = detect_identical_after_rounding(
-            sheet, r0, r1, c0, c1, header
-        )
-        gg = detect_grim_grimmer(
-            sheet, r0, r1, c0, c1, header
+        gg = (
+            detect_grim_grimmer(
+                sheet, r0, r1, c0, c1, header
+            )
+            if not wide_integer_count
+            else []
         )
         if not (
             rel or ap or eq or rp or wc or iar or gg
@@ -4335,6 +5092,12 @@ def _process_loaded_sheet(
             "fraction_reuse_work_limit",
             **limitation,
         )
+    if state.cross_sheet_work_budget is not None:
+        retained_within_sheet_findings = []
+        for finding in within_sheet_findings:
+            if state.cross_sheet_work_budget.retain_finding():
+                retained_within_sheet_findings.append(finding)
+        within_sheet_findings = retained_within_sheet_findings
 
     label = f"{file_name}::{sheet_name}"
     digit_reports = []
@@ -4372,6 +5135,7 @@ def _process_loaded_sheet(
         sheet_name,
         sheet,
         blocks=blocks,
+        budget=state.cross_sheet_summary_budget,
     )
     for limitation in summary_limitations:
         reason = (
@@ -4400,7 +5164,7 @@ def _process_loaded_sheet(
         report_blocks=report_blocks,
         digit_reports=digit_reports,
         decimal_reports=decimal_reports,
-        summaries=[summary],
+        summaries=[] if summary is None else [summary],
         within_sheet_findings=within_sheet_findings,
         stats=stats,
     )
@@ -4677,6 +5441,21 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         ),
         profile=profile,
         evidence=evidence,
+        cross_sheet_summary_budget=CrossSheetSummaryBudget(
+            summary_limit=_CROSS_SHEET_SUMMARY_LIMIT,
+            grid_cell_limit=_CROSS_SHEET_GRID_CELL_LIMIT,
+            label_cell_limit=_CROSS_SHEET_LABEL_CELL_LIMIT,
+            label_byte_limit=_CROSS_SHEET_LABEL_BYTE_LIMIT,
+            column_fingerprint_limit=(
+                _CROSS_SHEET_COLUMN_FINGERPRINT_LIMIT
+            ),
+        ),
+        cross_sheet_work_budget=CrossSheetWorkBudget(
+            pair_limit=_CROSS_SHEET_PAIR_BUDGET,
+            value_limit=_CROSS_SHEET_VALUE_BUDGET,
+            tail_match_limit=_CROSS_SHEET_TAIL_MATCH_BUDGET,
+            finding_limit=_CROSS_SHEET_FINDING_BUDGET,
+        ),
         include_runtime=include_runtime,
         defer_evidence=evidence,
     )
@@ -4719,6 +5498,16 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     _demote_dense_sheets(report_blocks, profile=profile)
     _demote_reused_progressions(report_blocks, profile=profile)
 
+    summary_budget = state.cross_sheet_summary_budget
+    if summary_budget is not None:
+        summary_limitations = summary_budget.coverage_limitations()
+        for limitation in summary_limitations:
+            details = dict(limitation)
+            reason = details.pop("reason")
+            coverage.add_limitation("scan", reason, **details)
+        if summary_limitations:
+            state.findings_omitted_is_lower_bound = True
+
     grids = {
         (summary.file, summary.sheet): summary.grid
         for summary in summaries
@@ -4731,10 +5520,12 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         grids,
         profile=profile,
         sheets=label_contexts,
+        budget=state.cross_sheet_work_budget,
     )
     cross_sheet_findings += detect_cross_sheet_column_duplicates(
         summaries,
         profile=profile,
+        budget=state.cross_sheet_work_budget,
     )
     cross_sheet_findings += within_sheet_fraction_findings
     recurring_findings, recurring_meta = state.recurring_index.findings(
@@ -4775,7 +5566,30 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             omitted_findings=recurring_omitted,
         )
         state.findings_omitted += recurring_omitted
-    cross_sheet_findings += recurring_findings
+    for finding in recurring_findings:
+        if (
+            state.cross_sheet_work_budget is None
+            or state.cross_sheet_work_budget.retain_finding()
+        ):
+            cross_sheet_findings.append(finding)
+
+    work_budget = state.cross_sheet_work_budget
+    if work_budget is not None:
+        work_limitation = work_budget.limitation_metadata()
+        if work_limitation["limits_reached"]:
+            coverage.add_limitation(
+                "scan",
+                "cross_sheet_work_limit",
+                **work_limitation,
+            )
+            state.findings_omitted += work_limitation[
+                "findings_skipped"
+            ]
+            if any(
+                dimension in work_limitation["limits_reached"]
+                for dimension in ("pair", "value", "tail_match")
+            ):
+                state.findings_omitted_is_lower_bound = True
     _attach_benign(cross_sheet_findings)
     if _MAX_TOTAL_FINDINGS > 0:
         global_omitted = _apply_global_finding_budget(
@@ -4963,6 +5777,43 @@ def _markdown_scan_status(out):
     return lines
 
 
+def _markdown_cross_sheet_example(example):
+    if not isinstance(example, dict):
+        return (
+            "    shared value: "
+            f"{_markdown_inline_code(example)}"
+        )
+    if not example:
+        return "    example: empty example object"
+    if {"row", "col", "value"}.issubset(example):
+        return (
+            "    example: row "
+            f"{_markdown_inline_code(example['row'])}, col "
+            f"{_markdown_inline_code(example['col'])}, value "
+            f"{_markdown_inline_code(example['value'])}"
+        )
+    labels = {
+        "row_a": "row A",
+        "col_a": "col A",
+        "value_a": "value A",
+        "row_b": "row B",
+        "col_b": "col B",
+        "value_b": "value B",
+        "decimal_tail": "decimal tail",
+        "start_col": "start col",
+        "end_col": "end col",
+    }
+    parts = [
+        f"{_markdown_inline_code(labels.get(key, key.replace('_', ' ')))}="
+        f"{_markdown_inline_code(example[key])}"
+        for key in sorted(
+            example,
+            key=_markdown_status_sort_key,
+        )
+    ]
+    return "    example: " + ", ".join(parts)
+
+
 def write_markdown_report(out, path):
     raw_scan_status = out.get("scan_status")
     scan_status = (
@@ -5043,15 +5894,14 @@ def write_markdown_report(out, path):
             )
 
     if csf:
-        lines.append(f"## ⚠️ Cross-sheet bit-identical collisions ({len(csf)})\n")
+        lines.append(
+            f"## Cross-table statistical signals ({len(csf)})\n"
+        )
         for cf in csf:
             sev = cf.get("severity", "?")
             lines.append(f"- **[{cf['kind']}]** ({sev}) `{cf['file']}` — {cf['rule']}")
             for ex in cf.get("examples", [])[:3]:
-                if isinstance(ex, dict):
-                    lines.append(f"    example: row {ex['row']}, col {ex['col']}, value {ex['value']}")
-                else:
-                    lines.append(f"    shared value: {ex}")
+                lines.append(_markdown_cross_sheet_example(ex))
         lines.append("")
 
     lines.append(f"## High-severity findings ({len(high)})\n")

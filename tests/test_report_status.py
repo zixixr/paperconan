@@ -1,7 +1,11 @@
 import pytest
 
 from paperconan._audit import _markdown_inline_code, write_markdown_report
-from paperconan._html import _fmt_cell, write_html_report
+from paperconan._html import (
+    _fmt_cell,
+    _render_cross_sheet_examples,
+    write_html_report,
+)
 
 
 _MISSING = object()
@@ -78,6 +82,23 @@ def _omission_warning(html):
     return next(warning for warning in warnings if "omitted" in warning)
 
 
+def _cross_finding(**overrides):
+    finding = {
+        "kind": "cross_sheet_position_identical",
+        "severity": "high",
+        "file": "good.xlsx",
+        "file_a": "good.xlsx",
+        "file_b": "good.xlsx",
+        "same_file": True,
+        "sheet_a": "Data",
+        "sheet_b": "Repeat",
+        "rule": "cross-table statistical signal requires review",
+        "examples": [0],
+    }
+    finding.update(overrides)
+    return finding
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -91,6 +112,98 @@ def _omission_warning(html):
 )
 def test_float_cell_formatting_is_truthful(value, expected):
     assert _fmt_cell(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("examples", "headings", "values"),
+    [
+        pytest.param(
+            [{"row": 0, "col": 2, "value": "<same>"}],
+            ["row", "col", "value"],
+            ["0", "2", "&lt;same&gt;"],
+            id="same-position",
+        ),
+        pytest.param(
+            [{
+                "row_a": 0,
+                "col_a": 1,
+                "value_a": 0,
+                "row_b": 3,
+                "col_b": 4,
+                "value_b": "<changed>",
+                "decimal_tail": "01234",
+            }],
+            [
+                "row A",
+                "col A",
+                "value A",
+                "row B",
+                "col B",
+                "value B",
+                "decimal tail",
+            ],
+            ["0", "1", "3", "4", "&lt;changed&gt;", "01234"],
+            id="decimal-tail",
+        ),
+        pytest.param(
+            [{"value": 0}, {"value": "<duplicate>"}],
+            ["value"],
+            ["0", "&lt;duplicate&gt;"],
+            id="value-only",
+        ),
+        pytest.param(
+            [{
+                "file": "a<&.xlsx",
+                "sheet": "S<script>",
+                "row": 0,
+                "start_col": 0,
+                "values": [0, "<vector>"],
+            }],
+            ["file", "sheet", "row", "start col", "values"],
+            [
+                "a&lt;&amp;.xlsx",
+                "S&lt;script&gt;",
+                "0",
+                "[0, &lt;vector&gt;]",
+            ],
+            id="recurring-location",
+        ),
+        pytest.param(
+            [{"mystery": 0, "hostile": "<script>"}],
+            ["hostile", "mystery"],
+            ["0", "&lt;script&gt;"],
+            id="unknown-dict",
+        ),
+        pytest.param(
+            [{}],
+            [],
+            ["empty example object"],
+            id="empty-unknown-dict",
+        ),
+    ],
+)
+def test_cross_sheet_example_renderer_is_shape_aware_and_escaped(
+    examples, headings, values
+):
+    rendered = _render_cross_sheet_examples({"examples": examples})
+
+    assert rendered
+    for heading in headings:
+        assert f"<th>{heading}</th>" in rendered
+    for value in values:
+        assert value in rendered
+    assert "<script>" not in rendered
+
+
+def test_cross_sheet_scalar_examples_preserve_falsey_and_hostile_values():
+    rendered = _render_cross_sheet_examples({
+        "examples": [0, False, "<shared>"],
+    })
+
+    assert ">0<" in rendered
+    assert ">FALSE<" in rendered
+    assert "&lt;shared&gt;" in rendered
+    assert "<shared>" not in rendered
 
 
 def _nested_limitations(reordered=False):
@@ -480,6 +593,169 @@ def test_reportable_signals_never_render_completed_empty_claim(
 
     assert "nothing flagged in this dataset" not in html.lower()
     assert "nothing flagged in this dataset" not in markdown.lower()
+
+
+def test_cross_table_section_uses_generic_heading_and_hint(tmp_path):
+    scan = _scan("complete")
+    scan["cross_sheet_findings"] = [_cross_finding()]
+
+    html = _render_html(tmp_path, scan)
+    markdown = _render_markdown(tmp_path, scan)
+
+    assert "Cross-table statistical signals" in html
+    assert "Cross-table statistical signals" in markdown
+    assert "Cross-sheet bit-identical collisions" not in html
+    assert "Cross-sheet bit-identical collisions" not in markdown
+    assert "同位置出现高度一致" not in html
+
+
+def test_raw_html_renders_decimal_tail_cross_table_evidence(tmp_path):
+    scan = _scan("complete")
+    scan["cross_sheet_findings"] = [_cross_finding(
+        kind="cross_sheet_decimal_tail_reuse",
+        examples=[{
+            "row_a": 0,
+            "col_a": 1,
+            "value_a": 0,
+            "row_b": 2,
+            "col_b": 3,
+            "value_b": "<changed>",
+            "decimal_tail": "01234",
+        }],
+    )]
+
+    html = _render_html(tmp_path, scan)
+
+    assert "<th>row A</th>" in html
+    assert "<th>value B</th>" in html
+    assert "<th>decimal tail</th>" in html
+    assert ">0<" in html
+    assert "&lt;changed&gt;" in html
+    assert "<changed>" not in html
+
+
+@pytest.mark.parametrize(
+    ("blocks", "cross_findings", "expected"),
+    [
+        pytest.param(True, [], 1, id="block-only"),
+        pytest.param(
+            False,
+            [_cross_finding()],
+            2,
+            id="cross-table-only",
+        ),
+        pytest.param(
+            True,
+            [_cross_finding()],
+            2,
+            id="mixed-deduplicated",
+        ),
+        pytest.param(
+            False,
+            [_cross_finding(), _cross_finding(kind="another_signal")],
+            2,
+            id="duplicate-cross-table-locations",
+        ),
+        pytest.param(
+            False,
+            [_cross_finding(
+                file="a.xlsx + b.xlsx",
+                file_a="a.xlsx",
+                file_b="b.xlsx",
+                same_file=False,
+                sheet_a="a.xlsx::Panel A",
+                sheet_b="b.xlsx::Panel B",
+            )],
+            2,
+            id="cross-file",
+        ),
+        pytest.param(
+            False,
+            [_cross_finding(
+                file="legacy.xlsx",
+                file_a=None,
+                file_b=None,
+                same_file=True,
+                sheet_a="A",
+                sheet_b="B",
+            )],
+            2,
+            id="legacy-same-file",
+        ),
+        pytest.param(
+            False,
+            [_cross_finding(
+                file="a.xlsx + b.xlsx",
+                file_a=None,
+                file_b=None,
+                same_file=False,
+                sheet_a="A",
+                sheet_b="B",
+            )],
+            0,
+            id="legacy-ambiguous-cross-file",
+        ),
+        pytest.param(
+            False,
+            [_cross_finding(
+                kind="recurring_row_vector",
+                file="A.xlsx; Z.xlsx",
+                file_a="A.xlsx",
+                file_b="Z.xlsx",
+                same_file=False,
+                sheet_a="Figure 002a",
+                sheet_b="Figure 115a",
+                examples=[{"value": 1.25}],
+            )],
+            0,
+            id="recurring-cross-file-extrema-are-not-paired",
+        ),
+        pytest.param(
+            False,
+            [_cross_finding(
+                kind="recurring_row_vector",
+                file="A.xlsx; Z.xlsx",
+                file_a="A.xlsx",
+                file_b="Z.xlsx",
+                same_file=False,
+                sheet_a="Figure 002a",
+                sheet_b="Figure 115a",
+                examples=[
+                    {
+                        "file": "A.xlsx",
+                        "sheet": "Figure 115a",
+                        "row": 4,
+                        "start_col": 2,
+                        "value": 1.25,
+                    },
+                    {
+                        "file": "Z.xlsx",
+                        "sheet": "Figure 002a",
+                        "row": 7,
+                        "start_col": 3,
+                        "value": 1.25,
+                    },
+                ],
+            )],
+            2,
+            id="recurring-explicit-occurrence-locations",
+        ),
+    ],
+)
+def test_html_location_count_unions_identifiable_physical_locations(
+    tmp_path, blocks, cross_findings, expected
+):
+    scan = _scan("complete")
+    if blocks:
+        _add_finding(scan)
+    scan["cross_sheet_findings"] = cross_findings
+
+    html = _render_html(tmp_path, scan)
+
+    assert (
+        f'<span class="stat"><strong>{expected}</strong> '
+        "sheets w/ findings</span>"
+    ) in html
 
 
 def test_unknown_html_status_never_uses_completed_empty_claim(tmp_path):

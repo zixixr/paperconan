@@ -65,3 +65,47 @@ def test_needs_human_verdict_renders_without_crash():
     html = render_adjudicated_report(SCAN, v)
     assert "NEEDS_HUMAN" in html
     assert "sample provenance missing" in html
+
+
+def test_adjudicated_report_uses_shared_decimal_tail_evidence_renderer():
+    scan = {
+        **SCAN,
+        "relations_blocks": [],
+        "cross_sheet_findings": [{
+            "kind": "cross_sheet_decimal_tail_reuse",
+            "severity": "high",
+            "file": "a.xlsx + b.xlsx",
+            "file_a": "a.xlsx",
+            "file_b": "b.xlsx",
+            "same_file": False,
+            "sheet_a": "Panel A",
+            "sheet_b": "Panel B",
+            "rule": "cross-table statistical signal requires review",
+            "examples": [{
+                "row_a": 0,
+                "col_a": 1,
+                "value_a": 0,
+                "row_b": 2,
+                "col_b": 3,
+                "value_b": "<changed>",
+                "decimal_tail": "01234",
+            }],
+        }],
+    }
+    verdict = {
+        "title": "T",
+        "verdict": "NEEDS_HUMAN",
+        "finding_refs": [{
+            "kind": "cross_sheet_decimal_tail_reuse",
+        }],
+        "review_status": "unreviewed",
+    }
+
+    html = render_adjudicated_report(scan, verdict)
+
+    assert "<th>row A</th>" in html
+    assert "<th>value B</th>" in html
+    assert "<th>decimal tail</th>" in html
+    assert ">0<" in html
+    assert "&lt;changed&gt;" in html
+    assert "<changed>" not in html

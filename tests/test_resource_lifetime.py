@@ -354,6 +354,76 @@ def test_large_single_column_sheet_keeps_retained_state_bounded(
     _assert_compact(result, state)
 
 
+def test_dense_detector_aggregation_avoids_row_sized_python_lists(
+    monkeypatch,
+):
+    original_counter = audit.Counter
+
+    def bounded_counter(values=None, *args, **kwargs):
+        if isinstance(values, list) and len(values) > 8:
+            raise AssertionError(
+                "dense detectors must not feed row-sized lists to Counter"
+            )
+        if values is None:
+            return original_counter(*args, **kwargs)
+        return original_counter(values, *args, **kwargs)
+
+    monkeypatch.setattr(audit, "Counter", bounded_counter)
+    values = [
+        1.1234 + (row % 17) * 0.137 + row * 0.0001
+        for row in range(120)
+    ]
+    sheet = Sheet.from_rows([["value"]] + [[value] for value in values])
+
+    audit.detect_within_column_patterns(
+        sheet, 1, sheet.nrows, 0, 1, ["value"]
+    )
+    audit.detect_dispersed_repeats(
+        sheet, 1, sheet.nrows, 0, 1, ["value"]
+    )
+    audit.detect_identical_after_rounding(
+        sheet, 1, sheet.nrows, 0, 1, ["value"]
+    )
+
+    assert not hasattr(audit, "_numeric_pairs")
+
+
+def test_dispersed_and_rounding_detectors_use_compact_dense_state():
+    values = [
+        1.2345 + (row % 13) * 0.1111 + row * 0.00001
+        for row in range(120)
+    ]
+    source = Sheet.from_rows(
+        [["left", "right"]]
+        + [
+            [value, value + (row % 5) * 0.00002]
+            for row, value in enumerate(values)
+        ]
+    )
+
+    class DenseOnlySheet(Sheet):
+        def cell(self, _row, _col):
+            raise AssertionError(
+                "dense detector must not materialize per-cell Python tuples"
+            )
+
+    sheet = DenseOnlySheet(
+        source.nrows,
+        source.ncols,
+        source.numeric,
+        source._text,
+        source._ints,
+        source._wide_ints,
+    )
+
+    audit.detect_dispersed_repeats(
+        sheet, 1, sheet.nrows, 0, 2, ["left", "right"]
+    )
+    audit.detect_identical_after_rounding(
+        sheet, 1, sheet.nrows, 0, 2, ["left", "right"]
+    )
+
+
 def test_very_wide_column_fingerprints_touch_only_fixed_budget(
     monkeypatch,
 ):

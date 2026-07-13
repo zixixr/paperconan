@@ -193,6 +193,70 @@ def test_cap_none_is_unlimited():
     assert len(groups["relations"]) == 500
 
 
+def test_within_sheet_findings_consume_shared_pre_cap_budget_before_return(
+    monkeypatch,
+):
+    markers = [
+        {
+            "kind": f"within_{index}",
+            "severity": "high",
+            "rule": f"marker {index}",
+        }
+        for index in range(3)
+    ]
+
+    monkeypatch.setattr(
+        A,
+        "_analyze_numeric_blocks",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        A,
+        "detect_within_sheet_fraction_reuse",
+        lambda *_args, **_kwargs: (
+            [dict(item) for item in markers],
+            [],
+        ),
+    )
+    monkeypatch.setattr(
+        A,
+        "build_cross_sheet_summary",
+        lambda *_args, **_kwargs: (None, []),
+    )
+
+    class NoopRecurringIndex:
+        initial_budget = 0
+
+        def add_sheet(self, *_args, **_kwargs):
+            return {"windows_skipped": 0}
+
+    budget = A.CrossSheetWorkBudget(
+        pair_limit=10,
+        value_limit=10,
+        tail_match_limit=10,
+        finding_limit=2,
+    )
+    state = A.ScanBudgetState(
+        coverage=A.ScanCoverage(files_discovered=1),
+        recurring_index=NoopRecurringIndex(),
+        profile="review",
+        evidence=False,
+        cross_sheet_work_budget=budget,
+    )
+
+    result = A._process_loaded_sheet(
+        A.Sheet.from_rows([[1.125]]),
+        file_name="source.csv",
+        sheet_name="source",
+        sheet_start=None,
+        state=state,
+    )
+
+    assert result.within_sheet_findings == markers[:2]
+    assert budget.limitation_metadata()["findings_retained"] == 2
+    assert budget.limitation_metadata()["findings_skipped"] == 1
+
+
 def _patch_scan_finding_sources(monkeypatch, block_findings, cross_findings):
     monkeypatch.setattr(
         A,

@@ -1,5 +1,8 @@
 import paperconan._audit as audit
+import pytest
+from paperconan._coverage import ScanCoverage
 from paperconan._sheet import Sheet
+from paperconan._summaries import RecurringRowIndex
 
 
 def _limitations(scan, reason):
@@ -19,6 +22,201 @@ def _qualifying_row_pair_rows():
         [value + 10 for value in base],
         [value + 20 for value in base],
     ]
+
+
+@pytest.mark.parametrize(
+    ("detector_name", "group_name"),
+    [
+        ("detect_relations", "relations"),
+        ("detect_equal_pairs", "equal_pairs"),
+        ("detect_arithmetic_progression", "progressions"),
+        ("detect_within_column_patterns", "within_col"),
+        ("detect_dispersed_repeats", "within_col"),
+        (
+            "detect_identical_after_rounding",
+            "identical_after_rounding",
+        ),
+    ],
+)
+def test_wide_integer_block_skips_affected_detector_with_one_limitation(
+    monkeypatch, detector_name, group_name
+):
+    wide_values = [10**400, 2**53 + 1]
+    sheet = Sheet.from_rows([
+        ["a", "b"],
+        [1.125, 1.125],
+        [2.25, 2.25],
+        [3.375, 3.375],
+        [4.5, 4.5],
+        [wide_values[0], wide_values[1]],
+        [6.75, 6.75],
+    ])
+    called = []
+
+    def fail_if_called(*_args, **_kwargs):
+        called.append(detector_name)
+        return [{
+            "kind": "must_not_be_emitted",
+            "severity": "high",
+            "rule": detector_name,
+        }]
+
+    monkeypatch.setattr(audit, detector_name, fail_if_called)
+    for name in (
+        "detect_relations",
+        "detect_arithmetic_progression",
+        "detect_equal_pairs",
+        "detect_within_column_patterns",
+        "detect_dispersed_repeats",
+        "detect_identical_after_rounding",
+        "detect_grim_grimmer",
+    ):
+        if name != detector_name:
+            monkeypatch.setattr(
+                audit, name, lambda *_args, **_kwargs: []
+            )
+    monkeypatch.setattr(
+        audit,
+        "detect_row_pair_digit_coupling",
+        lambda *_args, **_kwargs: ([], {"findings_omitted": 0}),
+    )
+    state = audit.ScanBudgetState(
+        coverage=ScanCoverage(files_discovered=1),
+        recurring_index=RecurringRowIndex(),
+        profile="review",
+        evidence=False,
+    )
+
+    blocks = audit._analyze_numeric_blocks(
+        sheet,
+        file_name="wide.csv",
+        sheet_name="wide",
+        blocks=[(1, sheet.nrows, 0, sheet.ncols)],
+        state=state,
+    )
+
+    assert called == []
+    assert all(
+        finding["kind"] != "must_not_be_emitted"
+        for block in blocks
+        for finding in block[group_name]
+    )
+    assert [
+        item for item in state.coverage.limitations
+        if item["reason"] == "wide_integer_detector_limit"
+    ] == [{
+        "scope": "block",
+        "reason": "wide_integer_detector_limit",
+        "file": "wide.csv",
+        "sheet": "wide",
+        "rows": "2-7",
+        "cols": "1-2",
+        "affected_cells": 2,
+        "detectors": [
+            "relations",
+            "equal_pairs",
+            "row_pairs",
+            "arithmetic_progression",
+            "within_column",
+            "dispersed_repeats",
+            "identical_after_rounding",
+            "grim_grimmer",
+        ],
+    }]
+
+
+def test_dense_detector_limits_preflight_every_named_family(
+    monkeypatch,
+):
+    sheet = Sheet.from_rows([
+        [float(row * 10 + col) + 0.125 for col in range(4)]
+        for row in range(12)
+    ])
+    called = []
+
+    def fail_if_called(name):
+        def detector(*_args, **_kwargs):
+            called.append(name)
+            return []
+        return detector
+
+    detector_names = (
+        "detect_relations",
+        "detect_equal_pairs",
+        "detect_arithmetic_progression",
+        "detect_within_column_patterns",
+        "detect_dispersed_repeats",
+        "detect_identical_after_rounding",
+    )
+    for name in detector_names:
+        monkeypatch.setattr(audit, name, fail_if_called(name))
+    monkeypatch.setattr(
+        audit, "detect_grim_grimmer", lambda *_args, **_kwargs: []
+    )
+    monkeypatch.setattr(
+        audit,
+        "detect_row_pair_digit_coupling",
+        lambda *_args, **_kwargs: ([], {"findings_omitted": 0}),
+    )
+    monkeypatch.setattr(
+        audit, "_DENSE_BLOCK_MAX_ROWS", 8, raising=False
+    )
+    monkeypatch.setattr(
+        audit, "_DENSE_BLOCK_CELL_WORK_LIMIT", 20, raising=False
+    )
+    monkeypatch.setattr(
+        audit, "_DENSE_BLOCK_STATE_CELL_LIMIT", 20, raising=False
+    )
+    state = audit.ScanBudgetState(
+        coverage=ScanCoverage(files_discovered=1),
+        recurring_index=RecurringRowIndex(),
+        profile="review",
+        evidence=False,
+    )
+
+    audit._analyze_numeric_blocks(
+        sheet,
+        file_name="large.csv",
+        sheet_name="large",
+        blocks=[(0, sheet.nrows, 0, sheet.ncols)],
+        state=state,
+    )
+
+    assert called == []
+    limitations = [
+        item for item in state.coverage.limitations
+        if item["reason"] == "dense_block_detector_limit"
+    ]
+    assert len(limitations) == 1
+    limitation = limitations[0]
+    assert limitation["scope"] == "block"
+    assert limitation["file"] == "large.csv"
+    assert limitation["sheet"] == "large"
+    assert limitation["rows"] == "1-12"
+    assert limitation["cols"] == "1-4"
+    assert limitation["max_rows"] == 8
+    assert limitation["cell_work_limit"] == 20
+    assert limitation["state_cell_limit"] == 20
+    assert [
+        item["family"] for item in limitation["detectors"]
+    ] == [
+        "relations",
+        "equal_pairs",
+        "arithmetic_progression",
+        "within_column",
+        "dispersed_repeats",
+        "identical_after_rounding",
+    ]
+    assert all(
+        item["candidates_examined"] == 0
+        and item["candidates_skipped"] == item["candidates_total"]
+        and item["work_examined"] == 0
+        and item["work_skipped"] == item["work_required"]
+        and item["limits_reached"]
+        for item in limitation["detectors"]
+    )
+    assert state.findings_omitted == 0
+    assert state.findings_omitted_is_lower_bound is True
 
 
 def test_wide_block_detector_skip_is_disclosed(tmp_path, monkeypatch):
@@ -365,6 +563,121 @@ def test_recurring_finalization_limit_is_disclosed_at_scan_level(
     assert scan["findings_omitted_is_lower_bound"] is True
     assert scan["scan_status"] == "partial"
     assert scan["coverage"]["truncated"] is True
+
+
+def test_scan_wide_summary_limit_is_aggregated_and_truthful(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    payload = (
+        "label,a,b\n"
+        + "\n".join(
+            f"g{row},{row + 1.1234},{row + 4.5678}"
+            for row in range(14)
+        )
+        + "\n"
+    )
+    for number in range(3):
+        (data / f"{number}.csv").write_text(
+            payload, encoding="utf-8"
+        )
+    monkeypatch.setattr(
+        audit, "_CROSS_SHEET_SUMMARY_LIMIT", 1, raising=False
+    )
+    monkeypatch.setattr(
+        audit, "_CROSS_SHEET_GRID_CELL_LIMIT", 100_000, raising=False
+    )
+    monkeypatch.setattr(
+        audit, "_CROSS_SHEET_LABEL_CELL_LIMIT", 100_000, raising=False
+    )
+    monkeypatch.setattr(
+        audit, "_CROSS_SHEET_LABEL_BYTE_LIMIT", 100_000, raising=False
+    )
+    monkeypatch.setattr(
+        audit,
+        "_CROSS_SHEET_COLUMN_FINGERPRINT_LIMIT",
+        100_000,
+        raising=False,
+    )
+
+    scan = audit.scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    assert _limitations(
+        scan, "cross_sheet_summary_count_limit"
+    ) == [{
+        "scope": "scan",
+        "reason": "cross_sheet_summary_count_limit",
+        "dimension": "summaries",
+        "limit": 1,
+        "retained": 1,
+        "skipped_sheets": 2,
+        "skipped_items": 2,
+        "summary_pairs_unavailable": 3,
+        "omitted_findings_lower_bound": 0,
+    }]
+    assert scan["cross_sheet_findings"] == []
+    assert scan["findings_omitted"] == 0
+    assert scan["findings_omitted_is_lower_bound"] is True
+    assert scan["scan_status"] == "partial"
+
+
+def test_scan_cross_sheet_work_limit_feeds_omission_lower_bound(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    payload = (
+        "a,b,c\n"
+        + "\n".join(
+            f"{row + 1.1234},{row + 4.5678},{row + 8.9012}"
+            for row in range(10)
+        )
+        + "\n"
+    )
+    for number in range(4):
+        (data / f"{number}.csv").write_text(
+            payload, encoding="utf-8"
+        )
+    monkeypatch.setattr(
+        audit, "_CROSS_SHEET_PAIR_BUDGET", 1, raising=False
+    )
+    monkeypatch.setattr(
+        audit, "_CROSS_SHEET_VALUE_BUDGET", 1_000_000, raising=False
+    )
+    monkeypatch.setattr(
+        audit,
+        "_CROSS_SHEET_TAIL_MATCH_BUDGET",
+        1_000_000,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        audit, "_CROSS_SHEET_FINDING_BUDGET", 0, raising=False
+    )
+
+    scan = audit.scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    limitations = _limitations(scan, "cross_sheet_work_limit")
+    assert len(limitations) == 1
+    limitation = limitations[0]
+    assert limitation["scope"] == "scan"
+    assert limitation["pair_limit"] == 1
+    assert limitation["pairs_examined"] == 1
+    assert limitation["pairs_skipped"] == 5
+    assert limitation["finding_limit"] == 0
+    assert limitation["findings_retained"] == 0
+    assert limitation["findings_skipped"] >= 1
+    assert limitation["limits_reached"] == ["pair", "finding"]
+    assert scan["cross_sheet_findings"] == []
+    assert scan["findings_omitted"] == limitation[
+        "findings_skipped"
+    ]
+    assert scan["findings_omitted_is_lower_bound"] is True
+    assert scan["scan_status"] == "partial"
 
 
 def test_detector_helpers_expose_coverage_without_changing_default_shapes():

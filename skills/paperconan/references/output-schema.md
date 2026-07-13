@@ -56,7 +56,8 @@ essentials; this file is the complete reference (it travels in the skill bundle)
   "digit_distribution": [...],
   // per-sheet two-decimal ending counts. Each: {label, n, n_unique, top}
   "decimal_endings": [...],
-  // bit-identical / value-overlap across sheets (same file OR cross-file). See fields below.
+  // cross-table statistical signals (same file OR cross-file): position/value overlap,
+  // decimal-tail reuse, repeated columns/vectors, and within-table fraction reuse.
   "cross_sheet_findings": [...]
 }
 ```
@@ -149,6 +150,26 @@ When this limitation is present, top-level
 exact omitted total: a lower-bound value proves only that at least that many
 findings were omitted, and additional omissions may be unknown.
 
+Dense detector admission and cross-table budgets use additional structured
+limitations:
+
+- `dense_block_detector_limit`: one block-level object listing detector
+  families whose complete candidate work or compact retained state did not fit.
+- `cross_sheet_summary_count_limit`, `cross_sheet_grid_cell_limit`,
+  `cross_sheet_label_cell_limit`, `cross_sheet_label_byte_limit`, and
+  `cross_sheet_column_fingerprint_limit`: one scan-level object per exhausted
+  retained-summary dimension. Each reports the configured limit, retained
+  amount, skipped sheets/items, and unavailable summary-pair count.
+- `cross_sheet_work_limit`: one scan-level object for shared pair, value,
+  decimal-tail tuple, and pre-cap finding budgets. It reports work performed,
+  known skipped work/findings, and `limits_reached`.
+
+Selection follows stable input order and stops before a configured limit is
+exceeded. A rejected detector candidate or summary is not treated as complete.
+Known finding omissions are counted exactly; pair/value/tail exhaustion can
+make the total unknowable, so top-level
+`findings_omitted_is_lower_bound: true` remains the authoritative disclosure.
+
 Archived schema-version-1 scans may omit `schema_version`, `scan_status`, and
 `coverage`. Both HTML and Markdown renderers accept that shape and label it as a
 legacy scan whose detailed coverage status is unavailable.
@@ -208,6 +229,17 @@ ordering.
 Treat this as a local row-pair anomaly. Confirm row independence and exclude formula-generated grids, low-cardinality scores, and legitimate transformations before escalating.
 
 ## cross_sheet_findings fields
+
+This array is the generic **cross-table statistical signals** family; the
+historical key and `cross_sheet_*` kind names remain for schema compatibility.
+It can contain:
+
+- `cross_sheet_position_identical`
+- `cross_sheet_value_overlap`
+- `cross_sheet_decimal_tail_reuse`
+- `cross_sheet_column_duplicate`
+- `recurring_row_vector`
+- `within_table_fraction_reuse`
 
 - `same_file`: whether the two sheets live in one workbook or span two files
 - `figure_a` / `figure_b` / `same_figure`: parsed figure identity (e.g. `main:5`, `ext:6`). When `same_figure` is true the overlap is a combined-vs-individual re-plot of one display item — it is **downgraded to `low`** and carries a `context` note. Cross-figure / cross-file overlaps keep `high`/`medium` and are the ones worth checking against the legend.

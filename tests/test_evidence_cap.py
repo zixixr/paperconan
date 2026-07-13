@@ -1,3 +1,5 @@
+import builtins
+
 import paperconan._audit as audit
 from paperconan._coverage import ScanCoverage
 from paperconan._sheet import Sheet
@@ -66,6 +68,75 @@ def test_truncated_evidence_keeps_distant_highlighted_rows(monkeypatch):
 
     assert ev["truncated"] is True
     assert [row["row_idx"] for row in ev["rows"]] == [1, 2, 100]
+
+
+def test_evidence_selection_keeps_logical_ranges_lazy(monkeypatch):
+    iterations = []
+
+    class GuardedRange:
+        def __init__(self, *args):
+            self._range = builtins.range(*args)
+
+        def __len__(self):
+            return len(self._range)
+
+        def __iter__(self):
+            for index, value in enumerate(self._range):
+                iterations.append(value)
+                if index >= 20:
+                    raise AssertionError(
+                        "evidence selection iterated the full logical range"
+                    )
+                yield value
+
+        def __getitem__(self, index):
+            return self._range[index]
+
+    class VirtualHeader:
+        def __getitem__(self, index):
+            return f"h{index}"
+
+    class VirtualSheet:
+        nrows = 10**9
+        ncols = 10**9
+
+        def __init__(self):
+            self.cell_calls = 0
+
+        def cell(self, row, col):
+            self.cell_calls += 1
+            return float((row % 1000) + (col % 100))
+
+    monkeypatch.setattr(audit, "range", GuardedRange, raising=False)
+    monkeypatch.setattr(audit, "_MAX_EV_ROWS", 3)
+    monkeypatch.setattr(audit, "_MAX_EV_COLS", 3)
+    sheet = VirtualSheet()
+
+    evidence = _block_evidence(
+        sheet,
+        1,
+        10**9 - 1,
+        2,
+        10**9 - 2,
+        VirtualHeader(),
+        [10**9 - 3],
+        highlight_rows=[10**9 - 2],
+    )
+
+    assert evidence["truncated"] is True
+    assert evidence["col_indices"] == [2, 3, 10**9 - 3]
+    assert [row["row_idx"] for row in evidence["rows"]] == [
+        1,
+        2,
+        10**9 - 2,
+    ]
+    assert sheet.cell_calls <= 9
+    assert len(iterations) <= 20
+    assert audit._bounded_evidence_indices(0, 6, [5], 3) == [
+        0,
+        1,
+        5,
+    ]
 
 
 def test_many_highlighted_cells_use_bounded_windows_without_cross_product(

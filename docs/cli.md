@@ -85,6 +85,18 @@ write_adjudicated_report(scan, verdict, "adjudication.html")  # scan/verdict 均
 | `PAPERCONAN_MAX_SPARSE_CELLS` | `250000` | 单 sheet 保留的文本、日期/对象及超宽整数稀疏 cell 数上限；超限 sheet 会跳过并记录实际观测值 |
 | `PAPERCONAN_MAX_SPARSE_BYTES` | `67108864` | 单 sheet 稀疏 payload 字节预算；超限 sheet 会跳过并记录实际观测值 |
 | `PAPERCONAN_COLUMN_FINGERPRINT_MAX_COLUMNS` | `512` | 跨 sheet 列指纹按物理列顺序最多处理的列数；超出部分会记录精确覆盖限制 |
+| `PAPERCONAN_DENSE_BLOCK_MAX_ROWS` | `100000` | 单个 numeric block 的逻辑行数上限；只接纳能完整运行的 detector family，超限记录 `dense_block_detector_limit` |
+| `PAPERCONAN_DENSE_BLOCK_CELL_WORK_LIMIT` | `10000000` | 单个 numeric block、每个 dense detector family 的逻辑 numeric-cell visit 预算；候选整体不适配时不执行并记录 `dense_block_detector_limit` |
+| `PAPERCONAN_DENSE_BLOCK_STATE_CELL_LIMIT` | `2000000` | 单个 numeric block、每个 dense detector family 可保留的紧凑 numeric element 数；超限前拒绝完整候选并记录 `dense_block_detector_limit` |
+| `PAPERCONAN_CROSS_SHEET_SUMMARY_LIMIT` | `2000` | 全 scan 最多保留的完整跨表 summary / sheet 数；后续 summary 整体拒绝并记录 `cross_sheet_summary_count_limit` |
+| `PAPERCONAN_CROSS_SHEET_GRID_CELL_LIMIT` | `2000000` | 全 scan 的跨表 collision-grid cell 保留预算；summary 整体不适配时拒绝并记录 `cross_sheet_grid_cell_limit` |
+| `PAPERCONAN_CROSS_SHEET_LABEL_CELL_LIMIT` | `500000` | 全 scan 的跨表 label cell 保留预算；summary 整体不适配时拒绝并记录 `cross_sheet_label_cell_limit` |
+| `PAPERCONAN_CROSS_SHEET_LABEL_BYTE_LIMIT` | `33554432` | 全 scan 的跨表 label UTF-8 payload 字节预算；summary 整体不适配时拒绝并记录 `cross_sheet_label_byte_limit` |
+| `PAPERCONAN_CROSS_SHEET_COLUMN_FINGERPRINT_LIMIT` | `200000` | 全 scan 的跨表 column fingerprint 保留数；summary 整体不适配时拒绝并记录 `cross_sheet_column_fingerprint_limit` |
+| `PAPERCONAN_CROSS_SHEET_PAIR_BUDGET` | `1000000` | 全 scan 的跨表 detector candidate-pair 工作预算；不同 detector family 的 pair 分别计数，耗尽时记录 `cross_sheet_work_limit` |
+| `PAPERCONAN_CROSS_SHEET_VALUE_BUDGET` | `50000000` | 全 scan 的跨表 axis classification 与 pair comparison 逻辑 value visit 预算；耗尽时记录 `cross_sheet_work_limit` |
+| `PAPERCONAN_CROSS_SHEET_TAIL_MATCH_BUDGET` | `1000000` | 全 scan 最多保留的 decimal-tail match tuple 数；达到上限后不再生成 tuple，并记录 `cross_sheet_work_limit` |
+| `PAPERCONAN_CROSS_SHEET_FINDING_BUDGET` | `10000` | 全 scan 在既有 global output cap 之前最多保留的跨表 finding 数；多出的已知 finding 精确计数并记录 `cross_sheet_work_limit` |
 | `PAPERCONAN_MAX_BLOCK_COLS` | `120` | 宽 block 跳过 O(col²) 关系 / equal-pair 检测 |
 | `PAPERCONAN_MAX_REPORT_BLOCKS` | `2000` | 最多收集多少个带 finding 的 block |
 | `PAPERCONAN_MAX_FINDINGS_PER_BLOCK` | `150` | 单 block 最多保留多少条 finding（密集/高相关 block 的 O(col²) 成对信号会成千上万，取 severity 最高的 N 条，其余记入 `findings_omitted`）；`0` 关闭 |
@@ -110,3 +122,5 @@ write_adjudicated_report(scan, verdict, "adjudication.html")  # scan/verdict 均
 | `PAPERCONAN_SOURCE_SIDECAR_NAME_BYTES` | `1048576` | provenance sidecar 保留的唯一 managed-name 累计 UTF-8 字节预算 |
 | `PAPERCONAN_MANAGED_OUTPUT_NAME_BYTES` | `4096` | 单个 requested/source/base/candidate 输出名称的 UTF-8 字节上限；在 hash、路径 probe 或候选名称分配前检查 |
 | `PAPERCONAN_MANAGED_OUTPUT_COLLISION_PROBE_LIMIT` | `128` | 单个 direct/archive 输出名称最多执行的 filesystem collision probe 数；包括 digest 与 numeric fallback |
+
+上述 dense-block 与跨表控制都按文件、sheet、block 及 detector 的稳定输入顺序确定性选择，并在超过预算前停止工作或状态增长。只有完整候选或完整 summary 能进入下游检测；不会把前缀当作完整覆盖，也不会静默截断。`coverage.limitations` 会给出配置上限、已完成工作/已保留状态，以及可知时的精确遗漏数；无法证明精确 finding 数时，顶层 `findings_omitted_is_lower_bound` 会明确标记下界语义。

@@ -6,8 +6,10 @@ so we can exercise severity/context logic without round-tripping through xlsx.
 from __future__ import annotations
 
 from paperconan._audit import (
+    CrossSheetWorkBudget,
     Sheet,
     _grid_from_rows,
+    _detect_decimal_tail_reuse_for_pair,
     build_cross_sheet_summary,
     detect_collisions,
 )
@@ -71,6 +73,80 @@ def test_cross_sheet_finding_carries_matched_control_labels():
     assert "control" in cf["label_context_a"]["text"].lower()
     assert "vehicle control" in cf["label_context_b"]["text"].lower()
     assert cf["shared_context"]["shared_control_or_baseline"] is True
+
+
+def test_cross_sheet_pair_work_budget_is_exact_and_deterministic():
+    grids = {
+        (f"{number}.xlsx", f"Figure {number}"): _identical_grids()[0]
+        for number in range(4)
+    }
+
+    def run():
+        budget = CrossSheetWorkBudget(
+            pair_limit=1,
+            value_limit=100_000,
+            tail_match_limit=100_000,
+            finding_limit=100,
+        )
+        findings = detect_collisions(grids, budget=budget)
+        return findings, budget.limitation_metadata()
+
+    first = run()
+    second = run()
+
+    assert first == second
+    findings, metadata = first
+    assert findings
+    assert metadata["pairs_examined"] == 1
+    assert metadata["pairs_skipped"] == 5
+    assert metadata["pair_limit"] == 1
+    assert metadata["limits_reached"] == ["pair"]
+
+
+def test_decimal_tail_match_state_stops_before_limit_is_exceeded():
+    ga, gb = {}, {}
+    for row in range(40):
+        tail = f"{row:04d}731"
+        ga[(row, 0)] = float(f"0.1{tail}")
+        gb[(row, 0)] = float(f"0.2{tail}")
+    budget = CrossSheetWorkBudget(
+        pair_limit=10,
+        value_limit=10_000,
+        tail_match_limit=3,
+        finding_limit=10,
+    )
+
+    result = _detect_decimal_tail_reuse_for_pair(
+        ga, gb, min_matches=2, budget=budget
+    )
+
+    assert result is None
+    metadata = budget.limitation_metadata()
+    assert metadata["tail_matches_retained"] == 3
+    assert metadata["tail_matches_skipped_lower_bound"] == 1
+    assert metadata["limits_reached"] == ["tail_match"]
+
+
+def test_cross_sheet_pre_cap_finding_budget_is_hard_bounded():
+    grids = {
+        (f"{number}.xlsx", f"Figure {number}"): _identical_grids()[0]
+        for number in range(4)
+    }
+    budget = CrossSheetWorkBudget(
+        pair_limit=100,
+        value_limit=1_000_000,
+        tail_match_limit=1_000_000,
+        finding_limit=2,
+    )
+
+    findings = detect_collisions(grids, budget=budget)
+
+    assert len(findings) == 2
+    metadata = budget.limitation_metadata()
+    assert metadata["findings_retained"] == 2
+    assert metadata["findings_skipped"] >= 4
+    assert metadata["finding_limit"] == 2
+    assert "finding" in metadata["limits_reached"]
 
 
 def test_cross_sheet_context_marks_time_axis_from_local_labels():
@@ -519,3 +595,36 @@ def test_b1_single_sheet_early_exit():
     one = {("A.xls", "Figure 1a"): _sheet_from_cols(["a", "b"], [[1.1 * i + 0.3 for i in range(14)],
                                                                  [9.0 - 0.2 * i for i in range(14)]])}
     assert detect_cross_sheet_column_duplicates(one) == []
+
+
+def test_column_duplicate_comparisons_share_pair_and_finding_budget():
+    duplicate = [
+        3.0, 3.2, 2.5, 2.8, 2.9, 2.2, 5.0, 5.2,
+        4.5, 4.8, 4.9, 4.2, 6.1, 6.3, 5.7,
+    ]
+    summaries = [
+        build_cross_sheet_summary(
+            f"{number}.xlsx",
+            f"Figure {number}",
+            _sheet_from_cols(["value"], [duplicate]),
+        )[0]
+        for number in range(4)
+    ]
+    budget = CrossSheetWorkBudget(
+        pair_limit=2,
+        value_limit=100_000,
+        tail_match_limit=100_000,
+        finding_limit=1,
+    )
+
+    findings = detect_cross_sheet_column_duplicates(
+        summaries, budget=budget
+    )
+
+    assert len(findings) == 1
+    metadata = budget.limitation_metadata()
+    assert metadata["pairs_examined"] == 2
+    assert metadata["pairs_skipped"] == 4
+    assert metadata["findings_retained"] == 1
+    assert metadata["findings_skipped"] == 1
+    assert metadata["limits_reached"] == ["pair", "finding"]

@@ -295,21 +295,194 @@ def _render_cross_sheet_examples(cf: dict) -> str:
     if not examples:
         return ""
     if examples and isinstance(examples[0], dict):
+        dict_examples = [
+            example for example in examples[:10]
+            if isinstance(example, dict)
+        ]
+        keys = {
+            key
+            for example in dict_examples
+            for key in example
+        }
+        if not keys:
+            return (
+                '<div class="shared-values">'
+                '<span class="muted">empty example object</span>'
+                "</div>"
+            )
+        decimal_tail_keys = (
+            "row_a",
+            "col_a",
+            "value_a",
+            "row_b",
+            "col_b",
+            "value_b",
+            "decimal_tail",
+        )
+        same_position_keys = ("row", "col", "value")
+        recurring_location_keys = (
+            "file",
+            "sheet",
+            "row",
+            "col",
+            "start_col",
+            "end_col",
+            "value",
+            "values",
+            "vector",
+        )
+        if set(decimal_tail_keys).issubset(keys):
+            ordered_keys = list(decimal_tail_keys)
+        elif set(same_position_keys).issubset(keys):
+            ordered_keys = list(same_position_keys)
+        elif keys == {"value"}:
+            ordered_keys = ["value"]
+        elif keys & {"file", "sheet", "start_col", "end_col", "values", "vector"}:
+            ordered_keys = [
+                key for key in recurring_location_keys
+                if key in keys
+            ]
+        else:
+            ordered_keys = sorted(keys, key=_status_sort_key)
+        ordered_keys.extend(
+            sorted(keys - set(ordered_keys), key=_status_sort_key)
+        )
+        labels = {
+            "row_a": "row A",
+            "col_a": "col A",
+            "value_a": "value A",
+            "row_b": "row B",
+            "col_b": "col B",
+            "value_b": "value B",
+            "decimal_tail": "decimal tail",
+            "start_col": "start col",
+            "end_col": "end col",
+        }
+
+        def render_value(value):
+            if isinstance(value, (dict, list, tuple)):
+                return _esc(_status_value(value))
+            return _fmt_cell(value)
+
+        headers = "".join(
+            f"<th>{_esc(labels.get(key, key))}</th>"
+            for key in ordered_keys
+        )
         rows = []
-        for ex in examples[:10]:
+        for ex in dict_examples:
             rows.append(
-                f'<tr><td>{_esc(ex.get("row"))}</td>'
-                f'<td>{_esc(ex.get("col"))}</td>'
-                f'<td>{_fmt_cell(ex.get("value"))}</td></tr>'
+                "<tr>"
+                + "".join(
+                    (
+                        f"<td>{render_value(ex[key])}</td>"
+                        if key in ex
+                        else "<td></td>"
+                    )
+                    for key in ordered_keys
+                )
+                + "</tr>"
             )
         return (
             '<div class="ev-wrap"><table class="ev">'
-            '<thead><tr><th>row</th><th>col</th><th>value</th></tr></thead>'
+            f"<thead><tr>{headers}</tr></thead>"
             f'<tbody>{"".join(rows)}</tbody></table></div>'
         )
     # value-overlap form: list of floats
     chips = "".join(f'<span class="val-chip">{_fmt_cell(v)}</span>' for v in examples[:12])
     return f'<div class="shared-values"><span class="muted">shared values: </span>{chips}</div>'
+
+
+def _physical_sheet_name(file_name: Any, sheet_name: Any) -> str | None:
+    if file_name in (None, "") or sheet_name in (None, "", "?", "—"):
+        return None
+    file_text = str(file_name)
+    sheet_text = str(sheet_name)
+    prefix = f"{file_text}::"
+    if sheet_text.startswith(prefix):
+        sheet_text = sheet_text[len(prefix):]
+    return sheet_text or None
+
+
+def _cross_sheet_locations(finding: dict) -> set[tuple[str, str]]:
+    locations = set()
+    file_a = finding.get("file_a")
+    file_b = finding.get("file_b")
+    sheet_a = finding.get("sheet_a")
+    sheet_b = finding.get("sheet_b")
+
+    if finding.get("kind") == "recurring_row_vector":
+        for example in finding.get("examples") or []:
+            if not isinstance(example, dict):
+                continue
+            example_file = example.get("file")
+            physical_sheet = _physical_sheet_name(
+                example_file, example.get("sheet")
+            )
+            if (
+                example_file not in (None, "")
+                and physical_sheet is not None
+            ):
+                locations.add(
+                    (str(example_file), physical_sheet)
+                )
+        if locations:
+            return locations
+        if finding.get("same_file") is True:
+            recurring_file = (
+                file_a
+                if file_a not in (None, "")
+                else file_b
+            )
+            if recurring_file in (None, ""):
+                recurring_file = finding.get("file")
+            if (
+                recurring_file not in (None, "")
+                and " + " not in str(recurring_file)
+                and "; " not in str(recurring_file)
+            ):
+                for sheet_name in (sheet_a, sheet_b):
+                    physical_sheet = _physical_sheet_name(
+                        recurring_file, sheet_name
+                    )
+                    if physical_sheet is not None:
+                        locations.add(
+                            (str(recurring_file), physical_sheet)
+                        )
+        return locations
+
+    if file_a not in (None, ""):
+        physical_sheet = _physical_sheet_name(file_a, sheet_a)
+        if physical_sheet is not None:
+            locations.add((str(file_a), physical_sheet))
+    if file_b not in (None, ""):
+        physical_sheet = _physical_sheet_name(file_b, sheet_b)
+        if physical_sheet is not None:
+            locations.add((str(file_b), physical_sheet))
+
+    if locations:
+        return locations
+
+    legacy_file = finding.get("file")
+    if legacy_file in (None, ""):
+        return locations
+    legacy_file = str(legacy_file)
+    split_fields_absent = (
+        finding.get("file_a") in (None, "")
+        and finding.get("file_b") in (None, "")
+    )
+    same_file = finding.get("same_file")
+    if (
+        split_fields_absent
+        and same_file is not False
+        and " + " not in legacy_file
+    ):
+        for sheet_name in (sheet_a, sheet_b):
+            physical_sheet = _physical_sheet_name(
+                legacy_file, sheet_name
+            )
+            if physical_sheet is not None:
+                locations.add((legacy_file, physical_sheet))
+    return locations
 
 
 # ---------- per-section rendering ----------
@@ -674,7 +847,17 @@ def write_html_report(scan: dict, out_path: str) -> None:
     )
     status_html = _render_scan_status(scan)
     findings = _all_findings(scan)
-    n_sheets = len({(it["file"], it["sheet"]) for it in findings if it["scope"] == "block"})
+    finding_locations = {
+        (item["file"], item["sheet"])
+        for item in findings
+        if item["scope"] == "block"
+    }
+    for finding in scan.get("cross_sheet_findings", []) or []:
+        if isinstance(finding, dict):
+            finding_locations.update(
+                _cross_sheet_locations(finding)
+            )
+    n_sheets = len(finding_locations)
     sev = _severity_counts(findings)
 
     cross = [it for it in findings if it["scope"] == "cross_sheet"]
@@ -695,8 +878,8 @@ def write_html_report(scan: dict, out_path: str) -> None:
         )
 
     sections = "".join([
-        section("Cross-sheet bit-identical collisions", cross, "sec-cross",
-                "同一文件的两张 sheet 在同位置出现高度一致的数值 — 最值得人工复核。"),
+        section("Cross-table statistical signals", cross, "sec-cross",
+                "跨表信号可包括同位置数值、共享小数尾数、重复列或重复向量；需要结合表格语义和方法人工复核。"),
         section("High-severity findings", high, "sec-high"),
         section("Medium-severity findings", medium, "sec-medium"),
         section("Low-severity findings", low, "sec-low"),
