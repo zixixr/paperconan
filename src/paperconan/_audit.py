@@ -6763,6 +6763,21 @@ def _iter_merged_column_intervals(blocks):
         yield merged_start, merged_stop
 
 
+def _selected_fingerprint_columns(blocks, column_limit):
+    column_limit = max(0, int(column_limit))
+    selected = []
+    columns_total = 0
+    for start, stop in _iter_merged_column_intervals(blocks):
+        interval_size = stop - start
+        remaining = column_limit - len(selected)
+        if remaining > 0:
+            selected.extend(
+                range(start, start + min(interval_size, remaining))
+            )
+        columns_total += interval_size
+    return tuple(selected), columns_total
+
+
 def _column_fingerprints(
     file,
     sheet,
@@ -6773,6 +6788,8 @@ def _column_fingerprints(
     column_limit=None,
     retained_limit=None,
     *,
+    selected_columns=None,
+    columns_total=None,
     with_metrics=False,
 ):
     if distinct_limit is None:
@@ -6780,16 +6797,24 @@ def _column_fingerprints(
     if column_limit is None:
         column_limit = _COLUMN_FINGERPRINT_MAX_COLUMNS
     column_limit = max(0, int(column_limit))
-    selected_columns = []
-    columns_total = 0
-    for start, stop in _iter_merged_column_intervals(blocks):
-        interval_size = stop - start
-        remaining = column_limit - len(selected_columns)
-        if remaining > 0:
-            take = min(interval_size, remaining)
-            selected_columns.extend(range(start, start + take))
-        columns_total += interval_size
-    selected_columns = tuple(selected_columns)
+    if (selected_columns is None) != (columns_total is None):
+        raise AssertionError(
+            "selected columns and total must be supplied together"
+        )
+    if selected_columns is None:
+        selected_columns, columns_total = (
+            _selected_fingerprint_columns(
+                blocks,
+                column_limit,
+            )
+        )
+    else:
+        selected_columns = tuple(selected_columns)
+        columns_total = max(0, int(columns_total))
+        if columns_total < len(selected_columns):
+            raise AssertionError(
+                "selected columns exceed declared total"
+            )
     columns_used = len(selected_columns)
     fingerprint_limit = (
         columns_used
@@ -6943,6 +6968,109 @@ _SUMMARY_DIMENSIONS = (
 )
 
 
+class CrossSheetSummaryReservation:
+    def __init__(self, budget):
+        self.budget = budget
+        self._reserved = {
+            dimension: 0 for dimension in _SUMMARY_DIMENSIONS
+        }
+        self._closed = False
+        self._validated_metrics = None
+
+    @property
+    def closed(self):
+        return self._closed
+
+    def reserve_capacity(self, dimension, count, *, rejection=None):
+        if self._closed:
+            raise AssertionError("summary reservation is closed")
+        count = max(0, int(count))
+        available = self.budget.available_metadata()[dimension]
+        if count > available:
+            details = {
+                "skipped_items": max(1, count),
+            }
+            if rejection:
+                details.update(rejection)
+            self.reject({dimension: details})
+            return False
+        self._reserved[dimension] += count
+        self.budget._reserved[dimension] += count
+        return True
+
+    def reserve_fingerprint_candidates(self, count):
+        count = max(0, int(count))
+        return self.reserve_capacity(
+            "column_fingerprints",
+            count,
+            rejection={
+                "candidate_columns_skipped": count,
+                "candidate_columns_may_qualify": True,
+            },
+        )
+
+    def amount(self, dimension):
+        return self._reserved[dimension]
+
+    @staticmethod
+    def _normalize_metrics(metrics):
+        return {
+            dimension: (
+                1
+                if dimension == "summaries"
+                else max(0, int(metrics[dimension]))
+            )
+            for dimension in _SUMMARY_DIMENSIONS
+        }
+
+    def validate_metrics(self, metrics):
+        if self._closed:
+            raise AssertionError("summary reservation is closed")
+        actual_metrics = self._normalize_metrics(metrics)
+        exceeded = {}
+        for dimension in _SUMMARY_DIMENSIONS:
+            actual = actual_metrics[dimension]
+            reserved = self._reserved[dimension]
+            if actual > reserved:
+                exceeded[dimension] = {
+                    "skipped_items": max(1, actual),
+                }
+        if exceeded:
+            self.reject(exceeded)
+            return False
+        self._validated_metrics = actual_metrics
+        return True
+
+    def commit(self, metrics):
+        if self._closed:
+            raise AssertionError("summary reservation is closed")
+        actual_metrics = self._normalize_metrics(metrics)
+        if actual_metrics != self._validated_metrics:
+            raise AssertionError(
+                "summary metrics changed after validation"
+            )
+        self.budget._commit_reservation(
+            self,
+            actual_metrics,
+        )
+        self._closed = True
+        return True
+
+    def reject(self, dimensions):
+        if self._closed:
+            return
+        self.budget._reject_reservation(self, dimensions)
+        self._validated_metrics = None
+        self._closed = True
+
+    def rollback(self):
+        if self._closed:
+            return
+        self.budget._release_reservation(self)
+        self._validated_metrics = None
+        self._closed = True
+
+
 @dataclass
 class CrossSheetSummaryBudget:
     summary_limit: int
@@ -6969,6 +7097,9 @@ class CrossSheetSummaryBudget:
         )
         if self._exhausted is None:
             self._exhausted = {}
+        self._reserved = {
+            dimension: 0 for dimension in _SUMMARY_DIMENSIONS
+        }
 
     def _limits(self):
         return {
@@ -6992,18 +7123,38 @@ class CrossSheetSummaryBudget:
             ),
         }
 
-    def remaining_metadata(self):
+    def reserved_metadata(self):
+        return dict(self._reserved)
+
+    def available_metadata(self):
         retained = self.retained_metadata()
+        limits = self._limits()
         return {
-            dimension: max(0, limit - retained[dimension])
-            for dimension, limit in self._limits().items()
+            dimension: max(
+                0,
+                limits[dimension]
+                - retained[dimension]
+                - self._reserved[dimension],
+            )
+            for dimension in _SUMMARY_DIMENSIONS
         }
+
+    def remaining_metadata(self):
+        return self.available_metadata()
 
     def _record_rejection(self, dimensions):
         self.summaries_skipped += 1
         retained = self.retained_metadata()
         limits = self._limits()
-        for dimension, skipped_items in dimensions.items():
+        for dimension, raw in dimensions.items():
+            details = (
+                {"skipped_items": raw}
+                if isinstance(raw, int)
+                else dict(raw)
+            )
+            skipped_items = max(
+                1, int(details.pop("skipped_items", 1))
+            )
             item = self._exhausted.setdefault(dimension, {
                 "limit": limits[dimension],
                 "retained": retained[dimension],
@@ -7012,35 +7163,46 @@ class CrossSheetSummaryBudget:
             })
             item["retained"] = retained[dimension]
             item["skipped_sheets"] += 1
-            item["skipped_items"] += max(1, int(skipped_items))
+            item["skipped_items"] += skipped_items
+            for key, value in details.items():
+                if (
+                    key.endswith("_skipped")
+                    and isinstance(value, int)
+                ):
+                    item[key] = item.get(key, 0) + value
+                else:
+                    item[key] = value
 
-    def begin_summary(self):
+    def start_summary(self):
         self.summaries_considered += 1
-        if self.summaries_retained >= self.summary_limit:
+        if self.available_metadata()["summaries"] < 1:
             self._record_rejection({"summaries": 1})
-            return False
-        return True
+            return None
+        reservation = CrossSheetSummaryReservation(self)
+        if not reservation.reserve_capacity("summaries", 1):
+            raise AssertionError("summary slot reservation diverged")
+        return reservation
 
-    def try_retain(self, metrics):
-        retained = self.retained_metadata()
-        limits = self._limits()
-        exceeded = {
-            dimension: metrics[dimension]
-            for dimension in _SUMMARY_DIMENSIONS[1:]
-            if retained[dimension] + metrics[dimension]
-            > limits[dimension]
-        }
-        if exceeded:
-            self._record_rejection(exceeded)
-            return False
+    def _release_reservation(self, reservation):
+        for dimension, count in reservation._reserved.items():
+            if count > self._reserved[dimension]:
+                raise AssertionError("summary reservation underflow")
+            self._reserved[dimension] -= count
+            reservation._reserved[dimension] = 0
+
+    def _commit_reservation(self, reservation, metrics):
+        self._release_reservation(reservation)
         self.summaries_retained += 1
-        self.grid_cells_retained += metrics["grid_cells"]
-        self.label_cells_retained += metrics["label_cells"]
-        self.label_bytes_retained += metrics["label_bytes"]
-        self.column_fingerprints_retained += metrics[
-            "column_fingerprints"
-        ]
-        return True
+        self.grid_cells_retained += int(metrics["grid_cells"])
+        self.label_cells_retained += int(metrics["label_cells"])
+        self.label_bytes_retained += int(metrics["label_bytes"])
+        self.column_fingerprints_retained += int(
+            metrics["column_fingerprints"]
+        )
+
+    def _reject_reservation(self, reservation, dimensions):
+        self._release_reservation(reservation)
+        self._record_rejection(dimensions)
 
     def limitation_metadata(self):
         unavailable_pairs = (
@@ -7152,95 +7314,131 @@ def build_cross_sheet_summary(
     min_column_length=12,
     budget=None,
 ) -> tuple[CrossSheetSummary | None, list[InputLimitation]]:
-    if budget is not None and not budget.begin_summary():
+    reservation = (
+        budget.start_summary() if budget is not None else None
+    )
+    if budget is not None and reservation is None:
         return None, []
-    if blocks is None:
-        blocks = find_numeric_blocks(source)
-    remaining = (
-        budget.remaining_metadata()
-        if budget is not None
-        else None
-    )
-    grid, grid_meta = _grid_from_rows(
-        source,
-        max_rows=collision_max_rows,
-        max_cells=collision_max_cells,
-        retained_cell_limit=(
-            remaining["grid_cells"]
-            if remaining is not None
-            else None
-        ),
-        with_coverage=True,
-    )
-    label_row_limit = min(source.nrows, collision_max_rows + 3)
-    labels, label_metrics = _bounded_sparse_label_context(
-        source,
-        row_limit=label_row_limit,
-        retained_cell_limit=(
-            remaining["label_cells"]
-            if remaining is not None
-            else None
-        ),
-        retained_byte_limit=(
-            remaining["label_bytes"]
-            if remaining is not None
-            else None
-        ),
-    )
-    (
-        columns,
-        column_limitations,
-        column_metrics,
-    ) = _column_fingerprints(
-        file,
-        sheet,
-        source,
-        blocks,
-        min_column_length,
-        retained_limit=(
-            remaining["column_fingerprints"]
-            if remaining is not None
-            else None
-        ),
-        with_metrics=True,
-    )
-    if budget is not None:
+
+    try:
+        if blocks is None:
+            blocks = find_numeric_blocks(source)
+        selected_columns, columns_total = (
+            _selected_fingerprint_columns(
+                blocks,
+                _COLUMN_FINGERPRINT_MAX_COLUMNS,
+            )
+        )
+        if reservation is not None:
+            available = budget.available_metadata()
+            for dimension in (
+                "grid_cells",
+                "label_cells",
+                "label_bytes",
+            ):
+                if not reservation.reserve_capacity(
+                    dimension, available[dimension]
+                ):
+                    raise AssertionError(
+                        f"{dimension} reservation diverged"
+                    )
+            if not reservation.reserve_fingerprint_candidates(
+                len(selected_columns)
+            ):
+                return None, []
+
+        grid, grid_meta = _grid_from_rows(
+            source,
+            max_rows=collision_max_rows,
+            max_cells=collision_max_cells,
+            retained_cell_limit=(
+                reservation.amount("grid_cells")
+                if reservation is not None else None
+            ),
+            with_coverage=True,
+        )
+        label_row_limit = min(
+            source.nrows, collision_max_rows + 3
+        )
+        labels, label_metrics = _bounded_sparse_label_context(
+            source,
+            row_limit=label_row_limit,
+            retained_cell_limit=(
+                reservation.amount("label_cells")
+                if reservation is not None else None
+            ),
+            retained_byte_limit=(
+                reservation.amount("label_bytes")
+                if reservation is not None else None
+            ),
+        )
+        (
+            columns,
+            column_limitations,
+            column_metrics,
+        ) = _column_fingerprints(
+            file,
+            sheet,
+            source,
+            blocks,
+            min_column_length,
+            selected_columns=selected_columns,
+            columns_total=columns_total,
+            retained_limit=(
+                reservation.amount("column_fingerprints")
+                if reservation is not None else None
+            ),
+            with_metrics=True,
+        )
         metrics = {
             "grid_cells": grid_meta["cells_used"],
             **label_metrics,
             **column_metrics,
         }
-        if not budget.try_retain(metrics):
+        if (
+            reservation is not None
+            and not reservation.validate_metrics(metrics)
+        ):
             return None, []
-    summary = CrossSheetSummary(
-        file=file,
-        sheet=sheet,
-        grid=grid,
-        labels=labels,
-        columns=columns,
-    )
-    limitations = list(column_limitations)
-    if grid_meta["row_limited"]:
-        limitations.append(InputLimitation(
-            scope="sheet",
-            reason="collision_row_limit",
+        summary = CrossSheetSummary(
+            file=file,
             sheet=sheet,
-            details={
-                "rows_total": grid_meta["rows_total"],
-                "rows_used": grid_meta["rows_used"],
-            },
-        ))
-    if grid_meta["cell_limited"]:
-        limitations.append(InputLimitation(
-            scope="sheet",
-            reason="collision_cell_limit",
-            sheet=sheet,
-            details={
-                "cells_used": grid_meta["cells_used"],
-                "max_cells": max(0, int(collision_max_cells)),
-            },
-        ))
-    return summary, limitations
+            grid=grid,
+            labels=labels,
+            columns=columns,
+        )
+        limitations = list(column_limitations)
+        if grid_meta["row_limited"]:
+            limitations.append(InputLimitation(
+                scope="sheet",
+                reason="collision_row_limit",
+                sheet=sheet,
+                details={
+                    "rows_total": grid_meta["rows_total"],
+                    "rows_used": grid_meta["rows_used"],
+                },
+            ))
+        if grid_meta["cell_limited"]:
+            limitations.append(InputLimitation(
+                scope="sheet",
+                reason="collision_cell_limit",
+                sheet=sheet,
+                details={
+                    "cells_used": grid_meta["cells_used"],
+                    "max_cells": max(
+                        0, int(collision_max_cells)
+                    ),
+                },
+            ))
+        if reservation is not None:
+            if not reservation.commit(metrics):
+                raise AssertionError(
+                    "validated summary commit was rejected"
+                )
+        return summary, limitations
+    finally:
+        if reservation is not None and not reservation.closed:
+            reservation.rollback()
 
 
 def detect_cross_sheet_column_duplicates(

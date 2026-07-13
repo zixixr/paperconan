@@ -1000,3 +1000,141 @@ def test_scan_uses_compact_cross_sheet_state(tmp_path, monkeypatch):
     assert len(indexes) == 1
     assert len(captured["recurring_sources"]) == 2
     assert within_sizes == [1, 1]
+
+
+def test_summary_reservation_commits_actual_fingerprints_not_upper_bound():
+    budget = audit.CrossSheetSummaryBudget(
+        summary_limit=10,
+        grid_cell_limit=100_000,
+        label_cell_limit=100_000,
+        label_byte_limit=100_000,
+        column_fingerprint_limit=10,
+    )
+
+    summary, _ = build_cross_sheet_summary(
+        "a.xlsx", "Figure 1", _sheet(), budget=budget
+    )
+
+    assert summary is not None
+    assert budget.retained_metadata()["column_fingerprints"] == len(
+        summary.columns
+    )
+    assert budget.reserved_metadata() == {
+        "summaries": 0,
+        "grid_cells": 0,
+        "label_cells": 0,
+        "label_bytes": 0,
+        "column_fingerprints": 0,
+    }
+
+
+def test_column_fingerprint_limit_metadata_remains_normalized():
+    columns, limitations = audit._column_fingerprints(
+        "a.xlsx",
+        "Figure 1",
+        _sheet(),
+        [(1, 15, 1, 3)],
+        min_column_length=12,
+        column_limit=-1,
+    )
+
+    assert columns == ()
+    assert limitations[0].details["limit"] == 0
+
+
+def test_summary_reservation_rejection_precedes_final_object_construction(
+    monkeypatch,
+):
+    budget = audit.CrossSheetSummaryBudget(
+        summary_limit=10,
+        grid_cell_limit=1,
+        label_cell_limit=100_000,
+        label_byte_limit=100_000,
+        column_fingerprint_limit=10,
+    )
+    monkeypatch.setattr(
+        audit,
+        "CrossSheetSummary",
+        lambda **_kwargs: pytest.fail(
+            "rejected summary reached final object construction"
+        ),
+    )
+
+    summary, _ = build_cross_sheet_summary(
+        "a.xlsx", "Figure 1", _sheet(), budget=budget
+    )
+
+    assert summary is None
+    assert budget.retained_metadata()["column_fingerprints"] == 0
+    assert budget.reserved_metadata() == {
+        "summaries": 0,
+        "grid_cells": 0,
+        "label_cells": 0,
+        "label_bytes": 0,
+        "column_fingerprints": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    [
+        "find_numeric_blocks",
+        "_grid_from_rows",
+        "CrossSheetSummary",
+    ],
+)
+def test_summary_reservation_rolls_back_after_any_builder_exception(
+    monkeypatch,
+    failure_point,
+):
+    budget = audit.CrossSheetSummaryBudget(
+        summary_limit=10,
+        grid_cell_limit=100_000,
+        label_cell_limit=100_000,
+        label_byte_limit=100_000,
+        column_fingerprint_limit=10,
+    )
+    original = getattr(audit, failure_point)
+
+    def raise_after_reservation(*_args, **_kwargs):
+        raise RuntimeError(
+            f"synthetic {failure_point} failure"
+        )
+
+    monkeypatch.setattr(
+        audit, failure_point, raise_after_reservation
+    )
+    with pytest.raises(
+        RuntimeError, match=f"synthetic {failure_point} failure"
+    ):
+        build_cross_sheet_summary(
+            "a.xlsx", "Figure 1", _sheet(), budget=budget
+        )
+
+    assert budget.reserved_metadata() == {
+        "summaries": 0,
+        "grid_cells": 0,
+        "label_cells": 0,
+        "label_bytes": 0,
+        "column_fingerprints": 0,
+    }
+    assert budget.retained_metadata() == {
+        "summaries": 0,
+        "grid_cells": 0,
+        "label_cells": 0,
+        "label_bytes": 0,
+        "column_fingerprints": 0,
+    }
+
+    monkeypatch.setattr(audit, failure_point, original)
+    summary, _ = build_cross_sheet_summary(
+        "b.xlsx", "Figure 2", _sheet(), budget=budget
+    )
+    assert summary is not None
+    assert budget.reserved_metadata() == {
+        "summaries": 0,
+        "grid_cells": 0,
+        "label_cells": 0,
+        "label_bytes": 0,
+        "column_fingerprints": 0,
+    }

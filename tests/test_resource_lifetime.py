@@ -3329,3 +3329,47 @@ def test_report_block_limit_remains_directory_wide(tmp_path, monkeypatch):
         "file": "b.csv",
         "sheet": "b",
     }]
+
+
+def test_fingerprint_capacity_is_checked_before_source_rows_are_touched():
+    class GuardedSource:
+        nrows = 40
+        ncols = 2
+        _text = {}
+
+        def cell(self, row, col):
+            return None
+
+        def exact_numeric(self, row, col):
+            raise AssertionError(
+                "fingerprint candidate started without capacity"
+            )
+
+    budget = audit.CrossSheetSummaryBudget(
+        summary_limit=10,
+        grid_cell_limit=100,
+        label_cell_limit=100,
+        label_byte_limit=100,
+        column_fingerprint_limit=0,
+    )
+
+    summary, limitations = audit.build_cross_sheet_summary(
+        "wide.csv",
+        "Figure 1",
+        GuardedSource(),
+        blocks=[(0, 40, 0, 2)],
+        budget=budget,
+    )
+
+    assert summary is None
+    assert limitations == []
+    metadata = budget.limitation_metadata()
+    assert metadata["exhausted_dimensions"] == [
+        "column_fingerprints"
+    ]
+    assert metadata["dimensions"]["column_fingerprints"][
+        "candidate_columns_skipped"
+    ] == 2
+    assert metadata["dimensions"]["column_fingerprints"][
+        "skipped_items"
+    ] == 2

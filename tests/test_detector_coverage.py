@@ -1018,3 +1018,61 @@ def test_cross_sheet_budget_aggregates_repeated_axis_coverage():
     assert metadata["axis_state_unit_limit"] == 900
     assert metadata["axis_peak_state_units"] == 700
     assert metadata["limits_reached"] == ["axis"]
+
+
+def test_scan_fingerprint_capacity_rejection_reports_candidates_truthfully(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    payload = (
+        "label,a,b\n"
+        + "\n".join(
+            f"g{row},{row + 1.1234},{row + 4.5678}"
+            for row in range(14)
+        )
+        + "\n"
+    )
+    (data / "wide.csv").write_text(payload, encoding="utf-8")
+    monkeypatch.setattr(
+        audit, "_CROSS_SHEET_SUMMARY_LIMIT", 10, raising=False
+    )
+    monkeypatch.setattr(
+        audit, "_CROSS_SHEET_GRID_CELL_LIMIT", 100_000, raising=False
+    )
+    monkeypatch.setattr(
+        audit, "_CROSS_SHEET_LABEL_CELL_LIMIT", 100_000, raising=False
+    )
+    monkeypatch.setattr(
+        audit, "_CROSS_SHEET_LABEL_BYTE_LIMIT", 100_000, raising=False
+    )
+    monkeypatch.setattr(
+        audit,
+        "_CROSS_SHEET_COLUMN_FINGERPRINT_LIMIT",
+        0,
+        raising=False,
+    )
+
+    scan = audit.scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    assert _limitations(
+        scan, "cross_sheet_column_fingerprint_limit"
+    ) == [{
+        "scope": "scan",
+        "reason": "cross_sheet_column_fingerprint_limit",
+        "dimension": "column_fingerprints",
+        "limit": 0,
+        "retained": 0,
+        "skipped_sheets": 1,
+        "skipped_items": 2,
+        "candidate_columns_skipped": 2,
+        "candidate_columns_may_qualify": True,
+        "summary_pairs_unavailable": 0,
+        "omitted_findings_lower_bound": 0,
+    }]
+    assert scan["cross_sheet_findings"] == []
+    assert scan["findings_omitted"] == 0
+    assert scan["findings_omitted_is_lower_bound"] is True
+    assert scan["scan_status"] == "partial"
