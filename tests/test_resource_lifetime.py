@@ -424,6 +424,79 @@ def test_dispersed_and_rounding_detectors_use_compact_dense_state():
     )
 
 
+@pytest.mark.parametrize(
+    ("family", "detector_name", "sheet", "bounds", "expected_states"),
+    [
+        (
+            "dispersed_repeats",
+            "detect_dispersed_repeats",
+            Sheet.from_rows(
+                [["value"]]
+                + [
+                    [1000.1234567 + (row % 60) * 0.7312345]
+                    for row in range(120)
+                ]
+            ),
+            (1, 121, 0, 1, ["value"]),
+            {
+                "numeric_mask",
+                "rows",
+                "values",
+                "rounded",
+                "inverse",
+                "counts",
+                "sorted_positions",
+            },
+        ),
+        (
+            "identical_after_rounding",
+            "detect_identical_after_rounding",
+            Sheet.from_rows(
+                [["left", "right"]]
+                + [
+                    [
+                        1.001 + (row % 20) * 0.0021,
+                        2.001 + (row % 20) * 0.0021,
+                    ]
+                    for row in range(60)
+                ]
+            ),
+            (1, 61, 0, 2, ["left", "right"]),
+            {
+                "candidate_mask",
+                "bucket_mask",
+                "flat_indices",
+                "values",
+                "rounded",
+                "inverse",
+                "counts",
+                "sorted_positions",
+            },
+        ),
+    ],
+)
+def test_dense_detector_declared_state_bounds_cover_actual_live_arrays(
+    family, detector_name, sheet, bounds, expected_states
+):
+    detector = getattr(audit, detector_name)
+    baseline = detector(sheet, *bounds)
+    tracker = audit._DenseStateTracker()
+
+    instrumented = detector(sheet, *bounds, _state_tracker=tracker)
+
+    requirement = next(
+        item
+        for item in audit._dense_detector_requirements(
+            bounds[1] - bounds[0], bounds[3] - bounds[2]
+        )
+        if item["family"] == family
+    )
+    assert instrumented == baseline
+    assert tracker.live_units == 0
+    assert tracker.peak_units <= requirement["state_required"]
+    assert expected_states <= tracker.seen_names
+
+
 def test_very_wide_column_fingerprints_touch_only_fixed_budget(
     monkeypatch,
 ):

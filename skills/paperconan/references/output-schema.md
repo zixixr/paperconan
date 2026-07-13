@@ -162,7 +162,10 @@ limitations:
   amount, skipped sheets/items, and unavailable summary-pair count.
 - `cross_sheet_work_limit`: one scan-level object for shared pair, value,
   decimal-tail tuple, and pre-cap finding budgets. It reports work performed,
-  known skipped work/findings, and `limits_reached`.
+  known skipped work/findings, and `limits_reached`. Detector-family pairs are
+  counted independently. `bucket_findings_skipped` reports exact omissions
+  after the stable first ten column-duplicate findings in one fingerprint
+  bucket; those omissions are included once in `findings_skipped`.
 
 Selection follows stable input order and stops before a configured limit is
 exceeded. A rejected detector candidate or summary is not treated as complete.

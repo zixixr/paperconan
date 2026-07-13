@@ -5,6 +5,9 @@ so we can exercise severity/context logic without round-tripping through xlsx.
 """
 from __future__ import annotations
 
+from itertools import combinations
+
+from paperconan import _audit as audit
 from paperconan._audit import (
     CrossSheetWorkBudget,
     Sheet,
@@ -98,9 +101,145 @@ def test_cross_sheet_pair_work_budget_is_exact_and_deterministic():
     findings, metadata = first
     assert findings
     assert metadata["pairs_examined"] == 1
-    assert metadata["pairs_skipped"] == 5
+    assert metadata["pairs_skipped"] == 11
     assert metadata["pair_limit"] == 1
     assert metadata["limits_reached"] == ["pair"]
+
+
+def _collision_and_tail_grids():
+    left = {}
+    right = {}
+    for row in range(20):
+        if row < 10:
+            value = round(1.1234 + row * 0.7317, 4)
+            left[(row, 0)] = value
+            right[(row, 0)] = value
+        else:
+            tail = f"{row:04d}731"
+            left[(row, 0)] = float(f"0.1{tail}")
+            right[(row, 0)] = float(f"0.2{tail}")
+    return left, right
+
+
+def test_pair_budget_admits_detector_families_independently():
+    ga, gb = _collision_and_tail_grids()
+    grids = {
+        ("a.xlsx", "Figure 1"): ga,
+        ("b.xlsx", "Figure 2"): gb,
+    }
+
+    one_family = CrossSheetWorkBudget(
+        pair_limit=1,
+        value_limit=100_000,
+        tail_match_limit=100_000,
+        finding_limit=100,
+    )
+    one_family_findings = detect_collisions(
+        grids, budget=one_family
+    )
+    two_families = CrossSheetWorkBudget(
+        pair_limit=2,
+        value_limit=100_000,
+        tail_match_limit=100_000,
+        finding_limit=100,
+    )
+    two_family_findings = detect_collisions(
+        grids, budget=two_families
+    )
+
+    assert _find(
+        one_family_findings, "cross_sheet_position_identical"
+    )
+    assert _find(
+        one_family_findings, "cross_sheet_decimal_tail_reuse"
+    ) is None
+    assert one_family.limitation_metadata()["pairs_examined"] == 1
+    assert one_family.limitation_metadata()["pairs_skipped"] == 1
+    assert _find(
+        two_family_findings, "cross_sheet_position_identical"
+    )
+    assert _find(
+        two_family_findings, "cross_sheet_decimal_tail_reuse"
+    )
+    assert two_families.limitation_metadata()["pairs_examined"] == 2
+    assert two_families.limitation_metadata()["pairs_skipped"] == 0
+
+
+def _sized_grid(size, offset=0.0):
+    return {
+        (row, 0): round(offset + 1.1234 + row * 0.7317, 4)
+        for row in range(size)
+    }
+
+
+def test_cross_sheet_value_work_counts_known_passes_exactly():
+    grids = {
+        ("a.xlsx", "Figure 1"): _sized_grid(6),
+        ("b.xlsx", "Figure 2"): _sized_grid(5),
+    }
+    budget = CrossSheetWorkBudget(
+        pair_limit=2,
+        value_limit=100_000,
+        tail_match_limit=100_000,
+        finding_limit=100,
+    )
+
+    detect_collisions(grids, budget=budget)
+
+    metadata = budget.limitation_metadata()
+    assert metadata["pairs_examined"] == 2
+    assert metadata["pairs_skipped"] == 0
+    assert metadata["values_examined"] == (
+        4 * (6 + 5)
+        + (6 + 5 + 6)
+        + (6 + 5)
+    )
+    assert metadata["values_skipped"] == 0
+
+
+def test_pair_stop_reports_exact_remaining_family_and_value_work():
+    grids = {
+        ("a.xlsx", "Figure 1"): _sized_grid(5, 0),
+        ("b.xlsx", "Figure 2"): _sized_grid(6, 100),
+        ("c.xlsx", "Figure 3"): _sized_grid(7, 200),
+    }
+    budget = CrossSheetWorkBudget(
+        pair_limit=1,
+        value_limit=100_000,
+        tail_match_limit=100_000,
+        finding_limit=100,
+    )
+
+    detect_collisions(grids, budget=budget)
+
+    metadata = budget.limitation_metadata()
+    assert metadata["pairs_examined"] == 1
+    assert metadata["pairs_skipped"] == 5
+    assert metadata["values_examined"] == 4 * 18 + 16
+    assert metadata["values_skipped"] == 72
+    assert metadata["limits_reached"] == ["pair"]
+
+
+def test_collision_context_uses_a_bounded_shared_cell_sample(monkeypatch):
+    ga, gb = _identical_grids(n_rows=50, n_cols=2)
+    sample_sizes = []
+    original = audit._label_context_for_matches
+
+    def tracked_context(sheet, shared, max_labels=40):
+        sample_sizes.append(len(shared))
+        return original(sheet, shared, max_labels=max_labels)
+
+    monkeypatch.setattr(
+        audit, "_label_context_for_matches", tracked_context
+    )
+
+    detect_collisions({
+        ("a.xlsx", "Figure 1"): ga,
+        ("b.xlsx", "Figure 2"): gb,
+    })
+
+    assert sample_sizes
+    assert max(sample_sizes) <= 40
 
 
 def test_decimal_tail_match_state_stops_before_limit_is_exceeded():
@@ -628,3 +767,73 @@ def test_column_duplicate_comparisons_share_pair_and_finding_budget():
     assert metadata["findings_retained"] == 1
     assert metadata["findings_skipped"] == 1
     assert metadata["limits_reached"] == ["pair", "finding"]
+
+
+def _duplicate_column_summaries(count):
+    duplicate = [
+        3.0, 3.2, 2.5, 2.8, 2.9, 2.2, 5.0, 5.2,
+        4.5, 4.8, 4.9, 4.2, 6.1, 6.3, 5.7,
+    ]
+    return [
+        build_cross_sheet_summary(
+            f"{number}.xlsx",
+            f"Figure {number}",
+            _sheet_from_cols(["value"], [duplicate]),
+        )[0]
+        for number in range(count)
+    ]
+
+
+def test_column_duplicate_bucket_preserves_legacy_first_ten_findings():
+    summaries = _duplicate_column_summaries(6)
+    budget = CrossSheetWorkBudget(
+        pair_limit=100,
+        value_limit=100_000,
+        tail_match_limit=100_000,
+        finding_limit=100,
+    )
+
+    findings = detect_cross_sheet_column_duplicates(
+        summaries, budget=budget
+    )
+
+    expected_pairs = [
+        (f"Figure {left}", f"Figure {right}")
+        for left, right in combinations(range(6), 2)
+    ][:10]
+    assert [
+        (finding["sheet_a"], finding["sheet_b"])
+        for finding in findings
+    ] == expected_pairs
+    metadata = budget.limitation_metadata()
+    assert metadata["pairs_examined"] == 15
+    assert metadata["pairs_skipped"] == 0
+    assert metadata["findings_retained"] == 10
+    assert metadata["bucket_findings_skipped"] == 5
+    assert metadata["findings_skipped"] == 5
+    assert metadata["limits_reached"] == ["fingerprint_bucket"]
+
+
+def test_column_duplicate_bucket_and_global_finding_omissions_are_exact():
+    summaries = _duplicate_column_summaries(6)
+    budget = CrossSheetWorkBudget(
+        pair_limit=100,
+        value_limit=100_000,
+        tail_match_limit=100_000,
+        finding_limit=8,
+    )
+
+    findings = detect_cross_sheet_column_duplicates(
+        summaries, budget=budget
+    )
+
+    assert len(findings) == 8
+    metadata = budget.limitation_metadata()
+    assert metadata["pairs_examined"] == 15
+    assert metadata["findings_retained"] == 8
+    assert metadata["bucket_findings_skipped"] == 5
+    assert metadata["findings_skipped"] == 7
+    assert metadata["limits_reached"] == [
+        "finding",
+        "fingerprint_bucket",
+    ]

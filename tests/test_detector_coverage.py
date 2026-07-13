@@ -125,6 +125,47 @@ def test_wide_integer_block_skips_affected_detector_with_one_limitation(
     }]
 
 
+def test_wide_integer_block_counts_use_one_near_linear_sheet_sweep():
+    row_count = 120
+    col_count = 12
+    rows = [
+        [
+            (
+                10**100 + row * col_count + col
+                if (row + col) % 2 == 0
+                else row + col + 0.125
+            )
+            for col in range(col_count)
+        ]
+        for row in range(row_count)
+    ]
+    sheet = Sheet.from_rows(rows)
+    blocks = [
+        (row, row + 3, col, col + 4)
+        for row in range(0, row_count, 3)
+        for col in range(0, col_count, 4)
+    ]
+    expected = [
+        sum(
+            1
+            for wide_row, wide_col in sheet._wide_ints
+            if r0 <= wide_row < r1 and c0 <= wide_col < c1
+        )
+        for r0, r1, c0, c1 in blocks
+    ]
+
+    counts, metadata = audit._wide_integer_counts_by_block(
+        sheet, blocks, with_coverage=True
+    )
+
+    assert counts == expected
+    assert metadata["coordinates_total"] == len(sheet._wide_ints)
+    assert metadata["coordinate_visits"] <= 2 * len(sheet._wide_ints)
+    assert metadata["event_records"] == 2 * len(blocks)
+    assert metadata["column_index_cells"] <= col_count
+    assert metadata["coordinate_copy_cells"] == 0
+
+
 def test_dense_detector_limits_preflight_every_named_family(
     monkeypatch,
 ):
@@ -667,7 +708,7 @@ def test_scan_cross_sheet_work_limit_feeds_omission_lower_bound(
     assert limitation["scope"] == "scan"
     assert limitation["pair_limit"] == 1
     assert limitation["pairs_examined"] == 1
-    assert limitation["pairs_skipped"] == 5
+    assert limitation["pairs_skipped"] == 11
     assert limitation["finding_limit"] == 0
     assert limitation["findings_retained"] == 0
     assert limitation["findings_skipped"] >= 1

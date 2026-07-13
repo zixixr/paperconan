@@ -197,6 +197,95 @@ def test_scan_summary_budget_selection_is_deterministic_and_bounded():
     assert limitation["summary_pairs_unavailable"] == 9
 
 
+@pytest.mark.parametrize(
+    "dimension",
+    [
+        "grid_cells",
+        "label_cells",
+        "label_bytes",
+        "column_fingerprints",
+    ],
+)
+def test_summary_builders_never_materialize_past_remaining_global_capacity(
+    monkeypatch, dimension
+):
+    limits = {
+        "summary_limit": 10,
+        "grid_cell_limit": 100_000,
+        "label_cell_limit": 100_000,
+        "label_byte_limit": 100_000,
+        "column_fingerprint_limit": 100_000,
+    }
+    limits[{
+        "grid_cells": "grid_cell_limit",
+        "label_cells": "label_cell_limit",
+        "label_bytes": "label_byte_limit",
+        "column_fingerprints": "column_fingerprint_limit",
+    }[dimension]] = 1
+    budget = audit.CrossSheetSummaryBudget(**limits)
+    peaks = {
+        "grid_cells": 0,
+        "label_cells": 0,
+        "label_bytes": 0,
+        "column_fingerprints": 0,
+    }
+    original_grid = audit._grid_from_rows
+    original_labels = audit.SparseLabelContext
+    original_fingerprints = audit._column_fingerprints
+
+    def tracked_grid(*args, **kwargs):
+        result = original_grid(*args, **kwargs)
+        grid = result[0] if kwargs.get("with_coverage") else result
+        peaks["grid_cells"] = max(peaks["grid_cells"], len(grid))
+        return result
+
+    def tracked_labels(*args, **kwargs):
+        text = kwargs["text"]
+        peaks["label_cells"] = max(
+            peaks["label_cells"], len(text)
+        )
+        peaks["label_bytes"] = max(
+            peaks["label_bytes"],
+            sum(len(value.encode("utf-8")) for value in text.values()),
+        )
+        return original_labels(*args, **kwargs)
+
+    def tracked_fingerprints(*args, **kwargs):
+        result = original_fingerprints(*args, **kwargs)
+        peaks["column_fingerprints"] = max(
+            peaks["column_fingerprints"], len(result[0])
+        )
+        return result
+
+    def rejected_summary_must_not_be_constructed(*_args, **_kwargs):
+        raise AssertionError(
+            "a summary rejected by a global dimension was constructed"
+        )
+
+    monkeypatch.setattr(audit, "_grid_from_rows", tracked_grid)
+    monkeypatch.setattr(audit, "SparseLabelContext", tracked_labels)
+    monkeypatch.setattr(
+        audit, "_column_fingerprints", tracked_fingerprints
+    )
+    monkeypatch.setattr(
+        audit, "CrossSheetSummary", rejected_summary_must_not_be_constructed
+    )
+
+    summary, limitations = build_cross_sheet_summary(
+        "bounded.xlsx",
+        "Figure 1",
+        _sheet(),
+        budget=budget,
+    )
+
+    assert summary is None
+    assert limitations == []
+    assert peaks[dimension] <= 1
+    metadata = budget.limitation_metadata()
+    assert metadata["exhausted_dimensions"] == [dimension]
+    assert metadata["dimensions"][dimension]["skipped_items"] > 1
+
+
 def test_column_fingerprint_uses_exact_values_and_preserves_wide_integer():
     wide = 10**400 + 1
     values = [
