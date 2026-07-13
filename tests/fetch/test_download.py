@@ -1276,6 +1276,337 @@ def test_tar_pax_path_supersedes_sparse_name_without_decode(
     assert "GNU.sparse.name" in actual.pax_headers
 
 
+@pytest.mark.parametrize(
+    (
+        "global_records",
+        "local_records",
+        "sparse_member",
+        "losing_field",
+        "winning_field",
+    ),
+    [
+        (
+            [],
+            [
+                (b"path", b"x" * 1_000 + b".csv"),
+                (b"GNU.sparse.name", b"final.csv"),
+            ],
+            False,
+            "path",
+            "GNU.sparse.name",
+        ),
+        (
+            [],
+            [
+                (b"GNU.sparse.name", b"x" * 1_000 + b".csv"),
+                (b"path", b"final.csv"),
+            ],
+            True,
+            "GNU.sparse.name",
+            "path",
+        ),
+        (
+            [
+                (b"path", b"x" * 1_000 + b".csv"),
+                (b"GNU.sparse.name", b"initial.csv"),
+            ],
+            [(b"GNU.sparse.name", b"final.csv")],
+            True,
+            "path",
+            "GNU.sparse.name",
+        ),
+        (
+            [
+                (b"GNU.sparse.name", b"x" * 1_000 + b".csv"),
+                (b"path", b"initial.csv"),
+            ],
+            [(b"path", b"final.csv")],
+            False,
+            "GNU.sparse.name",
+            "path",
+        ),
+    ],
+    ids=[
+        "local-path-before-sparse",
+        "local-sparse-before-path",
+        "inherited-path-local-sparse-update",
+        "inherited-sparse-local-path-update",
+    ],
+)
+def test_tar_raw_losing_pax_name_is_retained_but_never_applied(
+    tmp_path,
+    monkeypatch,
+    global_records,
+    local_records,
+    sparse_member,
+    losing_field,
+    winning_field,
+):
+    archive = tmp_path / "pax-raw-loser.tar.gz"
+    members = []
+    if global_records:
+        members.append((
+            "global",
+            tarfile.XGLTYPE,
+            b"".join(
+                _pax_record(key, value)
+                for key, value in global_records
+            ),
+        ))
+    if sparse_member:
+        local_records = [
+            *local_records,
+            (b"GNU.sparse.map", b"0,0"),
+        ]
+    members.extend([
+        (
+            "extended",
+            tarfile.XHDTYPE,
+            b"".join(
+                _pax_record(key, value)
+                for key, value in local_records
+            ),
+        ),
+        ("placeholder", tarfile.REGTYPE, b""),
+    ])
+    _write_raw_tar(archive, members)
+
+    base_path = tarfile.TarInfo.path
+
+    def reject_raw_assignment(info, value):
+        if isinstance(value, _download._RawTarText):
+            raise AssertionError(
+                "raw losing PAX name must not be applied to TarInfo"
+            )
+        return base_path.fset(info, value)
+
+    def reject_raw_string_method(_value, *_args):
+        raise AssertionError(
+            "raw losing PAX name must not use string methods"
+        )
+
+    monkeypatch.setattr(
+        _download._BoundedTarInfo,
+        "path",
+        property(
+            base_path.fget,
+            reject_raw_assignment,
+            base_path.fdel,
+            base_path.__doc__,
+        ),
+    )
+    monkeypatch.setattr(
+        _download._RawTarText,
+        "rstrip",
+        reject_raw_string_method,
+        raising=False,
+    )
+
+    expected, actual = _tar_info_snapshot(
+        archive,
+        monkeypatch,
+        len("final.csv"),
+    )
+
+    assert actual.name == expected.name == "final.csv"
+    assert tuple(actual.pax_headers) == tuple(expected.pax_headers)
+    assert isinstance(
+        actual.pax_headers[losing_field],
+        _download._RawTarText,
+    )
+    assert actual.pax_headers[winning_field] == "final.csv"
+    assert actual.sparse == expected.sparse
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        [
+            (b"path", b"losing-path.csv"),
+            (b"GNU.sparse.name", b"final.csv"),
+        ],
+        [
+            (b"GNU.sparse.name", b"losing-sparse.csv"),
+            (b"path", b"final.csv"),
+        ],
+    ],
+    ids=["path-before-sparse", "sparse-before-path"],
+)
+def test_tar_only_winning_decoded_pax_name_mutates_tarinfo(
+    tmp_path, monkeypatch, records
+):
+    archive = tmp_path / "pax-single-name-application.tar.gz"
+    _write_raw_tar(
+        archive,
+        [
+            (
+                "extended",
+                tarfile.XHDTYPE,
+                b"".join(
+                    _pax_record(key, value)
+                    for key, value in records
+                ),
+            ),
+            ("placeholder", tarfile.REGTYPE, b""),
+        ],
+    )
+    base_path = tarfile.TarInfo.path
+    applied_names = []
+
+    def record_assignment(info, value):
+        applied_names.append(value)
+        return base_path.fset(info, value)
+
+    monkeypatch.setattr(
+        _download._BoundedTarInfo,
+        "path",
+        property(
+            base_path.fget,
+            record_assignment,
+            base_path.fdel,
+            base_path.__doc__,
+        ),
+    )
+
+    expected, actual = _tar_info_snapshot(
+        archive,
+        monkeypatch,
+        100,
+    )
+
+    assert actual.name == expected.name == "final.csv"
+    assert actual.pax_headers == expected.pax_headers
+    assert applied_names == ["final.csv"]
+
+
+def test_tar_raw_global_pax_loser_is_not_applied_before_gnu_name(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "pax-before-gnu.tar.gz"
+    raw_loser = b"x" * 1_000 + b".csv"
+    final_name = "final.csv"
+    _write_raw_tar(
+        archive,
+        [
+            (
+                "global",
+                tarfile.XGLTYPE,
+                _pax_record(b"path", raw_loser),
+            ),
+            (
+                "long",
+                tarfile.GNUTYPE_LONGNAME,
+                final_name.encode("utf-8") + b"\0",
+            ),
+            ("placeholder", tarfile.REGTYPE, b""),
+        ],
+    )
+    base_path = tarfile.TarInfo.path
+
+    def reject_raw_assignment(info, value):
+        if isinstance(value, _download._RawTarText):
+            raise AssertionError(
+                "raw losing PAX name must not be applied to TarInfo"
+            )
+        return base_path.fset(info, value)
+
+    def reject_raw_string_method(_value, *_args):
+        raise AssertionError(
+            "raw losing PAX name must not use string methods"
+        )
+
+    monkeypatch.setattr(
+        _download._BoundedTarInfo,
+        "path",
+        property(
+            base_path.fget,
+            reject_raw_assignment,
+            base_path.fdel,
+            base_path.__doc__,
+        ),
+    )
+    monkeypatch.setattr(
+        _download._RawTarText,
+        "rstrip",
+        reject_raw_string_method,
+        raising=False,
+    )
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 20)
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_METADATA_BYTES", 100_000, raising=False
+    )
+    monkeypatch.setattr(
+        _download,
+        "_ARCHIVE_MEMBER_NAME_BYTES",
+        len(final_name),
+    )
+
+    with _download._BoundedTarFile.open(
+        archive,
+        "r:gz",
+        tarinfo=_download._BoundedTarInfo,
+    ) as bounded:
+        actual = bounded.next()
+
+    assert actual.name == final_name
+    assert isinstance(
+        actual.pax_headers["path"],
+        _download._RawTarText,
+    )
+
+
+def test_tar_pending_gnu_loser_is_not_applied_before_pax_name(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "gnu-before-pax-application.tar.gz"
+    raw_gnu_name = b"x" * 1_000 + b".csv"
+    final_name = "final.csv"
+    _write_raw_tar(
+        archive,
+        [
+            (
+                "extended",
+                tarfile.XHDTYPE,
+                _pax_record(
+                    b"path",
+                    final_name.encode("utf-8"),
+                ),
+            ),
+            (
+                "long",
+                tarfile.GNUTYPE_LONGNAME,
+                raw_gnu_name + b"\0",
+            ),
+            ("placeholder", tarfile.REGTYPE, b""),
+        ],
+    )
+    original_decode = _download._RawTarText.decode
+
+    def reject_losing_gnu_decode(value):
+        if value.raw == raw_gnu_name:
+            raise AssertionError(
+                "pending GNU loser must not be decoded"
+            )
+        return original_decode(value)
+
+    monkeypatch.setattr(
+        _download._RawTarText,
+        "decode",
+        reject_losing_gnu_decode,
+    )
+
+    names, preserved, skipped = _bounded_tar_names(
+        archive,
+        tmp_path,
+        monkeypatch,
+        len(final_name),
+    )
+
+    assert names == [final_name]
+    assert preserved == set()
+    assert skipped == []
+
+
 def test_tar_sparse_name_uses_exact_boundary_before_decode(
     tmp_path, monkeypatch
 ):

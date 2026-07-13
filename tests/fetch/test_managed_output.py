@@ -822,6 +822,91 @@ def test_source_sidecar_related_doi_budget_precedes_iterator_advance(
     assert related_dois.items_yielded == retained_count
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        [],
+        [0],
+        {"nested": [[]]},
+    ],
+    ids=["zero", "exact-single", "nested-empty"],
+)
+def test_source_sidecar_known_iterables_accept_exact_boundary(value):
+    expected = (
+        json.dumps(value, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+    assert _source_sidecar.encode_sidecar(
+        value,
+        byte_limit=len(expected),
+    ) == expected
+
+
+def test_source_sidecar_known_iterable_reports_exact_one_over():
+    exact = len(
+        _source_sidecar.encode_sidecar(
+            [0],
+            byte_limit=10_000,
+        )
+    )
+
+    with pytest.raises(_source_sidecar.SidecarLimitError) as error:
+        _source_sidecar.encode_sidecar(
+            [0, 0],
+            byte_limit=exact,
+        )
+
+    assert error.value.reason == "source sidecar byte limit"
+    assert (
+        "iterator_exhaustion_unverified"
+        not in error.value.details
+    )
+    assert error.value.details["iterable_entries_retained"] == 1
+    assert error.value.details["iterable_entries_remaining"] == 1
+
+
+def test_source_sidecar_nested_known_iterable_reports_exact_remaining(
+    tmp_path, monkeypatch
+):
+    cand = {
+        "doi": None,
+        "title": None,
+        "source": None,
+        "cand_id": None,
+        "related_dois": [[0]],
+    }
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", 10_000,
+        raising=False,
+    )
+    exact = len(
+        _download._source_sidecar_bytes(
+            cand,
+            str(tmp_path),
+            [],
+        )
+    )
+    cand["related_dois"] = [[0], [0], [0]]
+    monkeypatch.setattr(
+        _download,
+        "_SOURCE_SIDECAR_MAX_BYTES",
+        exact,
+        raising=False,
+    )
+
+    with pytest.raises(_download._SourceSidecarLimit) as error:
+        _download._source_sidecar_bytes(
+            cand,
+            str(tmp_path),
+            [],
+        )
+
+    assert error.value.record["reason"] == "source sidecar byte limit"
+    assert "iterator_exhaustion_unverified" not in error.value.record
+    assert error.value.record["iterable_entries_retained"] == 1
+    assert error.value.record["iterable_entries_remaining"] == 2
+
+
 def test_source_sidecar_encoding_rejects_large_title_before_json_escape(
     tmp_path, monkeypatch
 ):
@@ -898,6 +983,143 @@ def test_source_sidecar_encoding_bounds_escape_heavy_title_incrementally(
 
     assert error.value.record["reason"] == "source sidecar byte limit"
     assert error.value.record["observed_bytes_is_lower_bound"] is True
+
+
+@pytest.mark.parametrize("huge_key", ["a_huge", "z_huge"])
+def test_source_sidecar_preflight_saturates_huge_early_and_late_strings(
+    monkeypatch, huge_key
+):
+    import builtins
+
+    byte_limit = 128
+    huge = "x" * 100_000
+    value = {
+        huge_key: huge,
+        "m_small": "ok",
+    }
+    original_ord = builtins.ord
+    huge_char_visits = 0
+
+    def counted_ord(char):
+        nonlocal huge_char_visits
+        if char == "x":
+            huge_char_visits += 1
+        return original_ord(char)
+
+    monkeypatch.setattr(builtins, "ord", counted_ord)
+
+    with pytest.raises(_source_sidecar.SidecarLimitError):
+        _source_sidecar.encode_sidecar(
+            value,
+            byte_limit=byte_limit,
+        )
+
+    assert huge_char_visits <= byte_limit + 1
+
+
+def test_source_sidecar_preflight_shares_work_across_many_large_values(
+    monkeypatch,
+):
+    import builtins
+
+    byte_limit = 256
+    value = {
+        f"k{index:03d}": "x" * 64
+        for index in range(200)
+    }
+    original_ord = builtins.ord
+    original_minimum = _source_sidecar._minimum_json_value_size
+    huge_char_visits = 0
+    values_visited = 0
+
+    def counted_ord(char):
+        nonlocal huge_char_visits
+        if char == "x":
+            huge_char_visits += 1
+        return original_ord(char)
+
+    def counted_minimum(value, *args, **kwargs):
+        nonlocal values_visited
+        values_visited += 1
+        return original_minimum(value, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "ord", counted_ord)
+    monkeypatch.setattr(
+        _source_sidecar,
+        "_minimum_json_value_size",
+        counted_minimum,
+    )
+
+    with pytest.raises(_source_sidecar.SidecarLimitError):
+        _source_sidecar.encode_sidecar(
+            value,
+            byte_limit=byte_limit,
+        )
+
+    assert huge_char_visits <= byte_limit + 1
+    assert values_visited < 10
+
+
+def test_source_sidecar_preflight_saturates_across_many_long_keys(
+    monkeypatch,
+):
+    import builtins
+
+    byte_limit = 256
+    value = {
+        f"{index:03d}-" + ("k" * 200): None
+        for index in range(200)
+    }
+    original_ord = builtins.ord
+    key_char_visits = 0
+
+    def counted_ord(char):
+        nonlocal key_char_visits
+        if char == "k":
+            key_char_visits += 1
+        return original_ord(char)
+
+    monkeypatch.setattr(builtins, "ord", counted_ord)
+
+    with pytest.raises(_source_sidecar.SidecarLimitError):
+        _source_sidecar.encode_sidecar(
+            value,
+            byte_limit=byte_limit,
+        )
+
+    assert key_char_visits <= byte_limit + 1
+
+
+def test_source_sidecar_preflight_proves_tiny_limit_without_string_scan(
+    monkeypatch,
+):
+    import builtins
+
+    original_ord = builtins.ord
+    huge_char_visits = 0
+
+    def counted_ord(char):
+        nonlocal huge_char_visits
+        if char == "x":
+            huge_char_visits += 1
+        return original_ord(char)
+
+    monkeypatch.setattr(builtins, "ord", counted_ord)
+
+    with pytest.raises(_source_sidecar.SidecarLimitError):
+        _source_sidecar.encode_sidecar(
+            {"a": "x" * 100_000},
+            byte_limit=1,
+        )
+
+    assert huge_char_visits == 0
+
+
+def test_source_sidecar_preflight_has_no_per_key_tail_size_list():
+    assert (
+        "_dict_tail_sizes"
+        not in _source_sidecar._BoundedJsonWriter.__dict__
+    )
 
 
 def test_source_sidecar_encoding_never_calls_custom_string_fallback(
@@ -995,6 +1217,75 @@ def test_source_sidecar_canonicalizes_scalar_subclasses_without_hooks():
     assert _source_sidecar.encode_sidecar(
         value, byte_limit=len(expected)
     ) == expected
+
+
+def test_fetch_classifies_scalar_subclasses_before_iterator_probe(
+    tmp_path,
+):
+    class HostileString(str):
+        def __str__(self):
+            raise AssertionError("custom __str__ must not run")
+
+        def __iter__(self):
+            raise AssertionError("custom __iter__ must not run")
+
+        def __repr__(self):
+            raise AssertionError("custom __repr__ must not run")
+
+    class HostileInteger(int):
+        def __str__(self):
+            raise AssertionError("custom __str__ must not run")
+
+        def __repr__(self):
+            raise AssertionError("custom __repr__ must not run")
+
+        def __int__(self):
+            raise AssertionError("custom __int__ must not run")
+
+        def __index__(self):
+            raise AssertionError("custom __index__ must not run")
+
+        def __iter__(self):
+            raise AssertionError("custom __iter__ must not run")
+
+    class HostileFloat(float):
+        def __str__(self):
+            raise AssertionError("custom __str__ must not run")
+
+        def __repr__(self):
+            raise AssertionError("custom __repr__ must not run")
+
+        def __float__(self):
+            raise AssertionError("custom __float__ must not run")
+
+        def __iter__(self):
+            raise AssertionError("custom __iter__ must not run")
+
+    cases = [
+        (HostileString("text"), "text"),
+        (HostileInteger(7), 7),
+        (HostileFloat(1.25), 1.25),
+        (True, True),
+    ]
+    for index, (related_dois, expected) in enumerate(cases):
+        out_dir = tmp_path / str(index)
+        result = _download.download_candidate(
+            {
+                "cand_id": f"source:{index}",
+                "source": "source",
+                "related_dois": related_dois,
+                "tabular_files": [],
+            },
+            str(out_dir),
+        )
+
+        assert result["skipped"] == []
+        payload = json.loads(
+            (out_dir / _download.SOURCE_SIDECAR).read_text(
+                encoding="utf-8"
+            )
+        )
+        assert payload["related_dois"] == expected
 
 
 @pytest.mark.parametrize("value", ["text", 7, 1.25])

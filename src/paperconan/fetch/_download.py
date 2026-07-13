@@ -661,6 +661,8 @@ def _source_sidecar_limit_record(
     iterator_exhaustion_unverified=False,
     retained_bytes=None,
     minimum_bytes_if_additional_entry=None,
+    iterable_entries_retained=None,
+    iterable_entries_remaining=None,
     ownership_preserved=False,
 ):
     record = {
@@ -698,6 +700,14 @@ def _source_sidecar_limit_record(
     if minimum_bytes_if_additional_entry is not None:
         record["minimum_bytes_if_additional_entry"] = (
             minimum_bytes_if_additional_entry
+        )
+    if iterable_entries_retained is not None:
+        record["iterable_entries_retained"] = (
+            iterable_entries_retained
+        )
+    if iterable_entries_remaining is not None:
+        record["iterable_entries_remaining"] = (
+            iterable_entries_remaining
         )
     if ownership_preserved:
         record["ownership_preserved"] = True
@@ -1792,6 +1802,14 @@ def _apply_bounded_pax_info(
         effective_name_value=decoded_name_value,
     )
     for keyword, value in decoded_headers.items():
+        if (
+            keyword in ("path", "GNU.sparse.name")
+            and (
+                keyword != effective_name_field
+                or isinstance(value, _RawTarText)
+            )
+        ):
+            continue
         if keyword == "GNU.sparse.name":
             info.path = value
         elif keyword == "GNU.sparse.size":
@@ -2864,6 +2882,8 @@ def _prepare_sidecar_candidate(cand):
             related_dois,
             (
                 str,
+                int,
+                float,
                 bytes,
                 bytearray,
                 list,

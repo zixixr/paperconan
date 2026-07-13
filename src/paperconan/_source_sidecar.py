@@ -456,38 +456,101 @@ def _json_string_escape(codepoint):
     return f"\\u{high:04x}\\u{low:04x}".encode("ascii")
 
 
-def _encoded_json_string_size(value):
+def _saturated_size(size, maximum):
+    if size > maximum:
+        return maximum + 1
+    return size
+
+
+class _JsonPreflightBudget:
+    __slots__ = ("remaining",)
+
+    def __init__(self, byte_limit):
+        self.remaining = 4 * (max(0, int(byte_limit)) + 1)
+
+    def consume(self):
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+
+def _encoded_json_char_size(char):
+    if char in _SIMPLE_ESCAPES:
+        return 2
+    codepoint = ord(char)
+    if codepoint < 0x20 or codepoint >= 0x7F:
+        return 6 if codepoint <= 0xFFFF else 12
+    return 1
+
+
+def _encoded_json_string_size(value, maximum, work_budget):
     total = 2
+    if total > maximum:
+        return maximum + 1
     for char in value:
-        escaped = _SIMPLE_ESCAPES.get(char)
-        if escaped is None:
-            codepoint = ord(char)
-            if codepoint < 0x20 or codepoint >= 0x7F:
-                escaped = _json_string_escape(codepoint)
-            else:
-                escaped = bytes((codepoint,))
-        total += len(escaped)
+        if not work_budget.consume():
+            return maximum + 1
+        total += _encoded_json_char_size(char)
+        if total > maximum:
+            return maximum + 1
     return total
 
 
-def _minimum_json_value_size(value):
+def _minimum_json_value_size(value, maximum, work_budget):
     if value is None:
-        return 4
+        return _saturated_size(4, maximum)
     if value is True or value is False:
-        return 4 if value is True else 5
-    if type(value) is str:
-        return _encoded_json_string_size(value)
-    if type(value) is int:
-        return len(str(value))
-    if type(value) is float:
-        if math.isnan(value):
-            return 3
-        if math.isinf(value):
-            return 8 if value > 0 else 9
-        return len(repr(value))
+        return _saturated_size(
+            4 if value is True else 5,
+            maximum,
+        )
+    if isinstance(value, str):
+        canonical = (
+            value
+            if type(value) is str
+            else str.__str__(value)
+        )
+        return _encoded_json_string_size(
+            canonical,
+            maximum,
+            work_budget,
+        )
+    if isinstance(value, int):
+        if not work_budget.consume():
+            return maximum + 1
+        canonical = (
+            value
+            if type(value) is int
+            else int.__int__(value)
+        )
+        return _saturated_size(len(str(canonical)), maximum)
+    if isinstance(value, float):
+        if not work_budget.consume():
+            return maximum + 1
+        canonical = (
+            value
+            if type(value) is float
+            else float.__float__(value)
+        )
+        if math.isnan(canonical):
+            return _saturated_size(3, maximum)
+        if math.isinf(canonical):
+            return _saturated_size(
+                8 if canonical > 0 else 9,
+                maximum,
+            )
+        return _saturated_size(
+            len(repr(canonical)),
+            maximum,
+        )
     if type(value) in (dict, list, tuple):
-        return 2
-    return 1
+        return _saturated_size(2, maximum)
+    if not work_budget.consume():
+        return maximum + 1
+    if isinstance(value, (bytes, bytearray, set, frozenset)):
+        return _saturated_size(1, maximum)
+    return _saturated_size(2, maximum)
 
 
 class _BoundedJsonWriter:
@@ -495,6 +558,9 @@ class _BoundedJsonWriter:
         self.byte_limit = max(0, int(byte_limit))
         self.output = bytearray()
         self.markers = set()
+        self.preflight_work = _JsonPreflightBudget(
+            self.byte_limit
+        )
 
     def _write(self, chunk):
         requested_size = len(self.output) + len(chunk)
@@ -545,26 +611,71 @@ class _BoundedJsonWriter:
         self.markers.add(marker)
         return marker
 
-    def _dict_tail_sizes(
+    def _minimum_dict_entry_size(
+        self,
+        value,
+        key,
+        index,
+        level,
+        maximum,
+    ):
+        size = (1 if index == 0 else 2) + (level + 1) * 2
+        if size > maximum:
+            return maximum + 1
+        key_size = _encoded_json_string_size(
+            key,
+            maximum - size,
+            self.preflight_work,
+        )
+        if key_size > maximum - size:
+            return maximum + 1
+        size += key_size + 2
+        if size > maximum:
+            return maximum + 1
+        item_size = _minimum_json_value_size(
+            value[key],
+            maximum - size,
+            self.preflight_work,
+        )
+        if item_size > maximum - size:
+            return maximum + 1
+        return size + item_size
+
+    def _minimum_dict_size(
         self,
         value,
         keys,
         level,
         tail_size,
+        maximum,
     ):
         size = 1 + tail_size
         if keys:
             size += 1 + level * 2
-        sizes = [size] * (len(keys) + 1)
-        for index in range(len(keys) - 1, -1, -1):
-            key = keys[index]
-            size += 2
-            size += (level + 1) * 2
-            size += _encoded_json_string_size(key)
-            size += 2
-            size += _minimum_json_value_size(value[key])
-            sizes[index] = size
-        return sizes
+        if size > maximum:
+            return maximum + 1
+        for index, key in enumerate(keys):
+            entry_size = self._minimum_dict_entry_size(
+                value,
+                key,
+                index,
+                level,
+                maximum - size,
+            )
+            if entry_size > maximum - size:
+                return maximum + 1
+            size += entry_size
+        return size
+
+    def _raise_preflight_limit(self, minimum_size):
+        observed_bytes = len(self.output) + minimum_size
+        if observed_bytes <= self.byte_limit:
+            observed_bytes = self.byte_limit + 1
+        raise SidecarLimitError(
+            "source sidecar byte limit",
+            observed_bytes=observed_bytes,
+            observed_bytes_is_lower_bound=True,
+        )
 
     def _write_dict(self, value, level, tail_size):
         if len(value) > self.byte_limit:
@@ -578,13 +689,31 @@ class _BoundedJsonWriter:
                 "unsupported sidecar object key"
             )
         keys = sorted(value)
-        tail_sizes = self._dict_tail_sizes(
-            value, keys, level, tail_size
+        available = self.byte_limit - len(self.output)
+        minimum_size = self._minimum_dict_size(
+            value,
+            keys,
+            level,
+            tail_size,
+            available,
         )
+        if minimum_size > available:
+            self._raise_preflight_limit(minimum_size)
+        remaining_minimum = minimum_size
         marker = self._enter_container(value)
         try:
             self._write(b"{")
             for index, key in enumerate(keys):
+                entry_size = self._minimum_dict_entry_size(
+                    value,
+                    key,
+                    index,
+                    level,
+                    remaining_minimum,
+                )
+                if entry_size > remaining_minimum:
+                    self._raise_preflight_limit(entry_size)
+                remaining_minimum -= entry_size
                 self._write(b"\n" if index == 0 else b",\n")
                 self._write_indent(level + 1)
                 self._write_string(key)
@@ -592,7 +721,7 @@ class _BoundedJsonWriter:
                 self._write_value(
                     value[key],
                     level + 1,
-                    tail_sizes[index + 1],
+                    remaining_minimum,
                 )
             if keys:
                 self._write(b"\n")
@@ -635,13 +764,24 @@ class _BoundedJsonWriter:
                     + item_tail_size
                 )
                 if minimum_size > self.byte_limit:
-                    raise SidecarLimitError(
-                        "source sidecar byte limit",
-                        iterator_exhaustion_unverified=True,
-                        retained_bytes=len(self.output),
-                        minimum_bytes_if_additional_entry=(
+                    details = {
+                        "retained_bytes": len(self.output),
+                        "minimum_bytes_if_additional_entry": (
                             minimum_size
                         ),
+                    }
+                    if known_count is None:
+                        details[
+                            "iterator_exhaustion_unverified"
+                        ] = True
+                    else:
+                        details["iterable_entries_retained"] = count
+                        details["iterable_entries_remaining"] = (
+                            known_count - count
+                        )
+                    raise SidecarLimitError(
+                        "source sidecar byte limit",
+                        **details,
                     )
                 try:
                     item = next(iterator)
