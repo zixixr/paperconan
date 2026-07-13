@@ -3342,6 +3342,7 @@ def test_fingerprint_capacity_is_checked_before_source_rows_are_touched():
         nrows = 40
         ncols = 2
         _text = {}
+        numeric = np.full((nrows, ncols), np.nan)
 
         def cell(self, row, col):
             return None
@@ -3379,3 +3380,67 @@ def test_fingerprint_capacity_is_checked_before_source_rows_are_touched():
     assert metadata["dimensions"]["column_fingerprints"][
         "skipped_items"
     ] == 2
+
+
+def test_fingerprint_capacity_is_reserved_before_candidate_indexes(
+    monkeypatch,
+):
+    class GuardedSource:
+        nrows = 1
+        ncols = 1
+        _text = {}
+        numeric = np.full((nrows, ncols), np.nan)
+
+        def cell(self, _row, _col):
+            return None
+
+    events = []
+    original_grid = audit._grid_from_rows
+    original_labels = audit._bounded_sparse_label_context
+
+    def tracked_grid(*args, **kwargs):
+        events.append("grid")
+        return original_grid(*args, **kwargs)
+
+    def tracked_labels(*args, **kwargs):
+        events.append("labels")
+        return original_labels(*args, **kwargs)
+
+    monkeypatch.setattr(audit, "_grid_from_rows", tracked_grid)
+    monkeypatch.setattr(
+        audit, "_bounded_sparse_label_context", tracked_labels
+    )
+    monkeypatch.setattr(
+        audit,
+        "_selected_fingerprint_columns",
+        lambda *_args, **_kwargs: pytest.fail(
+            "candidate indexes were materialized before admission"
+        ),
+    )
+    candidate_count = 10**12
+    budget = audit.CrossSheetSummaryBudget(
+        summary_limit=1,
+        grid_cell_limit=1,
+        label_cell_limit=1,
+        label_byte_limit=1,
+        column_fingerprint_limit=0,
+    )
+
+    summary, limitations = audit.build_cross_sheet_summary(
+        "wide.csv",
+        "Figure 1",
+        GuardedSource(),
+        blocks=[(0, 1, 0, candidate_count)],
+        budget=budget,
+    )
+
+    assert summary is None
+    assert limitations == []
+    assert events == ["grid", "labels"]
+    metadata = budget.limitation_metadata()
+    assert metadata["exhausted_dimensions"] == [
+        "column_fingerprints"
+    ]
+    exhausted = metadata["dimensions"]["column_fingerprints"]
+    assert exhausted["candidate_columns_skipped"] == candidate_count
+    assert exhausted["skipped_items"] == candidate_count

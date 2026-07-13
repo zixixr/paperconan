@@ -6868,6 +6868,27 @@ def _iter_merged_column_intervals(blocks):
         yield merged_start, merged_stop
 
 
+def _fingerprint_column_counts(blocks, column_limit):
+    column_limit = (
+        None
+        if column_limit is None
+        else max(0, int(column_limit))
+    )
+    selected_count = 0
+    columns_total = 0
+    for start, stop in _iter_merged_column_intervals(blocks):
+        interval_size = stop - start
+        columns_total += interval_size
+        if column_limit is None:
+            selected_count += interval_size
+        elif selected_count < column_limit:
+            selected_count += min(
+                interval_size,
+                column_limit - selected_count,
+            )
+    return selected_count, columns_total
+
+
 def _selected_fingerprint_columns(blocks, column_limit):
     column_limit = (
         None
@@ -7504,12 +7525,6 @@ def build_cross_sheet_summary(
     try:
         if blocks is None:
             blocks = find_numeric_blocks(source)
-        selected_columns, columns_total = (
-            _selected_fingerprint_columns(
-                blocks,
-                column_limit,
-            )
-        )
         if reservation is not None:
             available = budget.available_metadata()
             for dimension in (
@@ -7523,10 +7538,6 @@ def build_cross_sheet_summary(
                     raise AssertionError(
                         f"{dimension} reservation diverged"
                     )
-            if not reservation.reserve_fingerprint_candidates(
-                len(selected_columns)
-            ):
-                return None, []
 
         grid, grid_meta = _grid_from_rows(
             source,
@@ -7577,6 +7588,31 @@ def build_cross_sheet_summary(
                 ),
             ):
                 return None, []
+            candidate_count, columns_total = (
+                _fingerprint_column_counts(
+                    blocks,
+                    column_limit,
+                )
+            )
+            if not reservation.reserve_fingerprint_candidates(
+                candidate_count
+            ):
+                return None, []
+        selected_columns, selected_columns_total = (
+            _selected_fingerprint_columns(
+                blocks,
+                column_limit,
+            )
+        )
+        if reservation is None:
+            columns_total = selected_columns_total
+        elif (
+            len(selected_columns) != candidate_count
+            or selected_columns_total != columns_total
+        ):
+            raise AssertionError(
+                "fingerprint candidate count changed after admission"
+            )
         (
             columns,
             column_limitations,

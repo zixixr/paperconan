@@ -58,6 +58,16 @@ WHEEL_DIST_INFO_MEMBERS = {
     "top_level.txt",
     "RECORD",
 }
+GENERATED_METADATA_MAX_BYTES = 1024 * 1024
+SDIST_GENERATED_METADATA_MAX_BYTES = {
+    name: GENERATED_METADATA_MAX_BYTES
+    for name in SDIST_GENERATED_METADATA
+}
+WHEEL_GENERATED_METADATA_MAX_BYTES = {
+    name: GENERATED_METADATA_MAX_BYTES
+    for name in WHEEL_DIST_INFO_MEMBERS
+    if name != "licenses/LICENSE"
+}
 
 
 def _copied_source_build_command(dist):
@@ -414,7 +424,7 @@ def _read_expected_payload(stream, expected_size):
 
 
 def _sdist_payloads(
-    path, expected_payloads, generated_metadata=()
+    path, expected_payloads, generated_metadata_limits=None
 ):
     if hasattr(expected_payloads, "items"):
         expected_payloads = dict(expected_payloads)
@@ -422,8 +432,16 @@ def _sdist_payloads(
         expected_payloads = {
             name: None for name in expected_payloads
         }
-    generated_metadata = set(generated_metadata)
-    expected_files = set(expected_payloads) | generated_metadata
+    generated_metadata_limits = {
+        name: max(0, int(limit))
+        for name, limit in (
+            generated_metadata_limits or {}
+        ).items()
+    }
+    expected_files = (
+        set(expected_payloads)
+        | set(generated_metadata_limits)
+    )
     expected_root = f"paperconan-{__version__}"
     allowed_directories = _archive_parent_directories(expected_files)
     seen = set()
@@ -456,9 +474,11 @@ def _sdist_payloads(
         for relative, member in file_members.items():
             expected = expected_payloads.get(relative)
             if expected is None:
-                if relative in generated_metadata:
-                    payloads[relative] = None
-                    continue
+                limit = generated_metadata_limits.get(
+                    relative,
+                    GENERATED_METADATA_MAX_BYTES,
+                )
+                assert member.size <= limit, member.name
                 expected_size = member.size
             else:
                 expected_size = len(expected)
@@ -475,12 +495,18 @@ def _sdist_payloads(
     return payloads
 
 
-def _wheel_payloads(path, expected_payloads=None):
+def _wheel_payloads(
+    path, expected_payloads=None, payload_limits=None
+):
     expected_payloads = (
         None
         if expected_payloads is None
         else dict(expected_payloads)
     )
+    payload_limits = {
+        name: max(0, int(limit))
+        for name, limit in (payload_limits or {}).items()
+    }
     seen = set()
     payloads = {}
     file_members = {}
@@ -504,11 +530,18 @@ def _wheel_payloads(path, expected_payloads=None):
                 else expected_payloads[normalized]
             )
             expected_size = (
-                member.file_size
-                if expected is None
-                else len(expected)
+                len(expected)
+                if expected is not None
+                else member.file_size
             )
-            if expected is not None:
+            if expected is None:
+                limit = payload_limits.get(normalized)
+                if expected_payloads is not None:
+                    assert limit is not None, normalized
+                else:
+                    limit = GENERATED_METADATA_MAX_BYTES
+                assert member.file_size <= limit, normalized
+            else:
                 assert member.file_size == expected_size, normalized
             with archive.open(member) as stream:
                 payload = _read_expected_payload(
@@ -577,7 +610,9 @@ def _assert_built_release_archives(dist=ROOT / "dist"):
     sdist_payloads = _sdist_payloads(
         sdists[0],
         expected_sdist_payloads,
-        generated_metadata=SDIST_GENERATED_METADATA,
+        generated_metadata_limits=(
+            SDIST_GENERATED_METADATA_MAX_BYTES
+        ),
     )
     assert set(sdist_payloads) == (
         expected_sdist | SDIST_GENERATED_METADATA
@@ -604,8 +639,16 @@ def _assert_built_release_archives(dist=ROOT / "dist"):
         },
         license_name: (ROOT / "LICENSE").read_bytes(),
     }
+    wheel_metadata_limits = {
+        f"{dist_info_root}/{relative}": limit
+        for relative, limit in (
+            WHEEL_GENERATED_METADATA_MAX_BYTES.items()
+        )
+    }
     wheel_payloads = _wheel_payloads(
-        wheels[0], wheel_expected_payloads
+        wheels[0],
+        wheel_expected_payloads,
+        payload_limits=wheel_metadata_limits,
     )
     package_payloads = {
         name: payload
@@ -1814,8 +1857,10 @@ def _write_test_release_archives(dist, *, mutation=None):
         "wheel-license-bytes",
         "sdist-missing-member",
         "sdist-extra-member",
+        "sdist-generated-metadata-oversize",
         "wheel-missing-member",
         "wheel-extra-member",
+        "wheel-generated-metadata-oversize",
         "record-missing-self",
         "record-self-hash",
         "record-self-size",
@@ -1840,6 +1885,10 @@ def _write_test_release_archives(dist, *, mutation=None):
         del sdist_payloads["README.md"]
     elif mutation == "sdist-extra-member":
         sdist_payloads["unexpected.txt"] = b"extra\n"
+    elif mutation == "sdist-generated-metadata-oversize":
+        sdist_payloads["PKG-INFO"] = (
+            b"x" * (GENERATED_METADATA_MAX_BYTES + 1)
+        )
 
     root = f"paperconan-{__version__}"
     sdist = dist / f"{root}.tar.gz"
@@ -1882,6 +1931,10 @@ def _write_test_release_archives(dist, *, mutation=None):
         wheel_payloads[
             f"{dist_info_root}/unexpected.json"
         ] = b"{}\n"
+    elif mutation == "wheel-generated-metadata-oversize":
+        wheel_payloads[f"{dist_info_root}/METADATA"] = (
+            b"x" * (GENERATED_METADATA_MAX_BYTES + 1)
+        )
 
     record_name = f"{dist_info_root}/RECORD"
     record_rows = [
@@ -2026,9 +2079,9 @@ def test_release_verifier_rejects_members_before_payload_read(
             tarfile.TarFile, "extractfile", guarded_extractfile
         )
     else:
-        real_read = zipfile.ZipFile.read
+        real_open = zipfile.ZipFile.open
 
-        def guarded_read(archive, member, *args, **kwargs):
+        def guarded_open(archive, member, *args, **kwargs):
             name = (
                 member.filename
                 if isinstance(member, zipfile.ZipInfo)
@@ -2036,12 +2089,131 @@ def test_release_verifier_rejects_members_before_payload_read(
             )
             if name.endswith(guarded_member):
                 raise UnexpectedPayloadRead(name)
-            return real_read(archive, member, *args, **kwargs)
+            return real_open(archive, member, *args, **kwargs)
 
-        monkeypatch.setattr(zipfile.ZipFile, "read", guarded_read)
+        monkeypatch.setattr(zipfile.ZipFile, "open", guarded_open)
 
     with pytest.raises(AssertionError):
         _assert_built_release_archives(dist)
+
+
+@pytest.mark.parametrize(
+    ("archive_kind", "mutation", "guarded_member"),
+    [
+        (
+            "sdist",
+            "sdist-generated-metadata-oversize",
+            "PKG-INFO",
+        ),
+        (
+            "wheel",
+            "wheel-generated-metadata-oversize",
+            ".dist-info/METADATA",
+        ),
+    ],
+)
+def test_release_verifier_rejects_oversized_generated_metadata_before_read(
+    tmp_path, monkeypatch, archive_kind, mutation, guarded_member
+):
+    class UnexpectedPayloadRead(BaseException):
+        pass
+
+    dist = tmp_path / "dist"
+    _write_test_release_archives(dist, mutation=mutation)
+
+    if archive_kind == "sdist":
+        real_extractfile = tarfile.TarFile.extractfile
+
+        def guarded_extractfile(archive, member):
+            if member.name.endswith(guarded_member):
+                raise UnexpectedPayloadRead(member.name)
+            return real_extractfile(archive, member)
+
+        monkeypatch.setattr(
+            tarfile.TarFile, "extractfile", guarded_extractfile
+        )
+    else:
+        real_open = zipfile.ZipFile.open
+
+        def guarded_open(archive, member, *args, **kwargs):
+            name = (
+                member.filename
+                if isinstance(member, zipfile.ZipInfo)
+                else member
+            )
+            if name.endswith(guarded_member):
+                raise UnexpectedPayloadRead(name)
+            return real_open(archive, member, *args, **kwargs)
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", guarded_open)
+
+    with pytest.raises(AssertionError):
+        _assert_built_release_archives(dist)
+
+
+@pytest.mark.parametrize(
+    ("archive_kind", "guarded_member"),
+    [
+        ("sdist", "PKG-INFO"),
+        ("wheel", ".dist-info/METADATA"),
+    ],
+)
+def test_release_verifier_bounds_accepted_generated_metadata_reads(
+    tmp_path, monkeypatch, archive_kind, guarded_member
+):
+    dist = tmp_path / "dist"
+    _write_test_release_archives(dist)
+    read_sizes = []
+
+    class GuardedStream:
+        def __init__(self, stream):
+            self._stream = stream
+
+        def read(self, size=-1):
+            read_sizes.append(size)
+            assert 0 <= size <= GENERATED_METADATA_MAX_BYTES + 1
+            return self._stream.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self._stream.close()
+
+        def __getattr__(self, name):
+            return getattr(self._stream, name)
+
+    if archive_kind == "sdist":
+        real_extractfile = tarfile.TarFile.extractfile
+
+        def guarded_extractfile(archive, member):
+            stream = real_extractfile(archive, member)
+            if member.name.endswith(guarded_member):
+                return GuardedStream(stream)
+            return stream
+
+        monkeypatch.setattr(
+            tarfile.TarFile, "extractfile", guarded_extractfile
+        )
+    else:
+        real_open = zipfile.ZipFile.open
+
+        def guarded_open(archive, member, *args, **kwargs):
+            stream = real_open(archive, member, *args, **kwargs)
+            name = (
+                member.filename
+                if isinstance(member, zipfile.ZipInfo)
+                else member
+            )
+            if name.endswith(guarded_member):
+                return GuardedStream(stream)
+            return stream
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", guarded_open)
+
+    _assert_built_release_archives(dist)
+
+    assert read_sizes
 
 
 def test_sdist_expected_payload_read_is_bounded(
