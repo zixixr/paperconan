@@ -53,7 +53,7 @@ class StateBudget:
         self.live_units -= lease.units
 
 
-@dataclass
+@dataclass(frozen=True)
 class StateLease:
     _budget: StateBudget
     name: str
@@ -75,7 +75,7 @@ class StateLease:
         if self._released:
             raise AssertionError(f"state lease already released: {self.name}")
         self._budget._release(self)
-        self._released = True
+        object.__setattr__(self, "_released", True)
 
     def __enter__(self) -> StateLease:
         return self
@@ -107,8 +107,12 @@ class BoundedFindingCollector:
         }
         self.cap = None if cap is None else max(0, int(cap))
         self.severity_rank = dict(severity_rank)
+        self._unknown_rank = max(
+            self.severity_rank.values(), default=-1
+        ) + 1
         self.offered = 0
         self.evicted = 0
+        self._building_depth = 0
         self._group_sequences = {
             name: 0 for name in self.group_names
         }
@@ -136,10 +140,15 @@ class BoundedFindingCollector:
         group_order = self.group_order[group]
         group_sequence = self._group_sequences[group]
         self._group_sequences[group] += 1
-        rank = self.severity_rank.get(str(severity).lower(), 3)
+        rank = self.severity_rank.get(
+            str(severity).lower(), self._unknown_rank
+        )
         if self.cap == 0:
             return False
+        if self.cap is not None and self._building_depth:
+            return False
 
+        replacement_token = None
         if self.cap is not None and len(self._entries) >= self.cap:
             worst_rank = -self._worst_heap[0][0]
             worst_group = -self._worst_heap[0][1]
@@ -154,15 +163,25 @@ class BoundedFindingCollector:
                 worst_sequence,
             ):
                 return False
+            replacement_token = self._worst_heap[0][3]
+
+        self._building_depth += 1
+        try:
+            payload = builder()
+        finally:
+            self._building_depth -= 1
+
+        if replacement_token is not None:
             _neg_rank, _neg_group, _neg_sequence, token = heapq.heappop(
                 self._worst_heap
             )
+            if token != replacement_token:
+                raise AssertionError("finding replacement state changed")
             del self._entries[token]
             self.evicted += 1
 
         token = self._next_token
         self._next_token += 1
-        payload = builder()
         self._entries[token] = _FindingEntry(
             group=group,
             group_order=group_order,

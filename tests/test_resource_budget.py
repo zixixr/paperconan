@@ -54,6 +54,25 @@ def test_state_budget_rejects_duplicate_live_name():
     lease.release()
 
 
+def test_state_lease_accounting_identity_is_immutable():
+    budget = StateBudget(4)
+    lease = budget.try_reserve("array", 2)
+    assert lease is not None
+
+    for attribute, value in (
+        ("_budget", StateBudget(10)),
+        ("name", "other"),
+        ("units", 4),
+    ):
+        with pytest.raises(AttributeError):
+            setattr(lease, attribute, value)
+
+    assert budget.live_units == 2
+    assert budget.live_names == frozenset({"array"})
+    lease.release()
+    assert budget.live_units == 0
+
+
 RANK = {"high": 0, "medium": 1, "low": 2}
 
 
@@ -131,3 +150,93 @@ def test_bounded_collector_unlimited_and_zero_cap_semantics():
     assert zero.materialize() == {"relations": []}
     assert zero.omitted == 4
     assert zero_calls == []
+
+
+def test_bounded_collector_reentrant_builder_never_exceeds_cap():
+    collector = BoundedFindingCollector(
+        ("relations",), cap=1, severity_rank=RANK
+    )
+    assert collector.offer(
+        "relations",
+        "low",
+        lambda: {"id": "seed", "severity": "low"},
+    )
+    observed_retained = []
+    nested_results = []
+
+    def build_replacement():
+        observed_retained.append(collector.retained)
+        nested_results.append(
+            collector.offer(
+                "relations",
+                "high",
+                lambda: {"id": "nested", "severity": "high"},
+            )
+        )
+        observed_retained.append(collector.retained)
+        return {"id": "replacement", "severity": "high"}
+
+    assert collector.offer("relations", "high", build_replacement)
+
+    assert nested_results == [False]
+    assert observed_retained == [1, 1]
+    assert collector.retained == 1
+    assert collector.materialize() == {
+        "relations": [{"id": "replacement", "severity": "high"}],
+    }
+
+
+def test_bounded_collector_replacement_is_transactional_if_builder_raises():
+    collector = BoundedFindingCollector(
+        ("relations",), cap=1, severity_rank=RANK
+    )
+    assert collector.offer(
+        "relations",
+        "low",
+        lambda: {"id": "seed", "severity": "low"},
+    )
+
+    def fail_build():
+        raise RuntimeError("build failed")
+
+    with pytest.raises(RuntimeError, match="build failed"):
+        collector.offer("relations", "high", fail_build)
+
+    assert collector.retained == 1
+    assert collector.evicted == 0
+    assert collector.materialize() == {
+        "relations": [{"id": "seed", "severity": "low"}],
+    }
+    assert collector.offer(
+        "relations",
+        "medium",
+        lambda: {"id": "next", "severity": "medium"},
+    )
+    assert collector.evicted == 1
+    assert collector.materialize() == {
+        "relations": [{"id": "next", "severity": "medium"}],
+    }
+
+
+def test_bounded_collector_unknown_severity_is_worse_than_configured_ranks():
+    calls = []
+    collector = BoundedFindingCollector(
+        ("relations",),
+        cap=1,
+        severity_rank={"high": 10, "low": 20},
+    )
+    assert collector.offer(
+        "relations",
+        "low",
+        lambda: {"id": "known", "severity": "low"},
+    )
+
+    assert not collector.offer(
+        "relations",
+        "unknown",
+        _builder(calls, id="unknown", severity="unknown"),
+    )
+    assert calls == []
+    assert collector.materialize() == {
+        "relations": [{"id": "known", "severity": "low"}],
+    }
