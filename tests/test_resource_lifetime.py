@@ -11,6 +11,7 @@ import paperconan._extract as extract
 import pytest
 from paperconan._coverage import ScanCoverage
 from paperconan._input import TableLoadResult
+from paperconan._resources import BoundedFindingCollector
 from paperconan._sheet import Sheet
 from paperconan._sheet import SheetBuilder
 from paperconan._summaries import RecurringRowIndex
@@ -1491,6 +1492,88 @@ def test_relation_branch_inventory_reserves_every_declared_state(
 
 
 @pytest.mark.parametrize(
+    "rows,live_name,reservation_name",
+    [
+        (
+            [
+                [1.125, 9.0],
+                [2.25, 1.2],
+                [3.375, 8.1],
+                [4.5, 4.7],
+                [5.625, 12.2],
+                [6.75, 2.5],
+            ],
+            "ratio",
+            "relation_close_workspace",
+        ),
+        (
+            [
+                [value, 7.25]
+                for value in (
+                    1.125,
+                    2.25,
+                    3.375,
+                    4.5,
+                    5.625,
+                    6.75,
+                )
+            ],
+            "fitted",
+            "fitted_relation_workspace",
+        ),
+    ],
+    ids=["unstable-ratio", "constant-response"],
+)
+def test_relation_ineligible_comparisons_short_circuit_before_reservation(
+    rows, live_name, reservation_name, monkeypatch
+):
+    sheet = Sheet.from_rows([["left", "right"], *rows])
+    resources = audit._DenseFamilyResources(
+        family="relations",
+        max_rows=100,
+        work_limit=100_000,
+        state_limit=100_000,
+    )
+    comparison_states = []
+    reservation_states = []
+    original_relation_close = audit.relation_close
+    original_reserve = audit._DenseCandidate.reserve
+
+    def tracked_relation_close(*args, **kwargs):
+        live_names = resources.state.live_names
+        if live_name in live_names:
+            comparison_states.append(live_names)
+        return original_relation_close(*args, **kwargs)
+
+    def tracked_reserve(self, name, units):
+        live_names = resources.state.live_names
+        if name == reservation_name and live_name in live_names:
+            reservation_states.append(live_names)
+        return original_reserve(self, name, units)
+
+    monkeypatch.setattr(
+        audit, "relation_close", tracked_relation_close
+    )
+    monkeypatch.setattr(
+        audit._DenseCandidate, "reserve", tracked_reserve
+    )
+
+    audit.detect_relations(
+        sheet,
+        1,
+        sheet.nrows,
+        0,
+        2,
+        ["left", "right"],
+        _resources=resources,
+    )
+
+    assert comparison_states == []
+    assert reservation_states == []
+    assert resources.state.live_units == 0
+
+
+@pytest.mark.parametrize(
     "rows,expected_kinds",
     [
         (
@@ -2592,6 +2675,119 @@ def test_dense_candidate_finalizer_commits_or_discards_atomically():
     assert result.candidates_examined == 0
     assert result.candidates_skipped == 1
     assert rejected.state.live_units == 0
+
+
+def test_dense_candidate_builder_failure_rolls_back_shared_sink_atomically():
+    collector = BoundedFindingCollector(
+        ("relations",),
+        cap=4,
+        severity_rank={"high": 0, "low": 1},
+    )
+    local, emit = audit._finding_emitter(
+        "relations", collector
+    )
+    resources = audit._DenseFamilyResources(
+        family="probe",
+        max_rows=10,
+        work_limit=10,
+        state_limit=1,
+    )
+    assert resources.begin(
+        row_count=1,
+        candidates_total=1,
+        minimum_candidate_work=1,
+        state_required=1,
+    )
+    candidate = resources.start_candidate(1, emit)
+    assert candidate is not None
+    built = []
+
+    def build(identifier, *, fail=False):
+        def builder():
+            built.append(identifier)
+            if fail:
+                raise RuntimeError("candidate builder failed")
+            return {"id": identifier, "severity": "high"}
+
+        return builder
+
+    with pytest.raises(
+        RuntimeError, match="candidate builder failed"
+    ):
+        with candidate:
+            candidate.reserve("held", 1)
+            candidate.offer("high", build("first"))
+            candidate.offer(
+                "high", build("second", fail=True)
+            )
+
+    result = resources.result()
+    assert built == ["first", "second"]
+    assert local == []
+    assert collector.materialize() == {"relations": []}
+    assert collector.offered == 0
+    assert collector.retained == 0
+    assert collector.evicted == 0
+    assert collector.omitted == 0
+    assert candidate.closed is True
+    assert result.candidates_examined == 0
+    assert result.candidates_skipped == 1
+    assert resources.state.live_units == 0
+
+
+def test_dense_candidate_atomic_commit_preserves_shared_cap_laziness():
+    collector = BoundedFindingCollector(
+        ("relations",),
+        cap=1,
+        severity_rank={"high": 0, "low": 1},
+    )
+    assert collector.offer(
+        "relations",
+        "low",
+        lambda: {"id": "seed", "severity": "low"},
+    )
+    _local, emit = audit._finding_emitter(
+        "relations", collector
+    )
+    resources = audit._DenseFamilyResources(
+        family="probe",
+        max_rows=10,
+        work_limit=10,
+        state_limit=0,
+    )
+    assert resources.begin(
+        row_count=1,
+        candidates_total=1,
+        minimum_candidate_work=1,
+        state_required=0,
+    )
+    candidate = resources.start_candidate(1, emit)
+    assert candidate is not None
+    built = []
+
+    def kept_builder():
+        built.append("kept")
+        return {"id": "kept", "severity": "high"}
+
+    with candidate:
+        candidate.offer("high", kept_builder)
+        candidate.offer(
+            "low",
+            lambda: pytest.fail(
+                "shared-cap rejection built a payload"
+            ),
+        )
+
+    assert built == ["kept"]
+    assert collector.materialize() == {
+        "relations": [{"id": "kept", "severity": "high"}],
+    }
+    assert collector.offered == 3
+    assert collector.retained == 1
+    assert collector.evicted == 1
+    assert collector.omitted == 2
+    assert resources.result().candidates_examined == 1
+    assert resources.state.live_units == 0
 
 
 def test_very_wide_column_fingerprints_touch_only_fixed_budget(

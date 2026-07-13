@@ -1313,6 +1313,25 @@ def _finding_emitter(group, sink):
             return True
         return sink.offer(group, severity, builder)
 
+    def commit_candidate(items):
+        items = tuple(items)
+        if sink is None:
+            payloads = [
+                builder()
+                for _severity, builder in items
+            ]
+            local.extend(payloads)
+            return tuple(True for _item in items)
+        return sink.offer_batch(
+            (
+                group,
+                severity,
+                builder,
+            )
+            for severity, builder in items
+        )
+
+    emit.commit_candidate = commit_candidate
     return local, emit
 
 
@@ -1514,8 +1533,22 @@ class _CandidateFindingBuffer:
         self._items.append((severity, builder))
 
     def commit(self, emit):
-        for severity, builder in self._items:
-            emit(severity, builder)
+        items = tuple(self._items)
+        commit_candidate = getattr(
+            emit, "commit_candidate", None
+        )
+        if commit_candidate is not None:
+            commit_candidate(items)
+        else:
+            payloads = [
+                (severity, builder())
+                for severity, builder in items
+            ]
+            for severity, payload in payloads:
+                emit(
+                    severity,
+                    lambda payload=payload: payload,
+                )
         self._items.clear()
 
     def discard(self):
@@ -1631,7 +1664,11 @@ class _DenseCandidate:
         resource_rejection = exc_type is _DenseCandidateRejected
         try:
             if exc_type is None and not self._rejected:
-                self.findings.commit(self.emit)
+                try:
+                    self.findings.commit(self.emit)
+                except BaseException:
+                    self.findings.discard()
+                    raise
                 self._resources._complete_candidate()
             else:
                 self.findings.discard()
@@ -1930,43 +1967,45 @@ def detect_relations(
                     )
                     stable_ratio = np.std(ratio) < ratio_tol
                     candidate.release(ratio_stats_workspace)
-                    ratio_close_workspace = candidate.reserve(
-                        "relation_close_workspace",
-                        12 * n,
-                    )
-                    closes = bool(
-                        relation_close(y, mean_ratio * x).all()
-                    )
-                    candidate.release(ratio_close_workspace)
                     if (
                         stable_ratio
                         and abs(mean_ratio - 1) > 1e-9
                         and abs(mean_ratio) > 1e-9
-                        and closes
                     ):
-                        candidate.offer(
-                            "high",
-                            lambda ci=ci, cj=cj, n=n,
-                            mean_ratio=mean_ratio,
-                            x_sample=x_sample,
-                            y_sample=y_sample: dict(
-                                kind="constant_ratio",
-                                col_a=header[ci - c0],
-                                col_b=header[cj - c0],
-                                col_a_idx=ci,
-                                col_b_idx=cj,
-                                n=n,
-                                ratio=mean_ratio,
-                                severity="high",
-                                col_a_sample=list(x_sample),
-                                col_b_sample=list(y_sample),
-                                rule=(
-                                    f"col[{cj}] = col[{ci}] * "
-                                    f"{mean_ratio:.6g}"
-                                ),
-                            ),
+                        ratio_close_workspace = candidate.reserve(
+                            "relation_close_workspace",
+                            12 * n,
                         )
-                        ratio_emitted = True
+                        closes = bool(
+                            relation_close(
+                                y, mean_ratio * x
+                            ).all()
+                        )
+                        candidate.release(ratio_close_workspace)
+                        if closes:
+                            candidate.offer(
+                                "high",
+                                lambda ci=ci, cj=cj, n=n,
+                                mean_ratio=mean_ratio,
+                                x_sample=x_sample,
+                                y_sample=y_sample: dict(
+                                    kind="constant_ratio",
+                                    col_a=header[ci - c0],
+                                    col_b=header[cj - c0],
+                                    col_a_idx=ci,
+                                    col_b_idx=cj,
+                                    n=n,
+                                    ratio=mean_ratio,
+                                    severity="high",
+                                    col_a_sample=list(x_sample),
+                                    col_b_sample=list(y_sample),
+                                    rule=(
+                                        f"col[{cj}] = col[{ci}] * "
+                                        f"{mean_ratio:.6g}"
+                                    ),
+                                ),
+                            )
+                            ratio_emitted = True
                     del ratio
                     candidate.release(ratio_lease)
 
@@ -2062,67 +2101,74 @@ def detect_relations(
                         candidate.release(
                             fitted_build_workspace
                         )
-                        fitted_relation_workspace = (
-                            candidate.reserve(
-                                "fitted_relation_workspace",
-                                12 * n,
-                            )
-                        )
-                        fitted_close = bool(
-                            relation_close(
-                                y, fitted, rtol=1e-7
-                            ).all()
-                        )
-                        candidate.release(
-                            fitted_relation_workspace
-                        )
-                        del fitted
-                        candidate.release(fitted_lease)
                         if (
                             y_has_variation
-                            and fitted_close
-                            and abs(r) > 0.99
                         ):
-                            intercept_is_zero = (
-                                abs(intercept) < tol
-                            )
-                            is_identity = (
-                                abs(slope - 1) < 1e-9
-                                and intercept_is_zero
-                            )
-                            redundant_scaling = (
-                                intercept_is_zero
-                                and ratio_emitted
-                            )
-                            if not (
-                                is_identity or redundant_scaling
-                            ):
-                                candidate.offer(
-                                    "high",
-                                    lambda ci=ci, cj=cj, n=n,
-                                    slope=slope,
-                                    intercept=intercept,
-                                    x_sample=x_sample,
-                                    y_sample=y_sample: dict(
-                                        kind="exact_linear",
-                                        col_a=header[ci - c0],
-                                        col_b=header[cj - c0],
-                                        col_a_idx=ci,
-                                        col_b_idx=cj,
-                                        n=n,
-                                        slope=float(slope),
-                                        intercept=float(intercept),
-                                        severity="high",
-                                        col_a_sample=list(x_sample),
-                                        col_b_sample=list(y_sample),
-                                        rule=(
-                                            f"col[{cj}] = "
-                                            f"{slope:.4g} * "
-                                            f"col[{ci}] + "
-                                            f"{intercept:.4g}"
-                                        ),
-                                    ),
+                            fitted_relation_workspace = (
+                                candidate.reserve(
+                                    "fitted_relation_workspace",
+                                    12 * n,
                                 )
+                            )
+                            fitted_close = bool(
+                                relation_close(
+                                    y, fitted, rtol=1e-7
+                                ).all()
+                            )
+                            candidate.release(
+                                fitted_relation_workspace
+                            )
+                            if (
+                                fitted_close
+                                and abs(r) > 0.99
+                            ):
+                                intercept_is_zero = (
+                                    abs(intercept) < tol
+                                )
+                                is_identity = (
+                                    abs(slope - 1) < 1e-9
+                                    and intercept_is_zero
+                                )
+                                redundant_scaling = (
+                                    intercept_is_zero
+                                    and ratio_emitted
+                                )
+                                if not (
+                                    is_identity
+                                    or redundant_scaling
+                                ):
+                                    candidate.offer(
+                                        "high",
+                                        lambda ci=ci, cj=cj, n=n,
+                                        slope=slope,
+                                        intercept=intercept,
+                                        x_sample=x_sample,
+                                        y_sample=y_sample: dict(
+                                            kind="exact_linear",
+                                            col_a=header[ci - c0],
+                                            col_b=header[cj - c0],
+                                            col_a_idx=ci,
+                                            col_b_idx=cj,
+                                            n=n,
+                                            slope=float(slope),
+                                            intercept=float(intercept),
+                                            severity="high",
+                                            col_a_sample=list(
+                                                x_sample
+                                            ),
+                                            col_b_sample=list(
+                                                y_sample
+                                            ),
+                                            rule=(
+                                                f"col[{cj}] = "
+                                                f"{slope:.4g} * "
+                                                f"col[{ci}] + "
+                                                f"{intercept:.4g}"
+                                            ),
+                                        ),
+                                    )
+                        del fitted
+                        candidate.release(fitted_lease)
 
                 if n >= 24:
                     best_len = cur_len = 1

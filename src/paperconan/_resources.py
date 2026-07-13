@@ -195,6 +195,44 @@ class BoundedFindingCollector:
         )
         return True
 
+    def offer_batch(
+        self,
+        items: Iterable[
+            tuple[
+                str,
+                str,
+                Callable[[], dict[str, Any]],
+            ]
+        ],
+    ) -> tuple[bool, ...]:
+        snapshot = (
+            self.offered,
+            self.evicted,
+            self._building_depth,
+            dict(self._group_sequences),
+            self._next_token,
+            dict(self._entries),
+            list(self._worst_heap),
+        )
+        results = []
+        try:
+            for group, severity, builder in items:
+                results.append(
+                    self.offer(group, severity, builder)
+                )
+        except BaseException:
+            (
+                self.offered,
+                self.evicted,
+                self._building_depth,
+                self._group_sequences,
+                self._next_token,
+                self._entries,
+                self._worst_heap,
+            ) = snapshot
+            raise
+        return tuple(results)
+
     def materialize(self) -> dict[str, list[dict[str, Any]]]:
         groups = {name: [] for name in self.group_names}
         for entry in sorted(
