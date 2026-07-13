@@ -1211,6 +1211,91 @@ def test_axis_compact_finalization_matches_concrete_processing(
     assert coverage["axis_work_skipped_is_lower_bound"] is False
 
 
+def test_axis_fingerprint_hash_collision_uses_exact_payloads(
+    monkeypatch,
+):
+    class ConstantHash:
+        def digest(self):
+            return b"x" * 32
+
+    recurring_values = (
+        1.125,
+        4.875,
+        2.250,
+        7.625,
+        1.125,
+        4.875,
+    )
+    distinct_values = (
+        3.375,
+        8.125,
+        5.625,
+        11.875,
+        3.375,
+        8.125,
+    )
+    grids = {
+        (f"recurring-{index}.csv", f"Figure {index}"): {
+            (row, 0): value
+            for row, value in enumerate(recurring_values)
+        }
+        for index in range(3)
+    }
+    distinct_key = ("distinct.csv", "Figure 4")
+    grids[distinct_key] = {
+        (row, 0): value
+        for row, value in enumerate(distinct_values)
+    }
+    monkeypatch.setattr(
+        audit.hashlib,
+        "sha256",
+        lambda _payload: ConstantHash(),
+    )
+
+    axis = audit._axis_columns(grids)
+
+    assert axis == {
+        key: ({0} if key != distinct_key else set())
+        for key in grids
+    }
+
+
+def test_axis_unexpected_exception_releases_all_state(
+    monkeypatch,
+):
+    states = []
+    original_try_reserve = audit.StateBudget.try_reserve
+
+    def tracked_reserve(state, name, units):
+        if state not in states:
+            states.append(state)
+        return original_try_reserve(state, name, units)
+
+    def fail_payload_comparison(*_args, **_kwargs):
+        raise RuntimeError("injected axis payload comparison failure")
+
+    monkeypatch.setattr(
+        audit.StateBudget,
+        "try_reserve",
+        tracked_reserve,
+    )
+    monkeypatch.setattr(
+        audit,
+        "_axis_payload_equal",
+        fail_payload_comparison,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="injected axis payload comparison failure",
+    ):
+        audit._axis_columns(_axis_finalization_grids())
+
+    assert states
+    assert all(state.live_units == 0 for state in states)
+    assert all(not state.live_names for state in states)
+
+
 def test_axis_comparison_budget_stops_before_uncharged_compare(
     monkeypatch
 ):
