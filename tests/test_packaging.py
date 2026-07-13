@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import ast
+import base64
 from collections import Counter
+import csv
+import hashlib
+import io
 import json
 from pathlib import Path, PurePosixPath
 import posixpath
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tarfile
+import warnings
+import zipfile
 
 try:
     import tomllib
@@ -42,6 +49,14 @@ SDIST_GENERATED_METADATA = {
     "PKG-INFO",
     "setup.cfg",
     "src/paperconan.egg-info/SOURCES.txt",
+}
+WHEEL_DIST_INFO_MEMBERS = {
+    "METADATA",
+    "WHEEL",
+    "entry_points.txt",
+    "licenses/LICENSE",
+    "top_level.txt",
+    "RECORD",
 }
 
 
@@ -363,6 +378,174 @@ def _sdist_allowlist(root=ROOT):
         ).splitlines()
         if line.startswith("include ")
     }
+
+
+def _validated_archive_member(name, seen):
+    assert name
+    assert "\\" not in name
+    normalized = name[:-1] if name.endswith("/") else name
+    assert normalized
+    path = PurePosixPath(normalized)
+    assert not path.is_absolute()
+    assert path.as_posix() == normalized
+    assert all(part not in {"", ".", ".."} for part in path.parts)
+    assert normalized not in seen, (
+        f"duplicate archive member: {normalized}"
+    )
+    seen.add(normalized)
+    return path.parts
+
+
+def _archive_parent_directories(paths):
+    directories = set()
+    for name in paths:
+        parts = PurePosixPath(name).parts
+        for stop in range(1, len(parts)):
+            directories.add(
+                PurePosixPath(*parts[:stop]).as_posix()
+            )
+    return directories
+
+
+def _sdist_payloads(path, expected_files):
+    expected_root = f"paperconan-{__version__}"
+    allowed_directories = _archive_parent_directories(expected_files)
+    seen = set()
+    roots = set()
+    payloads = {}
+    root_directory_seen = False
+
+    with tarfile.open(path, "r:gz") as archive:
+        for member in archive.getmembers():
+            parts = _validated_archive_member(member.name, seen)
+            roots.add(parts[0])
+            assert member.isfile() or member.isdir(), member.name
+            if len(parts) == 1:
+                assert member.isdir(), member.name
+                root_directory_seen = True
+                continue
+            assert parts[0] == expected_root, member.name
+            relative = PurePosixPath(*parts[1:]).as_posix()
+            if member.isdir():
+                assert relative in allowed_directories, member.name
+                continue
+            assert relative not in payloads
+            stream = archive.extractfile(member)
+            assert stream is not None
+            payloads[relative] = stream.read()
+
+    assert root_directory_seen
+    assert roots == {expected_root}
+    return payloads
+
+
+def _wheel_payloads(path):
+    seen = set()
+    payloads = {}
+    with zipfile.ZipFile(path) as archive:
+        for member in archive.infolist():
+            parts = _validated_archive_member(
+                member.filename,
+                seen,
+            )
+            assert not member.is_dir(), member.filename
+            mode = member.external_attr >> 16
+            assert mode == 0 or stat.S_ISREG(mode), member.filename
+            normalized = PurePosixPath(*parts).as_posix()
+            payloads[normalized] = archive.read(member)
+    return payloads
+
+
+def _record_hash(payload):
+    digest = hashlib.sha256(payload).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode(
+        "ascii"
+    )
+
+
+def _assert_wheel_record(payloads, record_name):
+    rows = csv.reader(
+        io.StringIO(
+            payloads[record_name].decode("utf-8"),
+            newline="",
+        )
+    )
+    records = {}
+    record_seen = set()
+    for row in rows:
+        assert len(row) == 3, row
+        name, digest, size = row
+        _validated_archive_member(name, record_seen)
+        records[name] = (digest, size)
+
+    assert set(records) == set(payloads)
+    for name, payload in payloads.items():
+        digest, size = records[name]
+        if name == record_name:
+            assert digest == ""
+            assert size == ""
+            continue
+        assert digest == f"sha256={_record_hash(payload)}"
+        assert size == str(len(payload))
+
+
+def _assert_exact_wheel_members(payloads, expected_wheel):
+    dist_info_root = f"paperconan-{__version__}.dist-info"
+    expected_metadata = {
+        f"{dist_info_root}/{relative}"
+        for relative in WHEEL_DIST_INFO_MEMBERS
+    }
+    assert set(payloads) == set(expected_wheel) | expected_metadata
+    return dist_info_root
+
+
+def _assert_built_release_archives(dist=ROOT / "dist"):
+    sdists = sorted(dist.glob("paperconan-*.tar.gz"))
+    wheels = sorted(dist.glob("paperconan-*.whl"))
+    assert len(sdists) == 1, sdists
+    assert len(wheels) == 1, wheels
+
+    expected_sdist = _sdist_allowlist()
+    expected_sdist_files = (
+        expected_sdist | SDIST_GENERATED_METADATA
+    )
+    sdist_payloads = _sdist_payloads(
+        sdists[0],
+        expected_sdist_files,
+    )
+    assert set(sdist_payloads) == expected_sdist_files
+    for relative in expected_sdist:
+        assert (
+            sdist_payloads[relative]
+            == (ROOT / relative).read_bytes()
+        )
+
+    expected_wheel = {
+        relative.removeprefix("src/"): (
+            ROOT / relative
+        ).read_bytes()
+        for relative in expected_sdist
+        if relative.startswith("src/paperconan/")
+    }
+    wheel_payloads = _wheel_payloads(wheels[0])
+    package_payloads = {
+        name: payload
+        for name, payload in wheel_payloads.items()
+        if name.startswith("paperconan/")
+    }
+    assert package_payloads == expected_wheel
+
+    dist_info_root = _assert_exact_wheel_members(
+        wheel_payloads,
+        expected_wheel,
+    )
+    license_name = f"{dist_info_root}/licenses/LICENSE"
+    assert (
+        wheel_payloads[license_name]
+        == (ROOT / "LICENSE").read_bytes()
+    )
+    record_name = f"{dist_info_root}/RECORD"
+    _assert_wheel_record(wheel_payloads, record_name)
 
 
 def _replace_sdist_job(old, new=""):
@@ -1379,3 +1562,160 @@ def test_sdist_contains_test_and_skill_closure(tmp_path):
     assert names == _sdist_allowlist() | SDIST_GENERATED_METADATA
 
     assert not {probe.relative_to(ROOT).as_posix() for probe in probes} & names
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "/absolute",
+        "../escape",
+        "root/../escape",
+        "./root/file",
+        "root//file",
+        r"root\file",
+    ],
+)
+def test_archive_member_validation_rejects_unsafe_paths(name):
+    with pytest.raises(AssertionError):
+        _validated_archive_member(name, set())
+
+
+def test_archive_member_validation_rejects_duplicates():
+    seen = set()
+    assert _validated_archive_member("root/file", seen) == (
+        "root",
+        "file",
+    )
+    with pytest.raises(AssertionError, match="duplicate"):
+        _validated_archive_member("root/file", seen)
+
+
+def _add_tar_directory(archive, name):
+    member = tarfile.TarInfo(name)
+    member.type = tarfile.DIRTYPE
+    archive.addfile(member)
+
+
+def _add_tar_file(archive, name, payload=b"x"):
+    member = tarfile.TarInfo(name)
+    member.size = len(payload)
+    archive.addfile(member, io.BytesIO(payload))
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    ["multiple-root", "link", "extra-directory"],
+)
+def test_sdist_reader_rejects_structural_extras(
+    tmp_path, malformation
+):
+    root = f"paperconan-{__version__}"
+    path = tmp_path / f"{malformation}.tar.gz"
+    with tarfile.open(path, "w:gz") as archive:
+        _add_tar_directory(archive, f"{root}/")
+        _add_tar_file(archive, f"{root}/README.md")
+        if malformation == "multiple-root":
+            _add_tar_directory(archive, "other/")
+        elif malformation == "link":
+            member = tarfile.TarInfo(f"{root}/link")
+            member.type = tarfile.SYMTYPE
+            member.linkname = "README.md"
+            archive.addfile(member)
+        else:
+            _add_tar_directory(archive, f"{root}/unexpected/")
+
+    with pytest.raises(AssertionError):
+        _sdist_payloads(path, {"README.md"})
+
+
+@pytest.mark.parametrize(
+    ("malformation", "expected_message"),
+    [
+        pytest.param(
+            "duplicate",
+            "duplicate archive member",
+            id="duplicate",
+        ),
+        pytest.param("directory", None, id="directory"),
+        pytest.param("link", None, id="link"),
+    ],
+)
+def test_wheel_reader_rejects_non_regular_or_duplicate_members(
+    tmp_path, malformation, expected_message
+):
+    path = tmp_path / f"{malformation}.whl"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(path, "w") as archive:
+            if malformation == "duplicate":
+                for payload in (b"first", b"second"):
+                    member = zipfile.ZipInfo("paperconan/module.py")
+                    member.create_system = 3
+                    member.external_attr = (
+                        stat.S_IFREG | 0o644
+                    ) << 16
+                    archive.writestr(member, payload)
+            elif malformation == "directory":
+                archive.writestr("paperconan/", b"")
+            else:
+                member = zipfile.ZipInfo("paperconan/link")
+                member.create_system = 3
+                member.external_attr = (
+                    stat.S_IFLNK | 0o777
+                ) << 16
+                archive.writestr(member, "target")
+
+    with pytest.raises(AssertionError, match=expected_message):
+        _wheel_payloads(path)
+
+
+def test_exact_wheel_members_rejects_extra_metadata():
+    dist_info_root = f"paperconan-{__version__}.dist-info"
+    expected_wheel = {"paperconan/module.py": b"source"}
+    payloads = {
+        **expected_wheel,
+        **{
+            f"{dist_info_root}/{name}": b""
+            for name in WHEEL_DIST_INFO_MEMBERS
+        },
+        f"{dist_info_root}/unexpected.json": b"extra",
+    }
+
+    with pytest.raises(AssertionError):
+        _assert_exact_wheel_members(payloads, expected_wheel)
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    ["bad-hash", "bad-size", "duplicate"],
+)
+def test_wheel_record_rejects_invalid_rows(malformation):
+    record_name = (
+        f"paperconan-{__version__}.dist-info/RECORD"
+    )
+    if malformation == "bad-hash":
+        rows = [
+            "paperconan/module.py,sha256=incorrect,6",
+            f"{record_name},,",
+        ]
+    elif malformation == "bad-size":
+        digest = _record_hash(b"source")
+        rows = [
+            f"paperconan/module.py,sha256={digest},7",
+            f"{record_name},,",
+        ]
+    else:
+        digest = _record_hash(b"source")
+        rows = [
+            f"paperconan/module.py,sha256={digest},6",
+            f"paperconan/module.py,sha256={digest},6",
+            f"{record_name},,",
+        ]
+    record = ("\n".join(rows) + "\n").encode("utf-8")
+    payloads = {
+        "paperconan/module.py": b"source",
+        record_name: record,
+    }
+
+    with pytest.raises(AssertionError):
+        _assert_wheel_record(payloads, record_name)

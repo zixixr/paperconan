@@ -226,7 +226,7 @@ def test_cli_documents_fetch_state_and_work_controls() -> None:
 
 
 def test_cli_documents_wave4_detector_and_cross_table_budgets() -> None:
-    text = (ROOT / "docs" / "cli.md").read_text(
+    cli_text = (ROOT / "docs" / "cli.md").read_text(
         encoding="utf-8"
     )
     controls = {
@@ -283,27 +283,47 @@ def test_cli_documents_wave4_detector_and_cross_table_budgets() -> None:
     for name, (default, reason) in controls.items():
         row = re.search(
             rf"^\| `{re.escape(name)}` \| `{default}` \| (?P<body>.+) \|$",
-            text,
+            cli_text,
             re.MULTILINE,
         )
         assert row is not None, f"missing documented control: {name}"
         assert f"`{reason}`" in row.group("body")
 
-    assert "稳定输入顺序" in text
-    assert "超过预算前停止" in text
-    assert "完整候选" in text
-    assert "wide_integer_block_index_limit" in text
-    assert "positional/value family 对 A、B 各扫描 1 次" in text
+    assert "稳定输入顺序" in cli_text
+    assert "超过预算前停止" in cli_text
+    assert "完整候选" in cli_text
+    assert "wide_integer_block_index_limit" in cli_text
+    assert "positional/value family 对 A、B 各扫描 1 次" in cli_text
+    assert "detector-owned" in cli_text
+    assert "allocation 前" in cli_text
+    assert "detector-owned source-grid loops" in cli_text
+    assert (
+        "axis loading / grouping / progression / fingerprint"
+        in cli_text
+    )
+    assert (
+        "recurrence order / group / comparison / mark / output"
+        in cli_text
+    )
+    assert "axis classification 固定每值 4 次" not in cli_text
 
 
 def test_output_schema_documents_consolidated_wave4_resource_units() -> None:
-    text = (REF_DIR / "output-schema.md").read_text(
+    schema_text = (REF_DIR / "output-schema.md").read_text(
         encoding="utf-8"
     )
 
-    assert "wide_integer_block_index_limit" in text
-    assert "one source-grid pass per side" in text
-    assert "impossible detector families are excluded" in text
+    assert "wide_integer_block_index_limit" in schema_text
+    assert "one source-grid pass per side" in schema_text
+    assert "impossible detector families are excluded" in schema_text
+    assert "candidate_columns_skipped" in schema_text
+    assert "work_skipped_lower_bound" in schema_text
+    assert "state_required_lower_bound" in schema_text
+    assert "axis_context_available" in schema_text
+    assert "axis_recurrence_comparison_visits" in schema_text
+    assert "axis_work_skipped_is_lower_bound" in schema_text
+    assert "axis_state_unit_limit" in schema_text
+    assert "axis_peak_state_units" in schema_text
 
 
 def test_agent_schema_describes_generic_cross_table_signal_family() -> None:

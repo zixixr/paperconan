@@ -154,7 +154,15 @@ Dense detector admission and cross-table budgets use additional structured
 limitations:
 
 - `dense_block_detector_limit`: one block-level object listing detector
-  families whose complete candidate work or compact retained state did not fit.
+  families whose detector-owned row/work/state checks stopped before a complete
+  candidate could run. `work_examined` is concrete completed source work.
+  `work_skipped_lower_bound` is the authoritative minimum when skipped
+  branch-dependent work cannot be known without executing it; it must not be
+  read as an exact skipped total. `state_required` is the complete
+  detector-declared simultaneous-state upper bound,
+  `state_required_lower_bound` is the largest simultaneous reservation actually
+  attempted, and `peak_state_units` is the accepted live-state peak. State is
+  measured in 8-byte float64-equivalent units and reserved before allocation.
 - `wide_integer_block_index_limit`: one sheet-level object emitted before
   detector allocation when the compact wide-integer block range index cannot
   fit the same 8-byte state-unit limit. It reports the required/available
@@ -164,23 +172,56 @@ limitations:
   `cross_sheet_label_cell_limit`, `cross_sheet_label_byte_limit`, and
   `cross_sheet_column_fingerprint_limit`: one scan-level object per exhausted
   retained-summary dimension. Each reports the configured limit, retained
-  amount, skipped sheets/items, and unavailable summary-pair count.
+  amount, skipped sheets/items, and unavailable summary-pair count. A
+  fingerprint-capacity rejection also reports `candidate_columns_skipped`
+  before source rows are scanned and
+  `candidate_columns_may_qualify: true`, because those unscanned columns may
+  have qualified.
 - `cross_sheet_work_limit`: one scan-level object for shared pair, value,
   decimal-tail tuple, and pre-cap finding budgets. It reports work performed,
   known skipped work/findings, and `limits_reached`. Detector-family pairs are
   counted independently, impossible detector families are excluded before
   admission, and positional/value work is one source-grid pass per side.
-  Remaining feasible family counts and value visits use linear-size aggregate
-  totals rather than an all-pairs prepass. `bucket_findings_skipped` reports
-  exact omissions after the stable first ten column-duplicate findings in one
-  fingerprint bucket; those omissions are included once in
-  `findings_skipped`.
+  Positional/value and decimal-tail helpers admit their complete pair/value
+  upper bound immediately before their detector-owned source-grid loop and
+  report concrete visits on normal exits. Only later never-entered candidates
+  move to the linear remaining-work ledger.
+
+`cross_sheet_work_limit` also exposes additive axis-classification coverage:
+
+- `axis_context_available` says whether complete axis context was produced.
+- `axis_loading_visits`, `axis_grouping_visits`,
+  `axis_progression_visits`, and `axis_fingerprint_visits` are concrete
+  completed visits over recurrence-support summaries and eligible position
+  columns.
+- `axis_recurrence_order_visits`, `axis_recurrence_group_visits`,
+  `axis_recurrence_comparison_visits`, `axis_recurrence_mark_visits`, and
+  `axis_output_visits` are concrete completed compact-finalization visits.
+  Every pass is admitted before it runs, and exact payload comparisons are
+  admitted individually.
+- `axis_work_skipped_lower_bound` is the known minimum skipped axis work.
+  When `axis_work_skipped_is_lower_bound` is `true`, remaining
+  outcome-dependent comparisons/marks cannot be known without execution and
+  the value is not exact. When it is `false`, all remaining work was knowable
+  and the reported skipped value is exact.
+- `axis_state_unit_limit` is the fixed-multiplier private-workspace cap in
+  8-byte units; `axis_peak_state_units` is the accepted live
+  axis-classification peak.
+
+Four- and five-cell grids remain recurrence-support context for compatibility,
+but never enter pair comparison or the final axis mapping. The finding cap is
+enforced during detection. `bucket_findings_skipped` reports exact omissions
+after the stable first ten column-duplicate findings in one fingerprint
+bucket; those omissions are included once in `findings_skipped`.
 
 Selection follows stable input order and stops before a configured limit is
 exceeded. A rejected detector candidate or summary is not treated as complete.
 Known finding omissions are counted exactly; pair/value/tail exhaustion can
 make the total unknowable, so top-level
 `findings_omitted_is_lower_bound: true` remains the authoritative disclosure.
+These fields are additive: archived scans and verdicts that predate them remain
+accepted through the existing compatibility path. No new public environment
+control was added.
 
 Archived schema-version-1 scans may omit `schema_version`, `scan_status`, and
 `coverage`. Both HTML and Markdown renderers accept that shape and label it as a
