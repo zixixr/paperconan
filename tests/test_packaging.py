@@ -59,6 +59,9 @@ WHEEL_DIST_INFO_MEMBERS = {
     "RECORD",
 }
 GENERATED_METADATA_MAX_BYTES = 1024 * 1024
+OVERSIZED_UNEXPECTED_MEMBER_BYTES = (
+    GENERATED_METADATA_MAX_BYTES + 1
+)
 SDIST_GENERATED_METADATA_MAX_BYTES = {
     name: GENERATED_METADATA_MAX_BYTES
     for name in SDIST_GENERATED_METADATA
@@ -1884,7 +1887,9 @@ def _write_test_release_archives(dist, *, mutation=None):
     elif mutation == "sdist-missing-member":
         del sdist_payloads["README.md"]
     elif mutation == "sdist-extra-member":
-        sdist_payloads["unexpected.txt"] = b"extra\n"
+        sdist_payloads["unexpected.txt"] = (
+            b"x" * OVERSIZED_UNEXPECTED_MEMBER_BYTES
+        )
     elif mutation == "sdist-generated-metadata-oversize":
         sdist_payloads["PKG-INFO"] = (
             b"x" * (GENERATED_METADATA_MAX_BYTES + 1)
@@ -1930,7 +1935,7 @@ def _write_test_release_archives(dist, *, mutation=None):
     elif mutation == "wheel-extra-member":
         wheel_payloads[
             f"{dist_info_root}/unexpected.json"
-        ] = b"{}\n"
+        ] = b"x" * OVERSIZED_UNEXPECTED_MEMBER_BYTES
     elif mutation == "wheel-generated-metadata-oversize":
         wheel_payloads[f"{dist_info_root}/METADATA"] = (
             b"x" * (GENERATED_METADATA_MAX_BYTES + 1)
@@ -2031,6 +2036,52 @@ def test_built_release_archives_integrated_rejects_payload_or_members(
 
     with pytest.raises(AssertionError):
         _assert_built_release_archives(dist)
+
+
+@pytest.mark.parametrize(
+    ("archive_kind", "mutation", "guarded_member"),
+    [
+        (
+            "sdist",
+            "sdist-extra-member",
+            "unexpected.txt",
+        ),
+        (
+            "wheel",
+            "wheel-extra-member",
+            "unexpected.json",
+        ),
+    ],
+)
+def test_unexpected_member_mutations_are_oversized(
+    tmp_path, archive_kind, mutation, guarded_member
+):
+    dist = tmp_path / "dist"
+    sdist, wheel = _write_test_release_archives(
+        dist,
+        mutation=mutation,
+    )
+
+    if archive_kind == "sdist":
+        with tarfile.open(sdist, "r:gz") as archive:
+            matches = [
+                member
+                for member in archive.getmembers()
+                if member.name.endswith(guarded_member)
+            ]
+            assert len(matches) == 1
+            declared_size = matches[0].size
+    else:
+        with zipfile.ZipFile(wheel) as archive:
+            matches = [
+                member
+                for member in archive.infolist()
+                if member.filename.endswith(guarded_member)
+            ]
+            assert len(matches) == 1
+            declared_size = matches[0].file_size
+
+    assert declared_size == OVERSIZED_UNEXPECTED_MEMBER_BYTES
 
 
 @pytest.mark.parametrize(
