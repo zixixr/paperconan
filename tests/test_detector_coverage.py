@@ -277,7 +277,7 @@ def test_wide_integer_block_index_exhaustion_skips_before_state_grows(
     assert state.findings_omitted_is_lower_bound is True
 
 
-def test_dense_detector_limits_preflight_every_named_family(
+def test_dense_row_limit_rejects_inside_every_real_detector(
     monkeypatch,
 ):
     sheet = Sheet.from_rows([
@@ -285,13 +285,6 @@ def test_dense_detector_limits_preflight_every_named_family(
         for row in range(12)
     ])
     called = []
-
-    def fail_if_called(name):
-        def detector(*_args, **_kwargs):
-            called.append(name)
-            return []
-        return detector
-
     detector_names = (
         "detect_relations",
         "detect_equal_pairs",
@@ -300,8 +293,46 @@ def test_dense_detector_limits_preflight_every_named_family(
         "detect_dispersed_repeats",
         "detect_identical_after_rounding",
     )
-    for name in detector_names:
-        monkeypatch.setattr(audit, name, fail_if_called(name))
+    expected_totals = {
+        "relations": 6,
+        "equal_pairs": 6,
+        "arithmetic_progression": 4,
+        "within_column": 4,
+        "dispersed_repeats": 4,
+        "identical_after_rounding": 1,
+    }
+
+    for detector_name in detector_names:
+        original = getattr(audit, detector_name)
+
+        def wrapped(
+            *args,
+            _original=original,
+            **kwargs,
+        ):
+            resources = kwargs["_resources"]
+            called.append(resources.family)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(audit, detector_name, wrapped)
+
+    def fail_source_or_allocation(*_args, **_kwargs):
+        pytest.fail("row-limited detector performed source/allocation work")
+
+    monkeypatch.setattr(
+        audit, "_numeric_pair_stats", fail_source_or_allocation
+    )
+    monkeypatch.setattr(audit, "col_array", fail_source_or_allocation)
+    monkeypatch.setattr(audit.np, "isnan", fail_source_or_allocation)
+    for method_name in (
+        "_reserve",
+        "start_allocated_candidate",
+    ):
+        monkeypatch.setattr(
+            audit._DenseFamilyResources,
+            method_name,
+            fail_source_or_allocation,
+        )
     monkeypatch.setattr(
         audit, "detect_grim_grimmer", lambda *_args, **_kwargs: []
     )
@@ -311,14 +342,10 @@ def test_dense_detector_limits_preflight_every_named_family(
         lambda *_args, **_kwargs: ([], {"findings_omitted": 0}),
     )
     monkeypatch.setattr(
-        audit, "_DENSE_BLOCK_MAX_ROWS", 8, raising=False
+        audit, "_DENSE_BLOCK_MAX_ROWS", 8
     )
-    monkeypatch.setattr(
-        audit, "_DENSE_BLOCK_CELL_WORK_LIMIT", 20, raising=False
-    )
-    monkeypatch.setattr(
-        audit, "_DENSE_BLOCK_STATE_CELL_LIMIT", 20, raising=False
-    )
+    monkeypatch.setattr(audit, "_DENSE_BLOCK_CELL_WORK_LIMIT", 1_000_000)
+    monkeypatch.setattr(audit, "_DENSE_BLOCK_STATE_CELL_LIMIT", 1_000_000)
     state = audit.ScanBudgetState(
         coverage=ScanCoverage(files_discovered=1),
         recurring_index=RecurringRowIndex(),
@@ -334,41 +361,71 @@ def test_dense_detector_limits_preflight_every_named_family(
         state=state,
     )
 
-    assert called == []
-    limitations = [
-        item for item in state.coverage.limitations
+    assert sorted(called) == sorted(expected_totals)
+    limitation = next(
+        item
+        for item in state.coverage.limitations
         if item["reason"] == "dense_block_detector_limit"
-    ]
-    assert len(limitations) == 1
-    limitation = limitations[0]
-    assert limitation["scope"] == "block"
-    assert limitation["file"] == "large.csv"
-    assert limitation["sheet"] == "large"
-    assert limitation["rows"] == "1-12"
-    assert limitation["cols"] == "1-4"
-    assert limitation["max_rows"] == 8
-    assert limitation["cell_work_limit"] == 20
-    assert limitation["state_cell_limit"] == 20
-    assert [
-        item["family"] for item in limitation["detectors"]
-    ] == [
-        "relations",
-        "equal_pairs",
-        "arithmetic_progression",
-        "within_column",
-        "dispersed_repeats",
-        "identical_after_rounding",
-    ]
-    assert all(
-        item["candidates_examined"] == 0
-        and item["candidates_skipped"] == item["candidates_total"]
-        and item["work_examined"] == 0
-        and item["work_skipped"] == item["work_required"]
-        and item["limits_reached"]
-        for item in limitation["detectors"]
     )
-    assert state.findings_omitted == 0
+    detectors = {
+        item["family"]: item for item in limitation["detectors"]
+    }
+    assert set(detectors) == set(expected_totals)
+    for family, candidates_total in expected_totals.items():
+        result = detectors[family]
+        assert result["candidates_total"] == candidates_total
+        assert result["candidates_examined"] == 0
+        assert result["candidates_skipped"] == candidates_total
+        assert result["work_examined"] == 0
+        assert result["work_skipped"] == result["work_required"]
+        assert result["state_required_lower_bound"] == 0
+        assert result["peak_state_units"] == 0
+        assert result["limits_reached"] == ["row"]
+    assert detectors["equal_pairs"]["state_required"] == 0
+    assert all(
+        item["state_required"] > 0
+        for family, item in detectors.items()
+        if family != "equal_pairs"
+    )
     assert state.findings_omitted_is_lower_bound is True
+
+
+def test_dense_resource_exhaustion_reports_detector_owned_counters(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "values.csv").write_text(
+        "left,right\n"
+        + "\n".join(
+            f"{i + 0.125},{3 * (i + 0.125) + 7}"
+            for i in range(40)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(audit, "_DENSE_BLOCK_STATE_CELL_LIMIT", 1)
+
+    scan = audit.scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+    limitation = next(
+        item for item in scan["coverage"]["limitations"]
+        if item["reason"] == "dense_block_detector_limit"
+    )
+
+    relation = next(
+        item for item in limitation["detectors"]
+        if item["family"] == "relations"
+    )
+    assert relation["candidates_examined"] == 0
+    assert relation["candidates_skipped"] == 1
+    assert relation["state_required"] > 1
+    assert relation["state_required_lower_bound"] > 1
+    assert relation["peak_state_units"] <= 1
+    assert relation["limits_reached"] == ["state"]
+    assert scan["scan_status"] == "partial"
+    assert scan["findings_omitted_is_lower_bound"] is True
 
 
 def test_wide_block_detector_skip_is_disclosed(tmp_path, monkeypatch):

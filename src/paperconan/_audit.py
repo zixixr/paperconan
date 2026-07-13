@@ -50,7 +50,11 @@ from ._input import (
 )
 from ._numeric import integer_shift_close, relation_close
 from ._profiles import apply_profile_to_findings, normalize_profile
-from ._resources import BoundedFindingCollector
+from ._resources import (
+    BoundedFindingCollector,
+    StateBudget,
+    state_units_for_nbytes,
+)
 from ._sheet import (
     Sheet,
     SheetBuilder,
@@ -1312,6 +1316,334 @@ def _finding_emitter(group, sink):
     return local, emit
 
 
+@dataclass(frozen=True)
+class _DenseFamilyResult:
+    family: str
+    candidates_total: int
+    candidates_examined: int
+    candidates_skipped: int
+    work_required: int
+    work_examined: int
+    work_skipped: int
+    work_skipped_lower_bound: int
+    state_required: int
+    state_required_lower_bound: int
+    peak_state_units: int
+    limits_reached: tuple[str, ...]
+
+
+class _DenseFamilyResources:
+    def __init__(
+        self,
+        *,
+        family,
+        max_rows,
+        work_limit,
+        state_limit,
+    ):
+        self.family = family
+        self.max_rows = (
+            None if max_rows is None else max(0, int(max_rows))
+        )
+        self.work_limit = (
+            None if work_limit is None else max(0, int(work_limit))
+        )
+        self._state = StateBudget(
+            None
+            if state_limit is None
+            else max(0, int(state_limit))
+        )
+        self.candidates_total = 0
+        self.candidates_started = 0
+        self.candidates_examined = 0
+        self.work_examined = 0
+        self.minimum_candidate_work = 0
+        self.state_required = 0
+        self._limits_reached = set()
+        self._stopped = False
+
+    @classmethod
+    def unlimited(cls, family):
+        return cls(
+            family=family,
+            max_rows=None,
+            work_limit=None,
+            state_limit=None,
+        )
+
+    def begin(
+        self,
+        *,
+        row_count,
+        candidates_total,
+        minimum_candidate_work,
+        state_required,
+    ):
+        self.candidates_total = max(0, int(candidates_total))
+        self.minimum_candidate_work = max(
+            0, int(minimum_candidate_work)
+        )
+        self.state_required = max(0, int(state_required))
+        if self.max_rows is not None and row_count > self.max_rows:
+            self._limits_reached.add("row")
+            self._stopped = True
+            return False
+        return True
+
+    def _begin_candidate(self, source_visits):
+        if self._stopped:
+            return False
+        source_visits = max(0, int(source_visits))
+        if (
+            self.work_limit is not None
+            and self.work_examined + source_visits > self.work_limit
+        ):
+            self._limits_reached.add("work")
+            self._stopped = True
+            return False
+        self.candidates_started += 1
+        self.work_examined += source_visits
+        return True
+
+    def _reserve(self, name, units):
+        lease = self._state.try_reserve(name, units)
+        if lease is None:
+            self._limits_reached.add("state")
+            self._stopped = True
+        return lease
+
+    @staticmethod
+    def _release_leases(leases):
+        for lease in reversed(tuple(leases)):
+            lease.release()
+
+    def start_allocated_candidate(
+        self,
+        name,
+        units,
+        source_visits,
+        emit,
+        *,
+        initial_reservations=(),
+    ):
+        leases = []
+        for initial_name, initial_units in initial_reservations:
+            initial_lease = self._reserve(
+                initial_name, initial_units
+            )
+            if initial_lease is None:
+                self._release_leases(leases)
+                return None, None, ()
+            leases.append(initial_lease)
+        lease = self._reserve(name, units)
+        if lease is None:
+            self._release_leases(leases)
+            return None, None, ()
+        leases.append(lease)
+        if not self._begin_candidate(source_visits):
+            self._release_leases(leases)
+            return None, None, ()
+        try:
+            candidate = self._candidate(emit, *leases)
+        except BaseException:
+            self._release_leases(leases)
+            raise
+        return candidate, lease, tuple(leases[:-1])
+
+    def _candidate(self, emit, *initial_leases):
+        return _DenseCandidate(
+            self,
+            emit,
+            initial_leases=initial_leases,
+        )
+
+    def start_candidate(self, source_visits, emit):
+        if not self._begin_candidate(source_visits):
+            return None
+        return self._candidate(emit)
+
+    def _complete_candidate(self):
+        self.candidates_examined += 1
+
+    @property
+    def state(self):
+        return self._state
+
+    @property
+    def stopped(self):
+        return self._stopped
+
+    def result(self):
+        unstarted = self.candidates_total - self.candidates_started
+        work_required = (
+            self.candidates_total * self.minimum_candidate_work
+        )
+        work_skipped = max(0, work_required - self.work_examined)
+        state_required_lower_bound = (
+            self._state.required_peak_units
+        )
+        assert state_required_lower_bound <= self.state_required
+        return _DenseFamilyResult(
+            family=self.family,
+            candidates_total=self.candidates_total,
+            candidates_examined=self.candidates_examined,
+            candidates_skipped=(
+                self.candidates_total - self.candidates_examined
+            ),
+            work_required=work_required,
+            work_examined=self.work_examined,
+            work_skipped=work_skipped,
+            work_skipped_lower_bound=(
+                max(0, unstarted) * self.minimum_candidate_work
+            ),
+            state_required=self.state_required,
+            state_required_lower_bound=state_required_lower_bound,
+            peak_state_units=self._state.peak_units,
+            limits_reached=tuple(
+                name for name in ("row", "work", "state")
+                if name in self._limits_reached
+            ),
+        )
+
+
+class _CandidateFindingBuffer:
+    def __init__(self):
+        self._items = []
+
+    def offer(self, severity, builder):
+        self._items.append((severity, builder))
+
+    def commit(self, emit):
+        for severity, builder in self._items:
+            emit(severity, builder)
+        self._items.clear()
+
+    def discard(self):
+        self._items.clear()
+
+
+class _DenseCandidateRejected(RuntimeError):
+    pass
+
+
+class _DenseCandidate:
+    def __init__(
+        self,
+        resources,
+        emit,
+        *,
+        initial_leases=(),
+    ):
+        self._resources = resources
+        self.emit = emit
+        self.findings = _CandidateFindingBuffer()
+        self._leases = {}
+        self._peak_lease_count = 0
+        self._rejected = False
+        self.entered = False
+        self.closed = False
+        for lease in initial_leases:
+            self._adopt(lease)
+
+    def _adopt(self, lease):
+        key = id(lease)
+        assert key not in self._leases
+        assert not lease.released
+        self._leases[key] = lease
+        self._peak_lease_count = max(
+            self._peak_lease_count, len(self._leases)
+        )
+
+    def __enter__(self):
+        assert not self.closed
+        assert not self.entered
+        self.entered = True
+        return self
+
+    def reserve(self, name, units):
+        assert self.entered
+        assert not self.closed
+        if self._rejected:
+            raise _DenseCandidateRejected
+        lease = self._resources._reserve(name, units)
+        if lease is None:
+            self._rejected = True
+            raise _DenseCandidateRejected
+        self._adopt(lease)
+        return lease
+
+    def allocate(self, name, units, factory):
+        assert self.entered
+        assert not self.closed
+        lease = self.reserve(name, units)
+        return self.materialize(lease, factory), lease
+
+    def materialize(self, lease, factory, *, release_after=()):
+        assert self.entered
+        assert not self.closed
+        assert id(lease) in self._leases
+        assert not lease.released
+        release_after = tuple(release_after)
+        assert all(item is not lease for item in release_after)
+        try:
+            value = factory()
+            values = value if isinstance(value, tuple) else (value,)
+            lease.validate_nbytes(*(
+                item.nbytes
+                for item in values
+                if hasattr(item, "nbytes")
+            ))
+            for transient_lease in release_after:
+                self.release(transient_lease)
+        except BaseException:
+            self._rejected = True
+            raise
+        return value
+
+    def release(self, lease):
+        assert self.entered
+        assert not self.closed
+        tracked = self._leases.pop(id(lease))
+        assert tracked is lease
+        assert not lease.released
+        lease.release()
+
+    def offer(self, severity, builder):
+        assert self.entered
+        assert not self.closed
+        self.findings.offer(severity, builder)
+
+    @property
+    def rejected(self):
+        return self._rejected
+
+    @property
+    def live_lease_count(self):
+        return len(self._leases)
+
+    @property
+    def peak_lease_count(self):
+        return self._peak_lease_count
+
+    def __exit__(self, exc_type, _exc, _traceback):
+        assert not self.closed
+        assert self.entered
+        resource_rejection = exc_type is _DenseCandidateRejected
+        try:
+            if exc_type is None and not self._rejected:
+                self.findings.commit(self.emit)
+                self._resources._complete_candidate()
+            else:
+                self.findings.discard()
+        finally:
+            for lease in reversed(tuple(self._leases.values())):
+                assert not lease.released
+                lease.release()
+            self._leases.clear()
+            self.closed = True
+        return resource_rejection
+
+
 class _BoundedRankedFindingBuffer:
     def __init__(self, cap):
         self.cap = max(0, int(cap))
@@ -1348,335 +1680,725 @@ class _BoundedRankedFindingBuffer:
         return omitted
 
 
+def _compact_high_precision_fractions(frac_x, hp_rows):
+    count = 0
+    for index, selected in enumerate(hp_rows):
+        value = frac_x[index]
+        if selected and _sig_frac_digits(value) >= 4:
+            frac_x[count] = round(float(value), 6)
+            count += 1
+    return count
+
+
 def detect_relations(
-    sheet, r0, r1, c0, c1, header, *, _finding_sink=None
+    sheet,
+    r0,
+    r1,
+    c0,
+    c1,
+    header,
+    *,
+    _resources=None,
+    _finding_sink=None,
 ):
     findings, emit = _finding_emitter("relations", _finding_sink)
+    resources = _resources or _DenseFamilyResources.unlimited(
+        "relations"
+    )
+    row_count = r1 - r0
+    bool_units = state_units_for_nbytes(row_count)
+    relation_state_upper_bounds = {
+        "mask": bool_units,
+        "mask_rhs_workspace": bool_units,
+        "filtered_values": 2 * row_count,
+        "abs_scale_workspace": 2 * row_count,
+        "diff": row_count,
+        "nonzero_workspace": bool_units,
+        "relation_close_workspace": 12 * row_count,
+        "ratio": row_count,
+        "ratio_stats_workspace": 2 * row_count,
+        "sum": row_count,
+        "sum_compare_workspace": 13 * row_count,
+        "linear_fit_workspace": 12 * row_count,
+        "fitted": row_count,
+        "fitted_build_workspace": 2 * row_count,
+        "fitted_relation_workspace": 12 * row_count,
+        "integer_shift_workspace": 8 * row_count,
+        "diff_is_int": bool_units,
+        "fractional_workspace": row_count,
+        "frac_x": row_count,
+        "hp_rows": bool_units,
+        "high_precision_unique_workspace": 4 * row_count,
+        "high_precision_unique": row_count,
+        "integer_diff_round_workspace": row_count,
+        "int_diff_rounded": row_count,
+        "integer_diff_unique_workspace": 4 * row_count,
+        "int_diffs": row_count,
+        "diff_rounded": row_count,
+        "diff_unique_workspace": 4 * row_count,
+        "unique_diffs": row_count,
+    }
+    pair_count = (c1 - c0) * (c1 - c0 - 1) // 2
+    if not resources.begin(
+        row_count=row_count,
+        candidates_total=pair_count,
+        minimum_candidate_work=2 * row_count,
+        state_required=sum(relation_state_upper_bounds.values()),
+    ):
+        return findings
+
     for ci in range(c0, c1):
         ai = sheet.numeric[r0:r1, ci]
         for cj in range(ci + 1, c1):
             aj = sheet.numeric[r0:r1, cj]
-            pair_stats = _numeric_pair_stats(
-                sheet, r0, r1, ci, cj
+            candidate = resources.start_candidate(
+                2 * row_count,
+                emit,
             )
-            if pair_stats.n < 4:
-                continue
-            if pair_stats.all_equal:
-                emit(
-                    "high",
-                    lambda ci=ci, cj=cj, pair_stats=pair_stats: dict(
-                        kind="identical_column",
-                        col_a=header[ci - c0],
-                        col_b=header[cj - c0],
-                        col_a_idx=ci,
-                        col_b_idx=cj,
-                        n=pair_stats.n,
-                        severity="high",
-                        col_a_sample=_sample_exact(
-                            pair_stats.sample_a
-                        ),
-                        col_b_sample=_sample_exact(
-                            pair_stats.sample_b
-                        ),
-                        rule=f"col[{cj}] == col[{ci}]",
-                    ),
+            if candidate is None:
+                break
+
+            def run_pair_candidate():
+                pair_stats = _numeric_pair_stats(
+                    sheet, r0, r1, ci, cj
                 )
-                continue
-            if (
-                pair_stats.all_int
-                and pair_stats.constant_offset not in (None, 0)
-            ):
-                offset = pair_stats.constant_offset
-                emit(
-                    "high",
-                    lambda ci=ci, cj=cj, pair_stats=pair_stats,
-                    offset=offset: dict(
-                        kind="constant_offset",
-                        col_a=header[ci - c0],
-                        col_b=header[cj - c0],
-                        col_a_idx=ci,
-                        col_b_idx=cj,
-                        n=pair_stats.n,
-                        offset=offset,
-                        severity="high",
-                        col_a_sample=_sample_exact(
-                            pair_stats.sample_a
+                if pair_stats.n < 4:
+                    return
+                if pair_stats.all_equal:
+                    candidate.offer(
+                        "high",
+                        lambda ci=ci, cj=cj,
+                        pair_stats=pair_stats: dict(
+                            kind="identical_column",
+                            col_a=header[ci - c0],
+                            col_b=header[cj - c0],
+                            col_a_idx=ci,
+                            col_b_idx=cj,
+                            n=pair_stats.n,
+                            severity="high",
+                            col_a_sample=_sample_exact(
+                                pair_stats.sample_a
+                            ),
+                            col_b_sample=_sample_exact(
+                                pair_stats.sample_b
+                            ),
+                            rule=f"col[{cj}] == col[{ci}]",
                         ),
-                        col_b_sample=_sample_exact(
-                            pair_stats.sample_b
-                        ),
-                        rule=f"col[{cj}] = col[{ci}] + {offset}",
-                    ),
-                )
-                continue
-            if pair_stats.has_wide_integer:
-                continue
-            mask = ~np.isnan(ai) & ~np.isnan(aj)
-            n = int(mask.sum())
-            if n < 4:
-                continue
-            x, y = ai[mask], aj[mask]
-            # B4 retains its existing scale-relative run policy. Whole-column identity,
-            # transforms, and integer shifts use their dedicated policies below.
-            tol = 1e-9 * max(float(np.max(np.abs(x))), float(np.max(np.abs(y))), 1e-300)
-            # constant offset
-            diff = y - x
-            mean_diff = float(np.mean(diff))
-            if mean_diff != 0 and np.all(relation_close(y, x + mean_diff)):
-                emit(
-                    "high",
-                    lambda ci=ci, cj=cj, n=n, mean_diff=mean_diff,
-                    x=x, y=y: dict(
-                        kind="constant_offset",
-                        col_a=header[ci - c0],
-                        col_b=header[cj - c0],
-                        col_a_idx=ci,
-                        col_b_idx=cj,
-                        n=n,
-                        offset=mean_diff,
-                        severity="high",
-                        col_a_sample=_sample(x),
-                        col_b_sample=_sample(y),
-                        rule=(
-                            f"col[{cj}] = col[{ci}] + "
-                            f"{mean_diff:.6g}"
-                        ),
-                    ),
-                )
-                continue
-            # constant ratio
-            ratio_emitted = False
-            if np.all(x != 0):
-                ratio = y / x
-                mean_ratio = float(np.mean(ratio))
-                ratio_tol = 1e-9 * max(abs(mean_ratio), 1e-300)
+                    )
+                    return
                 if (
-                    np.std(ratio) < ratio_tol
-                    and abs(mean_ratio - 1) > 1e-9
-                    and abs(mean_ratio) > 1e-9
-                    and np.all(relation_close(y, mean_ratio * x))
+                    pair_stats.all_int
+                    and pair_stats.constant_offset not in (None, 0)
                 ):
-                    emit(
+                    offset = pair_stats.constant_offset
+                    candidate.offer(
+                        "high",
+                        lambda ci=ci, cj=cj,
+                        pair_stats=pair_stats,
+                        offset=offset: dict(
+                            kind="constant_offset",
+                            col_a=header[ci - c0],
+                            col_b=header[cj - c0],
+                            col_a_idx=ci,
+                            col_b_idx=cj,
+                            n=pair_stats.n,
+                            offset=offset,
+                            severity="high",
+                            col_a_sample=_sample_exact(
+                                pair_stats.sample_a
+                            ),
+                            col_b_sample=_sample_exact(
+                                pair_stats.sample_b
+                            ),
+                            rule=(
+                                f"col[{cj}] = col[{ci}] + {offset}"
+                            ),
+                        ),
+                    )
+                    return
+                if pair_stats.has_wide_integer:
+                    return
+
+                mask, mask_lease = candidate.allocate(
+                    "mask",
+                    relation_state_upper_bounds["mask"],
+                    lambda: np.isnan(ai),
+                )
+                np.logical_not(mask, out=mask)
+                mask_rhs, mask_rhs_lease = candidate.allocate(
+                    "mask_rhs_workspace",
+                    relation_state_upper_bounds[
+                        "mask_rhs_workspace"
+                    ],
+                    lambda: np.isnan(aj),
+                )
+                np.logical_not(mask_rhs, out=mask_rhs)
+                np.logical_and(mask, mask_rhs, out=mask)
+                del mask_rhs
+                candidate.release(mask_rhs_lease)
+                n = int(mask.sum())
+                if n < 4:
+                    del mask
+                    candidate.release(mask_lease)
+                    return
+                (x, y), filtered_lease = candidate.allocate(
+                    "filtered_values",
+                    2 * row_count,
+                    lambda: (ai[mask], aj[mask]),
+                )
+                del mask
+                candidate.release(mask_lease)
+                x_sample = tuple(_sample(x))
+                y_sample = tuple(_sample(y))
+
+                abs_scale_workspace = candidate.reserve(
+                    "abs_scale_workspace",
+                    2 * n,
+                )
+                tol = 1e-9 * max(
+                    float(np.max(np.abs(x))),
+                    float(np.max(np.abs(y))),
+                    1e-300,
+                )
+                candidate.release(abs_scale_workspace)
+
+                diff, diff_lease = candidate.allocate(
+                    "diff",
+                    n,
+                    lambda: y - x,
+                )
+                mean_diff = float(np.mean(diff))
+                relation_workspace = candidate.reserve(
+                    "relation_close_workspace",
+                    12 * n,
+                )
+                offset_close = (
+                    mean_diff != 0
+                    and bool(
+                        relation_close(y, x + mean_diff).all()
+                    )
+                )
+                candidate.release(relation_workspace)
+                if offset_close:
+                    candidate.offer(
                         "high",
                         lambda ci=ci, cj=cj, n=n,
-                        mean_ratio=mean_ratio, x=x, y=y: dict(
-                            kind="constant_ratio",
+                        mean_diff=mean_diff,
+                        x_sample=x_sample,
+                        y_sample=y_sample: dict(
+                            kind="constant_offset",
                             col_a=header[ci - c0],
                             col_b=header[cj - c0],
                             col_a_idx=ci,
                             col_b_idx=cj,
                             n=n,
-                            ratio=mean_ratio,
+                            offset=mean_diff,
                             severity="high",
-                            col_a_sample=_sample(x),
-                            col_b_sample=_sample(y),
+                            col_a_sample=list(x_sample),
+                            col_b_sample=list(y_sample),
                             rule=(
-                                f"col[{cj}] = col[{ci}] * "
-                                f"{mean_ratio:.6g}"
+                                f"col[{cj}] = col[{ci}] + "
+                                f"{mean_diff:.6g}"
                             ),
                         ),
                     )
-                    ratio_emitted = True
-            # mirror: x + y == constant
-            csum = x + y
-            if n >= 5:
-                K = float(np.mean(csum))
-                if K != 0 and np.all(relation_close(csum, np.full_like(csum, K))):
-                    emit(
-                        "high",
-                        lambda ci=ci, cj=cj, n=n, K=K,
-                        x=x, y=y: dict(
-                            kind="sum_constant",
-                            col_a=header[ci - c0],
-                            col_b=header[cj - c0],
-                            col_a_idx=ci,
-                            col_b_idx=cj,
-                            n=n,
-                            sum=K,
-                            severity="high",
-                            col_a_sample=_sample(x),
-                            col_b_sample=_sample(y),
-                            rule=(
-                                f"col[{ci}] + col[{cj}] = {K:.6g}"
-                            ),
-                        ),
+                    del diff, x, y
+                    candidate.release(diff_lease)
+                    candidate.release(filtered_lease)
+                    return
+
+                ratio_emitted = False
+                nonzero_workspace = candidate.reserve(
+                    "nonzero_workspace",
+                    state_units_for_nbytes(n),
+                )
+                all_nonzero = bool((x != 0).all())
+                candidate.release(nonzero_workspace)
+                if all_nonzero:
+                    ratio, ratio_lease = candidate.allocate(
+                        "ratio",
+                        n,
+                        lambda: y / x,
                     )
-            # exact linear (non-identical)
-            if n >= 5 and np.ptp(x) > 0:
-                lo = int(np.argmin(x))
-                hi = int(np.argmax(x))
-                dx = x[hi] - x[lo]
-                try:
-                    _fit_slope, _fit_intercept, r, _p, _se = stats.linregress(x, y)
-                except ValueError:
-                    continue
-                if dx == 0:
-                    continue
-                slope = (y[hi] - y[lo]) / dx
-                intercept = y[lo] - slope * x[lo]
-                fitted = slope * x + intercept
-                if np.std(y) > 0 and np.all(relation_close(y, fitted, rtol=1e-7)) and abs(r) > 0.99:
-                    # A scale-relatively zero intercept means the fit is y = slope*x: the
-                    # identity (slope~=1, caught by identical_column) or a pure scaling. When a
-                    # constant_ratio already captured that scaling, a second exact_linear finding
-                    # is redundant (same relationship, b==0 to round-off) and only inflates the
-                    # count — suppress it. exact_linear is reserved for a non-zero
-                    # intercept (an affine offset constant_ratio cannot express), and still fires
-                    # when no constant_ratio covered the pair (e.g. a zero in x skips its guard).
-                    intercept_is_zero = abs(intercept) < tol
-                    is_identity = abs(slope - 1) < 1e-9 and intercept_is_zero
-                    redundant_scaling = intercept_is_zero and ratio_emitted
-                    if not (is_identity or redundant_scaling):
-                        emit(
+                    mean_ratio = float(np.mean(ratio))
+                    ratio_tol = 1e-9 * max(
+                        abs(mean_ratio), 1e-300
+                    )
+                    ratio_stats_workspace = candidate.reserve(
+                        "ratio_stats_workspace",
+                        2 * n,
+                    )
+                    stable_ratio = np.std(ratio) < ratio_tol
+                    candidate.release(ratio_stats_workspace)
+                    ratio_close_workspace = candidate.reserve(
+                        "relation_close_workspace",
+                        12 * n,
+                    )
+                    closes = bool(
+                        relation_close(y, mean_ratio * x).all()
+                    )
+                    candidate.release(ratio_close_workspace)
+                    if (
+                        stable_ratio
+                        and abs(mean_ratio - 1) > 1e-9
+                        and abs(mean_ratio) > 1e-9
+                        and closes
+                    ):
+                        candidate.offer(
                             "high",
-                            lambda ci=ci, cj=cj, n=n, slope=slope,
-                            intercept=intercept, x=x, y=y: dict(
-                                kind="exact_linear",
+                            lambda ci=ci, cj=cj, n=n,
+                            mean_ratio=mean_ratio,
+                            x_sample=x_sample,
+                            y_sample=y_sample: dict(
+                                kind="constant_ratio",
                                 col_a=header[ci - c0],
                                 col_b=header[cj - c0],
                                 col_a_idx=ci,
                                 col_b_idx=cj,
                                 n=n,
-                                slope=float(slope),
-                                intercept=float(intercept),
+                                ratio=mean_ratio,
                                 severity="high",
-                                col_a_sample=_sample(x),
-                                col_b_sample=_sample(y),
+                                col_a_sample=list(x_sample),
+                                col_b_sample=list(y_sample),
                                 rule=(
-                                    f"col[{cj}] = {slope:.4g} * "
-                                    f"col[{ci}] + {intercept:.4g}"
+                                    f"col[{cj}] = col[{ci}] * "
+                                    f"{mean_ratio:.6g}"
                                 ),
                             ),
                         )
-            # B4: partial constant offset — a long CONSECUTIVE run where y = x + k for a fixed
-            # non-zero k, while the rest of the column diverges (the whole-column case is
-            # constant_offset above). A contiguous block shifted by a fixed amount is a
-            # copy-then-shift fingerprint; two independent columns do not hold a fixed offset
-            # over a long contiguous run. Guarded to non-trivial offsets and long runs only.
-            if n >= 24:
-                # Scale-relative run detection on the raw diff (a fixed decimal round would be
-                # inert on small-magnitude data — the exact regime `tol` above was written for).
-                best_len = cur_len = 1
-                best_val = float(diff[0])
-                for t in range(1, len(diff)):
-                    if abs(diff[t] - diff[t - 1]) < tol:
-                        cur_len += 1
+                        ratio_emitted = True
+                    del ratio
+                    candidate.release(ratio_lease)
+
+                csum, sum_lease = candidate.allocate(
+                    "sum",
+                    n,
+                    lambda: x + y,
+                )
+                if n >= 5:
+                    K = float(np.mean(csum))
+                    sum_compare_workspace = candidate.reserve(
+                        "sum_compare_workspace",
+                        13 * n,
+                    )
+                    sum_close = (
+                        K != 0
+                        and bool(
+                            relation_close(
+                                csum,
+                                np.full_like(csum, K),
+                            ).all()
+                        )
+                    )
+                    candidate.release(sum_compare_workspace)
+                    if sum_close:
+                        candidate.offer(
+                            "high",
+                            lambda ci=ci, cj=cj, n=n, K=K,
+                            x_sample=x_sample,
+                            y_sample=y_sample: dict(
+                                kind="sum_constant",
+                                col_a=header[ci - c0],
+                                col_b=header[cj - c0],
+                                col_a_idx=ci,
+                                col_b_idx=cj,
+                                n=n,
+                                sum=K,
+                                severity="high",
+                                col_a_sample=list(x_sample),
+                                col_b_sample=list(y_sample),
+                                rule=(
+                                    f"col[{ci}] + col[{cj}] = "
+                                    f"{K:.6g}"
+                                ),
+                            ),
+                        )
+                del csum
+                candidate.release(sum_lease)
+
+                if n >= 5:
+                    linear_fit_workspace = candidate.reserve(
+                        "linear_fit_workspace",
+                        12 * n,
+                    )
+                    varying_x = np.ptp(x) > 0
+                    if varying_x:
+                        lo = int(np.argmin(x))
+                        hi = int(np.argmax(x))
+                        dx = x[hi] - x[lo]
+                        try:
+                            (
+                                _fit_slope,
+                                _fit_intercept,
+                                r,
+                                _p,
+                                _se,
+                            ) = stats.linregress(x, y)
+                        except ValueError:
+                            candidate.release(
+                                linear_fit_workspace
+                            )
+                            del diff, x, y
+                            candidate.release(diff_lease)
+                            candidate.release(filtered_lease)
+                            return
+                        y_has_variation = np.std(y) > 0
                     else:
-                        if cur_len > best_len:
-                            best_len, best_val = cur_len, float(diff[t - 1])
-                        cur_len = 1
-                if cur_len > best_len:
-                    best_len, best_val = cur_len, float(diff[-1])
-                run_floor = max(20, int(round(0.5 * n)))
-                col_hp = sum(1 for v in x if _sig_frac_digits(v) >= 2) >= 0.6 * len(x)
-                # The benign case to exclude is a run shifted by a small WHOLE number on
-                # low-precision data (e.g. B = A + 5). Test that scale-relatively (tol), so a
-                # A small-magnitude offset like 3e-14 is not mistaken for "integer 0".
-                off_is_small_integer = abs(best_val - round(best_val)) < tol and abs(round(best_val)) >= 1
-                non_trivial_offset = (not off_is_small_integer) or col_hp
-                if (best_len >= run_floor and best_len < n
-                        and abs(best_val) > tol and non_trivial_offset):
-                    emit(
-                        "high",
-                        lambda ci=ci, cj=cj, n=n,
-                        best_len=best_len, best_val=best_val,
-                        x=x, y=y: dict(
-                            kind="partial_constant_offset",
-                            col_a=header[ci - c0],
-                            col_b=header[cj - c0],
-                            col_a_idx=ci,
-                            col_b_idx=cj,
-                            n=n,
-                            run_length=int(best_len),
-                            offset=float(best_val),
-                            severity="high",
-                            col_a_sample=_sample(x),
-                            col_b_sample=_sample(y),
-                            rule=(
-                                f"col[{cj}] = col[{ci}] + "
-                                f"{best_val:.6g} over a run of "
-                                f"{int(best_len)}/{n} consecutive rows"
+                        dx = 0
+                        y_has_variation = False
+                    candidate.release(linear_fit_workspace)
+                    if varying_x and dx != 0:
+                        slope = (y[hi] - y[lo]) / dx
+                        intercept = y[lo] - slope * x[lo]
+                        fitted_build_workspace = candidate.reserve(
+                            "fitted_build_workspace",
+                            2 * n,
+                        )
+                        fitted, fitted_lease = candidate.allocate(
+                            "fitted",
+                            n,
+                            lambda: slope * x + intercept,
+                        )
+                        candidate.release(
+                            fitted_build_workspace
+                        )
+                        fitted_relation_workspace = (
+                            candidate.reserve(
+                                "fitted_relation_workspace",
+                                12 * n,
+                            )
+                        )
+                        fitted_close = bool(
+                            relation_close(
+                                y, fitted, rtol=1e-7
+                            ).all()
+                        )
+                        candidate.release(
+                            fitted_relation_workspace
+                        )
+                        del fitted
+                        candidate.release(fitted_lease)
+                        if (
+                            y_has_variation
+                            and fitted_close
+                            and abs(r) > 0.99
+                        ):
+                            intercept_is_zero = (
+                                abs(intercept) < tol
+                            )
+                            is_identity = (
+                                abs(slope - 1) < 1e-9
+                                and intercept_is_zero
+                            )
+                            redundant_scaling = (
+                                intercept_is_zero
+                                and ratio_emitted
+                            )
+                            if not (
+                                is_identity or redundant_scaling
+                            ):
+                                candidate.offer(
+                                    "high",
+                                    lambda ci=ci, cj=cj, n=n,
+                                    slope=slope,
+                                    intercept=intercept,
+                                    x_sample=x_sample,
+                                    y_sample=y_sample: dict(
+                                        kind="exact_linear",
+                                        col_a=header[ci - c0],
+                                        col_b=header[cj - c0],
+                                        col_a_idx=ci,
+                                        col_b_idx=cj,
+                                        n=n,
+                                        slope=float(slope),
+                                        intercept=float(intercept),
+                                        severity="high",
+                                        col_a_sample=list(x_sample),
+                                        col_b_sample=list(y_sample),
+                                        rule=(
+                                            f"col[{cj}] = "
+                                            f"{slope:.4g} * "
+                                            f"col[{ci}] + "
+                                            f"{intercept:.4g}"
+                                        ),
+                                    ),
+                                )
+
+                if n >= 24:
+                    best_len = cur_len = 1
+                    best_val = float(diff[0])
+                    for t in range(1, len(diff)):
+                        if abs(diff[t] - diff[t - 1]) < tol:
+                            cur_len += 1
+                        else:
+                            if cur_len > best_len:
+                                best_len = cur_len
+                                best_val = float(diff[t - 1])
+                            cur_len = 1
+                    if cur_len > best_len:
+                        best_len = cur_len
+                        best_val = float(diff[-1])
+                    run_floor = max(20, int(round(0.5 * n)))
+                    col_hp = (
+                        sum(
+                            1
+                            for value in x
+                            if _sig_frac_digits(value) >= 2
+                        )
+                        >= 0.6 * len(x)
+                    )
+                    off_is_small_integer = (
+                        abs(best_val - round(best_val)) < tol
+                        and abs(round(best_val)) >= 1
+                    )
+                    non_trivial_offset = (
+                        not off_is_small_integer
+                    ) or col_hp
+                    if (
+                        best_len >= run_floor
+                        and best_len < n
+                        and abs(best_val) > tol
+                        and non_trivial_offset
+                    ):
+                        candidate.offer(
+                            "high",
+                            lambda ci=ci, cj=cj, n=n,
+                            best_len=best_len,
+                            best_val=best_val,
+                            x_sample=x_sample,
+                            y_sample=y_sample: dict(
+                                kind="partial_constant_offset",
+                                col_a=header[ci - c0],
+                                col_b=header[cj - c0],
+                                col_a_idx=ci,
+                                col_b_idx=cj,
+                                n=n,
+                                run_length=int(best_len),
+                                offset=float(best_val),
+                                severity="high",
+                                col_a_sample=list(x_sample),
+                                col_b_sample=list(y_sample),
+                                rule=(
+                                    f"col[{cj}] = col[{ci}] + "
+                                    f"{best_val:.6g} over a run "
+                                    f"of {int(best_len)}/{n} "
+                                    "consecutive rows"
+                                ),
                             ),
+                        )
+                        del diff, x, y
+                        candidate.release(diff_lease)
+                        candidate.release(filtered_lease)
+                        return
+
+                if n >= 5:
+                    integer_shift_workspace = candidate.reserve(
+                        "integer_shift_workspace",
+                        8 * n,
+                    )
+                    diff_is_int, diff_is_int_lease = (
+                        candidate.allocate(
+                            "diff_is_int",
+                            state_units_for_nbytes(n),
+                            lambda: integer_shift_close(x, y),
+                        )
+                    )
+                    candidate.release(integer_shift_workspace)
+                    integer_shift_count = int(
+                        diff_is_int.sum()
+                    )
+                    fractional_workspace = candidate.reserve(
+                        "fractional_workspace",
+                        n,
+                    )
+                    frac_x, frac_x_lease = candidate.allocate(
+                        "frac_x",
+                        n,
+                        lambda: x - np.round(x),
+                    )
+                    hp_rows, hp_rows_lease = candidate.allocate(
+                        "hp_rows",
+                        state_units_for_nbytes(n),
+                        lambda: (
+                            diff_is_int
+                            & (np.abs(frac_x) > 1e-6)
                         ),
                     )
-                    continue
-            # integer difference with shared decimal fractions (B5), else small discrete diff set
-            # B5: y and x reproduce each other's HIGH-PRECISION decimal fractions row-wise while
-            # differing only by whole numbers that VARY across rows (a constant integer offset is
-            # already caught above as constant_offset). Independent measurements do not reproduce
-            # another column's 4+-decimal fractions on several rows — a copy-then-shift fingerprint
-            # (e.g. 178.7615 vs 112.7615, 169.8687 vs 115.8687). The precision requirement lets this
-            # fire from n>=5 without the false positives a bare small-diff-set floor would admit.
-            if n >= 5:
-                # Per-row tolerance for the integer-difference test: representation noise at each
-                # row's OWN magnitude, not the column-wide max. A single extreme value (an inf /
-                # placeholder like a 1e99 fold-change for a zero-denominator row) must not inflate
-                # the tolerance so that every row's diff reads as a whole number — that produced
-                # spurious whole-sheet integer_diff_shared_fraction findings (M2-1).
-                diff_is_int = integer_shift_close(x, y)
-                frac_x = x - np.round(x)                       # signed distance to nearest integer
-                hp_rows = diff_is_int & (np.abs(frac_x) > 1e-6)
-                hp_fracs = [float(v) for v in frac_x[hp_rows] if _sig_frac_digits(v) >= 4]
-                distinct_hp = len({round(v, 6) for v in hp_fracs})
-                int_diffs = np.unique(np.round(diff[diff_is_int]))
-                n_real_frac = int(hp_rows.sum())        # rows sharing a non-.0 fraction
-                if (int(diff_is_int.sum()) >= max(5, int(round(0.8 * n)))
+                    candidate.release(fractional_workspace)
+                    n_real_frac = int(hp_rows.sum())
+                    high_precision_count = (
+                        _compact_high_precision_fractions(
+                            frac_x, hp_rows
+                        )
+                    )
+                    del hp_rows
+                    candidate.release(hp_rows_lease)
+                    high_precision_workspace = candidate.reserve(
+                        "high_precision_unique_workspace",
+                        4 * n,
+                    )
+                    (
+                        high_precision_unique,
+                        high_precision_unique_lease,
+                    ) = candidate.allocate(
+                        "high_precision_unique",
+                        n,
+                        lambda: np.unique(
+                            frac_x[:high_precision_count]
+                        ),
+                    )
+                    distinct_hp = len(high_precision_unique)
+                    del high_precision_unique, frac_x
+                    candidate.release(
+                        high_precision_unique_lease
+                    )
+                    candidate.release(high_precision_workspace)
+                    candidate.release(frac_x_lease)
+
+                    integer_diff_round_workspace = (
+                        candidate.reserve(
+                            "integer_diff_round_workspace",
+                            n,
+                        )
+                    )
+                    (
+                        int_diff_rounded,
+                        int_diff_rounded_lease,
+                    ) = candidate.allocate(
+                        "int_diff_rounded",
+                        n,
+                        lambda: np.round(diff[diff_is_int]),
+                    )
+                    candidate.release(
+                        integer_diff_round_workspace
+                    )
+                    integer_diff_unique_workspace = (
+                        candidate.reserve(
+                            "integer_diff_unique_workspace",
+                            4 * n,
+                        )
+                    )
+                    int_diffs, int_diffs_lease = candidate.allocate(
+                        "int_diffs",
+                        n,
+                        lambda: np.unique(int_diff_rounded),
+                    )
+                    int_diff_count = len(int_diffs)
+                    del int_diffs, int_diff_rounded
+                    candidate.release(int_diffs_lease)
+                    candidate.release(
+                        integer_diff_unique_workspace
+                    )
+                    candidate.release(int_diff_rounded_lease)
+                    del diff_is_int
+                    candidate.release(diff_is_int_lease)
+                    if (
+                        integer_shift_count
+                        >= max(5, int(round(0.8 * n)))
                         and distinct_hp >= 3
-                        and len(int_diffs) >= 2):
-                    emit(
-                        "high",
-                        lambda ci=ci, cj=cj, n=n,
-                        n_real_frac=n_real_frac,
-                        distinct_hp=distinct_hp, x=x, y=y: dict(
-                            kind="integer_diff_shared_fraction",
-                            col_a=header[ci - c0],
-                            col_b=header[cj - c0],
-                            col_a_idx=ci,
-                            col_b_idx=cj,
-                            n=n,
-                            n_shared_fraction=n_real_frac,
-                            n_high_precision=distinct_hp,
-                            severity="high",
-                            col_a_sample=_sample(x),
-                            col_b_sample=_sample(y),
-                            rule=(
-                                f"col[{cj}] and col[{ci}] share the "
-                                "same decimal fraction on "
-                                f"{n_real_frac}/{n} rows "
-                                f"({distinct_hp} distinct "
-                                "high-precision fractions) but differ "
-                                "by whole numbers"
+                        and int_diff_count >= 2
+                    ):
+                        candidate.offer(
+                            "high",
+                            lambda ci=ci, cj=cj, n=n,
+                            n_real_frac=n_real_frac,
+                            distinct_hp=distinct_hp,
+                            x_sample=x_sample,
+                            y_sample=y_sample: dict(
+                                kind=(
+                                    "integer_diff_shared_fraction"
+                                ),
+                                col_a=header[ci - c0],
+                                col_b=header[cj - c0],
+                                col_a_idx=ci,
+                                col_b_idx=cj,
+                                n=n,
+                                n_shared_fraction=n_real_frac,
+                                n_high_precision=distinct_hp,
+                                severity="high",
+                                col_a_sample=list(x_sample),
+                                col_b_sample=list(y_sample),
+                                rule=(
+                                    f"col[{cj}] and col[{ci}] "
+                                    "share the same decimal "
+                                    f"fraction on {n_real_frac}/{n} "
+                                    f"rows ({distinct_hp} distinct "
+                                    "high-precision fractions) but "
+                                    "differ by whole numbers"
+                                ),
                             ),
-                        ),
+                        )
+                        del diff, x, y
+                        candidate.release(diff_lease)
+                        candidate.release(filtered_lease)
+                        return
+
+                if n >= 8:
+                    (
+                        diff_rounded,
+                        diff_rounded_lease,
+                    ) = candidate.allocate(
+                        "diff_rounded",
+                        n,
+                        lambda: np.round(diff, 4),
                     )
-                    continue
-            # small discrete diff set
-            if n >= 8:
-                diff_rounded = np.round(diff, 4)
-                uniq = np.unique(diff_rounded)
-                if 2 <= len(uniq) <= min(6, n // 3):
-                    emit(
-                        "medium",
-                        lambda ci=ci, cj=cj, n=n, uniq=uniq,
-                        x=x, y=y: dict(
-                            kind="small_diff_set",
-                            col_a=header[ci - c0],
-                            col_b=header[cj - c0],
-                            col_a_idx=ci,
-                            col_b_idx=cj,
-                            n=n,
-                            unique_diffs=[
-                                float(value) for value in uniq
-                            ],
-                            severity="medium",
-                            col_a_sample=_sample(x),
-                            col_b_sample=_sample(y),
-                            rule=(
-                                f"col[{cj}] - col[{ci}] only takes "
-                                f"{len(uniq)} discrete values"
+                    diff_unique_workspace = candidate.reserve(
+                        "diff_unique_workspace",
+                        4 * n,
+                    )
+                    unique_diffs, unique_diffs_lease = (
+                        candidate.allocate(
+                            "unique_diffs",
+                            n,
+                            lambda: np.unique(diff_rounded),
+                        )
+                    )
+                    unique_diff_count = len(unique_diffs)
+                    unique_diff_values = tuple(
+                        float(value) for value in unique_diffs
+                    )
+                    del unique_diffs, diff_rounded
+                    candidate.release(unique_diffs_lease)
+                    candidate.release(diff_unique_workspace)
+                    candidate.release(diff_rounded_lease)
+                    if (
+                        2 <= unique_diff_count
+                        <= min(6, n // 3)
+                    ):
+                        candidate.offer(
+                            "medium",
+                            lambda ci=ci, cj=cj, n=n,
+                            unique_diff_count=unique_diff_count,
+                            unique_diff_values=unique_diff_values,
+                            x_sample=x_sample,
+                            y_sample=y_sample: dict(
+                                kind="small_diff_set",
+                                col_a=header[ci - c0],
+                                col_b=header[cj - c0],
+                                col_a_idx=ci,
+                                col_b_idx=cj,
+                                n=n,
+                                unique_diffs=list(
+                                    unique_diff_values
+                                ),
+                                severity="medium",
+                                col_a_sample=list(x_sample),
+                                col_b_sample=list(y_sample),
+                                rule=(
+                                    f"col[{cj}] - col[{ci}] only "
+                                    f"takes {unique_diff_count} "
+                                    "discrete values"
+                                ),
                             ),
-                        ),
-                    )
+                        )
+                del diff, x, y
+                candidate.release(diff_lease)
+                candidate.release(filtered_lease)
+
+            with candidate:
+                run_pair_candidate()
+            if candidate.rejected:
+                break
     return findings
 
 
@@ -2046,37 +2768,134 @@ def _demote_reused_progressions(report_blocks, profile="review"):
 
 
 def detect_arithmetic_progression(
-    sheet, r0, r1, c0, c1, header, *, _finding_sink=None
+    sheet,
+    r0,
+    r1,
+    c0,
+    c1,
+    header,
+    *,
+    _resources=None,
+    _finding_sink=None,
 ):
     findings, emit = _finding_emitter(
         "progressions", _finding_sink
     )
+    resources = _resources or _DenseFamilyResources.unlimited(
+        "arithmetic_progression"
+    )
+    row_count = r1 - r0
+    state_upper_bounds = {
+        "column": row_count,
+        "numeric_mask": state_units_for_nbytes(row_count),
+        "values": row_count,
+        "diffs": max(0, row_count - 1),
+        "progression_abs_workspace": row_count,
+        "progression_close_workspace": 4 * row_count,
+    }
+    if not resources.begin(
+        row_count=row_count,
+        candidates_total=c1 - c0,
+        minimum_candidate_work=row_count,
+        state_required=sum(state_upper_bounds.values()),
+    ):
+        return findings
+
     for c in range(c0, c1):
-        a = col_array(sheet, r0, r1, c)
-        a = a[~np.isnan(a)]
-        if len(a) < 5:
-            continue
-        diffs = np.diff(a)
-        tol = 1e-9 * max(float(np.max(np.abs(a))), 1e-300)   # scale-relative (see detect_relations)
-        if np.allclose(diffs, diffs[0], atol=tol, rtol=1e-9) and abs(diffs[0]) > tol:
-            sev = "medium" if abs(diffs[0] - round(diffs[0])) < 1e-9 else "high"
-            emit(
-                sev,
-                lambda c=c, a=a, diffs=diffs, sev=sev: dict(
+        candidate, column_lease, initial_leases = (
+            resources.start_allocated_candidate(
+                "column",
+                row_count,
+                row_count,
+                emit,
+            )
+        )
+        if candidate is None:
+            break
+        assert initial_leases == ()
+
+        def run_column_candidate():
+            column = candidate.materialize(
+                column_lease,
+                lambda: col_array(sheet, r0, r1, c),
+            )
+            numeric_mask, numeric_mask_lease = candidate.allocate(
+                "numeric_mask",
+                state_units_for_nbytes(row_count),
+                lambda: np.isnan(column),
+            )
+            np.logical_not(numeric_mask, out=numeric_mask)
+            values, values_lease = candidate.allocate(
+                "values",
+                row_count,
+                lambda: column[numeric_mask],
+            )
+            del numeric_mask, column
+            candidate.release(numeric_mask_lease)
+            candidate.release(column_lease)
+            n = len(values)
+            if n < 5:
+                del values
+                candidate.release(values_lease)
+                return
+            diffs, diffs_lease = candidate.allocate(
+                "diffs",
+                max(0, n - 1),
+                lambda: np.diff(values),
+            )
+            abs_workspace = candidate.reserve(
+                "progression_abs_workspace",
+                n,
+            )
+            tol = 1e-9 * max(
+                float(np.max(np.abs(values))), 1e-300
+            )
+            candidate.release(abs_workspace)
+            close_workspace = candidate.reserve(
+                "progression_close_workspace",
+                4 * n,
+            )
+            closes = np.allclose(
+                diffs,
+                diffs[0],
+                atol=tol,
+                rtol=1e-9,
+            )
+            candidate.release(close_workspace)
+            step = float(diffs[0])
+            first = float(values[0])
+            del diffs, values
+            candidate.release(diffs_lease)
+            candidate.release(values_lease)
+            if closes and abs(step) > tol:
+                sev = (
+                    "medium"
+                    if abs(step - round(step)) < 1e-9
+                    else "high"
+                )
+                candidate.offer(
+                    sev,
+                    lambda c=c, n=n, step=step,
+                    first=first, sev=sev: dict(
                     kind="arithmetic_progression",
                     col=header[c - c0],
                     col_idx=c,
                     block_c0=c0,
-                    n=int(len(a)),
-                    step=float(diffs[0]),
-                    first=float(a[0]),
+                    n=int(n),
+                    step=step,
+                    first=first,
                     severity=sev,
                     rule=(
                         f"col[{c}] = arithmetic progression, "
-                        f"step={diffs[0]:.6g}"
+                        f"step={step:.6g}"
                     ),
-                ),
-            )
+                    ),
+                )
+
+        with candidate:
+            run_column_candidate()
+        if candidate.rejected:
+            break
     return findings
 
 
@@ -2132,7 +2951,7 @@ def detect_within_column_patterns(
     header,
     min_n=6,
     *,
-    _state_tracker=None,
+    _resources=None,
     _finding_sink=None,
 ):
     """Detect within-column anomalies:
@@ -2142,20 +2961,65 @@ def detect_within_column_patterns(
        - missing last digits (Su Jiacao: '70 个数据中末位完全没有 3 或 7')
     """
     findings, emit = _finding_emitter("within_col", _finding_sink)
-    tracker = _state_tracker or _DenseStateTracker()
+    resources = _resources or _DenseFamilyResources.unlimited(
+        "within_column"
+    )
+    row_count = r1 - r0
+    state_upper_bounds = {
+        "column": row_count,
+        "numeric_mask": state_units_for_nbytes(row_count),
+        "values": row_count,
+        "rounded": row_count,
+        "frequency_workspace": 8 * row_count,
+        "unique": row_count,
+        "counts": row_count,
+        "order": row_count,
+        "integer_workspace": 3 * row_count,
+    }
+    if not resources.begin(
+        row_count=row_count,
+        candidates_total=c1 - c0,
+        minimum_candidate_work=row_count,
+        state_required=sum(state_upper_bounds.values()),
+    ):
+        return findings
 
-    def detect_column(c):
-        try:
-            column = col_array(sheet, r0, r1, c)
-            tracker.retain("column", column)
-            numeric_mask = ~np.isnan(column)
-            tracker.retain("numeric_mask", numeric_mask)
-            values = column[numeric_mask]
-            tracker.retain("values", values)
-            del column, numeric_mask
-            tracker.release("column", "numeric_mask")
+    for c in range(c0, c1):
+        candidate, column_lease, initial_leases = (
+            resources.start_allocated_candidate(
+                "column",
+                row_count,
+                row_count,
+                emit,
+            )
+        )
+        if candidate is None:
+            break
+        assert initial_leases == ()
+
+        def run_column_candidate():
+            column = candidate.materialize(
+                column_lease,
+                lambda: col_array(sheet, r0, r1, c),
+            )
+            numeric_mask, numeric_mask_lease = candidate.allocate(
+                "numeric_mask",
+                state_units_for_nbytes(row_count),
+                lambda: np.isnan(column),
+            )
+            np.logical_not(numeric_mask, out=numeric_mask)
+            values, values_lease = candidate.allocate(
+                "values",
+                row_count,
+                lambda: column[numeric_mask],
+            )
+            del numeric_mask, column
+            candidate.release(numeric_mask_lease)
+            candidate.release(column_lease)
             n = len(values)
             if n < min_n:
+                del values
+                candidate.release(values_lease)
                 return
             col_name = (
                 header[c - c0]
@@ -2163,40 +3027,61 @@ def detect_within_column_patterns(
                 else f"col{c}"
             )
 
-            rounded = np.round(values, 4)
-            tracker.retain("rounded", rounded)
-            tracker.retain_units("frequency_workspace", 8 * n)
+            rounded, rounded_lease = candidate.allocate(
+                "rounded",
+                n,
+                lambda: np.round(values, 4),
+            )
+            frequency_workspace = candidate.reserve(
+                "frequency_workspace",
+                8 * n,
+            )
+            unique_lease = candidate.reserve("unique", n)
+            counts_lease = candidate.reserve("counts", n)
+            order_lease = candidate.reserve("order", n)
             unique, value_counts, value_order = (
                 _numpy_frequency_summary(rounded)
             )
-            tracker.retain("unique", unique)
-            tracker.retain("counts", value_counts)
-            tracker.retain("order", value_order)
-            tracker.release("frequency_workspace")
+            unique_lease.validate_nbytes(unique.nbytes)
+            counts_lease.validate_nbytes(value_counts.nbytes)
+            order_lease.validate_nbytes(value_order.nbytes)
+            candidate.release(frequency_workspace)
             n_distinct = int(len(unique))
 
-            tracker.retain_units("integer_workspace", 3 * n)
+            integer_workspace = candidate.reserve(
+                "integer_workspace",
+                3 * n,
+            )
             all_integer = bool(
                 np.all(
                     np.abs(values - np.round(values)) < 1e-9
                 )
             )
-            tracker.release("integer_workspace")
+            candidate.release(integer_workspace)
 
             top_index = int(value_order[0])
-            top_val = unique[top_index]
+            top_val = float(unique[top_index])
             top_count = int(value_counts[top_index])
+            value_sample = tuple(
+                float(unique[index])
+                for index in value_order[:8]
+            )
+            del rounded, unique, value_counts, value_order
+            candidate.release(rounded_lease)
+            candidate.release(unique_lease)
+            candidate.release(counts_lease)
+            candidate.release(order_lease)
             if (
                 top_count >= max(4, n // 2)
                 and n - top_count >= 1
             ):
-                emit(
+                candidate.offer(
                     "high",
                     lambda c=c, col_name=col_name, n=n,
                     top_val=top_val, top_count=top_count,
                     n_distinct=n_distinct,
-                    all_integer=all_integer, unique=unique,
-                    value_order=value_order: dict(
+                    all_integer=all_integer,
+                    value_sample=value_sample: dict(
                         kind="within_col_value_duplication",
                         col=col_name,
                         col_idx=c,
@@ -2206,10 +3091,7 @@ def detect_within_column_patterns(
                         frac_repeat=top_count / n,
                         n_distinct=n_distinct,
                         all_integer=all_integer,
-                        value_sample=[
-                            float(unique[index])
-                            for index in value_order[:8]
-                        ],
+                        value_sample=list(value_sample),
                         severity="high",
                         rule=(
                             f"col[{c}] has value {top_val} repeated "
@@ -2230,15 +3112,15 @@ def detect_within_column_patterns(
                 if top_end_count >= max(
                     5, 2 * ending_count // 3
                 ):
-                    emit(
+                    candidate.offer(
                         "high",
                         lambda c=c, col_name=col_name,
                         ending_count=ending_count,
                         top_end=top_end,
                         top_end_count=top_end_count,
                         n_distinct=n_distinct,
-                        all_integer=all_integer, unique=unique,
-                        value_order=value_order: dict(
+                        all_integer=all_integer,
+                        value_sample=value_sample: dict(
                             kind="within_col_decimal_repetition",
                             col=col_name,
                             col_idx=c,
@@ -2250,10 +3132,7 @@ def detect_within_column_patterns(
                             ),
                             n_distinct=n_distinct,
                             all_integer=all_integer,
-                            value_sample=[
-                                float(unique[index])
-                                for index in value_order[:8]
-                            ],
+                            value_sample=list(value_sample),
                             severity="high",
                             rule=(
                                 f"col[{c}]: "
@@ -2271,6 +3150,8 @@ def detect_within_column_patterns(
                 if digit is not None:
                     last_digit_counts[digit] += 1
                     last_digit_count += 1
+            del values
+            candidate.release(values_lease)
             if last_digit_count >= max(min_n, 10):
                 zeros_fives = (
                     last_digit_counts["0"]
@@ -2279,7 +3160,7 @@ def detect_within_column_patterns(
                 if zeros_fives >= max(
                     7, 0.7 * last_digit_count
                 ):
-                    emit(
+                    candidate.offer(
                         "medium",
                         lambda c=c, col_name=col_name,
                         last_digit_count=last_digit_count,
@@ -2306,7 +3187,7 @@ def detect_within_column_patterns(
                     if digit not in present
                 ]
                 if missing and len(present) <= 6:
-                    emit(
+                    candidate.offer(
                         "medium",
                         lambda c=c, col_name=col_name,
                         last_digit_count=last_digit_count,
@@ -2324,11 +3205,11 @@ def detect_within_column_patterns(
                             ),
                         ),
                     )
-        finally:
-            tracker.release_all()
 
-    for c in range(c0, c1):
-        detect_column(c)
+        with candidate:
+            run_column_candidate()
+        if candidate.rejected:
+            break
     return findings
 
 
@@ -2341,7 +3222,7 @@ def detect_dispersed_repeats(
     header,
     min_n=30,
     *,
-    _state_tracker=None,
+    _resources=None,
     _finding_sink=None,
 ):
     """Many DISTINCT high-precision values each repeated across DISPERSED rows.
@@ -2353,90 +3234,226 @@ def detect_dispersed_repeats(
     defaults pinned by tests; not env-tunable.
     """
     findings, emit = _finding_emitter("within_col", _finding_sink)
-    tracker = _state_tracker or _DenseStateTracker()
+    resources = _resources or _DenseFamilyResources.unlimited(
+        "dispersed_repeats"
+    )
+    row_count = r1 - r0
+    bool_units = state_units_for_nbytes(row_count)
+    state_upper_bounds = {
+        "numeric_mask": bool_units,
+        "rows": row_count,
+        "values": row_count,
+        "integer_gate_workspace": 3 * row_count,
+        "rounded": row_count,
+        "frequency_workspace": 8 * row_count,
+        "unique_all": row_count,
+        "counts_all": row_count,
+        "order_all": row_count,
+        "core_mask": bool_units,
+        "core_rows": row_count,
+        "core_values": row_count,
+        "decimal_places": bool_units,
+        "precision_gate": bool_units,
+        "rounded_core": row_count,
+        "unique_workspace": 10 * row_count,
+        "unique_core": row_count,
+        "first_core": row_count,
+        "inverse": row_count,
+        "counts": row_count,
+        "partition_workspace": row_count,
+        "sort_workspace": 3 * row_count,
+        "sorted_positions": row_count,
+        "group_start_workspace": 2 * row_count,
+        "group_starts": row_count,
+        "group_rows": row_count,
+        "group_diffs": row_count,
+        "group_gaps": bool_units,
+        "sample_rounded": row_count,
+        "sample_frequency_workspace": 8 * row_count,
+        "sample_unique": row_count,
+        "sample_counts": row_count,
+        "sample_order": row_count,
+    }
+    if not resources.begin(
+        row_count=row_count,
+        candidates_total=c1 - c0,
+        minimum_candidate_work=row_count,
+        state_required=sum(state_upper_bounds.values()),
+    ):
+        return findings
 
     def _dec_places(v):
         s = f"{v:.10f}".rstrip("0")
         return len(s.split(".")[1]) if "." in s else 0
 
-    def detect_column(c):
-        try:
-            column = sheet.numeric[r0:r1, c]
-            numeric_mask = ~np.isnan(column)
-            tracker.retain("numeric_mask", numeric_mask)
-            rows = np.flatnonzero(numeric_mask) + r0
-            tracker.retain("rows", rows)
-            vals = column[numeric_mask]
-            tracker.retain("values", vals)
-            n = int(len(vals))
+    for c in range(c0, c1):
+        column = sheet.numeric[r0:r1, c]
+        candidate, numeric_mask_lease, initial_leases = (
+            resources.start_allocated_candidate(
+                "numeric_mask",
+                state_units_for_nbytes(row_count),
+                row_count,
+                emit,
+            )
+        )
+        if candidate is None:
+            break
+        assert initial_leases == ()
+
+        def run_column_candidate():
+            numeric_mask = candidate.materialize(
+                numeric_mask_lease,
+                lambda: np.isnan(column),
+            )
+            np.logical_not(numeric_mask, out=numeric_mask)
+            rows, rows_lease = candidate.allocate(
+                "rows",
+                row_count,
+                lambda: np.flatnonzero(numeric_mask),
+            )
+            rows += r0
+            values, values_lease = candidate.allocate(
+                "values",
+                row_count,
+                lambda: column[numeric_mask],
+            )
+            del numeric_mask
+            candidate.release(numeric_mask_lease)
+            n = int(len(values))
             if n < min_n:
-                return None
+                del rows, values
+                candidate.release(rows_lease)
+                candidate.release(values_lease)
+                return
 
-            tracker.retain_units("integer_gate_workspace", 3 * n)
+            integer_workspace = candidate.reserve(
+                "integer_gate_workspace",
+                3 * n,
+            )
             all_integer = bool(
-                np.all(np.abs(vals - np.round(vals)) < 1e-9)
+                np.all(
+                    np.abs(values - np.round(values)) < 1e-9
+                )
             )
-            tracker.release("integer_gate_workspace")
+            candidate.release(integer_workspace)
             if all_integer:
-                return None
+                del rows, values
+                candidate.release(rows_lease)
+                candidate.release(values_lease)
+                return
 
-            # Strip a dominant boundary/censor value FIRST (e.g. 600s ceiling), so it
-            # neither drags down the precision fraction nor counts as a "repeat".
-            rounded = np.round(vals, 6)
-            tracker.retain("rounded", rounded)
-            tracker.retain_units("frequency_workspace", 8 * n)
-            unique_all, counts_all, order_all = _numpy_frequency_summary(
-                rounded
+            rounded, rounded_lease = candidate.allocate(
+                "rounded",
+                n,
+                lambda: np.round(values, 6),
             )
-            tracker.retain("unique_all", unique_all)
-            tracker.retain("counts_all", counts_all)
-            tracker.retain("order_all", order_all)
-            tracker.release("frequency_workspace")
+            frequency_workspace = candidate.reserve(
+                "frequency_workspace",
+                8 * n,
+            )
+            unique_all_lease = candidate.reserve(
+                "unique_all", n
+            )
+            counts_all_lease = candidate.reserve(
+                "counts_all", n
+            )
+            order_all_lease = candidate.reserve(
+                "order_all", n
+            )
+            unique_all, counts_all, order_all = (
+                _numpy_frequency_summary(rounded)
+            )
+            unique_all_lease.validate_nbytes(unique_all.nbytes)
+            counts_all_lease.validate_nbytes(counts_all.nbytes)
+            order_all_lease.validate_nbytes(order_all.nbytes)
+            candidate.release(frequency_workspace)
             top_index = int(order_all[0])
             top_v = unique_all[top_index]
             top_c = int(counts_all[top_index])
             boundary = top_v if top_c > 0.25 * n else None
-            core_mask = (
-                np.ones(n, dtype=np.bool_)
-                if boundary is None
-                else rounded != boundary
-            )
-            tracker.retain("core_mask", core_mask)
-            core_rows = rows[core_mask]
-            tracker.retain("core_rows", core_rows)
-            core_vals = vals[core_mask]
-            tracker.retain("core_values", core_vals)
-            m = int(len(core_vals))
-            del numeric_mask, rows, vals, rounded
-            del unique_all, counts_all, order_all, core_mask
-            tracker.release(
-                "numeric_mask",
-                "rows",
-                "values",
-                "rounded",
-                "unique_all",
-                "counts_all",
-                "order_all",
+            core_mask, core_mask_lease = candidate.allocate(
                 "core_mask",
+                state_units_for_nbytes(n),
+                lambda: (
+                    np.ones(n, dtype=np.bool_)
+                    if boundary is None
+                    else rounded != boundary
+                ),
             )
+            core_rows, core_rows_lease = candidate.allocate(
+                "core_rows",
+                n,
+                lambda: rows[core_mask],
+            )
+            core_values, core_values_lease = candidate.allocate(
+                "core_values",
+                n,
+                lambda: values[core_mask],
+            )
+            m = int(len(core_values))
+            del rows, values, rounded, unique_all
+            del counts_all, order_all, core_mask
+            candidate.release(rows_lease)
+            candidate.release(values_lease)
+            candidate.release(rounded_lease)
+            candidate.release(unique_all_lease)
+            candidate.release(counts_all_lease)
+            candidate.release(order_all_lease)
+            candidate.release(core_mask_lease)
             if m < min_n:
-                return None
+                del core_rows, core_values
+                candidate.release(core_rows_lease)
+                candidate.release(core_values_lease)
+                return
 
-            # Gate 1 — continuity / high precision (computed on core)
-            decimal_places = np.fromiter(
-                (_dec_places(value) for value in core_vals),
-                dtype=np.uint8,
-                count=m,
+            decimal_places, decimal_places_lease = (
+                candidate.allocate(
+                    "decimal_places",
+                    state_units_for_nbytes(m),
+                    lambda: np.fromiter(
+                        (
+                            _dec_places(value)
+                            for value in core_values
+                        ),
+                        dtype=np.uint8,
+                        count=m,
+                    ),
+                )
             )
-            tracker.retain("decimal_places", decimal_places)
+            precision_gate, precision_gate_lease = (
+                candidate.allocate(
+                    "precision_gate",
+                    state_units_for_nbytes(m),
+                    lambda: np.greater_equal(
+                        decimal_places, 2
+                    ),
+                )
+            )
             frac_hi_prec = (
-                float(np.count_nonzero(decimal_places >= 2)) / m
+                float(np.count_nonzero(precision_gate)) / m
             )
+            del precision_gate
+            candidate.release(precision_gate_lease)
             if frac_hi_prec < 0.6:
-                return None
-            rounded_core = np.round(core_vals, 6)
-            tracker.retain("rounded_core", rounded_core)
-            tracker.retain_units("unique_workspace", 10 * m)
+                return
+
+            rounded_core, rounded_core_lease = candidate.allocate(
+                "rounded_core",
+                m,
+                lambda: np.round(core_values, 6),
+            )
+            unique_workspace = candidate.reserve(
+                "unique_workspace",
+                10 * m,
+            )
+            unique_core_lease = candidate.reserve(
+                "unique_core", m
+            )
+            first_core_lease = candidate.reserve(
+                "first_core", m
+            )
+            inverse_lease = candidate.reserve("inverse", m)
+            counts_lease = candidate.reserve("counts", m)
             (
                 unique_core,
                 first_core,
@@ -2448,49 +3465,64 @@ def detect_dispersed_repeats(
                 return_inverse=True,
                 return_counts=True,
             )
-            tracker.retain("unique_core", unique_core)
-            tracker.retain("first_core", first_core)
-            tracker.retain("inverse", inverse_core)
-            tracker.retain("counts", counts_core)
-            tracker.release("unique_workspace")
+            unique_core_lease.validate_nbytes(unique_core.nbytes)
+            first_core_lease.validate_nbytes(first_core.nbytes)
+            inverse_lease.validate_nbytes(inverse_core.nbytes)
+            counts_lease.validate_nbytes(counts_core.nbytes)
+            candidate.release(unique_workspace)
             distinct = int(len(unique_core))
             if distinct < 50 or distinct / m < 0.3:
-                return None
+                return
 
-            # Gate 1b — birthday / effective-support gate: the recording precision must
-            # be fine ENOUGH relative to the value range that exact collisions are
-            # near-zero-expected. A coarse column (e.g. 2 decimals over [0,1] -> only
-            # ~100 possible values) collides naturally and must NOT fire.
-            tracker.retain_units("partition_workspace", m)
+            partition_workspace = candidate.reserve(
+                "partition_workspace",
+                m,
+            )
             med_dp = int(np.partition(
-                decimal_places, len(decimal_places) // 2
+                decimal_places,
+                len(decimal_places) // 2,
             )[len(decimal_places) // 2])
-            tracker.release("partition_workspace")
+            candidate.release(partition_workspace)
             support = (
-                float(np.max(core_vals)) - float(np.min(core_vals))
+                float(np.max(core_values))
+                - float(np.min(core_values))
             ) * (10 ** med_dp)
             if support < 20 * m:
-                return None
+                return
 
-            # Gate 2 + 3 — dispersed exact-duplicate groups
             block_h = r1 - r0
-            tracker.retain_units("sort_workspace", 3 * m)
-            sorted_positions = np.argsort(
-                inverse_core, kind="stable"
+            sort_workspace = candidate.reserve(
+                "sort_workspace",
+                3 * m,
             )
-            tracker.retain("sorted_positions", sorted_positions)
-            tracker.release("sort_workspace")
-            tracker.retain_units(
-                "group_start_workspace", 2 * len(counts_core)
+            sorted_positions, sorted_positions_lease = (
+                candidate.allocate(
+                    "sorted_positions",
+                    m,
+                    lambda: np.argsort(
+                        inverse_core, kind="stable"
+                    ),
+                )
             )
-            group_starts = np.cumsum(
-                np.concatenate((
-                    np.array([0], dtype=np.int64),
-                    counts_core[:-1],
-                ))
+            candidate.release(sort_workspace)
+            distinct_count = len(counts_core)
+            group_start_workspace = candidate.reserve(
+                "group_start_workspace",
+                2 * distinct_count,
             )
-            tracker.retain("group_starts", group_starts)
-            tracker.release("group_start_workspace")
+            group_starts, group_starts_lease = (
+                candidate.allocate(
+                    "group_starts",
+                    distinct_count,
+                    lambda: np.cumsum(
+                        np.concatenate((
+                            np.array([0], dtype=np.int64),
+                            counts_core[:-1],
+                        ))
+                    ),
+                )
+            )
+            candidate.release(group_start_workspace)
             top_groups = []
             dispersed_count = 0
             dup_cells = 0
@@ -2500,18 +3532,33 @@ def detect_dispersed_repeats(
                     continue
                 start = int(group_starts[group_index])
                 stop = start + group_count
-                group_rows = core_rows[
-                    sorted_positions[start:stop]
-                ]
-                tracker.retain("group_rows", group_rows)
+                group_rows, group_rows_lease = candidate.allocate(
+                    "group_rows",
+                    group_count,
+                    lambda: core_rows[
+                        sorted_positions[start:stop]
+                    ],
+                )
                 span = int(group_rows[-1] - group_rows[0])
-                tracker.retain_units(
-                    "group_diff_workspace", group_count
+                group_diffs, group_diffs_lease = (
+                    candidate.allocate(
+                        "group_diffs",
+                        group_count,
+                        lambda: np.diff(group_rows),
+                    )
                 )
-                non_adjacent = bool(
-                    np.any(np.diff(group_rows) > 1)
+                group_gaps, group_gaps_lease = (
+                    candidate.allocate(
+                        "group_gaps",
+                        state_units_for_nbytes(group_count),
+                        lambda: np.greater(group_diffs, 1),
+                    )
                 )
-                tracker.release("group_diff_workspace")
+                non_adjacent = bool(np.any(group_gaps))
+                del group_gaps
+                candidate.release(group_gaps_lease)
+                del group_diffs
+                candidate.release(group_diffs_lease)
                 if span >= 0.5 * block_h and non_adjacent:
                     dispersed_count += 1
                     dup_cells += group_count
@@ -2525,61 +3572,100 @@ def detect_dispersed_repeats(
                     )
                     del top_groups[3:]
                 del group_rows
-                tracker.release("group_rows")
+                candidate.release(group_rows_lease)
 
             if (
                 dispersed_count < 10
                 or dup_cells < 0.15 * m
             ):
-                return None
+                return
             col_name = (
                 header[c - c0]
                 if c - c0 < len(header)
                 else f"col{c}"
             )
-            del decimal_places, rounded_core
-            del unique_core, first_core, inverse_core, counts_core
-            tracker.release(
-                "decimal_places",
-                "rounded_core",
-                "unique_core",
-                "first_core",
-                "inverse",
-                "counts",
-            )
 
-            def build_finding(
-                c=c,
-                col_name=col_name,
-                m=m,
+            sample_rounded, sample_rounded_lease = (
+                candidate.allocate(
+                    "sample_rounded",
+                    m,
+                    lambda: np.round(core_values, 4),
+                )
+            )
+            sample_frequency_workspace = candidate.reserve(
+                "sample_frequency_workspace",
+                8 * m,
+            )
+            sample_unique_lease = candidate.reserve(
+                "sample_unique", m
+            )
+            sample_counts_lease = candidate.reserve(
+                "sample_counts", m
+            )
+            sample_order_lease = candidate.reserve(
+                "sample_order", m
+            )
+            (
+                sample_unique,
+                sample_counts,
+                sample_order,
+            ) = _numpy_frequency_summary(sample_rounded)
+            sample_unique_lease.validate_nbytes(
+                sample_unique.nbytes
+            )
+            sample_counts_lease.validate_nbytes(
+                sample_counts.nbytes
+            )
+            sample_order_lease.validate_nbytes(
+                sample_order.nbytes
+            )
+            candidate.release(sample_frequency_workspace)
+            n_distinct = int(len(sample_unique))
+            value_sample = tuple(
+                float(sample_unique[index])
+                for index in sample_order[:8]
+            )
+            example_cells = []
+            for group_count, _first, group_index in top_groups:
+                start = int(group_starts[group_index])
+                for offset in range(min(group_count, 8)):
+                    position = int(
+                        sorted_positions[start + offset]
+                    )
+                    example_cells.append((
+                        int(core_rows[position]) + 1,
+                        c + 1,
+                    ))
+            example_cells = tuple(example_cells)
+            del sample_rounded, sample_unique
+            del sample_counts, sample_order
+            candidate.release(sample_rounded_lease)
+            candidate.release(sample_unique_lease)
+            candidate.release(sample_counts_lease)
+            candidate.release(sample_order_lease)
+            del decimal_places, rounded_core, unique_core
+            del first_core, inverse_core, counts_core
+            candidate.release(decimal_places_lease)
+            candidate.release(rounded_core_lease)
+            candidate.release(unique_core_lease)
+            candidate.release(first_core_lease)
+            candidate.release(inverse_lease)
+            candidate.release(counts_lease)
+            del core_values, core_rows
+            del sorted_positions, group_starts
+            candidate.release(core_values_lease)
+            candidate.release(core_rows_lease)
+            candidate.release(sorted_positions_lease)
+            candidate.release(group_starts_lease)
+
+            candidate.offer(
+                "medium",
+                lambda c=c, col_name=col_name, m=m,
                 dispersed_count=dispersed_count,
                 dup_cells=dup_cells,
-                core_vals=core_vals,
-                top_groups=tuple(top_groups),
-                core_rows=core_rows,
-                sorted_positions=sorted_positions,
-                group_starts=group_starts,
-            ):
-                (
-                    sample_unique,
-                    _sample_counts,
-                    sample_order,
-                ) = _numpy_frequency_summary(
-                    np.round(core_vals, 4)
-                )
-                example_cells = []
-                for group_count, _first, group_index in top_groups:
-                    start = int(group_starts[group_index])
-                    rows = core_rows[
-                        sorted_positions[
-                            start:start + group_count
-                        ]
-                    ]
-                    example_cells.extend(
-                        (int(row) + 1, c + 1)
-                        for row in rows[:8]
-                    )
-                return dict(
+                n_distinct=n_distinct,
+                value_sample=value_sample,
+                example_cells=example_cells: dict(
                     kind="within_col_dispersed_repeats",
                     col=col_name,
                     col_idx=c,
@@ -2587,33 +3673,23 @@ def detect_dispersed_repeats(
                     n_repeat_groups=dispersed_count,
                     dup_cells=dup_cells,
                     frac_repeat=dup_cells / m,
-                    n_distinct=int(len(sample_unique)),
+                    n_distinct=n_distinct,
                     all_integer=False,
-                    value_sample=[
-                        float(sample_unique[index])
-                        for index in sample_order[:8]
-                    ],
-                    example_cells=example_cells,
+                    value_sample=list(value_sample),
+                    example_cells=list(example_cells),
                     severity="medium",
                     rule=(
                         f"col[{c}]: {dispersed_count} distinct "
                         "high-precision values each recur across "
                         f"dispersed rows ({dup_cells}/{m} cells)"
                     ),
-                )
-
-            emit("medium", build_finding)
-            del core_rows, sorted_positions, group_starts
-            tracker.release(
-                "core_rows",
-                "sorted_positions",
-                "group_starts",
+                ),
             )
-        finally:
-            tracker.release_all()
 
-    for c in range(c0, c1):
-        detect_column(c)
+        with candidate:
+            run_column_candidate()
+        if candidate.rejected:
+            break
     return findings
 
 
@@ -2625,7 +3701,7 @@ def detect_identical_after_rounding(
     c1,
     header,
     *,
-    _state_tracker=None,
+    _resources=None,
     _finding_sink=None,
 ):
     """Detect pairs/groups of cells that differ at higher precision but match at lower (e.g.
@@ -2633,32 +3709,114 @@ def detect_identical_after_rounding(
     findings, emit = _finding_emitter(
         "identical_after_rounding", _finding_sink
     )
-    tracker = _state_tracker or _DenseStateTracker()
-    try:
-        block = sheet.numeric[r0:r1, c0:c1]
-        cell_count = block.size
-        tracker.retain_units("candidate_workspace", 3 * cell_count)
-        candidate_mask = (
-            ~np.isnan(block) & (np.abs(block) > 1e-9)
+    resources = _resources or _DenseFamilyResources.unlimited(
+        "identical_after_rounding"
+    )
+    row_count = r1 - r0
+    col_count = c1 - c0
+    cell_count = row_count * col_count
+    state_upper_bounds = {
+        "candidate_workspace": 3 * cell_count,
+        "candidate_mask": state_units_for_nbytes(cell_count),
+        "bucket_workspace": 2 * cell_count,
+        "bucket_mask": state_units_for_nbytes(cell_count),
+        "flat_indices": cell_count,
+        "values": cell_count,
+        "rounded": cell_count,
+        "unique_workspace": 10 * cell_count,
+        "rounded_values": cell_count,
+        "first_indices": cell_count,
+        "inverse": cell_count,
+        "counts": cell_count,
+        "sort_workspace": 3 * cell_count,
+        "sorted_positions": cell_count,
+        "group_start_workspace": 2 * cell_count,
+        "group_starts": cell_count,
+        "group_values": cell_count,
+        "precise_rounded": cell_count,
+        "precise_unique_workspace": 4 * cell_count,
+        "precise_values": cell_count,
+    }
+    if not resources.begin(
+        row_count=row_count,
+        candidates_total=1,
+        minimum_candidate_work=cell_count,
+        state_required=sum(state_upper_bounds.values()),
+    ):
+        return findings
+
+    block = sheet.numeric[r0:r1, c0:c1]
+    candidate, candidate_mask_lease, initial_leases = (
+        resources.start_allocated_candidate(
+            "candidate_mask",
+            state_units_for_nbytes(cell_count),
+            cell_count,
+            emit,
+            initial_reservations=(
+                ("candidate_workspace", 3 * cell_count),
+            ),
         )
-        tracker.release("candidate_workspace")
-        tracker.retain("candidate_mask", candidate_mask)
+    )
+    if candidate is None:
+        return findings
+
+    def run_rounding_candidate():
+        candidate_mask = candidate.materialize(
+            candidate_mask_lease,
+            lambda: (
+                ~np.isnan(block) & (np.abs(block) > 1e-9)
+            ),
+            release_after=initial_leases,
+        )
         if int(np.count_nonzero(candidate_mask)) < 20:
-            return findings
-        tracker.retain_units("bucket_workspace", 2 * cell_count)
-        bucket_mask = candidate_mask & (np.abs(block) < 100)
-        tracker.release("bucket_workspace")
-        tracker.retain("bucket_mask", bucket_mask)
-        flat_indices = np.flatnonzero(bucket_mask)
-        tracker.retain("flat_indices", flat_indices)
+            return
+        bucket_workspace = candidate.reserve(
+            "bucket_workspace",
+            2 * cell_count,
+        )
+        bucket_mask, bucket_mask_lease = candidate.allocate(
+            "bucket_mask",
+            state_units_for_nbytes(cell_count),
+            lambda: candidate_mask & (np.abs(block) < 100),
+        )
+        candidate.release(bucket_workspace)
+        flat_indices, flat_indices_lease = candidate.allocate(
+            "flat_indices",
+            cell_count,
+            lambda: np.flatnonzero(bucket_mask),
+        )
+        del bucket_mask, candidate_mask
+        candidate.release(bucket_mask_lease)
+        candidate.release(candidate_mask_lease)
         if len(flat_indices) < 4:
-            return findings
-        values = block.ravel()[flat_indices]
-        tracker.retain("values", values)
-        rounded = np.round(values, 1)
-        tracker.retain("rounded", rounded)
+            return
+        values, values_lease = candidate.allocate(
+            "values",
+            cell_count,
+            lambda: block.ravel()[flat_indices],
+        )
         value_count = len(values)
-        tracker.retain_units("unique_workspace", 10 * value_count)
+        rounded, rounded_lease = candidate.allocate(
+            "rounded",
+            value_count,
+            lambda: np.round(values, 1),
+        )
+        unique_workspace = candidate.reserve(
+            "unique_workspace",
+            10 * value_count,
+        )
+        rounded_values_lease = candidate.reserve(
+            "rounded_values", value_count
+        )
+        first_indices_lease = candidate.reserve(
+            "first_indices", value_count
+        )
+        inverse_lease = candidate.reserve(
+            "inverse", value_count
+        )
+        counts_lease = candidate.reserve(
+            "counts", value_count
+        )
         (
             rounded_values,
             first_indices,
@@ -2670,29 +3828,47 @@ def detect_identical_after_rounding(
             return_inverse=True,
             return_counts=True,
         )
-        tracker.retain("rounded_values", rounded_values)
-        tracker.retain("first_indices", first_indices)
-        tracker.retain("inverse", inverse)
-        tracker.retain("counts", counts)
-        tracker.release("unique_workspace")
-        tracker.retain_units("sort_workspace", 3 * value_count)
-        sorted_positions = np.argsort(inverse, kind="stable")
-        tracker.retain("sorted_positions", sorted_positions)
-        tracker.release("sort_workspace")
-        tracker.retain_units(
-            "group_start_workspace", 2 * len(counts)
+        rounded_values_lease.validate_nbytes(
+            rounded_values.nbytes
         )
-        group_starts = np.cumsum(
-            np.concatenate((
-                np.array([0], dtype=np.int64),
-                counts[:-1],
-            ))
+        first_indices_lease.validate_nbytes(
+            first_indices.nbytes
         )
-        tracker.retain("group_starts", group_starts)
-        tracker.release("group_start_workspace")
+        inverse_lease.validate_nbytes(inverse.nbytes)
+        counts_lease.validate_nbytes(counts.nbytes)
+        candidate.release(unique_workspace)
+        sort_workspace = candidate.reserve(
+            "sort_workspace",
+            3 * value_count,
+        )
+        sorted_positions, sorted_positions_lease = (
+            candidate.allocate(
+                "sorted_positions",
+                value_count,
+                lambda: np.argsort(inverse, kind="stable"),
+            )
+        )
+        candidate.release(sort_workspace)
+        distinct_count = len(counts)
+        group_start_workspace = candidate.reserve(
+            "group_start_workspace",
+            2 * distinct_count,
+        )
+        group_starts, group_starts_lease = candidate.allocate(
+            "group_starts",
+            distinct_count,
+            lambda: np.cumsum(
+                np.concatenate((
+                    np.array([0], dtype=np.int64),
+                    counts[:-1],
+                ))
+            ),
+        )
+        candidate.release(group_start_workspace)
 
         # Find buckets where multiple DIFFERENT (>1e-4 apart) values map to the same rounded value
         rounding_groups = []
+        width = c1 - c0
         for group_index, count in enumerate(counts):
             count = int(count)
             if count < 4:
@@ -2700,90 +3876,110 @@ def detect_identical_after_rounding(
             start = int(group_starts[group_index])
             stop = start + count
             positions = sorted_positions[start:stop]
-            group_values = values[positions]
-            tracker.retain("group_values", group_values)
-            precise_rounded = np.round(group_values, 4)
-            tracker.retain("precise_rounded", precise_rounded)
-            tracker.retain_units(
-                "precise_unique_workspace", 4 * count
+            group_values, group_values_lease = candidate.allocate(
+                "group_values",
+                count,
+                lambda: values[positions],
             )
-            precise_values = np.unique(precise_rounded)
-            tracker.retain("precise_values", precise_values)
-            tracker.release("precise_unique_workspace")
+            precise_rounded, precise_rounded_lease = (
+                candidate.allocate(
+                    "precise_rounded",
+                    count,
+                    lambda: np.round(group_values, 4),
+                )
+            )
+            precise_unique_workspace = candidate.reserve(
+                "precise_unique_workspace",
+                4 * count,
+            )
+            precise_values, precise_values_lease = (
+                candidate.allocate(
+                    "precise_values",
+                    count,
+                    lambda: np.unique(precise_rounded),
+                )
+            )
+            candidate.release(precise_unique_workspace)
             if len(precise_values) >= 3:
+                example_values = tuple(
+                    float(value) for value in precise_values[:6]
+                )
+                example_cells = []
+                for position in positions[:6]:
+                    flat_index = int(
+                        flat_indices[int(position)]
+                    )
+                    row_offset, col_offset = divmod(
+                        flat_index, width
+                    )
+                    example_cells.append((
+                        r0 + row_offset + 1,
+                        c0 + col_offset + 1,
+                    ))
                 rounding_groups.append((
                     count,
                     int(first_indices[group_index]),
                     float(rounded_values[group_index]),
-                    group_index,
                     int(len(precise_values)),
+                    example_values,
+                    tuple(example_cells),
                 ))
                 rounding_groups.sort(
                     key=lambda item: (-item[0], item[1])
                 )
                 del rounding_groups[5:]
             del group_values, precise_rounded, precise_values
-            tracker.release(
-                "group_values",
-                "precise_rounded",
-                "precise_values",
-            )
+            candidate.release(group_values_lease)
+            candidate.release(precise_rounded_lease)
+            candidate.release(precise_values_lease)
         if rounding_groups:
-            width = c1 - c0
             for (
                 count,
                 _first_index,
                 rounded_value,
-                group_index,
                 unique_count,
+                example_values,
+                example_cells,
             ) in rounding_groups:
-                def build_finding(
-                    count=count,
+                candidate.offer(
+                    "medium",
+                    lambda count=count,
                     rounded_value=rounded_value,
-                    group_index=group_index,
                     unique_count=unique_count,
-                ):
-                    start = int(group_starts[group_index])
-                    positions = sorted_positions[
-                        start:start + count
-                    ]
-                    example_values = np.unique(
-                        np.round(values[positions], 4)
-                    )[:6]
-                    example_cells = []
-                    for position in positions[:6]:
-                        flat_index = int(
-                            flat_indices[int(position)]
-                        )
-                        row_offset, col_offset = divmod(
-                            flat_index, width
-                        )
-                        example_cells.append((
-                            r0 + row_offset + 1,
-                            c0 + col_offset + 1,
-                        ))
-                    return dict(
+                    example_values=example_values,
+                    example_cells=example_cells: dict(
                         kind="identical_after_rounding",
                         rounded_to=rounded_value,
                         n_cells=count,
                         n_unique=unique_count,
-                        example_values=[
-                            float(value)
-                            for value in example_values
-                        ],
-                        example_cells=example_cells,
+                        example_values=list(example_values),
+                        example_cells=list(example_cells),
                         severity="medium",
                         rule=(
                             f"{count} cells share rounded value "
                             f"{rounded_value} but have {unique_count} "
                             "distinct precise values"
                         ),
-                    )
+                    ),
+                )
+        del rounded_values, first_indices, inverse, counts
+        del sorted_positions, group_starts, rounded, values
+        del flat_indices
+        candidate.release(rounded_values_lease)
+        candidate.release(first_indices_lease)
+        candidate.release(inverse_lease)
+        candidate.release(counts_lease)
+        candidate.release(sorted_positions_lease)
+        candidate.release(group_starts_lease)
+        candidate.release(rounded_lease)
+        candidate.release(values_lease)
+        candidate.release(flat_indices_lease)
 
-                emit("medium", build_finding)
+    with candidate:
+        run_rounding_candidate()
+    if candidate.rejected:
         return findings
-    finally:
-        tracker.release_all()
+    return findings
 
 
 def detect_grim_grimmer(
@@ -2976,48 +4172,83 @@ def benjamini_hochberg(pvals, alpha=0.05):
 
 
 def detect_equal_pairs(
-    sheet, r0, r1, c0, c1, header, *, _finding_sink=None
+    sheet,
+    r0,
+    r1,
+    c0,
+    c1,
+    header,
+    *,
+    _resources=None,
+    _finding_sink=None,
 ):
     """Detect column pairs where many rows have identical values
     (e.g. tumor length == tumor width)."""
     findings, emit = _finding_emitter("equal_pairs", _finding_sink)
+    resources = _resources or _DenseFamilyResources.unlimited(
+        "equal_pairs"
+    )
+    row_count = r1 - r0
+    col_count = c1 - c0
+    pair_count = col_count * (col_count - 1) // 2
+    if not resources.begin(
+        row_count=row_count,
+        candidates_total=pair_count,
+        minimum_candidate_work=2 * row_count,
+        state_required=0,
+    ):
+        return findings
+
     for i in range(c1 - c0):
         for j in range(i + 1, c1 - c0):
-            pair_stats = _numeric_pair_stats(
-                sheet, r0, r1, c0 + i, c0 + j
+            candidate = resources.start_candidate(
+                2 * row_count,
+                emit,
             )
-            n = pair_stats.n
-            if n < 6:
-                continue
-            eq = pair_stats.equal
-            all_equal = pair_stats.all_equal
-            if eq >= max(6, n // 2) and eq / n >= 0.5 and not all_equal:
-                severity = "medium" if eq < n else "high"
-                emit(
-                    severity,
-                    lambda i=i, j=j, n=n, eq=eq,
-                    pair_stats=pair_stats,
-                    severity=severity: dict(
-                        kind="many_equal_pairs",
-                        col_a=header[i],
-                        col_b=header[j],
-                        col_a_idx=c0 + i,
-                        col_b_idx=c0 + j,
-                        n=n,
-                        equal=eq,
-                        severity=severity,
-                        col_a_sample=_sample_exact(
-                            pair_stats.sample_a
-                        ),
-                        col_b_sample=_sample_exact(
-                            pair_stats.sample_b
-                        ),
-                        rule=(
-                            f"col[{c0+i}] == col[{c0+j}] "
-                            f"in {eq}/{n} rows"
-                        ),
-                    ),
+            if candidate is None:
+                break
+            with candidate:
+                pair_stats = _numeric_pair_stats(
+                    sheet, r0, r1, c0 + i, c0 + j
                 )
+                n = pair_stats.n
+                if n < 6:
+                    continue
+                eq = pair_stats.equal
+                all_equal = pair_stats.all_equal
+                if (
+                    eq >= max(6, n // 2)
+                    and eq / n >= 0.5
+                    and not all_equal
+                ):
+                    severity = (
+                        "medium" if eq < n else "high"
+                    )
+                    candidate.offer(
+                        severity,
+                        lambda i=i, j=j, n=n, eq=eq,
+                        pair_stats=pair_stats,
+                        severity=severity: dict(
+                            kind="many_equal_pairs",
+                            col_a=header[i],
+                            col_b=header[j],
+                            col_a_idx=c0 + i,
+                            col_b_idx=c0 + j,
+                            n=n,
+                            equal=eq,
+                            severity=severity,
+                            col_a_sample=_sample_exact(
+                                pair_stats.sample_a
+                            ),
+                            col_b_sample=_sample_exact(
+                                pair_stats.sample_b
+                            ),
+                            rule=(
+                                f"col[{c0+i}] == col[{c0+j}] "
+                                f"in {eq}/{n} rows"
+                            ),
+                        ),
+                    )
     return findings
 
 
@@ -6120,87 +7351,17 @@ def _wide_integer_counts_by_block(
         tracker.release_all()
 
 
-def _dense_detector_requirements(row_count, col_count):
-    # State is measured in float64-equivalent 8-byte units. Instrumented
-    # families include every named live array plus conservative reserves for
-    # NumPy sort/unique/partition workspaces before those operations run.
-    pair_count = col_count * (col_count - 1) // 2
-    cell_count = row_count * col_count
-    return [
-        {
-            "family": "relations",
-            "candidates_total": pair_count,
-            "work_required": 2 * row_count * pair_count,
-            "state_required": 4 * row_count,
-        },
-        {
-            "family": "equal_pairs",
-            "candidates_total": pair_count,
-            "work_required": 2 * row_count * pair_count,
-            "state_required": 3 * row_count,
-        },
-        {
-            "family": "arithmetic_progression",
-            "candidates_total": col_count,
-            "work_required": cell_count,
-            "state_required": 3 * row_count,
-        },
-        {
-            "family": "within_column",
-            "candidates_total": col_count,
-            "work_required": cell_count,
-            "state_required": 16 * row_count,
-        },
-        {
-            "family": "dispersed_repeats",
-            "candidates_total": col_count,
-            "work_required": cell_count,
-            "state_required": 48 * row_count,
-        },
-        {
-            "family": "identical_after_rounding",
-            "candidates_total": 1,
-            "work_required": cell_count,
-            "state_required": 32 * cell_count,
-        },
-    ]
-
-
-def _dense_detector_admission(row_count, col_count):
-    allowed = {}
-    skipped = []
-    max_rows = max(0, _DENSE_BLOCK_MAX_ROWS)
-    work_limit = max(0, _DENSE_BLOCK_CELL_WORK_LIMIT)
-    state_limit = max(0, _DENSE_BLOCK_STATE_CELL_LIMIT)
-    for requirement in _dense_detector_requirements(
-        row_count, col_count
-    ):
-        limits_reached = []
-        if row_count > max_rows:
-            limits_reached.append("row")
-        if requirement["work_required"] > work_limit:
-            limits_reached.append("work")
-        if requirement["state_required"] > state_limit:
-            limits_reached.append("state")
-        family = requirement["family"]
-        allowed[family] = not limits_reached
-        if limits_reached:
-            skipped.append({
-                **requirement,
-                "candidates_examined": 0,
-                "candidates_skipped": requirement[
-                    "candidates_total"
-                ],
-                "work_examined": 0,
-                "work_skipped": requirement["work_required"],
-                "limits_reached": limits_reached,
-            })
-    return allowed, skipped
-
-
 def _analyze_numeric_blocks(
     sheet, *, file_name, sheet_name, blocks, state
 ):
+    def dense_resources(family):
+        return _DenseFamilyResources(
+            family=family,
+            max_rows=_DENSE_BLOCK_MAX_ROWS,
+            work_limit=_DENSE_BLOCK_CELL_WORK_LIMIT,
+            state_limit=_DENSE_BLOCK_STATE_CELL_LIMIT,
+        )
+
     report_blocks = []
     wide_integer_counts = None
     wide_integer_index_exhausted = False
@@ -6298,27 +7459,17 @@ def _analyze_numeric_blocks(
                 detectors=_WIDE_INTEGER_BLOCK_DETECTORS,
             )
             state.findings_omitted_is_lower_bound = True
-        dense_allowed, dense_skipped = _dense_detector_admission(
-            r1 - r0, c1 - c0
-        )
-        if dense_skipped and not wide_integer_limited:
-            state.coverage.add_limitation(
-                "block",
-                "dense_block_detector_limit",
-                file=file_name,
-                sheet=sheet_name,
-                rows=f"{r0 + 1}-{r1}",
-                cols=f"{c0 + 1}-{c1}",
-                max_rows=max(0, _DENSE_BLOCK_MAX_ROWS),
-                cell_work_limit=max(
-                    0, _DENSE_BLOCK_CELL_WORK_LIMIT
-                ),
-                state_cell_limit=max(
-                    0, _DENSE_BLOCK_STATE_CELL_LIMIT
-                ),
-                detectors=dense_skipped,
+        dense_sessions = {
+            family: dense_resources(family)
+            for family in (
+                "relations",
+                "equal_pairs",
+                "arithmetic_progression",
+                "within_column",
+                "dispersed_repeats",
+                "identical_after_rounding",
             )
-            state.findings_omitted_is_lower_bound = True
+        }
         row_pair_dimension_limited = (
             not wide_block
             and (
@@ -6345,12 +7496,12 @@ def _analyze_numeric_blocks(
                 c0,
                 c1,
                 header,
+                _resources=dense_sessions["relations"],
                 _finding_sink=collector,
             )
             if (
                 not wide_block
                 and not wide_integer_limited
-                and dense_allowed["relations"]
             )
             else []
         )
@@ -6362,11 +7513,13 @@ def _analyze_numeric_blocks(
                 c0,
                 c1,
                 header,
+                _resources=dense_sessions[
+                    "arithmetic_progression"
+                ],
                 _finding_sink=collector,
             )
             if (
                 not wide_integer_limited
-                and dense_allowed["arithmetic_progression"]
             )
             else []
         )
@@ -6378,12 +7531,12 @@ def _analyze_numeric_blocks(
                 c0,
                 c1,
                 header,
+                _resources=dense_sessions["equal_pairs"],
                 _finding_sink=collector,
             )
             if (
                 not wide_block
                 and not wide_integer_limited
-                and dense_allowed["equal_pairs"]
             )
             else []
         )
@@ -6432,18 +7585,15 @@ def _analyze_numeric_blocks(
                 c0,
                 c1,
                 header,
+                _resources=dense_sessions["within_column"],
                 _finding_sink=collector,
             )
             if (
                 not wide_integer_limited
-                and dense_allowed["within_column"]
             )
             else []
         )
-        if (
-            not wide_integer_limited
-            and dense_allowed["dispersed_repeats"]
-        ):
+        if not wide_integer_limited:
             wc += detect_dispersed_repeats(
                 sheet,
                 r0,
@@ -6451,6 +7601,7 @@ def _analyze_numeric_blocks(
                 c0,
                 c1,
                 header,
+                _resources=dense_sessions["dispersed_repeats"],
                 _finding_sink=collector,
             )
         iar = (
@@ -6461,14 +7612,69 @@ def _analyze_numeric_blocks(
                 c0,
                 c1,
                 header,
+                _resources=dense_sessions[
+                    "identical_after_rounding"
+                ],
                 _finding_sink=collector,
             )
             if (
                 not wide_integer_limited
-                and dense_allowed["identical_after_rounding"]
             )
             else []
         )
+        dense_results = []
+        for session in dense_sessions.values():
+            result = session.result()
+            if result.limits_reached:
+                dense_results.append(result)
+        if dense_results and not wide_integer_limited:
+            state.coverage.add_limitation(
+                "block",
+                "dense_block_detector_limit",
+                file=file_name,
+                sheet=sheet_name,
+                rows=f"{r0 + 1}-{r1}",
+                cols=f"{c0 + 1}-{c1}",
+                max_rows=max(0, _DENSE_BLOCK_MAX_ROWS),
+                cell_work_limit=max(
+                    0, _DENSE_BLOCK_CELL_WORK_LIMIT
+                ),
+                state_cell_limit=max(
+                    0, _DENSE_BLOCK_STATE_CELL_LIMIT
+                ),
+                detectors=[
+                    {
+                        "family": result.family,
+                        "candidates_total": (
+                            result.candidates_total
+                        ),
+                        "candidates_examined": (
+                            result.candidates_examined
+                        ),
+                        "candidates_skipped": (
+                            result.candidates_skipped
+                        ),
+                        "work_required": result.work_required,
+                        "work_examined": result.work_examined,
+                        "work_skipped": result.work_skipped,
+                        "work_skipped_lower_bound": (
+                            result.work_skipped_lower_bound
+                        ),
+                        "state_required": result.state_required,
+                        "state_required_lower_bound": (
+                            result.state_required_lower_bound
+                        ),
+                        "peak_state_units": (
+                            result.peak_state_units
+                        ),
+                        "limits_reached": list(
+                            result.limits_reached
+                        ),
+                    }
+                    for result in dense_results
+                ],
+            )
+            state.findings_omitted_is_lower_bound = True
         gg = (
             detect_grim_grimmer(
                 sheet,
