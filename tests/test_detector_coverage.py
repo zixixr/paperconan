@@ -916,3 +916,46 @@ def test_detector_helpers_expose_coverage_without_changing_default_shapes():
     assert isinstance(row_pairs, list)
     assert covered_row_pairs == row_pairs
     assert row_pair_meta == {"findings_omitted": 0}
+
+
+def test_cross_sheet_budget_reports_axis_work_and_state_coverage():
+    budget = audit.CrossSheetWorkBudget(
+        pair_limit=10,
+        value_limit=100,
+        tail_match_limit=10,
+        finding_limit=10,
+    )
+
+    budget.record_axis_coverage(
+        available=False,
+        loading_visits=8,
+        grouping_visits=8,
+        progression_visits=0,
+        fingerprint_visits=0,
+        recurrence_order_visits=0,
+        recurrence_group_visits=0,
+        recurrence_comparison_visits=0,
+        recurrence_mark_visits=0,
+        output_visits=0,
+        work_skipped_lower_bound=16,
+        work_skipped_is_lower_bound=True,
+        state_unit_limit=512,
+        peak_state_units=384,
+    )
+    metadata = budget.limitation_metadata()
+
+    assert metadata["axis_context_available"] is False
+    assert metadata["axis_loading_visits"] == 8
+    assert metadata["axis_grouping_visits"] == 8
+    assert metadata["axis_progression_visits"] == 0
+    assert metadata["axis_fingerprint_visits"] == 0
+    assert metadata["axis_recurrence_order_visits"] == 0
+    assert metadata["axis_recurrence_group_visits"] == 0
+    assert metadata["axis_recurrence_comparison_visits"] == 0
+    assert metadata["axis_recurrence_mark_visits"] == 0
+    assert metadata["axis_output_visits"] == 0
+    assert metadata["axis_work_skipped_lower_bound"] == 16
+    assert metadata["axis_work_skipped_is_lower_bound"] is True
+    assert metadata["axis_state_unit_limit"] == 512
+    assert metadata["axis_peak_state_units"] == 384
+    assert metadata["limits_reached"] == ["axis"]

@@ -738,3 +738,49 @@ def test_dense_resource_ownership_has_no_pretransaction_factory_escape():
                 "detect_relations",
                 expected_calls["detect_relations"],
             )
+
+
+def test_cross_sheet_pair_budget_is_owned_by_pair_helpers():
+    import inspect
+
+    import paperconan._audit as audit
+
+    caller_source = inspect.getsource(audit.detect_collisions)
+    assert ".begin_pair(" not in caller_source
+    assert ".record_values(" not in caller_source
+    assert "collision_value_work" not in caller_source
+    assert "tail_value_work" not in caller_source
+
+    for name in (
+        "_cross_sheet_pair_stats",
+        "_detect_decimal_tail_reuse_for_pair",
+    ):
+        helper_source = inspect.getsource(getattr(audit, name))
+        assert ".begin_pair(" in helper_source
+        assert ".record_values(" in helper_source
+
+
+def test_axis_compact_passes_have_detector_owned_admission():
+    import inspect
+
+    import paperconan._audit as audit
+
+    source = inspect.getsource(audit._axis_columns)
+    for stage in (
+        "recurrence_order",
+        "recurrence_group",
+        "output",
+    ):
+        assert f'admit_stage("{stage}"' in source
+    for stage in (
+        "recurrence_comparison",
+        "recurrence_mark",
+    ):
+        assert f'admit_dynamic_stage("{stage}"' in source
+
+    progression_source = inspect.getsource(
+        audit._is_axis_progression_arrays
+    )
+    assert progression_source.count(
+        "for index in range(len(values)):"
+    ) == 1

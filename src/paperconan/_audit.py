@@ -4410,9 +4410,40 @@ def _cross_sheet_pair_stats(
     gb,
     *,
     shared_cell_limit=40,
+    budget=None,
     with_coverage=False,
 ):
+    candidate_value_count = len(ga) + len(gb)
     value_visits = 0
+
+    def finish_pair_result(result, **extra_coverage):
+        if value_visits > candidate_value_count:
+            raise AssertionError(
+                "pair value work exceeded its candidate"
+            )
+        if budget is not None:
+            budget.record_values(value_visits)
+            budget.skip_values(
+                candidate_value_count - value_visits
+            )
+        coverage = {
+            "pair_admitted": True,
+            "candidate_value_count": candidate_value_count,
+            "value_visits": value_visits,
+            **extra_coverage,
+        }
+        return (result, coverage) if with_coverage else result
+
+    if budget is not None and not budget.begin_pair(
+        candidate_value_count
+    ):
+        coverage = {
+            "pair_admitted": False,
+            "candidate_value_count": candidate_value_count,
+            "value_visits": 0,
+        }
+        return (None, coverage) if with_coverage else None
+
     counts_b = Counter()
     for value in gb.values():
         value_visits += 1
@@ -4483,13 +4514,12 @@ def _cross_sheet_pair_stats(
             "only_in_b": only_b,
         },
     )
-    coverage = {
-        "value_visits": value_visits,
-        "retained_value_counts": (
+    return finish_pair_result(
+        result,
+        retained_value_counts=(
             len(counts_b) + len(matched_counts)
         ),
-    }
-    return (result, coverage) if with_coverage else result
+    )
 
 
 def _value_delta(ga, gb):
@@ -4546,6 +4576,20 @@ class CrossSheetWorkBudget:
     findings_retained: int = 0
     findings_skipped: int = 0
     bucket_findings_skipped: int = 0
+    axis_context_available: bool = True
+    axis_loading_visits: int = 0
+    axis_grouping_visits: int = 0
+    axis_progression_visits: int = 0
+    axis_fingerprint_visits: int = 0
+    axis_recurrence_order_visits: int = 0
+    axis_recurrence_group_visits: int = 0
+    axis_recurrence_comparison_visits: int = 0
+    axis_recurrence_mark_visits: int = 0
+    axis_output_visits: int = 0
+    axis_work_skipped_lower_bound: int = 0
+    axis_work_skipped_is_lower_bound: bool = False
+    axis_state_unit_limit: int = 0
+    axis_peak_state_units: int = 0
     _limits_reached: set = None
 
     def __post_init__(self):
@@ -4569,14 +4613,18 @@ class CrossSheetWorkBudget:
 
     def begin_pair(self, planned_value_count):
         planned_value_count = max(0, int(planned_value_count))
+        blocked_by = None
         if self.pairs_examined >= self.pair_limit:
-            self._limits_reached.add("pair")
-            return False
-        if (
+            blocked_by = "pair"
+        elif (
             self.values_examined + planned_value_count
             > self.value_limit
         ):
-            self._limits_reached.add("value")
+            blocked_by = "value"
+        if blocked_by is not None:
+            self._limits_reached.add(blocked_by)
+            self.pairs_skipped += 1
+            self.values_skipped += planned_value_count
             return False
         self.pairs_examined += 1
         return True
@@ -4629,10 +4677,73 @@ class CrossSheetWorkBudget:
         self.findings_skipped += count
         self._limits_reached.add("fingerprint_bucket")
 
+    def record_axis_coverage(
+        self,
+        *,
+        available,
+        loading_visits,
+        grouping_visits,
+        progression_visits,
+        fingerprint_visits,
+        recurrence_order_visits,
+        recurrence_group_visits,
+        recurrence_comparison_visits,
+        recurrence_mark_visits,
+        output_visits,
+        work_skipped_lower_bound,
+        work_skipped_is_lower_bound,
+        state_unit_limit,
+        peak_state_units,
+    ):
+        self.axis_context_available = (
+            self.axis_context_available and bool(available)
+        )
+        self.axis_loading_visits += max(0, int(loading_visits))
+        self.axis_grouping_visits += max(0, int(grouping_visits))
+        self.axis_progression_visits += max(
+            0, int(progression_visits)
+        )
+        self.axis_fingerprint_visits += max(
+            0, int(fingerprint_visits)
+        )
+        self.axis_recurrence_order_visits += max(
+            0, int(recurrence_order_visits)
+        )
+        self.axis_recurrence_group_visits += max(
+            0, int(recurrence_group_visits)
+        )
+        self.axis_recurrence_comparison_visits += max(
+            0, int(recurrence_comparison_visits)
+        )
+        self.axis_recurrence_mark_visits += max(
+            0, int(recurrence_mark_visits)
+        )
+        self.axis_output_visits += max(0, int(output_visits))
+        self.axis_work_skipped_lower_bound += max(
+            0, int(work_skipped_lower_bound)
+        )
+        self.axis_work_skipped_is_lower_bound = (
+            self.axis_work_skipped_is_lower_bound
+            or bool(work_skipped_is_lower_bound)
+        )
+        self.axis_state_unit_limit = max(
+            self.axis_state_unit_limit,
+            max(0, int(state_unit_limit)),
+        )
+        self.axis_peak_state_units = max(
+            self.axis_peak_state_units,
+            max(0, int(peak_state_units)),
+        )
+        if self.axis_peak_state_units > self.axis_state_unit_limit:
+            raise AssertionError("axis peak exceeded state limit")
+        if not available:
+            self._limits_reached.add("axis")
+
     def limitation_metadata(self):
         order = (
             "pair",
             "value",
+            "axis",
             "tail_match",
             "finding",
             "fingerprint_bucket",
@@ -4657,6 +4768,38 @@ class CrossSheetWorkBudget:
             "bucket_findings_skipped": (
                 self.bucket_findings_skipped
             ),
+            "axis_context_available": (
+                self.axis_context_available
+            ),
+            "axis_loading_visits": self.axis_loading_visits,
+            "axis_grouping_visits": self.axis_grouping_visits,
+            "axis_progression_visits": (
+                self.axis_progression_visits
+            ),
+            "axis_fingerprint_visits": (
+                self.axis_fingerprint_visits
+            ),
+            "axis_recurrence_order_visits": (
+                self.axis_recurrence_order_visits
+            ),
+            "axis_recurrence_group_visits": (
+                self.axis_recurrence_group_visits
+            ),
+            "axis_recurrence_comparison_visits": (
+                self.axis_recurrence_comparison_visits
+            ),
+            "axis_recurrence_mark_visits": (
+                self.axis_recurrence_mark_visits
+            ),
+            "axis_output_visits": self.axis_output_visits,
+            "axis_work_skipped_lower_bound": (
+                self.axis_work_skipped_lower_bound
+            ),
+            "axis_work_skipped_is_lower_bound": (
+                self.axis_work_skipped_is_lower_bound
+            ),
+            "axis_state_unit_limit": self.axis_state_unit_limit,
+            "axis_peak_state_units": self.axis_peak_state_units,
             "limits_reached": [
                 name for name in order
                 if name in self._limits_reached
@@ -4669,6 +4812,35 @@ class CrossSheetWorkBudget:
 
 _POSITION_VALUE_MIN_CELLS = 6
 _DECIMAL_TAIL_MIN_CELLS = 8
+_AXIS_PROGRESSION_MIN_CELLS = 4
+_AXIS_FINGERPRINT_MIN_UNIQUE = 4
+_AXIS_OUTPUT_COLUMN_UNITS = 20
+_AXIS_OUTPUT_SUMMARY_UNITS = 32
+_AXIS_STATE_UNITS_PER_CELL = 64
+_AXIS_RECORD_DTYPE = np.dtype([
+    ("column", np.int64),
+    ("row", np.int64),
+    ("value", np.float64),
+])
+_AXIS_COLUMN_DTYPE = np.dtype([
+    ("summary_index", np.int64),
+    ("column", np.int64),
+    ("cell_count", np.int64),
+    ("is_output", np.bool_),
+    ("is_progression", np.bool_),
+    ("fingerprint_offset", np.int64),
+    ("fingerprint_nbytes", np.int64),
+    ("fingerprint_hash", "S32"),
+    ("is_recurring", np.bool_),
+])
+
+
+def _position_family_keys(grids):
+    keys = tuple(
+        key for key, grid in grids.items()
+        if len(grid) >= _POSITION_VALUE_MIN_CELLS
+    )
+    return keys if len(keys) >= 2 else ()
 
 
 @dataclass
@@ -4760,7 +4932,37 @@ def _detect_decimal_tail_reuse_for_pair(
     cells still share the same (row_delta, col_delta). Grouping by that offset
     distinguishes a copied block from isolated coincidental tail matches.
     """
+    candidate_value_count = len(ga) + len(gb)
     value_visits = 0
+
+    def finish_pair_result(result, **extra_coverage):
+        if value_visits > candidate_value_count:
+            raise AssertionError(
+                "pair value work exceeded its candidate"
+            )
+        if budget is not None:
+            budget.record_values(value_visits)
+            budget.skip_values(
+                candidate_value_count - value_visits
+            )
+        coverage = {
+            "pair_admitted": True,
+            "candidate_value_count": candidate_value_count,
+            "value_visits": value_visits,
+            **extra_coverage,
+        }
+        return (result, coverage) if with_coverage else result
+
+    if budget is not None and not budget.begin_pair(
+        candidate_value_count
+    ):
+        coverage = {
+            "pair_admitted": False,
+            "candidate_value_count": candidate_value_count,
+            "value_visits": 0,
+        }
+        return (None, coverage) if with_coverage else None
+
     inv = {}
     for kb, vb in gb.items():
         value_visits += 1
@@ -4791,25 +4993,15 @@ def _detect_decimal_tail_reuse_for_pair(
             if math.isclose(float(va), float(vb), rel_tol=1e-9, abs_tol=1e-12):
                 continue
             if budget is not None and not budget.retain_tail_match():
-                result = None
-                coverage = {"value_visits": value_visits}
-                return (
-                    (result, coverage)
-                    if with_coverage
-                    else result
-                )
+                return finish_pair_result(None)
             off = (kb[0] - ka[0], kb[1] - ka[1])
             by_offset.setdefault(off, []).append((ka, kb, float(va), float(vb), sig))
 
     if not by_offset:
-        result = None
-        coverage = {"value_visits": value_visits}
-        return (result, coverage) if with_coverage else result
+        return finish_pair_result(None)
     off, pairs = max(by_offset.items(), key=lambda kv: len(kv[1]))
     if len(pairs) < min_matches:
-        result = None
-        coverage = {"value_visits": value_visits}
-        return (result, coverage) if with_coverage else result
+        return finish_pair_result(None)
     pairs = sorted(pairs, key=lambda p: (p[0][0], p[0][1], p[1][0], p[1][1]))
     result = {
         "offset": off,
@@ -4818,8 +5010,7 @@ def _detect_decimal_tail_reuse_for_pair(
         "min_tail_digits": min_tail_digits,
         "skip_decimal_digits": skip_decimal_digits,
     }
-    coverage = {"value_visits": value_visits}
-    return (result, coverage) if with_coverage else result
+    return finish_pair_result(result)
 
 
 def _decimal_tail_constant_transform(pairs):
@@ -5113,7 +5304,128 @@ def _is_axis_progression_cells(
     return arithmetic or geometric
 
 
-def _axis_columns(grids, recur_min=3):
+def _is_axis_progression_arrays(
+    rows,
+    values,
+    *,
+    min_n=4,
+    rel_tol=1e-4,
+    geo_tol=1e-3,
+    with_coverage=False,
+):
+    value_visits = 0
+
+    def finish(result):
+        coverage = {"value_visits": value_visits}
+        return (result, coverage) if with_coverage else result
+
+    if len(values) < min_n:
+        return finish(False)
+    first_row = int(rows[0])
+    last_row = int(rows[-1])
+    first_value = float(values[0])
+    last_value = float(values[-1])
+    span = last_row - first_row
+    if span <= 0:
+        return finish(False)
+
+    scale = 0.0
+    max_arithmetic_error = 0.0
+    max_geometric_error = 0.0
+    first_positive = first_value > 0
+    step = (last_value - first_value) / span
+    geometric = (
+        first_value != 0
+        and last_value != 0
+        and (last_value > 0) == first_positive
+    )
+    if geometric:
+        log_first = math.log(abs(first_value))
+        log_step = (
+            math.log(abs(last_value)) - log_first
+        ) / span
+    else:
+        log_first = 0.0
+        log_step = 0.0
+
+    for index in range(len(values)):
+        value_visits += 1
+        row = int(rows[index])
+        value = float(values[index])
+        scale = max(scale, abs(value))
+        max_arithmetic_error = max(
+            max_arithmetic_error,
+            abs(
+                value - (
+                    first_value + step * (row - first_row)
+                )
+            )
+        )
+        if geometric:
+            if value == 0 or (value > 0) != first_positive:
+                geometric = False
+            else:
+                max_geometric_error = max(
+                    max_geometric_error,
+                    abs(
+                        math.log(abs(value))
+                        - (
+                            log_first
+                            + log_step * (row - first_row)
+                        )
+                    ),
+                )
+    arithmetic = (
+        abs(step) > 1e-12
+        and max_arithmetic_error <= rel_tol * (scale or 1.0)
+    )
+    geometric = (
+        geometric
+        and abs(log_step) > 1e-9
+        and max_geometric_error <= geo_tol
+    )
+    return finish(arithmetic or geometric)
+
+
+def _axis_payload_equal(
+    payload_view,
+    table,
+    left_index,
+    right_index,
+):
+    fingerprint_nbytes = int(
+        table["fingerprint_nbytes"][left_index]
+    )
+    if (
+        int(table["fingerprint_nbytes"][right_index])
+        != fingerprint_nbytes
+    ):
+        return False
+    left_offset = int(
+        table["fingerprint_offset"][left_index]
+    )
+    right_offset = int(
+        table["fingerprint_offset"][right_index]
+    )
+    return (
+        payload_view[
+            left_offset:left_offset + fingerprint_nbytes
+        ]
+        == payload_view[
+            right_offset:right_offset + fingerprint_nbytes
+        ]
+    )
+
+
+def _axis_columns(
+    grids,
+    recur_min=3,
+    *,
+    position_keys=None,
+    budget=None,
+    with_coverage=False,
+    _state_limit=None,
+):
     """Classify, per (file, sheet), which columns are 'axis-like' so a cross-sheet
     overlap that lands only on them can be recognized as a shared-x-axis artifact.
 
@@ -5122,36 +5434,633 @@ def _axis_columns(grids, recur_min=3):
       (B) its exact value-set recurs as a column across >= ``recur_min`` distinct
           (file, sheet) grids — i.e. the same axis was reused across many panels.
     """
-    columns = {}
-    for key, grid in grids.items():
-        grouped = defaultdict(list)
-        for (row, col), value in grid.items():
-            grouped[col].append((row, value))
-        for cells in grouped.values():
-            cells.sort(key=lambda item: item[0])
-        columns[key] = grouped
-
-    # (B) fingerprint columns by their value-set; count how many sheets carry each.
-    fp_counts = Counter()
-    col_fps = {}
-    for key, grouped in columns.items():
-        for col, cells in grouped.items():
-            vals = frozenset(value for _row, value in cells)
-            if len(vals) >= 4:
-                col_fps[(key, col)] = vals
-                fp_counts[vals] += 1
-    recurring = {fp for fp, n in fp_counts.items() if n >= recur_min}
-
-    axis = {}
-    for key, grouped in columns.items():
-        axis[key] = {
-            col for col, cells in grouped.items()
+    if position_keys is None:
+        position_keys = _position_family_keys(grids)
+    else:
+        position_keys = tuple(position_keys)
+        if len(position_keys) < 2:
+            position_keys = ()
+    position_key_set = frozenset(position_keys)
+    support_keys = (
+        tuple(
+            key for key, grid in grids.items()
             if (
-                _is_axis_progression_cells(cells)
-                or col_fps.get((key, col)) in recurring
+                key in position_key_set
+                or len(grid) >= _AXIS_FINGERPRINT_MIN_UNIQUE
             )
+        )
+        if len(position_keys) >= 2
+        else ()
+    )
+    position_cell_count = sum(
+        len(grids[key]) for key in position_keys
+    )
+    support_cell_count = sum(
+        len(grids[key]) for key in support_keys
+    )
+    remaining_fixed_visits = 3 * support_cell_count
+    axis_work_skipped_lower_bound = 0
+    dynamic_finalization_complete = not bool(support_keys)
+    stage_visits = {
+        "loading": 0,
+        "grouping": 0,
+        "progression": 0,
+        "fingerprint": 0,
+        "recurrence_order": 0,
+        "recurrence_group": 0,
+        "recurrence_comparison": 0,
+        "recurrence_mark": 0,
+        "output": 0,
+    }
+    default_axis_state_limit = (
+        _AXIS_STATE_UNITS_PER_CELL
+        * support_cell_count
+    )
+    axis_state_limit = (
+        default_axis_state_limit
+        if _state_limit is None
+        else max(0, int(_state_limit))
+    )
+    state = StateBudget(axis_state_limit)
+    live_leases = []
+
+    def add_fixed_work(count):
+        nonlocal remaining_fixed_visits
+        remaining_fixed_visits += max(0, int(count))
+
+    def record_skipped_work(count, *, budget_recorded=False):
+        nonlocal axis_work_skipped_lower_bound
+        count = max(0, int(count))
+        axis_work_skipped_lower_bound += count
+        if budget is not None and not budget_recorded:
+            budget.skip_values(count)
+
+    def admit_stage(stage, count):
+        nonlocal remaining_fixed_visits
+        count = max(0, int(count))
+        if count > remaining_fixed_visits:
+            raise AssertionError("axis work ledger underflow")
+        remaining_fixed_visits -= count
+        if budget is not None and not budget.consume_values(count):
+            record_skipped_work(count, budget_recorded=True)
+            return False
+        stage_visits[stage] += count
+        return True
+
+    def admit_dynamic_stage(stage, count):
+        count = max(0, int(count))
+        if budget is not None and not budget.consume_values(count):
+            record_skipped_work(count, budget_recorded=True)
+            return False
+        stage_visits[stage] += count
+        return True
+
+    def skip_remaining_axis_work():
+        nonlocal remaining_fixed_visits
+        record_skipped_work(remaining_fixed_visits)
+        remaining_fixed_visits = 0
+
+    def release_all_axis_leases():
+        for lease in reversed(live_leases):
+            if not lease.released:
+                lease.release()
+        live_leases.clear()
+
+    def reserve_axis_state(name, units):
+        lease = state.try_reserve(name, units)
+        if lease is not None:
+            live_leases.append(lease)
+        return lease
+
+    def release_axis_state(lease):
+        lease.release()
+        live_leases.remove(lease)
+
+    def finish_result(result, *, available):
+        if not available:
+            skip_remaining_axis_work()
+        coverage = {
+            "participating_summaries": len(position_keys),
+            "participating_cells": position_cell_count,
+            "recurrence_support_summaries": len(support_keys),
+            "recurrence_support_cells": support_cell_count,
+            "axis_loading_visits": stage_visits["loading"],
+            "axis_grouping_visits": stage_visits["grouping"],
+            "axis_progression_visits": (
+                stage_visits["progression"]
+            ),
+            "axis_fingerprint_visits": (
+                stage_visits["fingerprint"]
+            ),
+            "axis_recurrence_order_visits": (
+                stage_visits["recurrence_order"]
+            ),
+            "axis_recurrence_group_visits": (
+                stage_visits["recurrence_group"]
+            ),
+            "axis_recurrence_comparison_visits": (
+                stage_visits["recurrence_comparison"]
+            ),
+            "axis_recurrence_mark_visits": (
+                stage_visits["recurrence_mark"]
+            ),
+            "axis_output_visits": stage_visits["output"],
+            "axis_value_visits": sum(stage_visits.values()),
+            "axis_work_skipped_lower_bound": (
+                axis_work_skipped_lower_bound
+            ),
+            "axis_work_skipped_is_lower_bound": (
+                not available
+                and not dynamic_finalization_complete
+            ),
+            "axis_context_available": bool(available),
+            "axis_state_unit_limit": axis_state_limit,
+            "axis_peak_state_units": state.peak_units,
         }
-    return axis
+        if budget is not None:
+            budget.record_axis_coverage(
+                available=available,
+                loading_visits=stage_visits["loading"],
+                grouping_visits=stage_visits["grouping"],
+                progression_visits=stage_visits[
+                    "progression"
+                ],
+                fingerprint_visits=stage_visits[
+                    "fingerprint"
+                ],
+                recurrence_order_visits=stage_visits[
+                    "recurrence_order"
+                ],
+                recurrence_group_visits=stage_visits[
+                    "recurrence_group"
+                ],
+                recurrence_comparison_visits=stage_visits[
+                    "recurrence_comparison"
+                ],
+                recurrence_mark_visits=stage_visits[
+                    "recurrence_mark"
+                ],
+                output_visits=stage_visits["output"],
+                work_skipped_lower_bound=(
+                    axis_work_skipped_lower_bound
+                ),
+                work_skipped_is_lower_bound=(
+                    not available
+                    and not dynamic_finalization_complete
+                ),
+                state_unit_limit=axis_state_limit,
+                peak_state_units=state.peak_units,
+            )
+        return (result, coverage) if with_coverage else result
+
+    def unavailable_result():
+        return finish_result({}, available=False)
+
+    def store_axis_fingerprint(
+        column_entry,
+        values,
+        *,
+        unique_lease,
+        canonical_lease,
+        temp_lease,
+    ):
+        nonlocal fingerprint_bytes_used
+        unique = np.unique(values)
+        unique_lease.validate_nbytes(unique.nbytes)
+        if len(unique) < _AXIS_FINGERPRINT_MIN_UNIQUE:
+            return
+        canonical = unique.astype("<f8", copy=False)
+        canonical_lease.validate_nbytes(canonical.nbytes)
+        fingerprint = canonical.tobytes()
+        temp_lease.validate_nbytes(len(fingerprint))
+        stop = fingerprint_bytes_used + len(fingerprint)
+        if stop > len(fingerprint_payload):
+            raise AssertionError(
+                "axis fingerprint payload overflow"
+            )
+        fingerprint_payload[fingerprint_bytes_used:stop] = (
+            fingerprint
+        )
+        column_table["fingerprint_offset"][
+            column_entry
+        ] = fingerprint_bytes_used
+        column_table["fingerprint_nbytes"][
+            column_entry
+        ] = len(fingerprint)
+        column_table["fingerprint_hash"][
+            column_entry
+        ] = hashlib.sha256(fingerprint).digest()
+        fingerprint_bytes_used = stop
+
+    try:
+        column_table_units = state_units_for_nbytes(
+            support_cell_count * _AXIS_COLUMN_DTYPE.itemsize
+        )
+        column_table_lease = reserve_axis_state(
+            "axis_column_table",
+            column_table_units,
+        )
+        fingerprint_payload_lease = reserve_axis_state(
+            "axis_fingerprint_payloads",
+            support_cell_count,
+        )
+        output_capacity_lease = reserve_axis_state(
+            "axis_output_capacity",
+            (
+                _AXIS_OUTPUT_COLUMN_UNITS * support_cell_count
+                + _AXIS_OUTPUT_SUMMARY_UNITS
+                * len(position_keys)
+            ),
+        )
+        if any(
+            lease is None
+            for lease in (
+                column_table_lease,
+                fingerprint_payload_lease,
+                output_capacity_lease,
+            )
+        ):
+            return unavailable_result()
+
+        column_table = np.zeros(
+            support_cell_count,
+            dtype=_AXIS_COLUMN_DTYPE,
+        )
+        column_table_lease.validate_nbytes(
+            column_table.nbytes
+        )
+        fingerprint_payload = bytearray(
+            support_cell_count * np.dtype("<f8").itemsize
+        )
+        fingerprint_payload_lease.validate_nbytes(
+            len(fingerprint_payload)
+        )
+        column_count = 0
+        fingerprint_bytes_used = 0
+
+        for summary_index, key in enumerate(support_keys):
+            grid = grids[key]
+            summary_cells = len(grid)
+            record_units = state_units_for_nbytes(
+                summary_cells * _AXIS_RECORD_DTYPE.itemsize
+            )
+            record_lease = reserve_axis_state(
+                "axis_records",
+                record_units,
+            )
+            if record_lease is None:
+                return unavailable_result()
+            if not admit_stage("loading", summary_cells):
+                return unavailable_result()
+
+            records = np.empty(
+                summary_cells,
+                dtype=_AXIS_RECORD_DTYPE,
+            )
+            record_lease.validate_nbytes(records.nbytes)
+            for index, ((row, column), value) in enumerate(
+                grid.items()
+            ):
+                canonical_value = 0.0 if value == 0.0 else value
+                records[index] = (
+                    column,
+                    row,
+                    canonical_value,
+                )
+
+            order_lease = reserve_axis_state(
+                "axis_order",
+                summary_cells,
+            )
+            workspace_lease = reserve_axis_state(
+                "axis_sort_workspace",
+                4 * summary_cells,
+            )
+            ordered_lease = reserve_axis_state(
+                "axis_ordered_records",
+                record_units,
+            )
+            leases = [
+                order_lease,
+                workspace_lease,
+                ordered_lease,
+            ]
+            if any(lease is None for lease in leases):
+                return unavailable_result()
+            if not admit_stage("grouping", summary_cells):
+                return unavailable_result()
+
+            order = np.lexsort((
+                records["row"],
+                records["column"],
+            ))
+            order_lease.validate_nbytes(order.nbytes)
+            ordered = records[order]
+            ordered_lease.validate_nbytes(ordered.nbytes)
+            release_axis_state(record_lease)
+            release_axis_state(order_lease)
+            release_axis_state(workspace_lease)
+
+            column_entry_start = column_count
+            summary_progression_cells = 0
+            start = 0
+            while start < len(ordered):
+                column = int(ordered["column"][start])
+                stop = start + 1
+                while (
+                    stop < len(ordered)
+                    and int(ordered["column"][stop]) == column
+                ):
+                    stop += 1
+                if column_count >= len(column_table):
+                    raise AssertionError(
+                        "axis column table overflow"
+                    )
+                cell_count = stop - start
+                column_table["summary_index"][
+                    column_count
+                ] = summary_index
+                column_table["column"][column_count] = column
+                column_table["cell_count"][
+                    column_count
+                ] = cell_count
+                column_table["is_output"][
+                    column_count
+                ] = key in position_key_set
+                if (
+                    key in position_key_set
+                    and cell_count
+                    >= _AXIS_PROGRESSION_MIN_CELLS
+                ):
+                    summary_progression_cells += cell_count
+                column_count += 1
+                start = stop
+            column_entry_stop = column_count
+            summary_column_count = (
+                column_entry_stop - column_entry_start
+            )
+            add_fixed_work(3 * summary_column_count)
+
+            if key in position_key_set:
+                add_fixed_work(summary_progression_cells)
+                if not admit_stage(
+                    "progression",
+                    summary_progression_cells,
+                ):
+                    return unavailable_result()
+                observed_progression_visits = 0
+                column_entry = column_entry_start
+                start = 0
+                while start < len(ordered):
+                    column = int(ordered["column"][start])
+                    stop = start + 1
+                    while (
+                        stop < len(ordered)
+                        and int(
+                            ordered["column"][stop]
+                        ) == column
+                    ):
+                        stop += 1
+                    rows = ordered["row"][start:stop]
+                    values = ordered["value"][start:stop]
+                    if (
+                        len(values)
+                        >= _AXIS_PROGRESSION_MIN_CELLS
+                    ):
+                        (
+                            is_progression,
+                            progression_coverage,
+                        ) = _is_axis_progression_arrays(
+                            rows,
+                            values,
+                            with_coverage=True,
+                        )
+                        observed_progression_visits += (
+                            progression_coverage[
+                                "value_visits"
+                            ]
+                        )
+                        column_table["is_progression"][
+                            column_entry
+                        ] = is_progression
+                    column_entry += 1
+                    start = stop
+                if column_entry != column_entry_stop:
+                    raise AssertionError(
+                        "axis progression columns diverged"
+                    )
+                if (
+                    observed_progression_visits
+                    != summary_progression_cells
+                ):
+                    raise AssertionError(
+                        "axis progression work diverged"
+                    )
+
+            unique_lease = reserve_axis_state(
+                "axis_unique_values",
+                summary_cells,
+            )
+            unique_workspace = reserve_axis_state(
+                "axis_unique_workspace",
+                5 * summary_cells,
+            )
+            canonical_lease = reserve_axis_state(
+                "axis_canonical_values",
+                summary_cells,
+            )
+            temp_lease = reserve_axis_state(
+                "axis_fingerprint_temp",
+                summary_cells,
+            )
+            fingerprint_stage_leases = (
+                unique_lease,
+                unique_workspace,
+                canonical_lease,
+                temp_lease,
+            )
+            if any(
+                lease is None
+                for lease in fingerprint_stage_leases
+            ):
+                return unavailable_result()
+            if not admit_stage("fingerprint", summary_cells):
+                return unavailable_result()
+
+            column_entry = column_entry_start
+            start = 0
+            while start < len(ordered):
+                column = int(ordered["column"][start])
+                stop = start + 1
+                while (
+                    stop < len(ordered)
+                    and int(ordered["column"][stop]) == column
+                ):
+                    stop += 1
+                values = ordered["value"][start:stop]
+                store_axis_fingerprint(
+                    column_entry,
+                    values,
+                    unique_lease=unique_lease,
+                    canonical_lease=canonical_lease,
+                    temp_lease=temp_lease,
+                )
+                column_entry += 1
+                start = stop
+
+            if column_entry != column_entry_stop:
+                raise AssertionError(
+                    "axis fingerprint columns diverged"
+                )
+            for lease in reversed(fingerprint_stage_leases):
+                release_axis_state(lease)
+            release_axis_state(ordered_lease)
+
+        fingerprint_order_lease = reserve_axis_state(
+            "axis_fingerprint_order",
+            column_count,
+        )
+        fingerprint_order_workspace = reserve_axis_state(
+            "axis_fingerprint_order_workspace",
+            4 * column_count,
+        )
+        if any(
+            lease is None
+            for lease in (
+                fingerprint_order_lease,
+                fingerprint_order_workspace,
+            )
+        ):
+            return unavailable_result()
+
+        table = column_table[:column_count]
+        if not admit_stage("recurrence_order", column_count):
+            return unavailable_result()
+        fingerprint_order = np.lexsort((
+            table["fingerprint_hash"],
+            table["fingerprint_nbytes"],
+        ))
+        fingerprint_order_lease.validate_nbytes(
+            fingerprint_order.nbytes
+        )
+        release_axis_state(fingerprint_order_workspace)
+        payload_view = memoryview(fingerprint_payload)
+
+        if not admit_stage("recurrence_group", column_count):
+            return unavailable_result()
+        position = 0
+        while position < column_count:
+            first_index = int(fingerprint_order[position])
+            fingerprint_nbytes = int(
+                table["fingerprint_nbytes"][first_index]
+            )
+            fingerprint_hash = table["fingerprint_hash"][
+                first_index
+            ]
+            stop = position + 1
+            while (
+                stop < column_count
+                and int(table["fingerprint_nbytes"][
+                    int(fingerprint_order[stop])
+                ]) == fingerprint_nbytes
+                and table["fingerprint_hash"][
+                    int(fingerprint_order[stop])
+                ] == fingerprint_hash
+            ):
+                stop += 1
+            if fingerprint_nbytes == 0:
+                position = stop
+                continue
+
+            class_start = position
+            while class_start < stop:
+                base_index = int(
+                    fingerprint_order[class_start]
+                )
+                match_stop = class_start
+                for candidate_position in range(
+                    class_start,
+                    stop,
+                ):
+                    candidate_index = int(
+                        fingerprint_order[candidate_position]
+                    )
+                    if not admit_dynamic_stage("recurrence_comparison", 1):
+                        return unavailable_result()
+                    if _axis_payload_equal(
+                        payload_view,
+                        table,
+                        base_index,
+                        candidate_index,
+                    ):
+                        displaced_index = int(
+                            fingerprint_order[match_stop]
+                        )
+                        fingerprint_order[
+                            match_stop
+                        ] = candidate_index
+                        fingerprint_order[
+                            candidate_position
+                        ] = displaced_index
+                        match_stop += 1
+                match_count = match_stop - class_start
+                if match_count <= 0:
+                    raise AssertionError(
+                        "axis fingerprint class made no progress"
+                    )
+                if match_count >= recur_min:
+                    if not admit_dynamic_stage("recurrence_mark", match_count):
+                        return unavailable_result()
+                    for match_position in range(
+                        class_start,
+                        match_stop,
+                    ):
+                        candidate_index = int(
+                            fingerprint_order[
+                                match_position
+                            ]
+                        )
+                        table["is_recurring"][
+                            candidate_index
+                        ] = True
+                class_start = match_stop
+            position = stop
+
+        dynamic_finalization_complete = True
+        if not admit_stage("output", column_count):
+            return unavailable_result()
+        axis = {key: set() for key in position_keys}
+        for index in range(column_count):
+            if (
+                bool(table["is_output"][index])
+                and (
+                    bool(table["is_progression"][index])
+                    or bool(table["is_recurring"][index])
+                )
+            ):
+                summary_index = int(
+                    table["summary_index"][index]
+                )
+                axis[support_keys[summary_index]].add(
+                    int(table["column"][index])
+                )
+
+        release_axis_state(fingerprint_order_lease)
+        release_axis_state(output_capacity_lease)
+        release_axis_state(fingerprint_payload_lease)
+        release_axis_state(column_table_lease)
+
+        if remaining_fixed_visits != 0:
+            raise AssertionError(
+                "axis work ledger did not close"
+            )
+        if not dynamic_finalization_complete:
+            raise AssertionError(
+                "axis finalization did not close"
+            )
+        return finish_result(axis, available=True)
+    finally:
+        release_all_axis_leases()
 
 
 def _text_cell(sheet, r, c):
@@ -5245,65 +6154,54 @@ def detect_collisions(
     Cross-figure overlaps that survive both checks keep their base severity.
     """
     findings = []
-    keys = [
-        key
-        for key in grids
-        if len(grids[key]) >= _POSITION_VALUE_MIN_CELLS
-    ]
-    sizes = tuple(len(grids[key]) for key in keys)
+    position_keys = _position_family_keys(grids)
+    sizes = tuple(len(grids[key]) for key in position_keys)
     candidate_ledger = _CrossSheetCandidateLedger.from_sizes(
         sizes
     )
-    if len(keys) >= 2:
-        axis_value_count = 4 * sum(
-            len(grid) for grid in grids.values()
+
+    def resolve_pair_family(coverage):
+        candidate_ledger.resolve(
+            coverage["candidate_value_count"]
         )
-    else:
-        axis_value_count = 0
-    if (
-        axis_value_count
-        and (
-            budget is None
-            or budget.consume_values(axis_value_count)
+        if coverage["pair_admitted"]:
+            return True
+        if budget is None:
+            raise AssertionError(
+                "unbudgeted pair helper rejected candidate"
+            )
+        pairs_remaining, values_remaining = (
+            candidate_ledger.remaining()
         )
-    ):
-        axis_cols = _axis_columns(grids)
-    else:
-        axis_cols = {key: set() for key in grids}
+        budget.skip_pairs(
+            pairs_remaining,
+            values=values_remaining,
+        )
+        return False
+
+    axis_cols = _axis_columns(
+        grids,
+        position_keys=position_keys,
+        budget=budget,
+    )
 
     def emit(finding):
         if budget is None or budget.retain_finding():
             findings.append(finding)
 
-    for key_a, key_b in combinations(keys, 2):
+    for key_a, key_b in combinations(position_keys, 2):
         (fa, sa), (fb, sb) = key_a, key_b
         ga, gb = grids[key_a], grids[key_b]
         size_a, size_b = len(ga), len(gb)
         smaller = min(size_a, size_b)
-        collision_value_work = size_a + size_b
-        if (
-            budget is not None
-            and not budget.begin_pair(collision_value_work)
-        ):
-            pairs_remaining, values_remaining = (
-                candidate_ledger.remaining()
-            )
-            budget.skip_pairs(
-                pairs_remaining,
-                values=values_remaining,
-            )
-            break
         pair_stats, pair_coverage = _cross_sheet_pair_stats(
-            ga, gb, with_coverage=True
+            ga,
+            gb,
+            budget=budget,
+            with_coverage=True,
         )
-        pair_value_visits = pair_coverage["value_visits"]
-        if pair_value_visits != collision_value_work:
-            raise AssertionError(
-                "cross-sheet pair work diverged from its plan"
-            )
-        if budget is not None:
-            budget.record_values(pair_value_visits)
-        candidate_ledger.resolve(collision_value_work)
+        if not resolve_pair_family(pair_coverage):
+            break
 
         same_file = fa == fb
         # label_a / label_b disambiguate sheets when the pair spans two files
@@ -5436,19 +6334,6 @@ def detect_collisions(
         if smaller < _DECIMAL_TAIL_MIN_CELLS:
             continue
 
-        tail_value_work = size_a + size_b
-        if (
-            budget is not None
-            and not budget.begin_pair(tail_value_work)
-        ):
-            pairs_remaining, values_remaining = (
-                candidate_ledger.remaining()
-            )
-            budget.skip_pairs(
-                pairs_remaining,
-                values=values_remaining,
-            )
-            break
         tail_min_matches = max(
             8, min(20, math.ceil(smaller * 0.03))
         )
@@ -5461,13 +6346,8 @@ def detect_collisions(
                 with_coverage=True,
             )
         )
-        tail_value_visits = tail_coverage["value_visits"]
-        if budget is not None:
-            budget.record_values(tail_value_visits)
-            budget.skip_values(
-                tail_value_work - tail_value_visits
-            )
-        candidate_ledger.resolve(tail_value_work)
+        if not resolve_pair_family(tail_coverage):
+            break
         if tail_reuse:
             pairs = tail_reuse["pairs"]
             context_pairs = pairs[:40]
@@ -6446,7 +7326,10 @@ def detect_cross_sheet_column_duplicates(
                     and not budget.consume_pair(0)
                 ):
                     budget.skip_pairs(
-                        total_pairs - candidate_index
+                        max(
+                            0,
+                            total_pairs - candidate_index - 1,
+                        )
                     )
                     stopped = True
                     break

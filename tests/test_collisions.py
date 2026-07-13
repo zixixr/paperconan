@@ -190,6 +190,17 @@ class _VisitGrid(dict):
             yield item
 
 
+class _CountingGrid(dict):
+    def __init__(self, values):
+        super().__init__(values)
+        self.item_visits = 0
+
+    def items(self):
+        for item in super().items():
+            self.item_visits += 1
+            yield item
+
+
 @pytest.mark.parametrize("distinct", [False, True])
 def test_pair_stats_use_one_exact_source_pass_per_grid(distinct):
     if distinct:
@@ -214,9 +225,7 @@ def test_pair_stats_use_one_exact_source_pass_per_grid(distinct):
     assert right.value_visits == len(right)
 
 
-def test_cross_sheet_value_work_counts_known_passes_exactly(
-    monkeypatch,
-):
+def test_cross_sheet_value_work_counts_known_passes_exactly():
     grids = {
         ("a.xlsx", "Figure 1"): _sized_grid(9),
         ("b.xlsx", "Figure 2"): _sized_grid(8),
@@ -227,12 +236,6 @@ def test_cross_sheet_value_work_counts_known_passes_exactly(
         tail_match_limit=100_000,
         finding_limit=100,
     )
-    monkeypatch.setattr(
-        audit,
-        "_axis_columns",
-        lambda source: {key: set() for key in source},
-    )
-
     detect_collisions(grids, budget=budget)
 
     metadata = budget.limitation_metadata()
@@ -240,27 +243,21 @@ def test_cross_sheet_value_work_counts_known_passes_exactly(
     assert metadata["pairs_skipped"] == 0
     assert metadata["values_examined"] == (
         4 * (9 + 8)
+        + 4 * 2
         + (9 + 8)
         + (9 + 8)
     )
     assert metadata["values_skipped"] == 0
 
 
-def test_pair_value_budget_stops_before_any_uncharged_pass(
-    monkeypatch,
-):
+def test_pair_value_budget_stops_before_any_uncharged_pass():
     left = _VisitGrid(_sized_grid(10))
     right = _VisitGrid(_sized_grid(8))
     grids = {
         ("a.xlsx", "Figure 1"): left,
         ("b.xlsx", "Figure 2"): right,
     }
-    monkeypatch.setattr(
-        audit,
-        "_axis_columns",
-        lambda source: {key: set() for key in source},
-    )
-    axis_work = 4 * (len(left) + len(right))
+    axis_work = 4 * (len(left) + len(right)) + 4 * 2
     family_work = len(left) + len(right)
     rejected = CrossSheetWorkBudget(
         pair_limit=2,
@@ -272,17 +269,15 @@ def test_pair_value_budget_stops_before_any_uncharged_pass(
     detect_collisions(grids, budget=rejected)
 
     rejected_meta = rejected.limitation_metadata()
-    assert left.value_visits == 0
-    assert right.value_visits == 0
+    assert left.value_visits == len(left)
+    assert right.value_visits == len(right)
     assert rejected_meta["pairs_examined"] == 0
     assert rejected_meta["pairs_skipped"] == 2
     assert rejected_meta["values_examined"] == axis_work
     assert rejected_meta["values_skipped"] == 2 * family_work
 
 
-def test_pair_stop_reports_exact_remaining_family_and_value_work(
-    monkeypatch,
-):
+def test_pair_stop_reports_exact_remaining_family_and_value_work():
     grids = {
         ("a.xlsx", "Figure 1"): _sized_grid(6, 0),
         ("b.xlsx", "Figure 2"): _sized_grid(8, 100),
@@ -294,25 +289,17 @@ def test_pair_stop_reports_exact_remaining_family_and_value_work(
         tail_match_limit=100_000,
         finding_limit=100,
     )
-    monkeypatch.setattr(
-        audit,
-        "_axis_columns",
-        lambda source: {key: set() for key in source},
-    )
-
     detect_collisions(grids, budget=budget)
 
     metadata = budget.limitation_metadata()
     assert metadata["pairs_examined"] == 1
     assert metadata["pairs_skipped"] == 3
-    assert metadata["values_examined"] == 4 * 23 + 14
+    assert metadata["values_examined"] == 4 * 23 + 4 * 3 + 14
     assert metadata["values_skipped"] == 49
     assert metadata["limits_reached"] == ["pair"]
 
 
-def test_impossible_families_do_not_displace_later_viable_pair(
-    monkeypatch,
-):
+def test_impossible_families_do_not_displace_later_viable_pair():
     viable = _sized_grid(8)
     grids = {
         ("a.xlsx", "Figure 1"): _sized_grid(5, 100),
@@ -326,19 +313,18 @@ def test_impossible_families_do_not_displace_later_viable_pair(
         tail_match_limit=100_000,
         finding_limit=100,
     )
-    monkeypatch.setattr(
-        audit,
-        "_axis_columns",
-        lambda source: {key: set() for key in source},
-    )
-
     findings = detect_collisions(grids, budget=budget)
 
     assert _find(findings, "cross_sheet_position_identical")
     metadata = budget.limitation_metadata()
     assert metadata["pairs_examined"] == 1
     assert metadata["pairs_skipped"] == 1
-    assert metadata["values_examined"] == 4 * 26 + 16
+    assert metadata["values_examined"] == (
+        3 * (5 + 5 + 2 * len(viable))
+        + 2 * len(viable)
+        + 4 * 4
+        + 16
+    )
     assert metadata["values_skipped"] == 16
     assert metadata["limits_reached"] == ["pair"]
 
@@ -365,11 +351,6 @@ def test_pair_setup_is_linear_and_remaining_work_is_exact(
             yield pair
 
     monkeypatch.setattr(audit, "combinations", tracked_combinations)
-    monkeypatch.setattr(
-        audit,
-        "_axis_columns",
-        lambda source: {key: set() for key in source},
-    )
     budget = CrossSheetWorkBudget(
         pair_limit=pair_limit,
         value_limit=10_000_000,
@@ -387,7 +368,9 @@ def test_pair_setup_is_linear_and_remaining_work_is_exact(
     assert metadata["pairs_examined"] == pair_limit
     assert metadata["pairs_skipped"] == family_pairs - pair_limit
     assert metadata["values_examined"] == (
-        4 * summary_count * grid_size + examined_work
+        4 * summary_count * grid_size
+        + 4 * summary_count
+        + examined_work
     )
     assert metadata["values_skipped"] == (
         family_value_work - examined_work
@@ -422,6 +405,8 @@ def test_decimal_tail_match_state_stops_before_limit_is_exceeded():
         tail = f"{row:04d}731"
         ga[(row, 0)] = float(f"0.1{tail}")
         gb[(row, 0)] = float(f"0.2{tail}")
+    ga = _VisitGrid(ga)
+    gb = _VisitGrid(gb)
     budget = CrossSheetWorkBudget(
         pair_limit=10,
         value_limit=10_000,
@@ -437,6 +422,14 @@ def test_decimal_tail_match_state_stops_before_limit_is_exceeded():
     metadata = budget.limitation_metadata()
     assert metadata["tail_matches_retained"] == 3
     assert metadata["tail_matches_skipped_lower_bound"] == 1
+    assert metadata["pairs_examined"] == 1
+    assert metadata["pairs_skipped"] == 0
+    assert metadata["values_examined"] == (
+        ga.value_visits + gb.value_visits
+    )
+    assert metadata["values_skipped"] == (
+        len(ga) + len(gb) - metadata["values_examined"]
+    )
     assert metadata["limits_reached"] == ["tail_match"]
 
 
@@ -1011,3 +1004,700 @@ def test_column_duplicate_bucket_and_global_finding_omissions_are_exact():
         "finding",
         "fingerprint_bucket",
     ]
+
+
+def test_axis_work_matches_concrete_passes_for_feasible_grids_only():
+    irrelevant = _CountingGrid({
+        (row, 0): row + 0.125 for row in range(3)
+    })
+    recurrence_support = _CountingGrid({
+        (row, 0): row + 20.625 for row in range(5)
+    })
+    left = _CountingGrid({
+        (row, 0): row + 0.125 for row in range(8)
+    })
+    right = _CountingGrid({
+        (row, 0): row + 10.375 for row in range(8)
+    })
+    budget = CrossSheetWorkBudget(
+        pair_limit=100,
+        value_limit=10_000,
+        tail_match_limit=100,
+        finding_limit=100,
+    )
+
+    axis, coverage = audit._axis_columns(
+        {
+            ("irrelevant.csv", "small"): irrelevant,
+            ("support.csv", "support"): recurrence_support,
+            ("left.csv", "Figure 1"): left,
+            ("right.csv", "Figure 2"): right,
+        },
+        budget=budget,
+        with_coverage=True,
+    )
+
+    assert irrelevant.item_visits == 0
+    assert recurrence_support.item_visits == len(
+        recurrence_support
+    )
+    assert left.item_visits == len(left)
+    assert right.item_visits == len(right)
+    assert {
+        name: coverage[name]
+        for name in (
+            "participating_summaries",
+            "participating_cells",
+            "recurrence_support_summaries",
+            "recurrence_support_cells",
+            "axis_loading_visits",
+            "axis_grouping_visits",
+            "axis_progression_visits",
+            "axis_fingerprint_visits",
+            "axis_recurrence_order_visits",
+            "axis_recurrence_group_visits",
+            "axis_recurrence_comparison_visits",
+            "axis_recurrence_mark_visits",
+            "axis_output_visits",
+            "axis_value_visits",
+            "axis_context_available",
+        )
+    } == {
+        "participating_summaries": 2,
+        "participating_cells": 16,
+        "recurrence_support_summaries": 3,
+        "recurrence_support_cells": 21,
+        "axis_loading_visits": 21,
+        "axis_grouping_visits": 21,
+        "axis_progression_visits": 16,
+        "axis_fingerprint_visits": 21,
+        "axis_recurrence_order_visits": 3,
+        "axis_recurrence_group_visits": 3,
+        "axis_recurrence_comparison_visits": 3,
+        "axis_recurrence_mark_visits": 0,
+        "axis_output_visits": 3,
+        "axis_value_visits": 91,
+        "axis_context_available": True,
+    }
+    assert coverage["axis_state_unit_limit"] == (
+        audit._AXIS_STATE_UNITS_PER_CELL * 21
+    )
+    assert 0 < coverage["axis_peak_state_units"] <= (
+        coverage["axis_state_unit_limit"]
+    )
+    assert budget.values_examined == 91
+    assert set(axis) == {
+        ("left.csv", "Figure 1"),
+        ("right.csv", "Figure 2"),
+    }
+
+
+def test_axis_fingerprint_preserves_signed_zero_set_equivalence():
+    def build_grids(zeros):
+        return {
+            (f"sheet-{index}.csv", f"Figure {index}"):
+                _CountingGrid({
+                    (row, 0): value
+                    for row, value in enumerate((
+                        zero,
+                        2.25,
+                        7.5,
+                        4.125,
+                        2.25,
+                        7.5,
+                    ))
+                })
+            for index, zero in enumerate(zeros)
+        }
+
+    baseline_grids = build_grids((0.0, 0.0, 0.0))
+    signed_grids = build_grids((0.0, -0.0, 0.0))
+    assert len({
+        frozenset(grid.values())
+        for grid in signed_grids.values()
+    }) == 1
+
+    baseline_axis, baseline_coverage = audit._axis_columns(
+        baseline_grids, with_coverage=True
+    )
+    signed_axis, signed_coverage = audit._axis_columns(
+        signed_grids, with_coverage=True
+    )
+
+    expected_axis = {key: {0} for key in signed_grids}
+    assert baseline_axis == expected_axis
+    assert signed_axis == expected_axis
+    assert signed_coverage == baseline_coverage
+    assert signed_coverage["axis_recurrence_mark_visits"] == 3
+    assert signed_coverage["axis_context_available"] is True
+    for grids in (baseline_grids, signed_grids):
+        assert all(
+            grid.item_visits == len(grid)
+            for grid in grids.values()
+        )
+
+
+def _axis_finalization_grids():
+    axis_values = (
+        1.125,
+        4.875,
+        2.250,
+        7.625,
+        1.125,
+        4.875,
+    )
+    support = {
+        (row, 0): value
+        for row, value in enumerate(axis_values[:4])
+    }
+    left = {}
+    right = {}
+    for row, value in enumerate(axis_values):
+        left[(row, 0)] = value
+        right[(row, 0)] = value
+        left[(row, 1)] = 100 + row + 0.125
+        right[(row, 1)] = 200 + row + 0.375
+    return {
+        ("support.csv", "support"): support,
+        ("left.csv", "Figure 1"): left,
+        ("right.csv", "Figure 2"): right,
+    }
+
+
+def test_axis_compact_finalization_matches_concrete_processing(
+    monkeypatch
+):
+    comparison_calls = 0
+    progression_cells = 0
+    original_equal = audit._axis_payload_equal
+    original_progression = audit._is_axis_progression_arrays
+
+    def tracked_equal(*args, **kwargs):
+        nonlocal comparison_calls
+        comparison_calls += 1
+        return original_equal(*args, **kwargs)
+
+    def tracked_progression(rows, values, **kwargs):
+        nonlocal progression_cells
+        progression_cells += len(values)
+        return original_progression(rows, values, **kwargs)
+
+    monkeypatch.setattr(
+        audit, "_axis_payload_equal", tracked_equal
+    )
+    monkeypatch.setattr(
+        audit,
+        "_is_axis_progression_arrays",
+        tracked_progression,
+    )
+
+    _axis, coverage = audit._axis_columns(
+        _axis_finalization_grids(),
+        with_coverage=True,
+    )
+
+    assert progression_cells == coverage[
+        "axis_progression_visits"
+    ]
+    assert comparison_calls == coverage[
+        "axis_recurrence_comparison_visits"
+    ]
+    assert coverage["axis_recurrence_order_visits"] == 5
+    assert coverage["axis_recurrence_group_visits"] == 5
+    assert coverage["axis_recurrence_comparison_visits"] == 5
+    assert coverage["axis_recurrence_mark_visits"] == 3
+    assert coverage["axis_output_visits"] == 5
+    assert coverage["axis_work_skipped_lower_bound"] == 0
+    assert coverage["axis_work_skipped_is_lower_bound"] is False
+
+
+def test_axis_comparison_budget_stops_before_uncharged_compare(
+    monkeypatch
+):
+    baseline, baseline_coverage = audit._axis_columns(
+        _axis_finalization_grids(),
+        with_coverage=True,
+    )
+    comparison_calls = 0
+    original_equal = audit._axis_payload_equal
+
+    def tracked_equal(*args, **kwargs):
+        nonlocal comparison_calls
+        comparison_calls += 1
+        return original_equal(*args, **kwargs)
+
+    monkeypatch.setattr(
+        audit, "_axis_payload_equal", tracked_equal
+    )
+    before_comparisons = (
+        baseline_coverage["axis_value_visits"]
+        - baseline_coverage["axis_recurrence_comparison_visits"]
+        - baseline_coverage["axis_recurrence_mark_visits"]
+        - baseline_coverage["axis_output_visits"]
+    )
+    budget = CrossSheetWorkBudget(
+        pair_limit=100,
+        value_limit=before_comparisons + 2,
+        tail_match_limit=100,
+        finding_limit=100,
+    )
+
+    limited, coverage = audit._axis_columns(
+        _axis_finalization_grids(),
+        budget=budget,
+        with_coverage=True,
+    )
+
+    assert baseline
+    assert limited == {}
+    assert comparison_calls == 2
+    assert coverage["axis_recurrence_comparison_visits"] == 2
+    assert coverage["axis_recurrence_mark_visits"] == 0
+    assert coverage["axis_output_visits"] == 0
+    assert coverage["axis_work_skipped_lower_bound"] > 0
+    assert coverage["axis_work_skipped_is_lower_bound"] is True
+    assert budget.values_examined == before_comparisons + 2
+
+
+def test_axis_output_budget_rejects_before_mapping_traversal():
+    _baseline, baseline_coverage = audit._axis_columns(
+        _axis_finalization_grids(),
+        with_coverage=True,
+    )
+    output_visits = baseline_coverage["axis_output_visits"]
+    before_output = (
+        baseline_coverage["axis_value_visits"] - output_visits
+    )
+    budget = CrossSheetWorkBudget(
+        pair_limit=100,
+        value_limit=before_output + output_visits - 1,
+        tail_match_limit=100,
+        finding_limit=100,
+    )
+
+    axis, coverage = audit._axis_columns(
+        _axis_finalization_grids(),
+        budget=budget,
+        with_coverage=True,
+    )
+
+    assert axis == {}
+    assert coverage["axis_output_visits"] == 0
+    assert coverage["axis_work_skipped_lower_bound"] == output_visits
+    assert coverage["axis_work_skipped_is_lower_bound"] is False
+    assert budget.values_examined == before_output
+
+
+def test_axis_fingerprint_keeps_existing_four_unique_value_floor():
+    grids = {
+        (f"{index}.csv", f"Figure {index}"): {
+            (0, 0): 1.125,
+            (2, 0): 4.875,
+            (5, 0): 2.250,
+            (0, 1): 10.125 + index,
+            (2, 1): 14.875 + index,
+            (5, 1): 12.250 + index,
+        }
+        for index in range(3)
+    }
+
+    axis = audit._axis_columns(grids)
+
+    assert all(0 not in columns for columns in axis.values())
+
+
+def test_four_cell_recurrence_support_preserves_axis_downgrade():
+    axis_values = (
+        1.125,
+        4.875,
+        2.250,
+        7.625,
+        1.125,
+        4.875,
+    )
+    support = _CountingGrid({
+        (row, 0): value
+        for row, value in enumerate(axis_values[:4])
+    })
+    left = {}
+    right = {}
+    for row, value in enumerate(axis_values):
+        left[(row, 0)] = value
+        right[(row, 0)] = value
+        left[(row, 1)] = 100 + row + 0.125
+        right[(row, 1)] = 200 + row + 0.375
+    grids = {
+        ("support.csv", "support"): support,
+        ("left.csv", "Figure 1"): left,
+        ("right.csv", "Figure 2"): right,
+    }
+
+    findings = detect_collisions(grids)
+    finding = _find(
+        findings,
+        "cross_sheet_position_identical",
+    )
+
+    assert finding is not None
+    assert {
+        finding["file_a"],
+        finding["file_b"],
+    } == {"left.csv", "right.csv"}
+    assert finding["axis_overlap"] is True
+    assert finding["severity"] == "low"
+    assert support.item_visits == len(support)
+
+
+@pytest.mark.parametrize(
+    "helper_name",
+    [
+        "_cross_sheet_pair_stats",
+        "_detect_decimal_tail_reuse_for_pair",
+    ],
+)
+@pytest.mark.parametrize("blocked_limit", ["pair", "value"])
+def test_pair_helpers_reject_before_source_grid_access(
+    helper_name, blocked_limit
+):
+    left = _VisitGrid(_sized_grid(9))
+    right = _VisitGrid(_sized_grid(8, 100))
+    candidate_value_count = len(left) + len(right)
+    budget = CrossSheetWorkBudget(
+        pair_limit=0 if blocked_limit == "pair" else 1,
+        value_limit=(
+            candidate_value_count - 1
+            if blocked_limit == "value"
+            else candidate_value_count
+        ),
+        tail_match_limit=100,
+        finding_limit=100,
+    )
+
+    result, coverage = getattr(audit, helper_name)(
+        left,
+        right,
+        budget=budget,
+        with_coverage=True,
+    )
+
+    assert result is None
+    assert coverage["pair_admitted"] is False
+    assert coverage["candidate_value_count"] == candidate_value_count
+    assert coverage["value_visits"] == 0
+    assert left.value_visits == 0
+    assert right.value_visits == 0
+    metadata = budget.limitation_metadata()
+    assert metadata["pairs_examined"] == 0
+    assert metadata["pairs_skipped"] == 1
+    assert metadata["values_examined"] == 0
+    assert metadata["values_skipped"] == candidate_value_count
+    assert metadata["limits_reached"] == [blocked_limit]
+
+
+@pytest.mark.parametrize(
+    "helper_name",
+    [
+        "_cross_sheet_pair_stats",
+        "_detect_decimal_tail_reuse_for_pair",
+    ],
+)
+def test_pair_helpers_own_exact_completed_work(helper_name):
+    left = _VisitGrid(_sized_grid(9))
+    right = _VisitGrid(_sized_grid(8, 100))
+    candidate_value_count = len(left) + len(right)
+    budget = CrossSheetWorkBudget(
+        pair_limit=1,
+        value_limit=candidate_value_count,
+        tail_match_limit=100,
+        finding_limit=100,
+    )
+
+    _result, coverage = getattr(audit, helper_name)(
+        left,
+        right,
+        budget=budget,
+        with_coverage=True,
+    )
+
+    assert coverage["pair_admitted"] is True
+    assert coverage["candidate_value_count"] == candidate_value_count
+    assert coverage["value_visits"] == candidate_value_count
+    assert left.value_visits == len(left)
+    assert right.value_visits == len(right)
+    metadata = budget.limitation_metadata()
+    assert metadata["pairs_examined"] == 1
+    assert metadata["pairs_skipped"] == 0
+    assert metadata["values_examined"] == candidate_value_count
+    assert metadata["values_skipped"] == 0
+
+
+@pytest.mark.parametrize(
+    (
+        "value_limit",
+        "expected_stage_visits",
+        "expected_grid_visits",
+        "expected_examined",
+        "expected_skipped",
+    ),
+    [
+        (7, (0, 0, 0, 0), 0, 0, 48),
+        (63, (16, 16, 16, 8), 16, 56, 14),
+    ],
+)
+def test_axis_work_stops_before_the_rejected_stage(
+    value_limit,
+    expected_stage_visits,
+    expected_grid_visits,
+    expected_examined,
+    expected_skipped,
+):
+    grids = {
+        ("a.csv", "Figure 1"): _CountingGrid({
+            (row, 0): row + 0.125 for row in range(8)
+        }),
+        ("b.csv", "Figure 2"): _CountingGrid({
+            (row, 0): row + 10.375 for row in range(8)
+        }),
+    }
+    budget = CrossSheetWorkBudget(
+        pair_limit=100,
+        value_limit=value_limit,
+        tail_match_limit=100,
+        finding_limit=100,
+    )
+
+    axis, coverage = audit._axis_columns(
+        grids, budget=budget, with_coverage=True
+    )
+
+    assert axis == {}
+    assert sum(grid.item_visits for grid in grids.values()) == (
+        expected_grid_visits
+    )
+    assert coverage["axis_context_available"] is False
+    assert coverage["axis_state_unit_limit"] == (
+        audit._AXIS_STATE_UNITS_PER_CELL * 16
+    )
+    assert coverage["axis_peak_state_units"] <= (
+        coverage["axis_state_unit_limit"]
+    )
+    assert (
+        coverage["axis_loading_visits"],
+        coverage["axis_grouping_visits"],
+        coverage["axis_progression_visits"],
+        coverage["axis_fingerprint_visits"],
+    ) == expected_stage_visits
+    assert coverage["axis_recurrence_order_visits"] == 0
+    assert coverage["axis_recurrence_group_visits"] == 0
+    assert coverage["axis_recurrence_comparison_visits"] == 0
+    assert coverage["axis_recurrence_mark_visits"] == 0
+    assert coverage["axis_output_visits"] == 0
+    assert coverage["axis_value_visits"] == sum(expected_stage_visits)
+    assert coverage["axis_work_skipped_lower_bound"] == (
+        expected_skipped
+    )
+    assert coverage["axis_work_skipped_is_lower_bound"] is True
+    assert budget.values_examined == expected_examined
+    assert budget.values_skipped == expected_skipped
+
+
+def test_axis_state_rejection_at_fingerprint_after_grouping_counts_known_work(
+    monkeypatch,
+):
+    grids = {
+        ("a.csv", "Figure 1"): _CountingGrid({
+            (row, 0): row + 0.125 for row in range(8)
+        }),
+        ("b.csv", "Figure 2"): _CountingGrid({
+            (row, 0): row + 10.375 for row in range(8)
+        }),
+    }
+    budget = CrossSheetWorkBudget(
+        pair_limit=100,
+        value_limit=10_000,
+        tail_match_limit=100,
+        finding_limit=100,
+    )
+    original_try_reserve = audit.StateBudget.try_reserve
+    rejected_names = []
+
+    def reject_fingerprint_state(state, name, units):
+        if name == "axis_unique_values":
+            rejected_names.append(name)
+            return None
+        return original_try_reserve(state, name, units)
+
+    monkeypatch.setattr(
+        audit.StateBudget,
+        "try_reserve",
+        reject_fingerprint_state,
+    )
+
+    axis, coverage = audit._axis_columns(
+        grids,
+        budget=budget,
+        with_coverage=True,
+    )
+
+    assert axis == {}
+    assert rejected_names == ["axis_unique_values"]
+    assert sum(grid.item_visits for grid in grids.values()) == 8
+    assert coverage["axis_context_available"] is False
+    assert (
+        coverage["axis_loading_visits"],
+        coverage["axis_grouping_visits"],
+        coverage["axis_progression_visits"],
+        coverage["axis_fingerprint_visits"],
+    ) == (8, 8, 8, 0)
+    assert coverage["axis_recurrence_order_visits"] == 0
+    assert coverage["axis_recurrence_group_visits"] == 0
+    assert coverage["axis_output_visits"] == 0
+    assert coverage["axis_value_visits"] == 24
+    assert coverage["axis_work_skipped_lower_bound"] == 35
+    assert coverage["axis_work_skipped_is_lower_bound"] is True
+    assert budget.values_examined == 24
+    assert budget.values_skipped == 35
+
+
+def test_axis_zero_support_has_zero_state_budget():
+    grids = {
+        ("a.csv", "Figure 1"): {
+            (row, 0): row + 0.125 for row in range(3)
+        },
+        ("b.csv", "Figure 2"): {
+            (row, 0): row + 10.375 for row in range(3)
+        },
+    }
+
+    axis, coverage = audit._axis_columns(
+        grids,
+        with_coverage=True,
+    )
+
+    assert axis == {}
+    assert coverage["recurrence_support_cells"] == 0
+    assert coverage["axis_value_visits"] == 0
+    assert coverage["axis_state_unit_limit"] == 0
+    assert coverage["axis_peak_state_units"] == 0
+
+
+def test_axis_state_rejection_precedes_grid_loading():
+    grids = {
+        ("a.csv", "Figure 1"): _CountingGrid({
+            (row, 0): row + 0.125 for row in range(8)
+        }),
+        ("b.csv", "Figure 2"): _CountingGrid({
+            (row, 0): row + 10.375 for row in range(8)
+        }),
+    }
+    budget = CrossSheetWorkBudget(
+        pair_limit=100,
+        value_limit=10_000,
+        tail_match_limit=100,
+        finding_limit=100,
+    )
+
+    axis, coverage = audit._axis_columns(
+        grids,
+        budget=budget,
+        with_coverage=True,
+        _state_limit=0,
+    )
+
+    assert axis == {}
+    assert sum(grid.item_visits for grid in grids.values()) == 0
+    assert coverage["axis_context_available"] is False
+    assert coverage["axis_value_visits"] == 0
+    assert coverage["axis_state_unit_limit"] == 0
+    assert coverage["axis_peak_state_units"] == 0
+    assert coverage["axis_work_skipped_lower_bound"] == 48
+    assert coverage["axis_work_skipped_is_lower_bound"] is True
+    assert budget.values_examined == 0
+    assert budget.values_skipped == 48
+    assert budget.limitation_metadata()["limits_reached"] == [
+        "axis"
+    ]
+
+
+def test_axis_state_multiplier_covers_many_column_worst_case(
+    monkeypatch
+):
+    grids = {
+        (f"{sheet}.csv", f"Figure {sheet}"): {
+            (row, column): row + 0.125
+            for row in range(4)
+            for column in range(64)
+        }
+        for sheet in range(3)
+    }
+    expected_names = {
+        "axis_column_table",
+        "axis_fingerprint_payloads",
+        "axis_records",
+        "axis_order",
+        "axis_sort_workspace",
+        "axis_ordered_records",
+        "axis_unique_workspace",
+        "axis_unique_values",
+        "axis_canonical_values",
+        "axis_fingerprint_temp",
+        "axis_fingerprint_order",
+        "axis_fingerprint_order_workspace",
+        "axis_output_capacity",
+    }
+    seen_names = set()
+    states = []
+    original = audit.StateBudget.try_reserve
+
+    def tracked_reserve(state, name, units):
+        if state not in states:
+            states.append(state)
+        seen_names.add(name.split(":", 1)[0])
+        return original(state, name, units)
+
+    monkeypatch.setattr(
+        audit.StateBudget, "try_reserve", tracked_reserve
+    )
+    baseline, baseline_coverage = audit._axis_columns(
+        grids,
+        with_coverage=True,
+        _state_limit=10_000_000,
+    )
+    required = baseline_coverage["axis_peak_state_units"]
+    cell_count = sum(len(grid) for grid in grids.values())
+    default_limit = audit._AXIS_STATE_UNITS_PER_CELL * cell_count
+
+    assert expected_names <= seen_names
+    assert baseline_coverage["axis_state_unit_limit"] == 10_000_000
+    assert 0 < required <= default_limit
+    assert all(state.live_units == 0 for state in states)
+
+    limited, limited_coverage = audit._axis_columns(
+        grids,
+        with_coverage=True,
+        _state_limit=required - 1,
+    )
+    assert limited == {}
+    assert limited_coverage["axis_context_available"] is False
+    assert limited_coverage["axis_state_unit_limit"] == required - 1
+    assert limited_coverage["axis_peak_state_units"] <= required - 1
+
+    exact, exact_coverage = audit._axis_columns(
+        grids,
+        with_coverage=True,
+        _state_limit=required,
+    )
+    assert exact == baseline
+    assert exact_coverage["axis_context_available"] is True
+    assert exact_coverage["axis_state_unit_limit"] == required
+    assert exact_coverage["axis_peak_state_units"] == required
+
+    default, default_coverage = audit._axis_columns(
+        grids,
+        with_coverage=True,
+    )
+    assert default == baseline
+    assert default_coverage["axis_context_available"] is True
+    assert default_coverage["axis_state_unit_limit"] == default_limit
+    assert default_coverage["axis_peak_state_units"] == required
+    assert all(state.live_units == 0 for state in states)
