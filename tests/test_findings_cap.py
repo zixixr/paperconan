@@ -21,6 +21,7 @@ from paperconan._audit import (
     _cap_block_findings,
     scan_dir,
 )
+from paperconan._resources import BoundedFindingCollector
 
 
 def _write_dense_csv(path, n_rows=40, n_cols=60):
@@ -258,10 +259,19 @@ def test_within_sheet_findings_consume_shared_pre_cap_budget_before_return(
 
 
 def _patch_scan_finding_sources(monkeypatch, block_findings, cross_findings):
+    def emit_block_findings(*_args, _finding_sink=None, **_kwargs):
+        for item in block_findings:
+            _finding_sink.offer(
+                "relations",
+                item["severity"],
+                lambda item=item: dict(item),
+            )
+        return []
+
     monkeypatch.setattr(
         A,
         "detect_relations",
-        lambda *_args, **_kwargs: [dict(item) for item in block_findings],
+        emit_block_findings,
     )
     for name in (
         "detect_arithmetic_progression",
@@ -525,13 +535,22 @@ def test_row_pair_omissions_compose_with_block_and_global_caps_once(
         }
         for severity in ("high", "medium", "low")
     ]
+
+    def emit_row_pair_findings(
+        *_args, _finding_sink=None, **_kwargs
+    ):
+        for item in row_pair_findings:
+            _finding_sink.offer(
+                "row_pairs",
+                item["severity"],
+                lambda item=item: dict(item),
+            )
+        return [], {"findings_omitted": 2}
+
     monkeypatch.setattr(
         A,
         "detect_row_pair_digit_coupling",
-        lambda *_args, **_kwargs: (
-            [dict(item) for item in row_pair_findings],
-            {"findings_omitted": 2},
-        ),
+        emit_row_pair_findings,
     )
     monkeypatch.setattr(A, "_MAX_FINDINGS_PER_BLOCK", 2)
     monkeypatch.setattr(A, "_MAX_TOTAL_FINDINGS", 1)
@@ -562,3 +581,164 @@ def test_row_pair_omissions_compose_with_block_and_global_caps_once(
         ("finding_limit", 1),
         ("global_finding_limit", 1),
     ]
+
+
+def test_bounded_collector_matches_post_materialization_oracle():
+    emitted = [
+        ("relations", {"severity": "low", "i": 0}),
+        ("relations", {"severity": "high", "i": 1}),
+        ("grim", {"severity": "medium", "i": 2}),
+        ("relations", {"severity": "high", "i": 3}),
+        ("grim", {"severity": "low", "i": 4}),
+        ("grim", {"severity": "medium", "i": 5}),
+    ]
+    oracle = {name: [] for name in BLOCK_FINDING_GROUPS}
+    collector = BoundedFindingCollector(
+        BLOCK_FINDING_GROUPS,
+        cap=3,
+        severity_rank=A._SEVERITY_RANK,
+    )
+    for group, finding in emitted:
+        oracle[group].append(dict(finding))
+        collector.offer(
+            group,
+            finding["severity"],
+            lambda finding=finding: dict(finding),
+        )
+
+    omitted = _cap_block_findings(oracle, 3)
+    assert collector.materialize() == oracle
+    assert collector.omitted == omitted
+
+
+def test_scan_path_never_retains_more_than_block_cap_during_detection(
+    monkeypatch,
+):
+    offered = []
+
+    def flood_relations(
+        *_args, _finding_sink=None, **_kwargs
+    ):
+        for index in range(10_000):
+            offered.append(index)
+            _finding_sink.offer(
+                "relations",
+                "low",
+                lambda index=index: {
+                    "kind": "marker",
+                    "severity": "low",
+                    "rule": f"marker {index}",
+                    "index": index,
+                },
+            )
+            assert _finding_sink.retained <= 7
+        return []
+
+    monkeypatch.setattr(A, "_MAX_FINDINGS_PER_BLOCK", 7)
+    monkeypatch.setattr(A, "detect_relations", flood_relations)
+    for name in [
+        "detect_arithmetic_progression",
+        "detect_equal_pairs",
+        "detect_within_column_patterns",
+        "detect_dispersed_repeats",
+        "detect_identical_after_rounding",
+        "detect_grim_grimmer",
+    ]:
+        monkeypatch.setattr(
+            A,
+            name,
+            lambda *_args, **_kwargs: [],
+        )
+    monkeypatch.setattr(
+        A,
+        "detect_row_pair_digit_coupling",
+        lambda *_args, **_kwargs: ([], {"findings_omitted": 0}),
+    )
+
+    state = A.ScanBudgetState(
+        coverage=A.ScanCoverage(files_discovered=1),
+        recurring_index=A.RecurringRowIndex(budget=0),
+        profile="review",
+        evidence=False,
+    )
+    blocks = [(1, 7, 0, 2)]
+    sheet = A.Sheet.from_rows(
+        [["a", "b"]] + [[row + 0.125, row + 1.375] for row in range(6)]
+    )
+
+    result = A._analyze_numeric_blocks(
+        sheet,
+        file_name="dense.csv",
+        sheet_name="dense",
+        blocks=blocks,
+        state=state,
+    )
+
+    assert offered == list(range(10_000))
+    assert len(result[0]["relations"]) == 7
+    assert result[0]["findings_omitted"] == 9_993
+
+
+def test_ranked_buffer_keeps_late_best_and_stable_ties_lazily():
+    calls = []
+    buffer = A._BoundedRankedFindingBuffer(cap=2)
+
+    def builder(name):
+        def build():
+            calls.append(name)
+            return {"id": name, "severity": "high"}
+        return build
+
+    buffer.offer((1, -0.80), "medium", builder("early-medium"))
+    buffer.offer((0, -0.90), "high", builder("early-high"))
+    buffer.offer((0, -0.90), "high", builder("late-tie"))
+    buffer.offer((0, -0.95), "high", builder("late-best"))
+    findings, emit = A._finding_emitter("row_pairs", None)
+
+    omitted = buffer.drain(emit)
+
+    assert findings == [
+        {"id": "late-best", "severity": "high"},
+        {"id": "early-high", "severity": "high"},
+    ]
+    assert omitted == 2
+    assert calls == ["late-best", "early-high"]
+
+
+def test_row_pair_sink_preserves_ranked_local_cap(monkeypatch):
+    header = [f"c{column}" for column in range(12)]
+    base = [
+        100 + column + (column + 1) / 100
+        for column in range(12)
+    ]
+    rows = [
+        header,
+        base,
+        [value + 10 for value in base],
+        [value + 20 for value in base],
+    ]
+    sheet = A.Sheet.from_rows(rows)
+    monkeypatch.setattr(A, "_ROW_PAIR_MAX_FINDINGS_PER_BLOCK", 1)
+    baseline, baseline_meta = A.detect_row_pair_digit_coupling(
+        sheet, 1, 4, 0, 12, header, with_coverage=True
+    )
+    collector = BoundedFindingCollector(
+        BLOCK_FINDING_GROUPS,
+        cap=None,
+        severity_rank=A._SEVERITY_RANK,
+    )
+
+    local, sink_meta = A.detect_row_pair_digit_coupling(
+        sheet,
+        1,
+        4,
+        0,
+        12,
+        header,
+        with_coverage=True,
+        _finding_sink=collector,
+    )
+
+    assert local == []
+    assert collector.materialize()["row_pairs"] == baseline
+    assert sink_meta == baseline_meta == {"findings_omitted": 2}

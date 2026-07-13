@@ -207,8 +207,18 @@ def test_evidence_limit_is_recorded_once_per_affected_block(monkeypatch):
             "col_b_idx": 38,
         },
     ]
+
+    def emit_findings(*_args, _finding_sink=None, **_kwargs):
+        for finding in findings:
+            _finding_sink.offer(
+                "relations",
+                finding["severity"],
+                lambda finding=finding: finding,
+            )
+        return []
+
     monkeypatch.setattr(
-        audit, "detect_relations", lambda *_args, **_kwargs: findings
+        audit, "detect_relations", emit_findings
     )
     for name in (
         "detect_arithmetic_progression",

@@ -50,6 +50,7 @@ from ._input import (
 )
 from ._numeric import integer_shift_close, relation_close
 from ._profiles import apply_profile_to_findings, normalize_profile
+from ._resources import BoundedFindingCollector
 from ._sheet import (
     Sheet,
     SheetBuilder,
@@ -1299,8 +1300,58 @@ def _grim_column_groups(header):
     return groups
 
 
-def detect_relations(sheet, r0, r1, c0, c1, header):
-    findings = []
+def _finding_emitter(group, sink):
+    local = []
+
+    def emit(severity, builder):
+        if sink is None:
+            local.append(builder())
+            return True
+        return sink.offer(group, severity, builder)
+
+    return local, emit
+
+
+class _BoundedRankedFindingBuffer:
+    def __init__(self, cap):
+        self.cap = max(0, int(cap))
+        self.offered = 0
+        self._sequence = 0
+        self._items = []
+
+    def offer(self, sort_key, severity, builder):
+        key = (*tuple(sort_key), self._sequence)
+        self._sequence += 1
+        self.offered += 1
+        item = (key, severity, builder)
+        if self.cap == 0:
+            return False
+        if len(self._items) < self.cap:
+            self._items.append(item)
+            return True
+        worst_index = max(
+            range(len(self._items)),
+            key=lambda index: self._items[index][0],
+        )
+        if key >= self._items[worst_index][0]:
+            return False
+        self._items[worst_index] = item
+        return True
+
+    def drain(self, emit):
+        omitted = self.offered - len(self._items)
+        for _key, severity, builder in sorted(
+            self._items, key=lambda item: item[0]
+        ):
+            emit(severity, builder)
+        self._items.clear()
+        return omitted
+
+
+def detect_relations(
+    sheet, r0, r1, c0, c1, header, *, _finding_sink=None
+):
+    findings, emit = _finding_emitter("relations", _finding_sink)
     for ci in range(c0, c1):
         ai = sheet.numeric[r0:r1, ci]
         for cj in range(ci + 1, c1):
@@ -1311,37 +1362,52 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
             if pair_stats.n < 4:
                 continue
             if pair_stats.all_equal:
-                findings.append(dict(
-                    kind="identical_column",
-                    col_a=header[ci - c0],
-                    col_b=header[cj - c0],
-                    col_a_idx=ci,
-                    col_b_idx=cj,
-                    n=pair_stats.n,
-                    severity="high",
-                    col_a_sample=_sample_exact(pair_stats.sample_a),
-                    col_b_sample=_sample_exact(pair_stats.sample_b),
-                    rule=f"col[{cj}] == col[{ci}]",
-                ))
+                emit(
+                    "high",
+                    lambda ci=ci, cj=cj, pair_stats=pair_stats: dict(
+                        kind="identical_column",
+                        col_a=header[ci - c0],
+                        col_b=header[cj - c0],
+                        col_a_idx=ci,
+                        col_b_idx=cj,
+                        n=pair_stats.n,
+                        severity="high",
+                        col_a_sample=_sample_exact(
+                            pair_stats.sample_a
+                        ),
+                        col_b_sample=_sample_exact(
+                            pair_stats.sample_b
+                        ),
+                        rule=f"col[{cj}] == col[{ci}]",
+                    ),
+                )
                 continue
             if (
                 pair_stats.all_int
                 and pair_stats.constant_offset not in (None, 0)
             ):
                 offset = pair_stats.constant_offset
-                findings.append(dict(
-                    kind="constant_offset",
-                    col_a=header[ci - c0],
-                    col_b=header[cj - c0],
-                    col_a_idx=ci,
-                    col_b_idx=cj,
-                    n=pair_stats.n,
-                    offset=offset,
-                    severity="high",
-                    col_a_sample=_sample_exact(pair_stats.sample_a),
-                    col_b_sample=_sample_exact(pair_stats.sample_b),
-                    rule=f"col[{cj}] = col[{ci}] + {offset}",
-                ))
+                emit(
+                    "high",
+                    lambda ci=ci, cj=cj, pair_stats=pair_stats,
+                    offset=offset: dict(
+                        kind="constant_offset",
+                        col_a=header[ci - c0],
+                        col_b=header[cj - c0],
+                        col_a_idx=ci,
+                        col_b_idx=cj,
+                        n=pair_stats.n,
+                        offset=offset,
+                        severity="high",
+                        col_a_sample=_sample_exact(
+                            pair_stats.sample_a
+                        ),
+                        col_b_sample=_sample_exact(
+                            pair_stats.sample_b
+                        ),
+                        rule=f"col[{cj}] = col[{ci}] + {offset}",
+                    ),
+                )
                 continue
             if pair_stats.has_wide_integer:
                 continue
@@ -1350,8 +1416,6 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
             if n < 4:
                 continue
             x, y = ai[mask], aj[mask]
-            # Compact value peek for downstream LLM triage (bounded <=8 each, ~tiny).
-            sa, sb = _sample(x), _sample(y)
             # B4 retains its existing scale-relative run policy. Whole-column identity,
             # transforms, and integer shifts use their dedicated policies below.
             tol = 1e-9 * max(float(np.max(np.abs(x))), float(np.max(np.abs(y))), 1e-300)
@@ -1359,11 +1423,26 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
             diff = y - x
             mean_diff = float(np.mean(diff))
             if mean_diff != 0 and np.all(relation_close(y, x + mean_diff)):
-                findings.append(dict(kind="constant_offset", col_a=header[ci - c0], col_b=header[cj - c0],
-                                     col_a_idx=ci, col_b_idx=cj, n=n, offset=mean_diff,
-                                     severity="high",
-                                     col_a_sample=sa, col_b_sample=sb,
-                                     rule=f"col[{cj}] = col[{ci}] + {mean_diff:.6g}"))
+                emit(
+                    "high",
+                    lambda ci=ci, cj=cj, n=n, mean_diff=mean_diff,
+                    x=x, y=y: dict(
+                        kind="constant_offset",
+                        col_a=header[ci - c0],
+                        col_b=header[cj - c0],
+                        col_a_idx=ci,
+                        col_b_idx=cj,
+                        n=n,
+                        offset=mean_diff,
+                        severity="high",
+                        col_a_sample=_sample(x),
+                        col_b_sample=_sample(y),
+                        rule=(
+                            f"col[{cj}] = col[{ci}] + "
+                            f"{mean_diff:.6g}"
+                        ),
+                    ),
+                )
                 continue
             # constant ratio
             ratio_emitted = False
@@ -1377,22 +1456,51 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                     and abs(mean_ratio) > 1e-9
                     and np.all(relation_close(y, mean_ratio * x))
                 ):
-                    findings.append(dict(kind="constant_ratio", col_a=header[ci - c0], col_b=header[cj - c0],
-                                         col_a_idx=ci, col_b_idx=cj, n=n, ratio=mean_ratio,
-                                         severity="high",
-                                         col_a_sample=sa, col_b_sample=sb,
-                                         rule=f"col[{cj}] = col[{ci}] * {mean_ratio:.6g}"))
+                    emit(
+                        "high",
+                        lambda ci=ci, cj=cj, n=n,
+                        mean_ratio=mean_ratio, x=x, y=y: dict(
+                            kind="constant_ratio",
+                            col_a=header[ci - c0],
+                            col_b=header[cj - c0],
+                            col_a_idx=ci,
+                            col_b_idx=cj,
+                            n=n,
+                            ratio=mean_ratio,
+                            severity="high",
+                            col_a_sample=_sample(x),
+                            col_b_sample=_sample(y),
+                            rule=(
+                                f"col[{cj}] = col[{ci}] * "
+                                f"{mean_ratio:.6g}"
+                            ),
+                        ),
+                    )
                     ratio_emitted = True
             # mirror: x + y == constant
             csum = x + y
             if n >= 5:
                 K = float(np.mean(csum))
                 if K != 0 and np.all(relation_close(csum, np.full_like(csum, K))):
-                    findings.append(dict(kind="sum_constant", col_a=header[ci - c0], col_b=header[cj - c0],
-                                         col_a_idx=ci, col_b_idx=cj, n=n, sum=K,
-                                         severity="high",
-                                         col_a_sample=sa, col_b_sample=sb,
-                                         rule=f"col[{ci}] + col[{cj}] = {K:.6g}"))
+                    emit(
+                        "high",
+                        lambda ci=ci, cj=cj, n=n, K=K,
+                        x=x, y=y: dict(
+                            kind="sum_constant",
+                            col_a=header[ci - c0],
+                            col_b=header[cj - c0],
+                            col_a_idx=ci,
+                            col_b_idx=cj,
+                            n=n,
+                            sum=K,
+                            severity="high",
+                            col_a_sample=_sample(x),
+                            col_b_sample=_sample(y),
+                            rule=(
+                                f"col[{ci}] + col[{cj}] = {K:.6g}"
+                            ),
+                        ),
+                    )
             # exact linear (non-identical)
             if n >= 5 and np.ptp(x) > 0:
                 lo = int(np.argmin(x))
@@ -1419,12 +1527,27 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                     is_identity = abs(slope - 1) < 1e-9 and intercept_is_zero
                     redundant_scaling = intercept_is_zero and ratio_emitted
                     if not (is_identity or redundant_scaling):
-                        findings.append(dict(kind="exact_linear", col_a=header[ci - c0], col_b=header[cj - c0],
-                                             col_a_idx=ci, col_b_idx=cj, n=n,
-                                             slope=float(slope), intercept=float(intercept),
-                                             severity="high",
-                                             col_a_sample=sa, col_b_sample=sb,
-                                             rule=f"col[{cj}] = {slope:.4g} * col[{ci}] + {intercept:.4g}"))
+                        emit(
+                            "high",
+                            lambda ci=ci, cj=cj, n=n, slope=slope,
+                            intercept=intercept, x=x, y=y: dict(
+                                kind="exact_linear",
+                                col_a=header[ci - c0],
+                                col_b=header[cj - c0],
+                                col_a_idx=ci,
+                                col_b_idx=cj,
+                                n=n,
+                                slope=float(slope),
+                                intercept=float(intercept),
+                                severity="high",
+                                col_a_sample=_sample(x),
+                                col_b_sample=_sample(y),
+                                rule=(
+                                    f"col[{cj}] = {slope:.4g} * "
+                                    f"col[{ci}] + {intercept:.4g}"
+                                ),
+                            ),
+                        )
             # B4: partial constant offset — a long CONSECUTIVE run where y = x + k for a fixed
             # non-zero k, while the rest of the column diverges (the whole-column case is
             # constant_offset above). A contiguous block shifted by a fixed amount is a
@@ -1453,14 +1576,29 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                 non_trivial_offset = (not off_is_small_integer) or col_hp
                 if (best_len >= run_floor and best_len < n
                         and abs(best_val) > tol and non_trivial_offset):
-                    findings.append(dict(kind="partial_constant_offset",
-                                         col_a=header[ci - c0], col_b=header[cj - c0],
-                                         col_a_idx=ci, col_b_idx=cj, n=n,
-                                         run_length=int(best_len), offset=float(best_val),
-                                         severity="high",
-                                         col_a_sample=sa, col_b_sample=sb,
-                                         rule=(f"col[{cj}] = col[{ci}] + {best_val:.6g} over a run of "
-                                               f"{int(best_len)}/{n} consecutive rows")))
+                    emit(
+                        "high",
+                        lambda ci=ci, cj=cj, n=n,
+                        best_len=best_len, best_val=best_val,
+                        x=x, y=y: dict(
+                            kind="partial_constant_offset",
+                            col_a=header[ci - c0],
+                            col_b=header[cj - c0],
+                            col_a_idx=ci,
+                            col_b_idx=cj,
+                            n=n,
+                            run_length=int(best_len),
+                            offset=float(best_val),
+                            severity="high",
+                            col_a_sample=_sample(x),
+                            col_b_sample=_sample(y),
+                            rule=(
+                                f"col[{cj}] = col[{ci}] + "
+                                f"{best_val:.6g} over a run of "
+                                f"{int(best_len)}/{n} consecutive rows"
+                            ),
+                        ),
+                    )
                     continue
             # integer difference with shared decimal fractions (B5), else small discrete diff set
             # B5: y and x reproduce each other's HIGH-PRECISION decimal fractions row-wise while
@@ -1485,28 +1623,60 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                 if (int(diff_is_int.sum()) >= max(5, int(round(0.8 * n)))
                         and distinct_hp >= 3
                         and len(int_diffs) >= 2):
-                    findings.append(dict(kind="integer_diff_shared_fraction",
-                                         col_a=header[ci - c0], col_b=header[cj - c0],
-                                         col_a_idx=ci, col_b_idx=cj, n=n,
-                                         n_shared_fraction=n_real_frac,
-                                         n_high_precision=distinct_hp,
-                                         severity="high",
-                                         col_a_sample=sa, col_b_sample=sb,
-                                         rule=(f"col[{cj}] and col[{ci}] share the same decimal fraction on "
-                                               f"{n_real_frac}/{n} rows ({distinct_hp} distinct high-precision "
-                                               f"fractions) but differ by whole numbers")))
+                    emit(
+                        "high",
+                        lambda ci=ci, cj=cj, n=n,
+                        n_real_frac=n_real_frac,
+                        distinct_hp=distinct_hp, x=x, y=y: dict(
+                            kind="integer_diff_shared_fraction",
+                            col_a=header[ci - c0],
+                            col_b=header[cj - c0],
+                            col_a_idx=ci,
+                            col_b_idx=cj,
+                            n=n,
+                            n_shared_fraction=n_real_frac,
+                            n_high_precision=distinct_hp,
+                            severity="high",
+                            col_a_sample=_sample(x),
+                            col_b_sample=_sample(y),
+                            rule=(
+                                f"col[{cj}] and col[{ci}] share the "
+                                "same decimal fraction on "
+                                f"{n_real_frac}/{n} rows "
+                                f"({distinct_hp} distinct "
+                                "high-precision fractions) but differ "
+                                "by whole numbers"
+                            ),
+                        ),
+                    )
                     continue
             # small discrete diff set
             if n >= 8:
                 diff_rounded = np.round(diff, 4)
                 uniq = np.unique(diff_rounded)
                 if 2 <= len(uniq) <= min(6, n // 3):
-                    findings.append(dict(kind="small_diff_set", col_a=header[ci - c0], col_b=header[cj - c0],
-                                         col_a_idx=ci, col_b_idx=cj, n=n,
-                                         unique_diffs=[float(x) for x in uniq],
-                                         severity="medium",
-                                         col_a_sample=sa, col_b_sample=sb,
-                                         rule=f"col[{cj}] - col[{ci}] only takes {len(uniq)} discrete values"))
+                    emit(
+                        "medium",
+                        lambda ci=ci, cj=cj, n=n, uniq=uniq,
+                        x=x, y=y: dict(
+                            kind="small_diff_set",
+                            col_a=header[ci - c0],
+                            col_b=header[cj - c0],
+                            col_a_idx=ci,
+                            col_b_idx=cj,
+                            n=n,
+                            unique_diffs=[
+                                float(value) for value in uniq
+                            ],
+                            severity="medium",
+                            col_a_sample=_sample(x),
+                            col_b_sample=_sample(y),
+                            rule=(
+                                f"col[{cj}] - col[{ci}] only takes "
+                                f"{len(uniq)} discrete values"
+                            ),
+                        ),
+                    )
     return findings
 
 
@@ -1567,8 +1737,76 @@ def _row_pair_low_cardinality_integer_like(x, y):
     return bool(near_integer >= 0.9 and max_abs <= 20 and distinct <= max(5, len(finite) // 4))
 
 
+def _row_pair_finding_builder(
+    *,
+    label_a,
+    label_b,
+    ra,
+    rb,
+    n,
+    changed,
+    same_decimal1,
+    frac_decimal1,
+    same_ones,
+    same_ones_decimal1,
+    frac_ones_decimal1,
+    coarse_10_diff,
+    frac_coarse_10,
+    top_diffs,
+    examples,
+    severity,
+):
+    top_diffs = tuple(top_diffs)
+    examples = tuple(dict(item) for item in examples)
+
+    def build():
+        return {
+            "kind": "row_pair_digit_coupling",
+            "row_a": label_a,
+            "row_b": label_b,
+            "row_a_idx": ra,
+            "row_b_idx": rb,
+            "n": n,
+            "changed": changed,
+            "same_decimal1": same_decimal1,
+            "same_decimal1_frac": frac_decimal1,
+            "same_ones": same_ones,
+            "same_ones_decimal1": same_ones_decimal1,
+            "same_ones_decimal1_frac": frac_ones_decimal1,
+            "coarse_10_diff": coarse_10_diff,
+            "coarse_10_diff_frac": frac_coarse_10,
+            "top_diffs": [
+                {"diff": float(diff), "count": int(count)}
+                for diff, count in top_diffs
+            ],
+            "examples": [dict(item) for item in examples],
+            "example_cells": (
+                [(ra + 1, item["col"]) for item in examples[:4]]
+                + [(rb + 1, item["col"]) for item in examples[:4]]
+            ),
+            "severity": severity,
+            "rule": (
+                f"rows {ra + 1} and {rb + 1}: first decimal digit "
+                f"matches {same_decimal1}/{n}; ones+decimal matches "
+                f"{same_ones_decimal1}/{n}; coarse 10-step "
+                f"differences {coarse_10_diff}/{n}"
+            ),
+        }
+
+    return build
+
+
 def detect_row_pair_digit_coupling(
-    sheet, r0, r1, c0, c1, header, min_n=10, *, with_coverage=False
+    sheet,
+    r0,
+    r1,
+    c0,
+    c1,
+    header,
+    min_n=10,
+    *,
+    with_coverage=False,
+    _finding_sink=None,
 ):
     """Detect paired rows that preserve low-order digits across many cells.
 
@@ -1578,7 +1816,10 @@ def detect_row_pair_digit_coupling(
     across many paired cells, with differences frequently landing on coarse
     multiples of 10.
     """
-    findings = []
+    findings, emit = _finding_emitter("row_pairs", _finding_sink)
+    ranked = _BoundedRankedFindingBuffer(
+        _ROW_PAIR_MAX_FINDINGS_PER_BLOCK
+    )
     n_rows = r1 - r0
     n_cols = c1 - c0
     if n_rows < 2 or n_cols < min_n:
@@ -1671,44 +1912,39 @@ def detect_row_pair_digit_coupling(
                 continue
 
             top_diffs = Counter(diffs).most_common(6)
-            findings.append(dict(
-                kind="row_pair_digit_coupling",
-                row_a=label_a,
-                row_b=label_b,
-                row_a_idx=ra,
-                row_b_idx=rb,
-                n=n,
-                changed=changed,
-                same_decimal1=same_decimal1,
-                same_decimal1_frac=frac_decimal1,
-                same_ones=same_ones,
-                same_ones_decimal1=same_ones_decimal1,
-                same_ones_decimal1_frac=frac_ones_decimal1,
-                coarse_10_diff=coarse_10_diff,
-                coarse_10_diff_frac=frac_coarse_10,
-                top_diffs=[{"diff": float(d), "count": int(c)} for d, c in top_diffs],
-                examples=examples,
-                example_cells=[(ra + 1, ex["col"]) for ex in examples[:4]]
-                              + [(rb + 1, ex["col"]) for ex in examples[:4]],
-                severity=severity,
-                rule=(f"rows {ra + 1} and {rb + 1}: first decimal digit matches "
-                      f"{same_decimal1}/{n}; ones+decimal matches "
-                      f"{same_ones_decimal1}/{n}; coarse 10-step differences "
-                      f"{coarse_10_diff}/{n}"),
-            ))
+            ranked.offer(
+                (
+                    0 if severity == "high" else 1,
+                    -frac_decimal1,
+                    -frac_ones_decimal1,
+                    -frac_coarse_10,
+                    -n,
+                ),
+                severity,
+                _row_pair_finding_builder(
+                    label_a=label_a,
+                    label_b=label_b,
+                    ra=ra,
+                    rb=rb,
+                    n=n,
+                    changed=changed,
+                    same_decimal1=same_decimal1,
+                    frac_decimal1=frac_decimal1,
+                    same_ones=same_ones,
+                    same_ones_decimal1=same_ones_decimal1,
+                    frac_ones_decimal1=frac_ones_decimal1,
+                    coarse_10_diff=coarse_10_diff,
+                    frac_coarse_10=frac_coarse_10,
+                    top_diffs=top_diffs,
+                    examples=examples,
+                    severity=severity,
+                ),
+            )
 
-    findings.sort(key=lambda f: (
-        0 if f["severity"] == "high" else 1,
-        -f["same_decimal1_frac"],
-        -f["same_ones_decimal1_frac"],
-        -f["coarse_10_diff_frac"],
-        -f["n"],
-    ))
-    omitted = max(0, len(findings) - _ROW_PAIR_MAX_FINDINGS_PER_BLOCK)
-    kept = findings[:_ROW_PAIR_MAX_FINDINGS_PER_BLOCK]
+    omitted = ranked.drain(emit)
     if with_coverage:
-        return kept, {"findings_omitted": omitted}
-    return kept
+        return findings, {"findings_omitted": omitted}
+    return findings
 
 
 # Above this many pairwise column relations in ONE block, the sheet is a dense /
@@ -1809,8 +2045,12 @@ def _demote_reused_progressions(report_blocks, profile="review"):
     return report_blocks
 
 
-def detect_arithmetic_progression(sheet, r0, r1, c0, c1, header):
-    findings = []
+def detect_arithmetic_progression(
+    sheet, r0, r1, c0, c1, header, *, _finding_sink=None
+):
+    findings, emit = _finding_emitter(
+        "progressions", _finding_sink
+    )
     for c in range(c0, c1):
         a = col_array(sheet, r0, r1, c)
         a = a[~np.isnan(a)]
@@ -1820,11 +2060,23 @@ def detect_arithmetic_progression(sheet, r0, r1, c0, c1, header):
         tol = 1e-9 * max(float(np.max(np.abs(a))), 1e-300)   # scale-relative (see detect_relations)
         if np.allclose(diffs, diffs[0], atol=tol, rtol=1e-9) and abs(diffs[0]) > tol:
             sev = "medium" if abs(diffs[0] - round(diffs[0])) < 1e-9 else "high"
-            findings.append(dict(kind="arithmetic_progression", col=header[c - c0], col_idx=c,
-                                 block_c0=c0,
-                                 n=int(len(a)), step=float(diffs[0]), first=float(a[0]),
-                                 severity=sev,
-                                 rule=f"col[{c}] = arithmetic progression, step={diffs[0]:.6g}"))
+            emit(
+                sev,
+                lambda c=c, a=a, diffs=diffs, sev=sev: dict(
+                    kind="arithmetic_progression",
+                    col=header[c - c0],
+                    col_idx=c,
+                    block_c0=c0,
+                    n=int(len(a)),
+                    step=float(diffs[0]),
+                    first=float(a[0]),
+                    severity=sev,
+                    rule=(
+                        f"col[{c}] = arithmetic progression, "
+                        f"step={diffs[0]:.6g}"
+                    ),
+                ),
+            )
     return findings
 
 
@@ -1881,6 +2133,7 @@ def detect_within_column_patterns(
     min_n=6,
     *,
     _state_tracker=None,
+    _finding_sink=None,
 ):
     """Detect within-column anomalies:
        - many identical values in one column (Su Jiacao: '13 中 8 个相同')
@@ -1888,11 +2141,10 @@ def detect_within_column_patterns(
        - too many .0 / .5 endings (Su Jiacao: '71 个中 51 个末位 0 或 5')
        - missing last digits (Su Jiacao: '70 个数据中末位完全没有 3 或 7')
     """
-    findings = []
+    findings, emit = _finding_emitter("within_col", _finding_sink)
     tracker = _state_tracker or _DenseStateTracker()
 
     def detect_column(c):
-        column_findings = []
         try:
             column = col_array(sheet, r0, r1, c)
             tracker.retain("column", column)
@@ -1904,7 +2156,7 @@ def detect_within_column_patterns(
             tracker.release("column", "numeric_mask")
             n = len(values)
             if n < min_n:
-                return column_findings
+                return
             col_name = (
                 header[c - c0]
                 if c - c0 < len(header)
@@ -1930,14 +2182,6 @@ def detect_within_column_patterns(
                 )
             )
             tracker.release("integer_workspace")
-            value_sample = [
-                float(unique[index]) for index in value_order[:8]
-            ]
-            enrich = dict(
-                n_distinct=n_distinct,
-                all_integer=all_integer,
-                value_sample=value_sample,
-            )
 
             top_index = int(value_order[0])
             top_val = unique[top_index]
@@ -1946,21 +2190,33 @@ def detect_within_column_patterns(
                 top_count >= max(4, n // 2)
                 and n - top_count >= 1
             ):
-                column_findings.append(dict(
-                    kind="within_col_value_duplication",
-                    col=col_name,
-                    col_idx=c,
-                    n=n,
-                    dup_value=float(top_val),
-                    dup_count=int(top_count),
-                    frac_repeat=top_count / n,
-                    **enrich,
-                    severity="high",
-                    rule=(
-                        f"col[{c}] has value {top_val} repeated "
-                        f"{top_count}/{n} times"
+                emit(
+                    "high",
+                    lambda c=c, col_name=col_name, n=n,
+                    top_val=top_val, top_count=top_count,
+                    n_distinct=n_distinct,
+                    all_integer=all_integer, unique=unique,
+                    value_order=value_order: dict(
+                        kind="within_col_value_duplication",
+                        col=col_name,
+                        col_idx=c,
+                        n=n,
+                        dup_value=float(top_val),
+                        dup_count=int(top_count),
+                        frac_repeat=top_count / n,
+                        n_distinct=n_distinct,
+                        all_integer=all_integer,
+                        value_sample=[
+                            float(unique[index])
+                            for index in value_order[:8]
+                        ],
+                        severity="high",
+                        rule=(
+                            f"col[{c}] has value {top_val} repeated "
+                            f"{top_count}/{n} times"
+                        ),
                     ),
-                ))
+                )
 
             ec = Counter()
             ending_count = 0
@@ -1974,24 +2230,39 @@ def detect_within_column_patterns(
                 if top_end_count >= max(
                     5, 2 * ending_count // 3
                 ):
-                    column_findings.append(dict(
-                        kind="within_col_decimal_repetition",
-                        col=col_name,
-                        col_idx=c,
-                        n=ending_count,
-                        ending=top_end,
-                        count=int(top_end_count),
-                        frac_repeat=(
-                            top_end_count / ending_count
+                    emit(
+                        "high",
+                        lambda c=c, col_name=col_name,
+                        ending_count=ending_count,
+                        top_end=top_end,
+                        top_end_count=top_end_count,
+                        n_distinct=n_distinct,
+                        all_integer=all_integer, unique=unique,
+                        value_order=value_order: dict(
+                            kind="within_col_decimal_repetition",
+                            col=col_name,
+                            col_idx=c,
+                            n=ending_count,
+                            ending=top_end,
+                            count=int(top_end_count),
+                            frac_repeat=(
+                                top_end_count / ending_count
+                            ),
+                            n_distinct=n_distinct,
+                            all_integer=all_integer,
+                            value_sample=[
+                                float(unique[index])
+                                for index in value_order[:8]
+                            ],
+                            severity="high",
+                            rule=(
+                                f"col[{c}]: "
+                                f"{top_end_count}/{ending_count} "
+                                "values share last-2 decimals "
+                                f"'.{top_end}'"
+                            ),
                         ),
-                        **enrich,
-                        severity="high",
-                        rule=(
-                            f"col[{c}]: {top_end_count}/{ending_count} "
-                            "values share last-2 decimals "
-                            f"'.{top_end}'"
-                        ),
-                    ))
+                    )
 
             last_digit_counts = Counter()
             last_digit_count = 0
@@ -2008,18 +2279,24 @@ def detect_within_column_patterns(
                 if zeros_fives >= max(
                     7, 0.7 * last_digit_count
                 ):
-                    column_findings.append(dict(
-                        kind="rounded_to_half_or_int",
-                        col=col_name,
-                        col_idx=c,
-                        n=last_digit_count,
-                        count_05=int(zeros_fives),
-                        severity="medium",
-                        rule=(
-                            f"col[{c}]: {zeros_fives}/"
-                            f"{last_digit_count} values end in 0 or 5"
+                    emit(
+                        "medium",
+                        lambda c=c, col_name=col_name,
+                        last_digit_count=last_digit_count,
+                        zeros_fives=zeros_fives: dict(
+                            kind="rounded_to_half_or_int",
+                            col=col_name,
+                            col_idx=c,
+                            n=last_digit_count,
+                            count_05=int(zeros_fives),
+                            severity="medium",
+                            rule=(
+                                f"col[{c}]: {zeros_fives}/"
+                                f"{last_digit_count} values end in "
+                                "0 or 5"
+                            ),
                         ),
-                    ))
+                    )
 
             if last_digit_count >= 20:
                 present = set(last_digit_counts)
@@ -2029,24 +2306,29 @@ def detect_within_column_patterns(
                     if digit not in present
                 ]
                 if missing and len(present) <= 6:
-                    column_findings.append(dict(
-                        kind="missing_last_digits",
-                        col=col_name,
-                        col_idx=c,
-                        n=last_digit_count,
-                        missing=missing,
-                        severity="medium",
-                        rule=(
-                            f"col[{c}]: last digits {missing} never "
-                            f"appear in {last_digit_count} values"
+                    emit(
+                        "medium",
+                        lambda c=c, col_name=col_name,
+                        last_digit_count=last_digit_count,
+                        missing=tuple(missing): dict(
+                            kind="missing_last_digits",
+                            col=col_name,
+                            col_idx=c,
+                            n=last_digit_count,
+                            missing=list(missing),
+                            severity="medium",
+                            rule=(
+                                f"col[{c}]: last digits "
+                                f"{list(missing)} never appear in "
+                                f"{last_digit_count} values"
+                            ),
                         ),
-                    ))
-            return column_findings
+                    )
         finally:
             tracker.release_all()
 
     for c in range(c0, c1):
-        findings.extend(detect_column(c))
+        detect_column(c)
     return findings
 
 
@@ -2060,6 +2342,7 @@ def detect_dispersed_repeats(
     min_n=30,
     *,
     _state_tracker=None,
+    _finding_sink=None,
 ):
     """Many DISTINCT high-precision values each repeated across DISPERSED rows.
 
@@ -2069,7 +2352,7 @@ def detect_dispersed_repeats(
     (not adjacent fill-down / technical replicates). Thresholds are conservative
     defaults pinned by tests; not env-tunable.
     """
-    findings = []
+    findings, emit = _finding_emitter("within_col", _finding_sink)
     tracker = _state_tracker or _DenseStateTracker()
 
     def _dec_places(v):
@@ -2235,10 +2518,7 @@ def detect_dispersed_repeats(
                     top_groups.append((
                         group_count,
                         int(first_core[group_index]),
-                        tuple(
-                            int(row)
-                            for row in group_rows[:8]
-                        ),
+                        group_index,
                     ))
                     top_groups.sort(
                         key=lambda item: (-item[0], item[1])
@@ -2252,69 +2532,88 @@ def detect_dispersed_repeats(
                 or dup_cells < 0.15 * m
             ):
                 return None
-            example_cells = []
-            for _, _, group_rows in top_groups:
-                for rr in group_rows:
-                    example_cells.append((rr + 1, c + 1))
             col_name = (
                 header[c - c0]
                 if c - c0 < len(header)
                 else f"col{c}"
             )
-            del core_rows, decimal_places, rounded_core
+            del decimal_places, rounded_core
             del unique_core, first_core, inverse_core, counts_core
-            del sorted_positions, group_starts
             tracker.release(
-                "core_rows",
                 "decimal_places",
                 "rounded_core",
                 "unique_core",
                 "first_core",
                 "inverse",
                 "counts",
+            )
+
+            def build_finding(
+                c=c,
+                col_name=col_name,
+                m=m,
+                dispersed_count=dispersed_count,
+                dup_cells=dup_cells,
+                core_vals=core_vals,
+                top_groups=tuple(top_groups),
+                core_rows=core_rows,
+                sorted_positions=sorted_positions,
+                group_starts=group_starts,
+            ):
+                (
+                    sample_unique,
+                    _sample_counts,
+                    sample_order,
+                ) = _numpy_frequency_summary(
+                    np.round(core_vals, 4)
+                )
+                example_cells = []
+                for group_count, _first, group_index in top_groups:
+                    start = int(group_starts[group_index])
+                    rows = core_rows[
+                        sorted_positions[
+                            start:start + group_count
+                        ]
+                    ]
+                    example_cells.extend(
+                        (int(row) + 1, c + 1)
+                        for row in rows[:8]
+                    )
+                return dict(
+                    kind="within_col_dispersed_repeats",
+                    col=col_name,
+                    col_idx=c,
+                    n=m,
+                    n_repeat_groups=dispersed_count,
+                    dup_cells=dup_cells,
+                    frac_repeat=dup_cells / m,
+                    n_distinct=int(len(sample_unique)),
+                    all_integer=False,
+                    value_sample=[
+                        float(sample_unique[index])
+                        for index in sample_order[:8]
+                    ],
+                    example_cells=example_cells,
+                    severity="medium",
+                    rule=(
+                        f"col[{c}]: {dispersed_count} distinct "
+                        "high-precision values each recur across "
+                        f"dispersed rows ({dup_cells}/{m} cells)"
+                    ),
+                )
+
+            emit("medium", build_finding)
+            del core_rows, sorted_positions, group_starts
+            tracker.release(
+                "core_rows",
                 "sorted_positions",
                 "group_starts",
-            )
-            sample_rounded = np.round(core_vals, 4)
-            tracker.retain("sample_rounded", sample_rounded)
-            tracker.retain_units("sample_frequency_workspace", 8 * m)
-            (
-                sample_unique,
-                sample_counts,
-                sample_order,
-            ) = _numpy_frequency_summary(sample_rounded)
-            tracker.retain("sample_unique", sample_unique)
-            tracker.retain("sample_counts", sample_counts)
-            tracker.retain("sample_order", sample_order)
-            tracker.release("sample_frequency_workspace")
-            return dict(
-                kind="within_col_dispersed_repeats",
-                col=col_name,
-                col_idx=c,
-                n=m,
-                n_repeat_groups=dispersed_count,
-                dup_cells=dup_cells,
-                frac_repeat=dup_cells / m,
-                n_distinct=int(len(sample_unique)),
-                all_integer=False,
-                value_sample=[
-                    float(sample_unique[index])
-                    for index in sample_order[:8]
-                ],
-                example_cells=example_cells,
-                severity="medium",
-                rule=(
-                    f"col[{c}]: {dispersed_count} distinct high-precision values "
-                    f"each recur across dispersed rows ({dup_cells}/{m} cells)"
-                ),
             )
         finally:
             tracker.release_all()
 
     for c in range(c0, c1):
-        finding = detect_column(c)
-        if finding is not None:
-            findings.append(finding)
+        detect_column(c)
     return findings
 
 
@@ -2327,10 +2626,13 @@ def detect_identical_after_rounding(
     header,
     *,
     _state_tracker=None,
+    _finding_sink=None,
 ):
     """Detect pairs/groups of cells that differ at higher precision but match at lower (e.g.
     4.2735 vs 4.2812 — both round to 4.3). Kang Tiebang ED6h/6j signal."""
-    findings = []
+    findings, emit = _finding_emitter(
+        "identical_after_rounding", _finding_sink
+    )
     tracker = _state_tracker or _DenseStateTracker()
     try:
         block = sheet.numeric[r0:r1, c0:c1]
@@ -2413,8 +2715,7 @@ def detect_identical_after_rounding(
                     count,
                     int(first_indices[group_index]),
                     float(rounded_values[group_index]),
-                    positions[:6].copy(),
-                    precise_values[:6].copy(),
+                    group_index,
                     int(len(precise_values)),
                 ))
                 rounding_groups.sort(
@@ -2433,51 +2734,68 @@ def detect_identical_after_rounding(
                 count,
                 _first_index,
                 rounded_value,
-                positions,
-                example_values,
+                group_index,
                 unique_count,
             ) in rounding_groups:
-                example_cells = []
-                for position in positions:
-                    flat_index = int(flat_indices[int(position)])
-                    row_offset, col_offset = divmod(
-                        flat_index, width
-                    )
-                    example_cells.append(
-                        (
+                def build_finding(
+                    count=count,
+                    rounded_value=rounded_value,
+                    group_index=group_index,
+                    unique_count=unique_count,
+                ):
+                    start = int(group_starts[group_index])
+                    positions = sorted_positions[
+                        start:start + count
+                    ]
+                    example_values = np.unique(
+                        np.round(values[positions], 4)
+                    )[:6]
+                    example_cells = []
+                    for position in positions[:6]:
+                        flat_index = int(
+                            flat_indices[int(position)]
+                        )
+                        row_offset, col_offset = divmod(
+                            flat_index, width
+                        )
+                        example_cells.append((
                             r0 + row_offset + 1,
                             c0 + col_offset + 1,
-                        )
+                        ))
+                    return dict(
+                        kind="identical_after_rounding",
+                        rounded_to=rounded_value,
+                        n_cells=count,
+                        n_unique=unique_count,
+                        example_values=[
+                            float(value)
+                            for value in example_values
+                        ],
+                        example_cells=example_cells,
+                        severity="medium",
+                        rule=(
+                            f"{count} cells share rounded value "
+                            f"{rounded_value} but have {unique_count} "
+                            "distinct precise values"
+                        ),
                     )
-                findings.append(dict(
-                    kind="identical_after_rounding",
-                    rounded_to=rounded_value,
-                    n_cells=count,
-                    n_unique=unique_count,
-                    example_values=[
-                        float(value) for value in example_values
-                    ],
-                    example_cells=example_cells,
-                    severity="medium",
-                    rule=(
-                        f"{count} cells share rounded value "
-                        f"{rounded_value} but have {unique_count} "
-                        "distinct precise values"
-                    ),
-                ))
+
+                emit("medium", build_finding)
         return findings
     finally:
         tracker.release_all()
 
 
-def detect_grim_grimmer(sheet, r0, r1, c0, c1, header):
+def detect_grim_grimmer(
+    sheet, r0, r1, c0, c1, header, *, _finding_sink=None
+):
     """GRIM/GRIMMER: flag reported means (and SDs) impossible for integer-valued
     data at the stated n. Strictly gated — needs a header-located mean+n group
     AND a count/score keyword in the MEAN column header signalling integer items —
     to stay false-positive-safe on continuous measurements where GRIM does not apply.
     GRIMMER runs only on a true SD column (SEM/SE columns are deliberately ignored,
     since GRIMMER is undefined for a standard error)."""
-    findings = []
+    findings, emit = _finding_emitter("grim", _finding_sink)
     for mean_i, n_i, sd_i in _grim_column_groups(header):
         mean_c, n_c = c0 + mean_i, c0 + n_i
         sd_c = c0 + sd_i if sd_i is not None else None
@@ -2513,30 +2831,92 @@ def detect_grim_grimmer(sheet, r0, r1, c0, c1, header):
         sd_name = str(header[sd_i] or f"col{sd_c}") if sd_i is not None else None
 
         if grim_fail:
-            f = dict(kind="grim_inconsistent", severity="high",
-                     mean_col=mean_name, n_col=n_name, sd_col=sd_name,
-                     col_a_idx=mean_c,
-                     n=checked, n_rows_checked=checked, n_failed=len(grim_fail),
-                     failed_rows=[dict(row=r + 1, mean=m, n=nn, decimals=dd,
-                                       nearest_consistent=round(round(m * nn) / nn, dd))
-                                  for (r, m, nn, dd) in grim_fail[:8]],
-                     example_cells=[[r + 1, mean_c + 1] for (r, *_rest) in grim_fail[:8]],
-                     rule=(f"{len(grim_fail)}/{checked} rows report a mean impossible for "
-                           f"integer data at the stated n (GRIM): col '{mean_name}'"))
-            if sd_c is not None:
-                f["col_b_idx"] = sd_c
-            findings.append(f)
+            def build_grim_finding(
+                mean_name=mean_name,
+                n_name=n_name,
+                sd_name=sd_name,
+                mean_c=mean_c,
+                sd_c=sd_c,
+                checked=checked,
+                grim_fail=tuple(grim_fail),
+            ):
+                finding = dict(
+                    kind="grim_inconsistent",
+                    severity="high",
+                    mean_col=mean_name,
+                    n_col=n_name,
+                    sd_col=sd_name,
+                    col_a_idx=mean_c,
+                    n=checked,
+                    n_rows_checked=checked,
+                    n_failed=len(grim_fail),
+                    failed_rows=[
+                        dict(
+                            row=r + 1,
+                            mean=m,
+                            n=nn,
+                            decimals=dd,
+                            nearest_consistent=round(
+                                round(m * nn) / nn, dd
+                            ),
+                        )
+                        for (r, m, nn, dd) in grim_fail[:8]
+                    ],
+                    example_cells=[
+                        [r + 1, mean_c + 1]
+                        for (r, *_rest) in grim_fail[:8]
+                    ],
+                    rule=(
+                        f"{len(grim_fail)}/{checked} rows report a "
+                        "mean impossible for integer data at the "
+                        f"stated n (GRIM): col '{mean_name}'"
+                    ),
+                )
+                if sd_c is not None:
+                    finding["col_b_idx"] = sd_c
+                return finding
+
+            emit("high", build_grim_finding)
         if grimmer_fail:
-            findings.append(dict(
-                kind="grimmer_inconsistent", severity="high",
-                mean_col=mean_name, n_col=n_name, sd_col=sd_name,
-                col_a_idx=mean_c, col_b_idx=sd_c,
-                n=grimmer_checked, n_rows_checked=grimmer_checked, n_failed=len(grimmer_fail),
-                failed_rows=[dict(row=r + 1, mean=m, sd=s, n=nn, sd_decimals=ds)
-                             for (r, m, s, nn, ds) in grimmer_fail[:8]],
-                example_cells=[[r + 1, sd_c + 1] for (r, *_rest) in grimmer_fail[:8]],
-                rule=(f"{len(grimmer_fail)}/{grimmer_checked} rows report an SD impossible for "
-                      f"integer data at the stated mean & n (GRIMMER): col '{sd_name}'")))
+            emit(
+                "high",
+                lambda mean_name=mean_name, n_name=n_name,
+                sd_name=sd_name, mean_c=mean_c, sd_c=sd_c,
+                grimmer_checked=grimmer_checked,
+                grimmer_fail=tuple(grimmer_fail): dict(
+                    kind="grimmer_inconsistent",
+                    severity="high",
+                    mean_col=mean_name,
+                    n_col=n_name,
+                    sd_col=sd_name,
+                    col_a_idx=mean_c,
+                    col_b_idx=sd_c,
+                    n=grimmer_checked,
+                    n_rows_checked=grimmer_checked,
+                    n_failed=len(grimmer_fail),
+                    failed_rows=[
+                        dict(
+                            row=r + 1,
+                            mean=m,
+                            sd=s,
+                            n=nn,
+                            sd_decimals=ds,
+                        )
+                        for (r, m, s, nn, ds)
+                        in grimmer_fail[:8]
+                    ],
+                    example_cells=[
+                        [r + 1, sd_c + 1]
+                        for (r, *_rest) in grimmer_fail[:8]
+                    ],
+                    rule=(
+                        f"{len(grimmer_fail)}/{grimmer_checked} "
+                        "rows report an SD impossible for integer "
+                        "data at the stated mean & n (GRIMMER): "
+                        f"col '{sd_name}'"
+                    ),
+                ),
+            )
     return findings
 
 
@@ -2595,10 +2975,12 @@ def benjamini_hochberg(pvals, alpha=0.05):
     return adj, sig
 
 
-def detect_equal_pairs(sheet, r0, r1, c0, c1, header):
+def detect_equal_pairs(
+    sheet, r0, r1, c0, c1, header, *, _finding_sink=None
+):
     """Detect column pairs where many rows have identical values
     (e.g. tumor length == tumor width)."""
-    findings = []
+    findings, emit = _finding_emitter("equal_pairs", _finding_sink)
     for i in range(c1 - c0):
         for j in range(i + 1, c1 - c0):
             pair_stats = _numeric_pair_stats(
@@ -2610,12 +2992,32 @@ def detect_equal_pairs(sheet, r0, r1, c0, c1, header):
             eq = pair_stats.equal
             all_equal = pair_stats.all_equal
             if eq >= max(6, n // 2) and eq / n >= 0.5 and not all_equal:
-                findings.append(dict(kind="many_equal_pairs", col_a=header[i], col_b=header[j],
-                                     col_a_idx=c0 + i, col_b_idx=c0 + j, n=n, equal=eq,
-                                     severity="medium" if eq < n else "high",
-                                     col_a_sample=_sample_exact(pair_stats.sample_a),
-                                     col_b_sample=_sample_exact(pair_stats.sample_b),
-                                     rule=f"col[{c0+i}] == col[{c0+j}] in {eq}/{n} rows"))
+                severity = "medium" if eq < n else "high"
+                emit(
+                    severity,
+                    lambda i=i, j=j, n=n, eq=eq,
+                    pair_stats=pair_stats,
+                    severity=severity: dict(
+                        kind="many_equal_pairs",
+                        col_a=header[i],
+                        col_b=header[j],
+                        col_a_idx=c0 + i,
+                        col_b_idx=c0 + j,
+                        n=n,
+                        equal=eq,
+                        severity=severity,
+                        col_a_sample=_sample_exact(
+                            pair_stats.sample_a
+                        ),
+                        col_b_sample=_sample_exact(
+                            pair_stats.sample_b
+                        ),
+                        rule=(
+                            f"col[{c0+i}] == col[{c0+j}] "
+                            f"in {eq}/{n} rows"
+                        ),
+                    ),
+                )
     return findings
 
 
@@ -5851,6 +6253,16 @@ def _analyze_numeric_blocks(
             break
         state.coverage.mark_block_analyzed()
         header = header_for(sheet, r0, c0, c1)
+        block_cap = (
+            _MAX_FINDINGS_PER_BLOCK
+            if _MAX_FINDINGS_PER_BLOCK > 0
+            else None
+        )
+        collector = BoundedFindingCollector(
+            BLOCK_FINDING_GROUPS,
+            cap=block_cap,
+            severity_rank=_SEVERITY_RANK,
+        )
         wide_block = (
             _MAX_BLOCK_COLS and (c1 - c0) > _MAX_BLOCK_COLS
         )
@@ -5926,7 +6338,15 @@ def _analyze_numeric_blocks(
                 max_cols=_ROW_PAIR_MAX_COLS,
             )
         rel = (
-            detect_relations(sheet, r0, r1, c0, c1, header)
+            detect_relations(
+                sheet,
+                r0,
+                r1,
+                c0,
+                c1,
+                header,
+                _finding_sink=collector,
+            )
             if (
                 not wide_block
                 and not wide_integer_limited
@@ -5936,7 +6356,13 @@ def _analyze_numeric_blocks(
         )
         ap = (
             detect_arithmetic_progression(
-                sheet, r0, r1, c0, c1, header
+                sheet,
+                r0,
+                r1,
+                c0,
+                c1,
+                header,
+                _finding_sink=collector,
             )
             if (
                 not wide_integer_limited
@@ -5945,7 +6371,15 @@ def _analyze_numeric_blocks(
             else []
         )
         eq = (
-            detect_equal_pairs(sheet, r0, r1, c0, c1, header)
+            detect_equal_pairs(
+                sheet,
+                r0,
+                r1,
+                c0,
+                c1,
+                header,
+                _finding_sink=collector,
+            )
             if (
                 not wide_block
                 and not wide_integer_limited
@@ -5969,6 +6403,7 @@ def _analyze_numeric_blocks(
                 c1,
                 header,
                 with_coverage=True,
+                _finding_sink=collector,
             )
             if isinstance(row_pair_result, tuple):
                 rp, row_pair_meta = row_pair_result
@@ -5991,7 +6426,13 @@ def _analyze_numeric_blocks(
             state.findings_omitted += row_pair_omitted
         wc = (
             detect_within_column_patterns(
-                sheet, r0, r1, c0, c1, header
+                sheet,
+                r0,
+                r1,
+                c0,
+                c1,
+                header,
+                _finding_sink=collector,
             )
             if (
                 not wide_integer_limited
@@ -6004,11 +6445,23 @@ def _analyze_numeric_blocks(
             and dense_allowed["dispersed_repeats"]
         ):
             wc += detect_dispersed_repeats(
-                sheet, r0, r1, c0, c1, header
+                sheet,
+                r0,
+                r1,
+                c0,
+                c1,
+                header,
+                _finding_sink=collector,
             )
         iar = (
             detect_identical_after_rounding(
-                sheet, r0, r1, c0, c1, header
+                sheet,
+                r0,
+                r1,
+                c0,
+                c1,
+                header,
+                _finding_sink=collector,
             )
             if (
                 not wide_integer_limited
@@ -6018,14 +6471,23 @@ def _analyze_numeric_blocks(
         )
         gg = (
             detect_grim_grimmer(
-                sheet, r0, r1, c0, c1, header
+                sheet,
+                r0,
+                r1,
+                c0,
+                c1,
+                header,
+                _finding_sink=collector,
             )
             if not wide_integer_limited
             else []
         )
+        groups = collector.materialize()
+        block_cap_omitted = collector.omitted
         if not (
-            rel or ap or eq or rp or wc or iar or gg
+            any(groups.values())
             or row_pair_omitted
+            or block_cap_omitted
         ):
             continue
 
@@ -6034,22 +6496,6 @@ def _analyze_numeric_blocks(
             sheet_name,
             *[str(value) for value in header],
         ])
-        groups = {
-            "relations": rel,
-            "progressions": ap,
-            "equal_pairs": eq,
-            "row_pairs": rp,
-            "within_col": wc,
-            "identical_after_rounding": iar,
-            "grim": gg,
-        }
-        per_block = (
-            _MAX_FINDINGS_PER_BLOCK
-            if _MAX_FINDINGS_PER_BLOCK > 0
-            else None
-        )
-        block_cap = per_block
-        block_cap_omitted = _cap_block_findings(groups, block_cap)
         state.findings_omitted += block_cap_omitted
         if block_cap_omitted:
             state.coverage.add_limitation(

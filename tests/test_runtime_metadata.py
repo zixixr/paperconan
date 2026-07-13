@@ -103,12 +103,20 @@ def test_runtime_metadata_attributes_deferred_evidence_to_its_source(
             ])
         })
 
-    def relation_finding(*_args, **_kwargs):
-        return [{
+    def relation_finding(
+        *_args, _finding_sink=None, **_kwargs
+    ):
+        finding = {
             "kind": "constant_offset",
             "severity": "medium",
             "rule": "runtime attribution",
-        }]
+        }
+        _finding_sink.offer(
+            "relations",
+            finding["severity"],
+            lambda: dict(finding),
+        )
+        return []
 
     for name in (
         "detect_arithmetic_progression",
