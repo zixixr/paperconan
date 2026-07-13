@@ -1328,6 +1328,10 @@ def test_sdist_includes_shared_sidecar_module():
     )
 
 
+def test_sdist_includes_detector_resource_module():
+    assert "src/paperconan/_resources.py" in _sdist_allowlist()
+
+
 def test_copied_source_build_command_disables_isolation(tmp_path):
     command = _copied_source_build_command(tmp_path / "dist")
 

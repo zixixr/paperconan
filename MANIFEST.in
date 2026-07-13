@@ -63,6 +63,7 @@ include src/paperconan/_input.py
 include src/paperconan/_numeric.py
 include src/paperconan/_prefilter.py
 include src/paperconan/_profiles.py
+include src/paperconan/_resources.py
 include src/paperconan/_sheet.py
 include src/paperconan/_source_sidecar.py
 include src/paperconan/_summaries.py
@@ -149,6 +150,7 @@ include tests/test_recurring_row_vector.py
 include tests/test_relations_flood.py
 include tests/test_relations_tolerance.py
 include tests/test_report_status.py
+include tests/test_resource_budget.py
 include tests/test_resource_lifetime.py
 include tests/test_row_pair_digit_coupling.py
 include tests/test_runtime_metadata.py
