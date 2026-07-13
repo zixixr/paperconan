@@ -1719,3 +1719,204 @@ def test_wheel_record_rejects_invalid_rows(malformation):
 
     with pytest.raises(AssertionError):
         _assert_wheel_record(payloads, record_name)
+
+
+def _add_wheel_file(archive, name, payload):
+    member = zipfile.ZipInfo(name)
+    member.create_system = 3
+    member.compress_type = zipfile.ZIP_DEFLATED
+    member.external_attr = (stat.S_IFREG | 0o644) << 16
+    archive.writestr(member, payload)
+
+
+def _write_test_release_archives(dist, *, mutation=None):
+    known_mutations = {
+        "sdist-source-bytes",
+        "wheel-source-bytes",
+        "wheel-license-bytes",
+        "sdist-missing-member",
+        "sdist-extra-member",
+        "wheel-missing-member",
+        "wheel-extra-member",
+        "record-missing-self",
+        "record-self-hash",
+        "record-self-size",
+        "record-bad-hash",
+        "record-bad-size",
+    }
+    assert mutation is None or mutation in known_mutations
+    dist.mkdir()
+
+    expected_sdist = _sdist_allowlist()
+    sdist_payloads = {
+        relative: (ROOT / relative).read_bytes()
+        for relative in expected_sdist
+    }
+    sdist_payloads.update({
+        relative: b"generated metadata\n"
+        for relative in SDIST_GENERATED_METADATA
+    })
+    if mutation == "sdist-source-bytes":
+        sdist_payloads["README.md"] += b"changed\n"
+    elif mutation == "sdist-missing-member":
+        del sdist_payloads["README.md"]
+    elif mutation == "sdist-extra-member":
+        sdist_payloads["unexpected.txt"] = b"extra\n"
+
+    root = f"paperconan-{__version__}"
+    sdist = dist / f"{root}.tar.gz"
+    with tarfile.open(sdist, "w:gz") as archive:
+        _add_tar_directory(archive, f"{root}/")
+        for relative, payload in sorted(sdist_payloads.items()):
+            _add_tar_file(
+                archive,
+                f"{root}/{relative}",
+                payload,
+            )
+
+    expected_wheel = {
+        relative.removeprefix("src/"): (
+            ROOT / relative
+        ).read_bytes()
+        for relative in expected_sdist
+        if relative.startswith("src/paperconan/")
+    }
+    dist_info_root = f"paperconan-{__version__}.dist-info"
+    wheel_payloads = dict(expected_wheel)
+    wheel_payloads.update({
+        f"{dist_info_root}/METADATA": b"Metadata-Version: 2.4\n",
+        f"{dist_info_root}/WHEEL": b"Wheel-Version: 1.0\n",
+        f"{dist_info_root}/entry_points.txt": b"[console_scripts]\n",
+        f"{dist_info_root}/licenses/LICENSE": (
+            ROOT / "LICENSE"
+        ).read_bytes(),
+        f"{dist_info_root}/top_level.txt": b"paperconan\n",
+    })
+    package_member = "paperconan/__init__.py"
+    license_member = f"{dist_info_root}/licenses/LICENSE"
+    if mutation == "wheel-source-bytes":
+        wheel_payloads[package_member] += b"changed\n"
+    elif mutation == "wheel-license-bytes":
+        wheel_payloads[license_member] += b"changed\n"
+    elif mutation == "wheel-missing-member":
+        del wheel_payloads[package_member]
+    elif mutation == "wheel-extra-member":
+        wheel_payloads[
+            f"{dist_info_root}/unexpected.json"
+        ] = b"{}\n"
+
+    record_name = f"{dist_info_root}/RECORD"
+    record_rows = [
+        [
+            name,
+            f"sha256={_record_hash(payload)}",
+            str(len(payload)),
+        ]
+        for name, payload in sorted(wheel_payloads.items())
+    ]
+    self_row = [record_name, "", ""]
+    if mutation == "record-self-hash":
+        self_row[1] = "sha256=incorrect"
+    elif mutation == "record-self-size":
+        self_row[2] = "0"
+    if mutation != "record-missing-self":
+        record_rows.append(self_row)
+
+    if mutation in {"record-bad-hash", "record-bad-size"}:
+        row = next(
+            item for item in record_rows
+            if item[0] == package_member
+        )
+        if mutation == "record-bad-hash":
+            row[1] = "sha256=incorrect"
+        else:
+            row[2] = str(int(row[2]) + 1)
+
+    record = io.StringIO(newline="")
+    csv.writer(record, lineterminator="\n").writerows(record_rows)
+    wheel_payloads[record_name] = record.getvalue().encode(
+        "utf-8"
+    )
+
+    wheel = dist / f"{root}-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, payload in sorted(wheel_payloads.items()):
+            _add_wheel_file(archive, name, payload)
+    return sdist, wheel
+
+
+def test_built_release_archives_integrated_accepts_temporary_artifacts(
+    tmp_path,
+):
+    dist = tmp_path / "dist"
+    _write_test_release_archives(dist)
+
+    _assert_built_release_archives(dist)
+
+
+@pytest.mark.parametrize(
+    ("archive_kind", "cardinality"),
+    [
+        ("sdist", "missing"),
+        ("sdist", "extra"),
+        ("wheel", "missing"),
+        ("wheel", "extra"),
+    ],
+)
+def test_built_release_archives_integrated_requires_exactly_one_archive(
+    tmp_path, archive_kind, cardinality
+):
+    dist = tmp_path / "dist"
+    sdist, wheel = _write_test_release_archives(dist)
+    archive = sdist if archive_kind == "sdist" else wheel
+    if cardinality == "missing":
+        archive.unlink()
+    else:
+        suffix = ".tar.gz" if archive_kind == "sdist" else ".whl"
+        duplicate = dist / f"paperconan-duplicate{suffix}"
+        duplicate.write_bytes(archive.read_bytes())
+
+    with pytest.raises(AssertionError):
+        _assert_built_release_archives(dist)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "sdist-source-bytes",
+        "wheel-source-bytes",
+        "wheel-license-bytes",
+        "sdist-missing-member",
+        "sdist-extra-member",
+        "wheel-missing-member",
+        "wheel-extra-member",
+    ],
+)
+def test_built_release_archives_integrated_rejects_payload_or_members(
+    tmp_path, mutation
+):
+    dist = tmp_path / "dist"
+    _write_test_release_archives(dist, mutation=mutation)
+
+    with pytest.raises(AssertionError):
+        _assert_built_release_archives(dist)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "record-missing-self",
+        "record-self-hash",
+        "record-self-size",
+        "record-bad-hash",
+        "record-bad-size",
+    ],
+)
+def test_built_release_archives_integrated_rejects_record_mutations(
+    tmp_path, mutation
+):
+    dist = tmp_path / "dist"
+    _write_test_release_archives(dist, mutation=mutation)
+
+    with pytest.raises(AssertionError):
+        _assert_built_release_archives(dist)

@@ -305,6 +305,10 @@ def test_cli_documents_wave4_detector_and_cross_table_budgets() -> None:
         "recurrence order / group / comparison / mark / output"
         in cli_text
     )
+    assert (
+        "只接纳能完整运行的 detector family"
+        not in cli_text
+    )
     assert "axis classification 固定每值 4 次" not in cli_text
 
 

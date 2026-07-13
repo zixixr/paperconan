@@ -85,7 +85,7 @@ write_adjudicated_report(scan, verdict, "adjudication.html")  # scan/verdict 均
 | `PAPERCONAN_MAX_SPARSE_CELLS` | `250000` | 单 sheet 保留的文本、日期/对象及超宽整数稀疏 cell 数上限；超限 sheet 会跳过并记录实际观测值 |
 | `PAPERCONAN_MAX_SPARSE_BYTES` | `67108864` | 单 sheet 稀疏 payload 字节预算；超限 sheet 会跳过并记录实际观测值 |
 | `PAPERCONAN_COLUMN_FINGERPRINT_MAX_COLUMNS` | `512` | 跨 sheet 列指纹按物理列顺序最多处理的列数；超出部分会记录精确覆盖限制 |
-| `PAPERCONAN_DENSE_BLOCK_MAX_ROWS` | `100000` | 单个 numeric block 的逻辑行数上限；由各 detector-owned family 在候选循环前检查，只接纳能完整运行的 detector family，超限记录 `dense_block_detector_limit` |
+| `PAPERCONAN_DENSE_BLOCK_MAX_ROWS` | `100000` | 单个 numeric block 的逻辑行数上限；由各 detector-owned family 在候选循环前检查，超限时该 family 不进入候选循环并记录 `dense_block_detector_limit` |
 | `PAPERCONAN_DENSE_BLOCK_CELL_WORK_LIMIT` | `10000000` | 单个 numeric block、每个 dense detector-owned family 的逻辑 numeric-cell visit 预算；候选整体不适配时不执行并记录 `dense_block_detector_limit` |
 | `PAPERCONAN_DENSE_BLOCK_STATE_CELL_LIMIT` | `2000000` | 统一的 8-byte float64-equivalent state unit 预算：用于单个 numeric block 的 dense detector family，也用于单 sheet 的超宽整数 block range index；每次 reservation 都在 allocation 前完成，覆盖同时存活的 NumPy array 及 sort/unique/partition workspace 保守上界，超限前拒绝完整候选并记录 `dense_block_detector_limit` 或 `wide_integer_block_index_limit` |
 | `PAPERCONAN_CROSS_SHEET_SUMMARY_LIMIT` | `2000` | 全 scan 最多保留的完整跨表 summary / sheet 数；后续 summary 整体拒绝并记录 `cross_sheet_summary_count_limit` |
@@ -124,7 +124,9 @@ write_adjudicated_report(scan, verdict, "adjudication.html")  # scan/verdict 均
 | `PAPERCONAN_MANAGED_OUTPUT_COLLISION_PROBE_LIMIT` | `128` | 单个 direct/archive 输出名称最多执行的 filesystem collision probe 数；包括 digest 与 numeric fallback |
 
 Dense row/work/state checks 由各 detector-owned family 自己在候选循环和
-allocation 前执行，不再由 caller 预估整个 family 后统一接纳。
+allocation 前执行，不再由 caller 预估整个 family 后统一接纳。Row gate 可在
+循环前拒绝该 family；work/state 则逐候选接纳，因此较早候选可以完成并保留，
+后续候选仍可因预算不足在执行前停止。
 `work_skipped_lower_bound` 用于未执行就无法知道 branch-dependent work 的情况；
 它只证明至少跳过这些 visits。`state_required` 是 detector 声明的完整同时存活
 state upper bound，`state_required_lower_bound` 是实际尝试过的最大 simultaneous
