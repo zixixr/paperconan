@@ -693,6 +693,148 @@ def _bounded_tar_names(
     return [member.name for member in members], set(), skipped
 
 
+def _tar_info_snapshot(path, monkeypatch, name_limit):
+    monkeypatch.setattr(_download, "_ARCHIVE_MEMBER_LIMIT", 20)
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_METADATA_BYTES", 100_000, raising=False
+    )
+    monkeypatch.setattr(
+        _download, "_ARCHIVE_MEMBER_NAME_BYTES", name_limit
+    )
+    with tarfile.open(path, "r:gz") as archive:
+        expected = archive.next()
+    with _download._BoundedTarFile.open(
+        path,
+        "r:gz",
+        tarinfo=_download._BoundedTarInfo,
+    ) as archive:
+        actual = archive.next()
+    return expected, actual
+
+
+@pytest.mark.parametrize(
+    (
+        "global_records",
+        "local_records",
+        "sparse_member",
+    ),
+    [
+        (
+            [],
+            [
+                (b"path", b"path-value.csv"),
+                (b"GNU.sparse.name", b"sparse-val.csv"),
+            ],
+            False,
+        ),
+        (
+            [],
+            [
+                (b"GNU.sparse.name", b"sparse-val.csv"),
+                (b"path", b"path-value.csv"),
+            ],
+            True,
+        ),
+        (
+            [
+                (b"path", b"path-value.csv"),
+                (b"GNU.sparse.name", b"sparse-val.csv"),
+            ],
+            [(b"path", b"final-path.csv")],
+            False,
+        ),
+        (
+            [
+                (b"GNU.sparse.name", b"sparse-val.csv"),
+                (b"path", b"path-value.csv"),
+            ],
+            [(b"GNU.sparse.name", b"final-sprs.csv")],
+            True,
+        ),
+        (
+            [],
+            [
+                (b"path", b"first-path.csv"),
+                (b"GNU.sparse.name", b"sparse-val.csv"),
+                (b"path", b"final-path.csv"),
+            ],
+            False,
+        ),
+        (
+            [],
+            [
+                (b"GNU.sparse.name", b"first-sprs.csv"),
+                (b"path", b"path-value.csv"),
+                (b"GNU.sparse.name", b"final-sprs.csv"),
+            ],
+            True,
+        ),
+    ],
+    ids=[
+        "local-path-then-sparse",
+        "local-sparse-then-path",
+        "global-order-local-path-replacement",
+        "global-order-local-sparse-replacement",
+        "repeated-path-keeps-first-position",
+        "repeated-sparse-keeps-first-position",
+    ],
+)
+def test_tar_pax_name_application_matches_stdlib_mapping_order(
+    tmp_path,
+    monkeypatch,
+    global_records,
+    local_records,
+    sparse_member,
+):
+    archive = tmp_path / "pax-name-order.tar.gz"
+    members = []
+    if global_records:
+        members.append((
+            "global",
+            tarfile.XGLTYPE,
+            b"".join(
+                _pax_record(key, value)
+                for key, value in global_records
+            ),
+        ))
+    if sparse_member:
+        local_records = [
+            *local_records,
+            (b"GNU.sparse.map", b"0,0"),
+        ]
+    members.extend([
+        (
+            "extended",
+            tarfile.XHDTYPE,
+            b"".join(
+                _pax_record(key, value)
+                for key, value in local_records
+            ),
+        ),
+        ("placeholder", tarfile.REGTYPE, b""),
+    ])
+    _write_raw_tar(archive, members)
+
+    with tarfile.open(archive, "r:gz") as stdlib_archive:
+        expected_name = stdlib_archive.next().name
+    exact = len(expected_name.encode("utf-8"))
+    expected, actual = _tar_info_snapshot(
+        archive, monkeypatch, exact
+    )
+
+    assert actual.name == expected.name
+    assert actual.pax_headers == expected.pax_headers
+    assert actual.sparse == expected.sparse
+
+    names, preserved, skipped = _bounded_tar_names(
+        archive, tmp_path, monkeypatch, exact - 1
+    )
+
+    assert names == []
+    assert preserved == set()
+    assert skipped[0]["reason"] == "archive member name byte limit"
+
+
 def test_tar_pax_uses_last_effective_utf8_path_at_exact_boundary(
     tmp_path, monkeypatch
 ):
@@ -1088,8 +1230,8 @@ def test_tar_pax_path_supersedes_sparse_name_without_decode(
     final_name = "nested/final.csv"
     raw_sparse_name = b"x" * 1_000 + b".csv"
     pax = (
-        _pax_record(b"path", final_name.encode("utf-8"))
-        + _pax_record(b"GNU.sparse.name", raw_sparse_name)
+        _pax_record(b"GNU.sparse.name", raw_sparse_name)
+        + _pax_record(b"path", final_name.encode("utf-8"))
     )
     _write_raw_tar(
         archive,
@@ -1123,6 +1265,15 @@ def test_tar_pax_path_supersedes_sparse_name_without_decode(
     assert names == [final_name]
     assert preserved == set()
     assert skipped == []
+
+    expected, actual = _tar_info_snapshot(
+        archive,
+        monkeypatch,
+        len(final_name.encode("utf-8")),
+    )
+
+    assert tuple(actual.pax_headers) == tuple(expected.pax_headers)
+    assert "GNU.sparse.name" in actual.pax_headers
 
 
 def test_tar_sparse_name_uses_exact_boundary_before_decode(

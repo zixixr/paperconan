@@ -456,6 +456,40 @@ def _json_string_escape(codepoint):
     return f"\\u{high:04x}\\u{low:04x}".encode("ascii")
 
 
+def _encoded_json_string_size(value):
+    total = 2
+    for char in value:
+        escaped = _SIMPLE_ESCAPES.get(char)
+        if escaped is None:
+            codepoint = ord(char)
+            if codepoint < 0x20 or codepoint >= 0x7F:
+                escaped = _json_string_escape(codepoint)
+            else:
+                escaped = bytes((codepoint,))
+        total += len(escaped)
+    return total
+
+
+def _minimum_json_value_size(value):
+    if value is None:
+        return 4
+    if value is True or value is False:
+        return 4 if value is True else 5
+    if type(value) is str:
+        return _encoded_json_string_size(value)
+    if type(value) is int:
+        return len(str(value))
+    if type(value) is float:
+        if math.isnan(value):
+            return 3
+        if math.isinf(value):
+            return 8 if value > 0 else 9
+        return len(repr(value))
+    if type(value) in (dict, list, tuple):
+        return 2
+    return 1
+
+
 class _BoundedJsonWriter:
     def __init__(self, byte_limit):
         self.byte_limit = max(0, int(byte_limit))
@@ -511,7 +545,28 @@ class _BoundedJsonWriter:
         self.markers.add(marker)
         return marker
 
-    def _write_dict(self, value, level):
+    def _dict_tail_sizes(
+        self,
+        value,
+        keys,
+        level,
+        tail_size,
+    ):
+        size = 1 + tail_size
+        if keys:
+            size += 1 + level * 2
+        sizes = [size] * (len(keys) + 1)
+        for index in range(len(keys) - 1, -1, -1):
+            key = keys[index]
+            size += 2
+            size += (level + 1) * 2
+            size += _encoded_json_string_size(key)
+            size += 2
+            size += _minimum_json_value_size(value[key])
+            sizes[index] = size
+        return sizes
+
+    def _write_dict(self, value, level, tail_size):
         if len(value) > self.byte_limit:
             raise SidecarLimitError(
                 "source sidecar byte limit",
@@ -523,6 +578,9 @@ class _BoundedJsonWriter:
                 "unsupported sidecar object key"
             )
         keys = sorted(value)
+        tail_sizes = self._dict_tail_sizes(
+            value, keys, level, tail_size
+        )
         marker = self._enter_container(value)
         try:
             self._write(b"{")
@@ -531,7 +589,11 @@ class _BoundedJsonWriter:
                 self._write_indent(level + 1)
                 self._write_string(key)
                 self._write(b": ")
-                self._write_value(value[key], level + 1)
+                self._write_value(
+                    value[key],
+                    level + 1,
+                    tail_sizes[index + 1],
+                )
             if keys:
                 self._write(b"\n")
                 self._write_indent(level)
@@ -539,9 +601,9 @@ class _BoundedJsonWriter:
         finally:
             self.markers.remove(marker)
 
-    def _write_iterable(self, value, level):
+    def _write_iterable(self, value, level, tail_size):
         if (
-            isinstance(value, (list, tuple))
+            type(value) in (list, tuple)
             and len(value) > self.byte_limit
         ):
             raise SidecarLimitError(
@@ -552,14 +614,46 @@ class _BoundedJsonWriter:
         marker = self._enter_container(value)
         try:
             iterator = iter(value)
+            known_count = (
+                len(value)
+                if type(value) in (list, tuple)
+                else None
+            )
             self._write(b"[")
             count = 0
-            for item in iterator:
+            while known_count is None or count < known_count:
+                prefix_size = (
+                    1 if count == 0 else 2
+                ) + (level + 1) * 2
+                item_tail_size = (
+                    1 + level * 2 + 1 + tail_size
+                )
+                minimum_size = (
+                    len(self.output)
+                    + prefix_size
+                    + 1
+                    + item_tail_size
+                )
+                if minimum_size > self.byte_limit:
+                    raise SidecarLimitError(
+                        "source sidecar byte limit",
+                        iterator_exhaustion_unverified=True,
+                        retained_bytes=len(self.output),
+                        minimum_bytes_if_additional_entry=(
+                            minimum_size
+                        ),
+                    )
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    break
                 self._write(
                     b"\n" if count == 0 else b",\n"
                 )
                 self._write_indent(level + 1)
-                self._write_value(item, level + 1)
+                self._write_value(
+                    item, level + 1, item_tail_size
+                )
                 count += 1
             if count:
                 self._write(b"\n")
@@ -568,28 +662,45 @@ class _BoundedJsonWriter:
         finally:
             self.markers.remove(marker)
 
-    def _write_value(self, value, level):
+    def _write_value(self, value, level, tail_size=0):
         if value is None:
             self._write(b"null")
         elif value is True:
             self._write(b"true")
         elif value is False:
             self._write(b"false")
-        elif type(value) is str:
-            self._write_string(value)
-        elif type(value) is int:
-            self._write(str(value).encode("ascii"))
-        elif type(value) is float:
-            if math.isnan(value):
+        elif isinstance(value, str):
+            canonical = (
+                value
+                if type(value) is str
+                else str.__str__(value)
+            )
+            self._write_string(canonical)
+        elif isinstance(value, int):
+            canonical = (
+                value
+                if type(value) is int
+                else int.__int__(value)
+            )
+            self._write(str(canonical).encode("ascii"))
+        elif isinstance(value, float):
+            canonical = (
+                value
+                if type(value) is float
+                else float.__float__(value)
+            )
+            if math.isnan(canonical):
                 self._write(b"NaN")
-            elif math.isinf(value):
+            elif math.isinf(canonical):
                 self._write(
-                    b"Infinity" if value > 0 else b"-Infinity"
+                    b"Infinity"
+                    if canonical > 0
+                    else b"-Infinity"
                 )
             else:
-                self._write(repr(value).encode("ascii"))
+                self._write(repr(canonical).encode("ascii"))
         elif type(value) is dict:
-            self._write_dict(value, level)
+            self._write_dict(value, level, tail_size)
         elif isinstance(value, (bytes, bytearray, set, frozenset)):
             raise TypeError(
                 "unsupported sidecar value: "
@@ -603,10 +714,10 @@ class _BoundedJsonWriter:
                     "unsupported sidecar value: "
                     f"{type(value).__name__}"
                 ) from None
-            self._write_iterable(value, level)
+            self._write_iterable(value, level, tail_size)
 
     def encode(self, value):
-        self._write_value(value, 0)
+        self._write_value(value, 0, 1)
         self._write(b"\n")
         return bytes(self.output)
 

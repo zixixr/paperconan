@@ -513,27 +513,49 @@ def _safe_managed_names(
 ):
     if isinstance(managed_files, str):
         entries = (managed_files,)
+        known_entry_count = 1
     elif managed_files is None:
         entries = ()
+        known_entry_count = 0
     else:
         try:
             entries = iter(managed_files)
         except TypeError:
             entries = ()
+        known_entry_count = (
+            len(managed_files)
+            if type(managed_files)
+            in (list, tuple, set, frozenset)
+            else None
+        )
 
     lexical_root = os.path.abspath(out_dir)
     safe = set()
     entries_inspected = 0
     retained_name_bytes = 0
-    for relative in entries:
+    while True:
         if (
             entry_limit is not None
             and entries_inspected >= entry_limit
         ):
+            if (
+                known_entry_count is not None
+                and entries_inspected >= known_entry_count
+            ):
+                break
             raise _SourceSidecarLimit(
                 _source_sidecar_limit_record(
                     "source sidecar managed entry limit",
                     limit=entry_limit,
+                    omitted_entries_lower_bound=(
+                        known_entry_count
+                        - entries_inspected
+                        if known_entry_count is not None
+                        else None
+                    ),
+                    iterator_exhaustion_unverified=(
+                        known_entry_count is None
+                    ),
                     managed_entries_inspected=entries_inspected,
                     managed_entries_retained=len(safe),
                     managed_name_bytes_retained=(
@@ -541,6 +563,10 @@ def _safe_managed_names(
                     ),
                 )
             )
+        try:
+            relative = next(entries)
+        except StopIteration:
+            break
         entries_inspected += 1
         if not isinstance(relative, str):
             continue
@@ -631,6 +657,10 @@ def _source_sidecar_limit_record(
     managed_entries_retained=None,
     managed_name_bytes_retained=None,
     requested_name_bytes=None,
+    omitted_entries_lower_bound=1,
+    iterator_exhaustion_unverified=False,
+    retained_bytes=None,
+    minimum_bytes_if_additional_entry=None,
     ownership_preserved=False,
 ):
     record = {
@@ -654,8 +684,21 @@ def _source_sidecar_limit_record(
         )
     if requested_name_bytes is not None:
         record["requested_name_bytes"] = requested_name_bytes
-    if reason != "source sidecar byte limit":
-        record["omitted_entries_lower_bound"] = 1
+    if (
+        reason != "source sidecar byte limit"
+        and omitted_entries_lower_bound is not None
+    ):
+        record["omitted_entries_lower_bound"] = (
+            omitted_entries_lower_bound
+        )
+    if iterator_exhaustion_unverified:
+        record["iterator_exhaustion_unverified"] = True
+    if retained_bytes is not None:
+        record["retained_bytes"] = retained_bytes
+    if minimum_bytes_if_additional_entry is not None:
+        record["minimum_bytes_if_additional_entry"] = (
+            minimum_bytes_if_additional_entry
+        )
     if ownership_preserved:
         record["ownership_preserved"] = True
     return record
@@ -1631,6 +1674,35 @@ def _decoded_pax_metadata(pax_headers):
     }
 
 
+def _decoded_pax_headers(
+    pax_headers,
+    archive,
+    *,
+    effective_name_field,
+    effective_name_value,
+):
+    state = _tar_state(archive)
+    remaining_name_bytes = (
+        state["name_byte_limit"]
+        - state["retained_name_bytes"]
+    )
+    decoded = {}
+    for keyword, value in pax_headers.items():
+        if not isinstance(value, _RawTarText):
+            decoded[keyword] = value
+        elif keyword == effective_name_field:
+            decoded[keyword] = effective_name_value
+        elif (
+            keyword in ("path", "GNU.sparse.name")
+            and _tar_name_utf8_length(value, None)
+            > remaining_name_bytes
+        ):
+            decoded[keyword] = value
+        else:
+            decoded[keyword] = value.decode()
+    return decoded
+
+
 def _tar_name_utf8_length(value, transform):
     if isinstance(value, _RawTarText):
         return value.utf8_length(
@@ -1683,34 +1755,42 @@ def _apply_bounded_pax_info(
         effective_transform = (
             info._paperconan_pending_name_transform
         )
-    if "GNU.sparse.name" in pax_headers:
-        effective_name = pax_headers["GNU.sparse.name"]
-        effective_name_field = "GNU.sparse.name"
-        effective_transform = None
-    if "path" in pax_headers:
-        effective_name = pax_headers["path"]
-        effective_name_field = "path"
-        effective_transform = "rstrip"
+    for keyword, value in pax_headers.items():
+        if keyword == "GNU.sparse.name":
+            effective_name = value
+            effective_name_field = keyword
+            effective_transform = None
+        elif keyword == "path":
+            effective_name = value
+            effective_name_field = keyword
+            effective_transform = "rstrip"
     if final_name_override is not None:
         effective_name = final_name_override
         effective_name_field = "final"
         effective_transform = final_name_transform
     decoded_name = None
+    decoded_name_value = None
     if effective_name is not None:
         _preflight_tar_name(
             archive, effective_name, effective_transform
         )
+        decoded_name_value = _decode_tar_name(
+            effective_name, None
+        )
         decoded_name = _decode_tar_name(
-            effective_name, effective_transform
+            decoded_name_value, effective_transform
         )
 
     if hasattr(info, "_paperconan_pending_name"):
         del info._paperconan_pending_name
         del info._paperconan_pending_name_transform
 
-    decoded_headers = _decoded_pax_metadata(pax_headers)
-    if effective_name_field in ("path", "GNU.sparse.name"):
-        decoded_headers[effective_name_field] = decoded_name
+    decoded_headers = _decoded_pax_headers(
+        pax_headers,
+        archive,
+        effective_name_field=effective_name_field,
+        effective_name_value=decoded_name_value,
+    )
     for keyword, value in decoded_headers.items():
         if keyword == "GNU.sparse.name":
             info.path = value

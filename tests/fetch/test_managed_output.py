@@ -696,6 +696,132 @@ def test_source_sidecar_bounds_lazy_managed_names_before_complete_iteration(
     assert 0 < names.items_yielded < names.count
 
 
+@pytest.mark.parametrize(
+    ("entry_limit", "item_count"),
+    [(0, 1), (3, 4), (3, 3)],
+    ids=["zero", "over-limit", "unknown-exact-boundary"],
+)
+def test_source_sidecar_managed_limit_precedes_iterator_advance(
+    tmp_path,
+    monkeypatch,
+    entry_limit,
+    item_count,
+):
+    class InstrumentedNames:
+        def __init__(self):
+            self.next_calls = 0
+            self.items_yielded = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.next_calls += 1
+            if self.items_yielded >= item_count:
+                raise StopIteration
+            name = f"{self.items_yielded}.csv"
+            self.items_yielded += 1
+            return name
+
+    names = InstrumentedNames()
+    cand = {
+        "doi": None,
+        "title": None,
+        "source": None,
+        "cand_id": None,
+        "related_dois": [],
+    }
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", 10_000,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_ENTRY_LIMIT", entry_limit,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_NAME_BYTES", 10_000,
+        raising=False,
+    )
+
+    with pytest.raises(_download._SourceSidecarLimit) as error:
+        _download._source_sidecar_bytes(
+            cand, str(tmp_path), names
+        )
+
+    assert error.value.record["reason"] == (
+        "source sidecar managed entry limit"
+    )
+    assert error.value.record["managed_entries_inspected"] == (
+        entry_limit
+    )
+    assert "omitted_entries_lower_bound" not in error.value.record
+    assert error.value.record["iterator_exhaustion_unverified"] is True
+    assert names.next_calls == entry_limit
+    assert names.items_yielded == entry_limit
+
+
+@pytest.mark.parametrize("retained_count", [0, 2])
+def test_source_sidecar_related_doi_budget_precedes_iterator_advance(
+    tmp_path,
+    monkeypatch,
+    retained_count,
+):
+    class InstrumentedRelatedDois:
+        def __init__(self):
+            self.next_calls = 0
+            self.items_yielded = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.next_calls += 1
+            if self.items_yielded > retained_count:
+                raise StopIteration
+            self.items_yielded += 1
+            return 0
+
+    cand = {
+        "doi": None,
+        "title": None,
+        "source": None,
+        "cand_id": None,
+        "related_dois": [0] * retained_count,
+    }
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", 10_000,
+        raising=False,
+    )
+    exact = len(
+        _download._source_sidecar_bytes(
+            cand, str(tmp_path), []
+        )
+    )
+    related_dois = InstrumentedRelatedDois()
+    cand["related_dois"] = related_dois
+    monkeypatch.setattr(
+        _download, "_SOURCE_SIDECAR_MAX_BYTES", exact,
+        raising=False,
+    )
+
+    with pytest.raises(_download._SourceSidecarLimit) as error:
+        _download._source_sidecar_bytes(
+            cand, str(tmp_path), []
+        )
+
+    assert error.value.record["reason"] == "source sidecar byte limit"
+    assert error.value.record["iterator_exhaustion_unverified"] is True
+    assert error.value.record["retained_bytes"] <= exact
+    assert (
+        error.value.record["minimum_bytes_if_additional_entry"]
+        > exact
+    )
+    assert "observed_bytes" not in error.value.record
+    assert related_dois.next_calls == retained_count
+    assert related_dois.items_yielded == retained_count
+
+
 def test_source_sidecar_encoding_rejects_large_title_before_json_escape(
     tmp_path, monkeypatch
 ):
@@ -806,6 +932,80 @@ def test_source_sidecar_encoding_never_calls_custom_string_fallback(
         )
 
     assert title.string_calls == 0
+
+
+def test_source_sidecar_canonicalizes_scalar_subclasses_without_hooks():
+    class HostileString(str):
+        def __str__(self):
+            raise AssertionError("custom __str__ must not run")
+
+        def __iter__(self):
+            raise AssertionError("custom __iter__ must not run")
+
+        def __repr__(self):
+            raise AssertionError("custom __repr__ must not run")
+
+    class HostileInteger(int):
+        def __str__(self):
+            raise AssertionError("custom __str__ must not run")
+
+        def __repr__(self):
+            raise AssertionError("custom __repr__ must not run")
+
+        def __int__(self):
+            raise AssertionError("custom __int__ must not run")
+
+        def __index__(self):
+            raise AssertionError("custom __index__ must not run")
+
+        def __iter__(self):
+            raise AssertionError("custom __iter__ must not run")
+
+    class HostileFloat(float):
+        def __str__(self):
+            raise AssertionError("custom __str__ must not run")
+
+        def __repr__(self):
+            raise AssertionError("custom __repr__ must not run")
+
+        def __float__(self):
+            raise AssertionError("custom __float__ must not run")
+
+        def __iter__(self):
+            raise AssertionError("custom __iter__ must not run")
+
+    value = {
+        "string": HostileString("text"),
+        "integer": HostileInteger(7),
+        "float": HostileFloat(1.25),
+    }
+    expected = (
+        json.dumps(
+            {
+                "string": "text",
+                "integer": 7,
+                "float": 1.25,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+    assert _source_sidecar.encode_sidecar(
+        value, byte_limit=len(expected)
+    ) == expected
+
+
+@pytest.mark.parametrize("value", ["text", 7, 1.25])
+def test_source_sidecar_exact_scalars_keep_json_shape(value):
+    expected = (
+        json.dumps(value, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+    assert _source_sidecar.encode_sidecar(
+        value, byte_limit=len(expected)
+    ) == expected
 
 
 def test_source_sidecar_encoding_matches_deterministic_json_bytes(
