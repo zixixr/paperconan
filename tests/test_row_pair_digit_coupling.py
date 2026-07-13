@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
 from paperconan import scan_dir
+from paperconan import _audit as audit
 from paperconan._audit import detect_row_pair_digit_coupling
 from paperconan._sheet import Sheet
 
@@ -48,6 +51,50 @@ def test_low_cardinality_integer_score_rows_are_not_flagged():
     sheet = Sheet.from_rows(rows)
 
     assert detect_row_pair_digit_coupling(sheet, 1, 3, 1, 13, rows[0][1:]) == []
+
+
+@pytest.mark.parametrize(
+    ("n_rows", "n_cols"),
+    [
+        (1, 10),
+        (2, 9),
+        (audit._ROW_PAIR_MAX_ROWS + 1, 10),
+        (2, audit._ROW_PAIR_MAX_COLS + 1),
+    ],
+    ids=[
+        "short-rows",
+        "short-columns",
+        "oversized-rows",
+        "oversized-columns",
+    ],
+)
+def test_dimension_exits_keep_coverage_return_shape(n_rows, n_cols):
+    class NoAccessSheet:
+        def cell(self, *_args):
+            raise AssertionError("dimension exit accessed source cells")
+
+        @property
+        def numeric(self):
+            raise AssertionError("dimension exit accessed numeric data")
+
+    header = [f"c{column}" for column in range(n_cols)]
+    sheet = NoAccessSheet()
+
+    assert detect_row_pair_digit_coupling(
+        sheet, 0, n_rows, 0, n_cols, header
+    ) == []
+    findings, metadata = detect_row_pair_digit_coupling(
+        sheet,
+        0,
+        n_rows,
+        0,
+        n_cols,
+        header,
+        with_coverage=True,
+    )
+
+    assert findings == []
+    assert metadata == {"findings_omitted": 0}
 
 
 def test_scan_dir_surfaces_row_pair_digit_coupling_and_html(tmp_path):

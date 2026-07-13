@@ -31,6 +31,22 @@ def _grid_sheets_two_blocks(a_rows, b_rows, sheet="Figure 4a"):
     return {("MOESM.xls", sheet): _sheet(rows)}
 
 
+def _grid_sheets_three_blocks(a_rows, b_rows):
+    independent = [
+        [round(value * 0.837 + 1.1119, 5) for value in row]
+        for row in a_rows
+    ]
+    rows = [["independent"]]
+    rows += independent
+    rows += [[], [], []]
+    rows += [["PDO #4"]]
+    rows += [list(row) for row in a_rows]
+    rows += [[], [], []]
+    rows += [["PDO #5"]]
+    rows += [list(row) for row in b_rows]
+    return {("MOESM.xls", "Figure 4a"): _sheet(rows)}
+
+
 def _b3_oracle(a_rows, b_rows):
     """Independent ground truth: >=80% of positionally-corresponding cells share the exact
     fraction (integer diff), >=half are high-precision (>=3 frac digits), >=3 real integer
@@ -187,10 +203,14 @@ def test_process_file_runs_fraction_reuse_while_sheet_is_live(
         profile="review",
         min_cells=10,
         *,
+        pair_budget=None,
+        cell_budget=None,
         with_coverage=False,
     ):
         assert profile == "review"
         assert min_cells == 10
+        assert pair_budget == audit._FRACTION_REUSE_PAIR_BUDGET
+        assert cell_budget == audit._FRACTION_REUSE_CELL_BUDGET
         assert with_coverage is True
         assert list(sheets) == [("source.csv", "source")]
         sheet = sheets[("source.csv", "source")]
@@ -263,6 +283,34 @@ def test_fraction_reuse_streams_large_block_pairs_with_bounded_state(
     assert stats.shared == rows_per_block
     assert len(stats.fraction_representatives) <= 5
     assert len(stats.difference_representatives) <= 2
+
+
+def test_direct_fraction_reuse_call_has_no_default_pair_budget(
+    monkeypatch,
+):
+    a_rows, b_rows = _matrix_block(_BASE, _SHIFTS)
+    monkeypatch.setattr(audit, "_FRACTION_REUSE_PAIR_BUDGET", 2)
+    monkeypatch.setattr(audit, "_FRACTION_REUSE_CELL_BUDGET", 1_000)
+
+    findings = detect_within_sheet_fraction_reuse(
+        _grid_sheets_three_blocks(a_rows, b_rows)
+    )
+
+    assert len(findings) == 1
+
+
+def test_direct_fraction_reuse_call_has_no_default_cell_budget(
+    monkeypatch,
+):
+    a_rows, b_rows = _matrix_block(_BASE, _SHIFTS)
+    monkeypatch.setattr(audit, "_FRACTION_REUSE_PAIR_BUDGET", 10)
+    monkeypatch.setattr(audit, "_FRACTION_REUSE_CELL_BUDGET", 98)
+
+    findings = detect_within_sheet_fraction_reuse(
+        _grid_sheets_three_blocks(a_rows, b_rows)
+    )
+
+    assert len(findings) == 1
 
 
 def test_fraction_reuse_rejects_impossible_geometry_before_cells(

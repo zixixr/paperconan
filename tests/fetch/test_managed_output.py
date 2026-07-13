@@ -36,6 +36,17 @@ def _write_sidecar(out_dir, managed_files, **extra):
     )
 
 
+def _sidecar_commit_skip(operation, message):
+    return {
+        "name": _download.SOURCE_SIDECAR,
+        "reason": "could not commit source sidecar",
+        "operation": operation,
+        "error_type": "OSError",
+        "error": message,
+        "ownership_preserved": True,
+    }
+
+
 def _is_tool_reserved_name(name):
     folded = Path(name).name.casefold()
     sidecar = _download.SOURCE_SIDECAR.casefold()
@@ -2097,6 +2108,9 @@ def test_sidecar_commit_failure_rolls_back_new_direct_output(
     )
 
     assert result["downloaded"] == []
+    assert result["skipped"] == [
+        _sidecar_commit_skip("initial", "sidecar commit failed")
+    ]
     assert old.read_text(encoding="utf-8") == "old"
     assert not (tmp_path / "new.csv").exists()
     assert (
@@ -2117,14 +2131,21 @@ def test_cleanup_failure_keeps_residual_file_owned_and_reports_it(
         return {"ok": True, "path": dest}
 
     remove = _download.os.remove
+    replace = _download.os.replace
 
     def fail_old_remove(path):
         if Path(path).name == "old.csv":
             raise OSError("cleanup blocked")
         return remove(path)
 
+    def fail_old_stage(src, dest):
+        if Path(src).name == "old.csv":
+            raise OSError("cleanup blocked")
+        return replace(src, dest)
+
     monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(_download.os, "remove", fail_old_remove)
+    monkeypatch.setattr(_download.os, "replace", fail_old_stage)
     result = _download.download_candidate(
         _candidate("new.csv", "https://x/new.csv"),
         str(tmp_path),
@@ -2163,11 +2184,17 @@ def test_cleanup_failure_retains_ownership_without_existence_probe(
         return {"ok": True, "path": dest}
 
     remove = _download.os.remove
+    replace = _download.os.replace
 
     def fail_old_remove(path):
         if Path(path).name == "old.csv":
             raise OSError("cleanup blocked")
         return remove(path)
+
+    def fail_old_stage(src, dest):
+        if Path(src).name == "old.csv":
+            raise OSError("cleanup blocked")
+        return replace(src, dest)
 
     lexists = _download.os.path.lexists
 
@@ -2180,6 +2207,7 @@ def test_cleanup_failure_retains_ownership_without_existence_probe(
 
     monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(_download.os, "remove", fail_old_remove)
+    monkeypatch.setattr(_download.os, "replace", fail_old_stage)
     monkeypatch.setattr(
         _download.os.path, "lexists", unreliable_lexists
     )
@@ -2232,6 +2260,8 @@ def test_narrowing_commit_failure_keeps_broad_manifest_ownership(
 
     def fail_narrowing_replace(src, dest):
         nonlocal sidecar_replaces
+        if Path(src).name == "residual.csv":
+            raise OSError("cleanup blocked")
         if Path(dest).name == _download.SOURCE_SIDECAR:
             sidecar_replaces += 1
             if sidecar_replaces == 2:
@@ -2248,13 +2278,18 @@ def test_narrowing_commit_failure_keeps_broad_manifest_ownership(
 
     new = tmp_path / "new.csv"
     assert new.read_bytes() == b"new-complete"
-    assert not removed.exists()
+    assert removed.read_bytes() == b"remove-me"
     assert residual.read_bytes() == b"keep-owned"
     assert result["downloaded"] == [str(new)]
-    assert result["skipped"] == [{
-        "name": "residual.csv",
-        "reason": "could not remove managed file",
-    }]
+    assert result["skipped"] == [
+        {
+            "name": "residual.csv",
+            "reason": "could not remove managed file",
+        },
+        _sidecar_commit_skip(
+            "cleanup_narrowing", "narrowing commit failed"
+        ),
+    ]
     sidecar = tmp_path / _download.SOURCE_SIDECAR
     assert sidecar.exists()
     assert json.loads(sidecar.read_text(encoding="utf-8"))[
@@ -2862,6 +2897,9 @@ def test_final_sidecar_failure_rolls_back_every_accepted_output(
 
     assert len(failures) == 1
     assert result["downloaded"] == []
+    assert result["skipped"] == [
+        _sidecar_commit_skip("initial", "sidecar commit failed")
+    ]
     if destination_state == "replacement":
         assert output.read_bytes() == b"old-output"
     else:

@@ -111,6 +111,49 @@ def test_formula_gap_marks_scan_partial_without_counting_failures(tmp_path):
     }]
 
 
+def test_oversized_formula_sheet_keeps_structural_rejection_reason(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    path = data / "formula.xlsx"
+    _write_formula_book(path)
+    wb = openpyxl.load_workbook(path)
+    wb["Stats"]["B3"] = 7
+    wb.save(path)
+    wb.close()
+    monkeypatch.setattr(
+        "paperconan._audit._MAX_CELLS", 5
+    )
+
+    scan = scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    assert scan["coverage"]["sheets_skipped"] == 1
+    assert [
+        item["reason"]
+        for item in scan["coverage"]["limitations"]
+    ] == ["formula_cache_missing", "cell_limit"]
+    assert scan["coverage"]["limitations"][0] == {
+        "scope": "sheet",
+        "reason": "formula_cache_missing",
+        "file": "formula.xlsx",
+        "sheet": "Stats",
+        "count": 1,
+        "cells": ["A3"],
+    }
+    assert scan["coverage"]["limitations"][1] == {
+        "scope": "sheet",
+        "reason": "cell_limit",
+        "file": "formula.xlsx",
+        "sheet": "Stats",
+        "cells": 6,
+        "max_cells": 5,
+    }
+    assert scan["scan_stats"]["sheets"][0]["oversized"] is True
+
+
 def test_present_formula_cache_is_not_reported(tmp_path):
     path = tmp_path / "cached.xlsx"
     _write_formula_book(path)

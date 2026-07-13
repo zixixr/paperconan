@@ -336,6 +336,24 @@ def _sheet_build_limitation(error, sheet_name):
     )
 
 
+def _record_preflight_cell_limit(
+    limitation_sink, sheet_name, declared
+):
+    if limitation_sink is None:
+        return
+    error = SheetBuildLimit(
+        "cell_limit",
+        cells=declared,
+        observed_sparse_cells=0,
+        observed_sparse_bytes=0,
+        max_sparse_cells=_MAX_SPARSE_CELLS,
+        max_sparse_bytes=_MAX_SPARSE_BYTES,
+    )
+    limitation_sink.append(
+        _sheet_build_limitation(error, sheet_name)
+    )
+
+
 def _fill_sheet_from_rows(
     rows_iter,
     mr,
@@ -411,6 +429,9 @@ def _load_workbook_openpyxl(path, *, _limitations=None):
             # Skip a sheet that is too big on its own, OR once this file's cumulative cell budget is
             # spent (a many-sheet workbook materialized at once OOMs even if each sheet is under cap).
             if loaded >= _MAX_CELLS or loaded + declared > _MAX_CELLS:
+                _record_preflight_cell_limit(
+                    _limitations, s, declared
+                )
                 out[s] = None
                 continue
             fill_kwargs = {}
@@ -482,6 +503,9 @@ def _load_workbook_calamine_scoped(path, *, _limitations=None):
         h, w = sh.height, sh.width
         declared = _dense_cells(h, w)
         if loaded >= _MAX_CELLS or loaded + declared > _MAX_CELLS:
+            _record_preflight_cell_limit(
+                _limitations, name, declared
+            )
             out[name] = None
             continue
         wide_ooxml_integer = False
@@ -1375,6 +1399,7 @@ class _DenseFamilyResources:
         self.candidates_total = 0
         self.candidates_started = 0
         self.candidates_examined = 0
+        self._work_admitted = 0
         self.work_examined = 0
         self.minimum_candidate_work = 0
         self.state_required = 0
@@ -1415,13 +1440,13 @@ class _DenseFamilyResources:
         source_visits = max(0, int(source_visits))
         if (
             self.work_limit is not None
-            and self.work_examined + source_visits > self.work_limit
+            and self._work_admitted + source_visits > self.work_limit
         ):
             self._limits_reached.add("work")
             self._stopped = True
             return False
         self.candidates_started += 1
-        self.work_examined += source_visits
+        self._work_admitted += source_visits
         return True
 
     def _reserve(self, name, units):
@@ -1463,23 +1488,42 @@ class _DenseFamilyResources:
             self._release_leases(leases)
             return None, None, ()
         try:
-            candidate = self._candidate(emit, *leases)
+            candidate = self._candidate(
+                emit,
+                *leases,
+                source_visits=source_visits,
+                source_lease=lease,
+            )
         except BaseException:
             self._release_leases(leases)
             raise
         return candidate, lease, tuple(leases[:-1])
 
-    def _candidate(self, emit, *initial_leases):
+    def _candidate(
+        self,
+        emit,
+        *initial_leases,
+        source_visits=0,
+        source_lease=None,
+    ):
         return _DenseCandidate(
             self,
             emit,
             initial_leases=initial_leases,
+            source_visits=source_visits,
+            source_lease=source_lease,
         )
 
     def start_candidate(self, source_visits, emit):
         if not self._begin_candidate(source_visits):
             return None
-        return self._candidate(emit)
+        return self._candidate(
+            emit,
+            source_visits=source_visits,
+        )
+
+    def _complete_work(self, source_visits):
+        self.work_examined += max(0, int(source_visits))
 
     def _complete_candidate(self):
         self.candidates_examined += 1
@@ -1566,6 +1610,8 @@ class _DenseCandidate:
         emit,
         *,
         initial_leases=(),
+        source_visits=0,
+        source_lease=None,
     ):
         self._resources = resources
         self.emit = emit
@@ -1573,6 +1619,11 @@ class _DenseCandidate:
         self._leases = {}
         self._peak_lease_count = 0
         self._rejected = False
+        self._source_visits = max(0, int(source_visits))
+        self._source_lease_id = (
+            None if source_lease is None else id(source_lease)
+        )
+        self._source_work_completed = False
         self.entered = False
         self.closed = False
         for lease in initial_leases:
@@ -1611,27 +1662,50 @@ class _DenseCandidate:
         lease = self.reserve(name, units)
         return self.materialize(lease, factory), lease
 
-    def materialize(self, lease, factory, *, release_after=()):
+    def materialize(
+        self,
+        lease,
+        factory,
+        *,
+        release_after=(),
+        completes_source=False,
+    ):
         assert self.entered
         assert not self.closed
-        assert id(lease) in self._leases
-        assert not lease.released
+        if lease is None:
+            assert completes_source
+        else:
+            assert id(lease) in self._leases
+            assert not lease.released
         release_after = tuple(release_after)
         assert all(item is not lease for item in release_after)
         try:
             value = factory()
             values = value if isinstance(value, tuple) else (value,)
-            lease.validate_nbytes(*(
-                item.nbytes
-                for item in values
-                if hasattr(item, "nbytes")
-            ))
+            if lease is not None:
+                lease.validate_nbytes(*(
+                    item.nbytes
+                    for item in values
+                    if hasattr(item, "nbytes")
+                ))
             for transient_lease in release_after:
                 self.release(transient_lease)
+            if (
+                completes_source
+                or id(lease) == self._source_lease_id
+            ):
+                self._complete_source_work()
         except BaseException:
             self._rejected = True
             raise
         return value
+
+    def _complete_source_work(self):
+        assert self.entered
+        assert not self.closed
+        assert not self._source_work_completed
+        self._resources._complete_work(self._source_visits)
+        self._source_work_completed = True
 
     def release(self, lease):
         assert self.entered
@@ -1796,8 +1870,12 @@ def detect_relations(
                 break
 
             def run_pair_candidate():
-                pair_stats = _numeric_pair_stats(
-                    sheet, r0, r1, ci, cj
+                pair_stats = candidate.materialize(
+                    None,
+                    lambda: _numeric_pair_stats(
+                        sheet, r0, r1, ci, cj
+                    ),
+                    completes_source=True,
                 )
                 if pair_stats.n < 4:
                     return
@@ -2591,9 +2669,17 @@ def detect_row_pair_digit_coupling(
     n_rows = r1 - r0
     n_cols = c1 - c0
     if n_rows < 2 or n_cols < min_n:
-        return findings
+        return (
+            (findings, {"findings_omitted": 0})
+            if with_coverage
+            else findings
+        )
     if n_rows > _ROW_PAIR_MAX_ROWS or n_cols > _ROW_PAIR_MAX_COLS:
-        return findings
+        return (
+            (findings, {"findings_omitted": 0})
+            if with_coverage
+            else findings
+        )
 
     labels = {r: _row_label(sheet, r, c0) for r in range(r0, r1)}
     for i, ra in enumerate(range(r0, r1)):
@@ -4041,7 +4127,9 @@ def detect_grim_grimmer(
     for mean_i, n_i, sd_i in _grim_column_groups(header):
         mean_c, n_c = c0 + mean_i, c0 + n_i
         sd_c = c0 + sd_i if sd_i is not None else None
-        grim_fail, grimmer_fail = [], []
+        grim_fail_count = grimmer_fail_count = 0
+        grim_examples = []
+        grimmer_examples = []
         checked = grimmer_checked = 0
         for r in range(r0, r1):
             mv = sheet.cell(r, mean_c)
@@ -4057,7 +4145,9 @@ def detect_grim_grimmer(
                 continue
             checked += 1
             if not grim_consistent(mean, n, d):
-                grim_fail.append((r, mean, n, d))
+                grim_fail_count += 1
+                if len(grim_examples) < 8:
+                    grim_examples.append((r, mean, n, d))
                 continue                     # GRIM-failing rows are not re-reported
             if sd_c is not None:
                 sv = sheet.cell(r, sd_c)
@@ -4066,13 +4156,17 @@ def detect_grim_grimmer(
                     ds = _decimals_of(sd)
                     grimmer_checked += 1
                     if not grimmer_consistent(mean, sd, n, d, ds):
-                        grimmer_fail.append((r, mean, sd, n, ds))
+                        grimmer_fail_count += 1
+                        if len(grimmer_examples) < 8:
+                            grimmer_examples.append(
+                                (r, mean, sd, n, ds)
+                            )
 
         mean_name = str(header[mean_i] or f"col{mean_c}")
         n_name = str(header[n_i] or f"col{n_c}")
         sd_name = str(header[sd_i] or f"col{sd_c}") if sd_i is not None else None
 
-        if grim_fail:
+        if grim_fail_count:
             def build_grim_finding(
                 mean_name=mean_name,
                 n_name=n_name,
@@ -4080,7 +4174,8 @@ def detect_grim_grimmer(
                 mean_c=mean_c,
                 sd_c=sd_c,
                 checked=checked,
-                grim_fail=tuple(grim_fail),
+                n_failed=grim_fail_count,
+                grim_fail=tuple(grim_examples),
             ):
                 finding = dict(
                     kind="grim_inconsistent",
@@ -4091,7 +4186,7 @@ def detect_grim_grimmer(
                     col_a_idx=mean_c,
                     n=checked,
                     n_rows_checked=checked,
-                    n_failed=len(grim_fail),
+                    n_failed=n_failed,
                     failed_rows=[
                         dict(
                             row=r + 1,
@@ -4109,7 +4204,7 @@ def detect_grim_grimmer(
                         for (r, *_rest) in grim_fail[:8]
                     ],
                     rule=(
-                        f"{len(grim_fail)}/{checked} rows report a "
+                        f"{n_failed}/{checked} rows report a "
                         "mean impossible for integer data at the "
                         f"stated n (GRIM): col '{mean_name}'"
                     ),
@@ -4119,13 +4214,14 @@ def detect_grim_grimmer(
                 return finding
 
             emit("high", build_grim_finding)
-        if grimmer_fail:
+        if grimmer_fail_count:
             emit(
                 "high",
                 lambda mean_name=mean_name, n_name=n_name,
                 sd_name=sd_name, mean_c=mean_c, sd_c=sd_c,
                 grimmer_checked=grimmer_checked,
-                grimmer_fail=tuple(grimmer_fail): dict(
+                n_failed=grimmer_fail_count,
+                grimmer_fail=tuple(grimmer_examples): dict(
                     kind="grimmer_inconsistent",
                     severity="high",
                     mean_col=mean_name,
@@ -4135,7 +4231,7 @@ def detect_grim_grimmer(
                     col_b_idx=sd_c,
                     n=grimmer_checked,
                     n_rows_checked=grimmer_checked,
-                    n_failed=len(grimmer_fail),
+                    n_failed=n_failed,
                     failed_rows=[
                         dict(
                             row=r + 1,
@@ -4152,7 +4248,7 @@ def detect_grim_grimmer(
                         for (r, *_rest) in grimmer_fail[:8]
                     ],
                     rule=(
-                        f"{len(grimmer_fail)}/{grimmer_checked} "
+                        f"{n_failed}/{grimmer_checked} "
                         "rows report an SD impossible for integer "
                         "data at the stated mean & n (GRIMMER): "
                         f"col '{sd_name}'"
@@ -4254,8 +4350,12 @@ def detect_equal_pairs(
             if candidate is None:
                 break
             with candidate:
-                pair_stats = _numeric_pair_stats(
-                    sheet, r0, r1, c0 + i, c0 + j
+                pair_stats = candidate.materialize(
+                    None,
+                    lambda: _numeric_pair_stats(
+                        sheet, r0, r1, c0 + i, c0 + j
+                    ),
+                    completes_source=True,
                 )
                 n = pair_stats.n
                 if n < 6:
@@ -6483,14 +6583,19 @@ def _fingerprint_example_value(value):
 
 class _BoundedDistinctValues:
     def __init__(self, limit):
-        self.limit = max(0, int(limit))
+        self.limit = (
+            None if limit is None else max(0, int(limit))
+        )
         self.values = set()
         self.overflowed = False
 
     def add(self, value):
         if value in self.values:
             return
-        if len(self.values) >= self.limit:
+        if (
+            self.limit is not None
+            and len(self.values) >= self.limit
+        ):
             self.overflowed = True
             return
         self.values.add(value)
@@ -6764,12 +6869,20 @@ def _iter_merged_column_intervals(blocks):
 
 
 def _selected_fingerprint_columns(blocks, column_limit):
-    column_limit = max(0, int(column_limit))
+    column_limit = (
+        None
+        if column_limit is None
+        else max(0, int(column_limit))
+    )
     selected = []
     columns_total = 0
     for start, stop in _iter_merged_column_intervals(blocks):
         interval_size = stop - start
-        remaining = column_limit - len(selected)
+        remaining = (
+            interval_size
+            if column_limit is None
+            else column_limit - len(selected)
+        )
         if remaining > 0:
             selected.extend(
                 range(start, start + min(interval_size, remaining))
@@ -6792,11 +6905,11 @@ def _column_fingerprints(
     columns_total=None,
     with_metrics=False,
 ):
-    if distinct_limit is None:
-        distinct_limit = _COLUMN_FINGERPRINT_DISTINCT_LIMIT
-    if column_limit is None:
-        column_limit = _COLUMN_FINGERPRINT_MAX_COLUMNS
-    column_limit = max(0, int(column_limit))
+    column_limit = (
+        None
+        if column_limit is None
+        else max(0, int(column_limit))
+    )
     if (selected_columns is None) != (columns_total is None):
         raise AssertionError(
             "selected columns and total must be supplied together"
@@ -7041,6 +7154,28 @@ class CrossSheetSummaryReservation:
         self._validated_metrics = actual_metrics
         return True
 
+    def validate_metric(
+        self, dimension, required, *, required_is_lower_bound=False
+    ):
+        if self._closed:
+            raise AssertionError("summary reservation is closed")
+        if dimension not in _SUMMARY_DIMENSIONS:
+            raise AssertionError(
+                f"unknown summary dimension: {dimension}"
+            )
+        actual = (
+            1
+            if dimension == "summaries"
+            else max(0, int(required))
+        )
+        if actual > self._reserved[dimension]:
+            details = {"skipped_items": max(1, actual)}
+            if required_is_lower_bound:
+                details["skipped_items_is_lower_bound"] = True
+            self.reject({dimension: details})
+            return False
+        return True
+
     def commit(self, metrics):
         if self._closed:
             raise AssertionError("summary reservation is closed")
@@ -7275,14 +7410,50 @@ def _bounded_sparse_label_context(
     retained_bytes = 0
     cells_required = 0
     bytes_required = 0
+    cells_required_is_lower_bound = False
+    bytes_required_is_lower_bound = False
     for (row_idx, col_idx), value in source._text.items():
         if row_idx >= row_limit or not isinstance(value, str):
             continue
-        payload_bytes = len(value.encode("utf-8"))
         cells_required += 1
+        if (
+            cell_limit is not None
+            and cells_required > cell_limit
+        ):
+            cells_required_is_lower_bound = True
+            bytes_required_is_lower_bound = True
+            break
+        remaining_bytes = (
+            None
+            if byte_limit is None
+            else max(0, byte_limit - bytes_required)
+        )
+        payload_bytes = 0
+        for char in value:
+            codepoint = ord(char)
+            if codepoint <= 0x7F:
+                width = 1
+            elif codepoint <= 0x7FF:
+                width = 2
+            elif 0xD800 <= codepoint <= 0xDFFF:
+                char.encode("utf-8")
+                raise AssertionError("unreachable UTF-8 surrogate")
+            elif codepoint <= 0xFFFF:
+                width = 3
+            else:
+                width = 4
+            if (
+                remaining_bytes is not None
+                and payload_bytes + width > remaining_bytes
+            ):
+                payload_bytes = remaining_bytes + 1
+                bytes_required_is_lower_bound = True
+                cells_required_is_lower_bound = True
+                break
+            payload_bytes += width
         bytes_required += payload_bytes
-        if cell_limit is not None and len(text) >= cell_limit:
-            continue
+        if bytes_required_is_lower_bound:
+            break
         if (
             byte_limit is not None
             and retained_bytes + payload_bytes > byte_limit
@@ -7296,10 +7467,18 @@ def _bounded_sparse_label_context(
             ncols=source.ncols,
             text=text,
         ),
-        {
+        dict({
             "label_cells": cells_required,
             "label_bytes": bytes_required,
-        },
+        }, **(
+            {"label_cells_is_lower_bound": True}
+            if cells_required_is_lower_bound
+            else {}
+        ), **(
+            {"label_bytes_is_lower_bound": True}
+            if bytes_required_is_lower_bound
+            else {}
+        )),
     )
 
 
@@ -7313,6 +7492,8 @@ def build_cross_sheet_summary(
     collision_max_cells=200000,
     min_column_length=12,
     budget=None,
+    column_distinct_limit=None,
+    column_limit=None,
 ) -> tuple[CrossSheetSummary | None, list[InputLimitation]]:
     reservation = (
         budget.start_summary() if budget is not None else None
@@ -7326,7 +7507,7 @@ def build_cross_sheet_summary(
         selected_columns, columns_total = (
             _selected_fingerprint_columns(
                 blocks,
-                _COLUMN_FINGERPRINT_MAX_COLUMNS,
+                column_limit,
             )
         )
         if reservation is not None:
@@ -7357,6 +7538,13 @@ def build_cross_sheet_summary(
             ),
             with_coverage=True,
         )
+        if (
+            reservation is not None
+            and not reservation.validate_metric(
+                "grid_cells", grid_meta["cells_used"]
+            )
+        ):
+            return None, []
         label_row_limit = min(
             source.nrows, collision_max_rows + 3
         )
@@ -7372,6 +7560,23 @@ def build_cross_sheet_summary(
                 if reservation is not None else None
             ),
         )
+        if reservation is not None:
+            if not reservation.validate_metric(
+                "label_cells",
+                label_metrics["label_cells"],
+                required_is_lower_bound=label_metrics.get(
+                    "label_cells_is_lower_bound", False
+                ),
+            ):
+                return None, []
+            if not reservation.validate_metric(
+                "label_bytes",
+                label_metrics["label_bytes"],
+                required_is_lower_bound=label_metrics.get(
+                    "label_bytes_is_lower_bound", False
+                ),
+            ):
+                return None, []
         (
             columns,
             column_limitations,
@@ -7382,6 +7587,8 @@ def build_cross_sheet_summary(
             source,
             blocks,
             min_column_length,
+            distinct_limit=column_distinct_limit,
+            column_limit=column_limit,
             selected_columns=selected_columns,
             columns_total=columns_total,
             retained_limit=(
@@ -7390,6 +7597,14 @@ def build_cross_sheet_summary(
             ),
             with_metrics=True,
         )
+        if (
+            reservation is not None
+            and not reservation.validate_metric(
+                "column_fingerprints",
+                column_metrics["column_fingerprints"],
+            )
+        ):
+            return None, []
         metrics = {
             "grid_cells": grid_meta["cells_used"],
             **label_metrics,
@@ -7681,16 +7896,16 @@ def detect_within_sheet_fraction_reuse(
     detect_collisions only compares distinct sheets, so this matrix-to-matrix within-sheet reuse
     has no other detector. The precision + integer-shift + coverage requirements make chance
     coincidence negligible."""
-    pair_limit = max(0, int(
-        _FRACTION_REUSE_PAIR_BUDGET
+    pair_limit = (
+        None
         if pair_budget is None
-        else pair_budget
-    ))
-    cell_limit = max(0, int(
-        _FRACTION_REUSE_CELL_BUDGET
+        else max(0, int(pair_budget))
+    )
+    cell_limit = (
+        None
         if cell_budget is None
-        else cell_budget
-    ))
+        else max(0, int(cell_budget))
+    )
     findings = []
     limitations = []
     for (fname, sname), sheet in grid_sheets.items():
@@ -7704,7 +7919,10 @@ def detect_within_sheet_fraction_reuse(
         for i in range(len(blocks)):
             for j in range(i + 1, len(blocks)):
                 ba, bb = blocks[i], blocks[j]
-                if pairs_examined >= pair_limit:
+                if (
+                    pair_limit is not None
+                    and pairs_examined >= pair_limit
+                ):
                     limits_reached.append("pair")
                     stop = True
                     break
@@ -7714,6 +7932,7 @@ def detect_within_sheet_fraction_reuse(
                 )
                 if (
                     potential_cells >= min_cells
+                    and cell_limit is not None
                     and cells_examined + potential_cells > cell_limit
                 ):
                     limits_reached.append("cell")
@@ -8913,6 +9132,8 @@ def _process_loaded_sheet(
     ) = detect_within_sheet_fraction_reuse(
         {(file_name, sheet_name): sheet},
         profile=state.profile,
+        pair_budget=_FRACTION_REUSE_PAIR_BUDGET,
+        cell_budget=_FRACTION_REUSE_CELL_BUDGET,
         with_coverage=True,
     )
     for limitation in fraction_reuse_limitations:
@@ -8965,6 +9186,10 @@ def _process_loaded_sheet(
         sheet,
         blocks=blocks,
         budget=state.cross_sheet_summary_budget,
+        column_distinct_limit=(
+            _COLUMN_FINGERPRINT_DISTINCT_LIMIT
+        ),
+        column_limit=_COLUMN_FINGERPRINT_MAX_COLUMNS,
     )
     for limitation in summary_limitations:
         reason = (
@@ -9020,6 +9245,11 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
         "file": file_name,
         "path": os.path.relpath(path, start=input_dir),
     }
+    structural_rejection_reasons = {
+        "cell_limit",
+        "sparse_cell_limit",
+        "sparse_payload_limit",
+    }
 
     try:
         fsize = os.path.getsize(path)
@@ -9055,6 +9285,7 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
                 loaded_sheet is None
                 and scope == "sheet"
                 and limitation_sheet == sheet_name
+                and reason in structural_rejection_reasons
                 and rejected_limitation is None
             ):
                 rejected_limitation = (reason, details)

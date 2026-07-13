@@ -407,12 +407,29 @@ def _archive_parent_directories(paths):
     return directories
 
 
-def _sdist_payloads(path, expected_files):
+def _read_expected_payload(stream, expected_size):
+    payload = stream.read(expected_size + 1)
+    assert len(payload) == expected_size
+    return payload
+
+
+def _sdist_payloads(
+    path, expected_payloads, generated_metadata=()
+):
+    if hasattr(expected_payloads, "items"):
+        expected_payloads = dict(expected_payloads)
+    else:
+        expected_payloads = {
+            name: None for name in expected_payloads
+        }
+    generated_metadata = set(generated_metadata)
+    expected_files = set(expected_payloads) | generated_metadata
     expected_root = f"paperconan-{__version__}"
     allowed_directories = _archive_parent_directories(expected_files)
     seen = set()
     roots = set()
     payloads = {}
+    file_members = {}
     root_directory_seen = False
 
     with tarfile.open(path, "r:gz") as archive:
@@ -429,19 +446,44 @@ def _sdist_payloads(path, expected_files):
             if member.isdir():
                 assert relative in allowed_directories, member.name
                 continue
-            assert relative not in payloads
+            assert relative not in file_members
+            file_members[relative] = member
+
+        assert root_directory_seen
+        assert roots == {expected_root}
+        assert set(file_members) == expected_files
+
+        for relative, member in file_members.items():
+            expected = expected_payloads.get(relative)
+            if expected is None:
+                if relative in generated_metadata:
+                    payloads[relative] = None
+                    continue
+                expected_size = member.size
+            else:
+                expected_size = len(expected)
+                assert member.size == expected_size, member.name
             stream = archive.extractfile(member)
             assert stream is not None
-            payloads[relative] = stream.read()
-
-    assert root_directory_seen
-    assert roots == {expected_root}
+            with stream:
+                payload = _read_expected_payload(
+                    stream, expected_size
+                )
+            if expected is not None:
+                assert payload == expected
+            payloads[relative] = payload
     return payloads
 
 
-def _wheel_payloads(path):
+def _wheel_payloads(path, expected_payloads=None):
+    expected_payloads = (
+        None
+        if expected_payloads is None
+        else dict(expected_payloads)
+    )
     seen = set()
     payloads = {}
+    file_members = {}
     with zipfile.ZipFile(path) as archive:
         for member in archive.infolist():
             parts = _validated_archive_member(
@@ -452,7 +494,29 @@ def _wheel_payloads(path):
             mode = member.external_attr >> 16
             assert mode == 0 or stat.S_ISREG(mode), member.filename
             normalized = PurePosixPath(*parts).as_posix()
-            payloads[normalized] = archive.read(member)
+            file_members[normalized] = member
+        if expected_payloads is not None:
+            assert set(file_members) == set(expected_payloads)
+        for normalized, member in file_members.items():
+            expected = (
+                None
+                if expected_payloads is None
+                else expected_payloads[normalized]
+            )
+            expected_size = (
+                member.file_size
+                if expected is None
+                else len(expected)
+            )
+            if expected is not None:
+                assert member.file_size == expected_size, normalized
+            with archive.open(member) as stream:
+                payload = _read_expected_payload(
+                    stream, expected_size
+                )
+            if expected is not None:
+                assert payload == expected
+            payloads[normalized] = payload
     return payloads
 
 
@@ -506,19 +570,22 @@ def _assert_built_release_archives(dist=ROOT / "dist"):
     assert len(wheels) == 1, wheels
 
     expected_sdist = _sdist_allowlist()
-    expected_sdist_files = (
-        expected_sdist | SDIST_GENERATED_METADATA
-    )
+    expected_sdist_payloads = {
+        relative: (ROOT / relative).read_bytes()
+        for relative in expected_sdist
+    }
     sdist_payloads = _sdist_payloads(
         sdists[0],
-        expected_sdist_files,
+        expected_sdist_payloads,
+        generated_metadata=SDIST_GENERATED_METADATA,
     )
-    assert set(sdist_payloads) == expected_sdist_files
+    assert set(sdist_payloads) == (
+        expected_sdist | SDIST_GENERATED_METADATA
+    )
     for relative in expected_sdist:
-        assert (
-            sdist_payloads[relative]
-            == (ROOT / relative).read_bytes()
-        )
+        assert sdist_payloads[relative] == expected_sdist_payloads[
+            relative
+        ]
 
     expected_wheel = {
         relative.removeprefix("src/"): (
@@ -527,7 +594,19 @@ def _assert_built_release_archives(dist=ROOT / "dist"):
         for relative in expected_sdist
         if relative.startswith("src/paperconan/")
     }
-    wheel_payloads = _wheel_payloads(wheels[0])
+    dist_info_root = f"paperconan-{__version__}.dist-info"
+    license_name = f"{dist_info_root}/licenses/LICENSE"
+    wheel_expected_payloads = {
+        **expected_wheel,
+        **{
+            f"{dist_info_root}/{relative}": None
+            for relative in WHEEL_DIST_INFO_MEMBERS
+        },
+        license_name: (ROOT / "LICENSE").read_bytes(),
+    }
+    wheel_payloads = _wheel_payloads(
+        wheels[0], wheel_expected_payloads
+    )
     package_payloads = {
         name: payload
         for name, payload in wheel_payloads.items()
@@ -535,11 +614,10 @@ def _assert_built_release_archives(dist=ROOT / "dist"):
     }
     assert package_payloads == expected_wheel
 
-    dist_info_root = _assert_exact_wheel_members(
+    assert _assert_exact_wheel_members(
         wheel_payloads,
         expected_wheel,
-    )
-    license_name = f"{dist_info_root}/licenses/LICENSE"
+    ) == dist_info_root
     assert (
         wheel_payloads[license_name]
         == (ROOT / "LICENSE").read_bytes()
@@ -1900,6 +1978,159 @@ def test_built_release_archives_integrated_rejects_payload_or_members(
 
     with pytest.raises(AssertionError):
         _assert_built_release_archives(dist)
+
+
+@pytest.mark.parametrize(
+    ("archive_kind", "mutation", "guarded_member"),
+    [
+        (
+            "sdist",
+            "sdist-extra-member",
+            "unexpected.txt",
+        ),
+        (
+            "sdist",
+            "sdist-source-bytes",
+            "README.md",
+        ),
+        (
+            "wheel",
+            "wheel-extra-member",
+            "unexpected.json",
+        ),
+        (
+            "wheel",
+            "wheel-source-bytes",
+            "paperconan/__init__.py",
+        ),
+    ],
+)
+def test_release_verifier_rejects_members_before_payload_read(
+    tmp_path, monkeypatch, archive_kind, mutation, guarded_member
+):
+    class UnexpectedPayloadRead(BaseException):
+        pass
+
+    dist = tmp_path / "dist"
+    _write_test_release_archives(dist, mutation=mutation)
+
+    if archive_kind == "sdist":
+        real_extractfile = tarfile.TarFile.extractfile
+
+        def guarded_extractfile(archive, member):
+            if member.name.endswith(guarded_member):
+                raise UnexpectedPayloadRead(member.name)
+            return real_extractfile(archive, member)
+
+        monkeypatch.setattr(
+            tarfile.TarFile, "extractfile", guarded_extractfile
+        )
+    else:
+        real_read = zipfile.ZipFile.read
+
+        def guarded_read(archive, member, *args, **kwargs):
+            name = (
+                member.filename
+                if isinstance(member, zipfile.ZipInfo)
+                else member
+            )
+            if name.endswith(guarded_member):
+                raise UnexpectedPayloadRead(name)
+            return real_read(archive, member, *args, **kwargs)
+
+        monkeypatch.setattr(zipfile.ZipFile, "read", guarded_read)
+
+    with pytest.raises(AssertionError):
+        _assert_built_release_archives(dist)
+
+
+def test_sdist_expected_payload_read_is_bounded(
+    tmp_path, monkeypatch
+):
+    dist = tmp_path / "dist"
+    _write_test_release_archives(dist)
+    target = "README.md"
+    expected_size = (ROOT / target).stat().st_size
+    read_sizes = []
+    real_extractfile = tarfile.TarFile.extractfile
+
+    class GuardedStream:
+        def __init__(self, stream):
+            self._stream = stream
+
+        def read(self, size=-1):
+            read_sizes.append(size)
+            assert 0 <= size <= expected_size + 1
+            return self._stream.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self._stream.close()
+
+        def __getattr__(self, name):
+            return getattr(self._stream, name)
+
+    def guarded_extractfile(archive, member):
+        stream = real_extractfile(archive, member)
+        if member.name.endswith(target):
+            return GuardedStream(stream)
+        return stream
+
+    monkeypatch.setattr(
+        tarfile.TarFile, "extractfile", guarded_extractfile
+    )
+
+    _assert_built_release_archives(dist)
+
+    assert read_sizes
+
+
+def test_wheel_expected_payload_read_is_bounded(
+    tmp_path, monkeypatch
+):
+    dist = tmp_path / "dist"
+    _write_test_release_archives(dist)
+    target = "paperconan/__init__.py"
+    expected_size = (ROOT / "src" / target).stat().st_size
+    read_sizes = []
+    real_open = zipfile.ZipFile.open
+
+    class GuardedStream:
+        def __init__(self, stream):
+            self._stream = stream
+
+        def read(self, size=-1):
+            read_sizes.append(size)
+            assert 0 <= size <= expected_size + 1
+            return self._stream.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self._stream.close()
+
+        def __getattr__(self, name):
+            return getattr(self._stream, name)
+
+    def guarded_open(archive, member, *args, **kwargs):
+        stream = real_open(archive, member, *args, **kwargs)
+        name = (
+            member.filename
+            if isinstance(member, zipfile.ZipInfo)
+            else member
+        )
+        if name == target:
+            return GuardedStream(stream)
+        return stream
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", guarded_open)
+
+    _assert_built_release_archives(dist)
+
+    assert read_sizes
 
 
 @pytest.mark.parametrize(

@@ -135,6 +135,29 @@ def iter_tables_to_sheets(
         del table
 
 
+def _sheet_to_rows(sheet):
+    if sheet is None:
+        return None
+    return [
+        [sheet.cell(row, col) for col in range(sheet.ncols)]
+        for row in range(sheet.nrows)
+    ]
+
+
+def _collect_compat_tables(table_iter, *, with_metadata):
+    tables = {}
+    limitations = []
+    for sheet_name, sheet, sheet_limitations in table_iter:
+        tables[sheet_name] = _sheet_to_rows(sheet)
+        limitations.extend(sheet_limitations)
+    if with_metadata:
+        return ExtractedTableResult(
+            tables=tables,
+            limitations=limitations,
+        )
+    return tables
+
+
 def tables_to_sheets(
     stem,
     labeled_tables,
@@ -143,7 +166,7 @@ def tables_to_sheets(
     max_sparse_bytes=None,
     with_metadata=False,
 ):
-    """Normalize extracted tables into ``{sheet_name: Sheet}``.
+    """Normalize extracted tables into ``{sheet_name: rows}``.
 
     ``labeled_tables`` yields ``(label, table)`` pairs where each ``table``
     yields rows of raw string/None cells. Each table becomes one sheet named
@@ -156,23 +179,16 @@ def tables_to_sheets(
     content at all are dropped. When ``max_cells`` is set, successful tables
     share one cumulative dense-cell budget.
     """
-    sheets = {}
-    limitations = []
-    for sheet_name, sheet, sheet_limitations in iter_tables_to_sheets(
-        stem,
-        labeled_tables,
-        max_cells=max_cells,
-        max_sparse_cells=max_sparse_cells,
-        max_sparse_bytes=max_sparse_bytes,
-    ):
-        sheets[sheet_name] = sheet
-        limitations.extend(sheet_limitations)
-    if with_metadata:
-        return ExtractedTableResult(
-            tables=sheets,
-            limitations=limitations,
-        )
-    return sheets
+    return _collect_compat_tables(
+        iter_tables_to_sheets(
+            stem,
+            labeled_tables,
+            max_cells=max_cells,
+            max_sparse_cells=max_sparse_cells,
+            max_sparse_bytes=max_sparse_bytes,
+        ),
+        with_metadata=with_metadata,
+    )
 
 
 def _as_text(cell):
@@ -230,26 +246,19 @@ def load_pdf_tables(
     max_sparse_bytes=None,
     with_metadata=False,
 ):
-    """Extract every table from a PDF as ``{sheet_name: Sheet}``.
+    """Extract every table from a PDF as ``{sheet_name: rows}``.
 
     Sheets are named ``<stem>!p<page>_t<table>`` (1-based page and table index).
     """
-    sheets = {}
-    limitations = []
-    for sheet_name, sheet, sheet_limitations in iter_pdf_tables(
-        path,
-        max_cells=max_cells,
-        max_sparse_cells=max_sparse_cells,
-        max_sparse_bytes=max_sparse_bytes,
-    ):
-        sheets[sheet_name] = sheet
-        limitations.extend(sheet_limitations)
-    if with_metadata:
-        return ExtractedTableResult(
-            tables=sheets,
-            limitations=limitations,
-        )
-    return sheets
+    return _collect_compat_tables(
+        iter_pdf_tables(
+            path,
+            max_cells=max_cells,
+            max_sparse_cells=max_sparse_cells,
+            max_sparse_bytes=max_sparse_bytes,
+        ),
+        with_metadata=with_metadata,
+    )
 
 
 def iter_docx_tables(
@@ -316,19 +325,12 @@ def load_docx_tables(
     max_sparse_bytes=None,
     with_metadata=False,
 ):
-    sheets = {}
-    limitations = []
-    for sheet_name, sheet, sheet_limitations in iter_docx_tables(
-        path,
-        max_cells=max_cells,
-        max_sparse_cells=max_sparse_cells,
-        max_sparse_bytes=max_sparse_bytes,
-    ):
-        sheets[sheet_name] = sheet
-        limitations.extend(sheet_limitations)
-    if with_metadata:
-        return ExtractedTableResult(
-            tables=sheets,
-            limitations=limitations,
-        )
-    return sheets
+    return _collect_compat_tables(
+        iter_docx_tables(
+            path,
+            max_cells=max_cells,
+            max_sparse_cells=max_sparse_cells,
+            max_sparse_bytes=max_sparse_bytes,
+        ),
+        with_metadata=with_metadata,
+    )

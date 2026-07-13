@@ -61,24 +61,27 @@ def test_tables_to_sheets_coerces_numbers_keeps_text_and_names_sheets():
     raw = [("p1_t1", [["sample", "x"], ["s1", "1.5"], ["s2", "2.5"]])]
     sheets = tables_to_sheets("supp", raw)
     assert list(sheets) == ["supp!p1_t1"]
-    sheet = sheets["supp!p1_t1"]
-    assert isinstance(sheet, Sheet)
-    assert sheet.cell(0, 0) == "sample"
-    assert sheet.cell(1, 1) == 1.5
-    assert sheet.cell(2, 1) == 2.5
+    assert sheets["supp!p1_t1"] == [
+        ["sample", "x"],
+        ["s1", 1.5],
+        ["s2", 2.5],
+    ]
 
 
 def test_tables_to_sheets_pads_ragged_rows():
     raw = [("t1", [["a", "b", "c"], ["1"], ["2", "3"]])]
-    sheet = tables_to_sheets("d", raw)["d!t1"]
-    assert sheet.ncols == 3
-    assert [sheet.cell(1, col) for col in range(3)] == [1, None, None]
+    rows = tables_to_sheets("d", raw)["d!t1"]
+    assert rows == [
+        ["a", "b", "c"],
+        [1, None, None],
+        [2, 3, None],
+    ]
 
 
 def test_tables_to_sheets_handles_none_cells():
     raw = [("t1", [["a", "b"], ["1.5", None]])]
-    sheet = tables_to_sheets("d", raw)["d!t1"]
-    assert [sheet.cell(1, col) for col in range(2)] == [1.5, None]
+    rows = tables_to_sheets("d", raw)["d!t1"]
+    assert rows == [["a", "b"], [1.5, None]]
 
 
 def test_tables_to_sheets_drops_fully_empty_tables():
@@ -112,9 +115,7 @@ def test_default_drops_over_budget_empty_table_after_budget_is_used():
 
     result = tables_to_sheets("d", raw, max_cells=2)
     assert list(result) == ["d!used"]
-    assert isinstance(result["d!used"], Sheet)
-    assert result["d!used"].cell(0, 0) == "value"
-    assert result["d!used"].cell(0, 1) == 1
+    assert result["d!used"] == [["value", 1]]
 
 
 def test_metadata_drops_over_budget_empty_table_after_budget_is_used():
@@ -128,7 +129,7 @@ def test_metadata_drops_over_budget_empty_table_after_budget_is_used():
     )
 
     assert list(result.tables) == ["d!used"]
-    assert isinstance(result.tables["d!used"], Sheet)
+    assert result.tables["d!used"] == [["value", 1]]
     assert result.limitations == []
 
 
@@ -204,8 +205,7 @@ def test_rejected_table_closes_generators_before_sibling_processing():
 
     assert events == ["row_closed", "table_closed", "sibling_started"]
     assert result.tables["d!t1"] is None
-    assert isinstance(result.tables["d!t2"], Sheet)
-    assert result.tables["d!t2"].cell(0, 0) == "ok"
+    assert result.tables["d!t2"] == [["ok"]]
 
 
 def test_owned_production_modules_use_neutral_language():
@@ -296,11 +296,11 @@ def test_docx_merged_cells_emit_text_once(tmp_path):
     table.cell(2, 1).text = "same"
     doc.save(path)
 
-    sheet = load_docx_tables(str(path))["merged!t1"]
-    assert [sheet.cell(0, col) for col in range(2)] == ["merged", None]
-    assert sheet.cell(1, 0) == "vertical"
-    assert sheet.cell(2, 0) is None
-    assert sheet.cell(1, 1) == sheet.cell(2, 1) == "same"
+    rows = load_docx_tables(str(path))["merged!t1"]
+    assert rows[0][:2] == ["merged", None]
+    assert rows[1][0] == "vertical"
+    assert rows[2][0] is None
+    assert rows[1][1] == rows[2][1] == "same"
 
 
 def test_pdf_adapter_extracts_one_table_at_a_time(monkeypatch):
@@ -340,7 +340,10 @@ def test_pdf_adapter_extracts_one_table_at_a_time(monkeypatch):
     sheets = extract.load_pdf_tables("tables.pdf")
 
     assert events == ["find", "extract:1", "extract:2"]
-    assert all(isinstance(sheet, Sheet) for sheet in sheets.values())
+    assert list(sheets.values()) == [
+        [["value"], [1]],
+        [["value"], [2]],
+    ]
 
 
 @pytest.mark.parametrize(

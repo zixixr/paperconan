@@ -273,9 +273,10 @@ def test_docx_merged_identity_state_releases_rows_older_than_previous(
         docx, "Document", lambda _path: StubDocument()
     )
 
-    sheets = extract.load_docx_tables("tables.docx")
+    entries = list(extract.iter_docx_tables("tables.docx"))
 
-    sheet = sheets["tables!t1"]
+    assert len(entries) == 1
+    sheet = entries[0][1]
     assert sheet.nrows == 8
     assert [sheet.cell(row, 0) for row in range(8)] == list(range(8))
 
@@ -2040,6 +2041,7 @@ def test_dense_source_factory_exception_uses_candidate_finalizer(
     assert candidate.live_lease_count == 0
     assert result.candidates_examined == 0
     assert result.candidates_skipped == 1
+    assert result.work_examined == 0
     assert resources.state.live_names == frozenset()
     assert resources.state.live_units == 0
 
@@ -2104,6 +2106,7 @@ def test_dense_source_validation_exception_uses_candidate_finalizer(
     result = resources.result()
     assert result.candidates_examined == 0
     assert result.candidates_skipped == 1
+    assert result.work_examined == 0
     assert resources.state.live_names == frozenset()
     assert resources.state.live_units == 0
 
@@ -2285,6 +2288,7 @@ def test_array_family_source_exception_uses_candidate_finalizer(
     result = resources.result()
     assert resources.candidates_started == 1
     assert result.candidates_examined == 0
+    assert result.work_examined == 0
     assert expected_leases <= resources.state.seen_names
     assert resources.state.live_names == frozenset()
     assert resources.state.live_units == 0
@@ -2532,7 +2536,7 @@ def test_scalar_pair_source_exception_uses_entered_finalizer(
     assert resources.candidates_started == 1
     assert result.candidates_examined == 0
     assert result.candidates_skipped == 1
-    assert result.work_examined == 80
+    assert result.work_examined == 0
     assert resources.state.live_names == frozenset()
 
 
@@ -2830,6 +2834,8 @@ def test_very_wide_column_fingerprints_touch_only_fixed_budget(
         source,
         [(0, row_count, 0, column_count)],
         min_column_length=12,
+        distinct_limit=100,
+        column_limit=column_limit,
     )
 
     assert len(columns) == column_limit

@@ -253,6 +253,27 @@ class _ManagedOutputJournal:
             os.replace(dest_path, backup_path)
         self._entries[dest_path] = backup_path
 
+    def stage_removal(self, dest_path):
+        if self._committed:
+            raise RuntimeError("managed-output journal is committed")
+        dest_path = os.path.abspath(dest_path)
+        if dest_path in self._entries:
+            return True
+        if self._backup_dir is None:
+            self._backup_dir = tempfile.mkdtemp(
+                prefix=".paperconan-output-rollback-",
+                dir=self._parent,
+            )
+        backup_path = os.path.join(
+            self._backup_dir, str(len(self._entries))
+        )
+        try:
+            os.replace(dest_path, backup_path)
+        except FileNotFoundError:
+            return False
+        self._entries[dest_path] = backup_path
+        return True
+
     def restore(self, dest_path, *, cleanup=True):
         dest_path = os.path.abspath(dest_path)
         if dest_path not in self._entries:
@@ -773,6 +794,28 @@ def _remove_managed_files(out_dir, managed_files):
         except OSError:
             failed.append(relative)
     return failed
+
+
+def _stage_managed_file_cleanup(
+    out_dir, managed_files, cleanup_journal
+):
+    failed = []
+    absent = []
+    for relative in _safe_managed_names(out_dir, managed_files):
+        path = _safe_managed_path(out_dir, relative)
+        if path is None:
+            continue
+        if os.path.isdir(path) and not os.path.islink(path):
+            failed.append(relative)
+            continue
+        try:
+            staged = cleanup_journal.stage_removal(path)
+        except OSError:
+            failed.append(relative)
+            continue
+        if not staged:
+            absent.append(relative)
+    return failed, absent
 
 
 def _managed_output_text_bytes(value, *, field):
@@ -3112,8 +3155,6 @@ def _write_source_sidecar(cand, out_dir, managed_files):
             os.fsync(fh.fileno())
         os.replace(temp_path, os.path.join(out_dir, SOURCE_SIDECAR))
         return True
-    except OSError:
-        return False
     finally:
         if fd is not None:
             try:
@@ -3125,6 +3166,17 @@ def _write_source_sidecar(cand, out_dir, managed_files):
                 os.remove(temp_path)
             except OSError:
                 pass
+
+
+def _sidecar_write_failure_record(error, *, operation):
+    return {
+        "name": SOURCE_SIDECAR,
+        "reason": "could not commit source sidecar",
+        "operation": operation,
+        "error_type": type(error).__name__,
+        "error": str(error),
+        "ownership_preserved": True,
+    }
 
 
 def _download_candidate(
@@ -3339,13 +3391,22 @@ def _download_candidate(
     sidecar_fits = (
         _dir_size(out_dir) + sidecar_delta <= _MAX_PAPER_BYTES
     )
-    sidecar_committed = (
+    sidecar_committed = False
+    if (
         not cap_state["ownership_blocked"]
-        and
-        not preserve_previous_refresh
+        and not preserve_previous_refresh
         and sidecar_fits
-        and _write_source_sidecar(cand, out_dir, committed_managed)
-    )
+    ):
+        try:
+            _write_source_sidecar(
+                cand, out_dir, committed_managed
+            )
+        except OSError as error:
+            skipped.append(_sidecar_write_failure_record(
+                error, operation="initial"
+            ))
+        else:
+            sidecar_committed = True
     if sidecar_committed:
         pending_cleanup = output_journal.commit()
         for path in pending_cleanup:
@@ -3354,9 +3415,14 @@ def _download_candidate(
                 "reason": "post-commit cleanup pending",
                 "path": path,
             })
-        failed_removals = set(
-            _remove_managed_files(out_dir, stale_managed)
+        cleanup_journal = _ManagedOutputJournal(out_dir)
+        failed_removals, absent_removals = (
+            _stage_managed_file_cleanup(
+                out_dir, stale_managed, cleanup_journal
+            )
         )
+        failed_removals = set(failed_removals)
+        absent_removals = set(absent_removals)
         for relative in sorted(failed_removals):
             skipped.append({
                 "name": relative,
@@ -3364,7 +3430,33 @@ def _download_candidate(
             })
         final_managed = managed_files | failed_removals
         if final_managed != committed_managed:
-            _write_source_sidecar(cand, out_dir, final_managed)
+            try:
+                _write_source_sidecar(
+                    cand, out_dir, final_managed
+                )
+            except OSError as error:
+                cleanup_journal.rollback()
+                if absent_removals:
+                    raise
+                skipped.append(_sidecar_write_failure_record(
+                    error, operation="cleanup_narrowing"
+                ))
+            else:
+                pending_cleanup = cleanup_journal.commit()
+                for path in pending_cleanup:
+                    skipped.append({
+                        "name": os.path.basename(path),
+                        "reason": "post-commit cleanup pending",
+                        "path": path,
+                    })
+        else:
+            pending_cleanup = cleanup_journal.commit()
+            for path in pending_cleanup:
+                skipped.append({
+                    "name": os.path.basename(path),
+                    "reason": "post-commit cleanup pending",
+                    "path": path,
+                })
     else:
         rolled_back = output_journal.rollback()
         if rolled_back:

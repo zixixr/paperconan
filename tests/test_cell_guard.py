@@ -3,6 +3,7 @@ import csv
 
 import numpy as np
 import openpyxl
+import pytest
 
 import paperconan._audit as A
 
@@ -26,6 +27,34 @@ def test_oversized_sheet_skipped_and_recorded(tmp_path, monkeypatch):
         item["reason"] == "cell_limit"
         for item in scan["coverage"]["limitations"]
     )
+
+
+@pytest.mark.parametrize(
+    "loader_name",
+    ["_load_workbook_openpyxl", "_load_workbook_calamine"],
+)
+def test_workbook_preflight_records_exact_cell_limit(
+    tmp_path, monkeypatch, loader_name
+):
+    if loader_name == "_load_workbook_calamine":
+        pytest.importorskip("python_calamine")
+    monkeypatch.setattr(A, "_MAX_CELLS", 50)
+    path = tmp_path / "big.xlsx"
+    _make_xlsx(str(path), 20, 10)
+    limitations = []
+
+    sheets = getattr(A, loader_name)(
+        str(path), _limitations=limitations
+    )
+
+    assert sheets["Sheet"] is None
+    assert [item.to_dict() for item in limitations] == [{
+        "scope": "sheet",
+        "reason": "cell_limit",
+        "sheet": "Sheet",
+        "cells": 200,
+        "max_cells": 50,
+    }]
 
 
 def test_normal_sheet_under_cap_is_audited(tmp_path, monkeypatch):

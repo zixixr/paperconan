@@ -2240,7 +2240,7 @@ def test_scalar_pair_source_exception_uses_entered_finalizer(
     assert resources.candidates_started == 1
     assert result.candidates_examined == 0
     assert result.candidates_skipped == 1
-    assert result.work_examined == 80
+    assert result.work_examined == 0
     assert resources.state.live_names == frozenset()
 
 
@@ -4554,7 +4554,7 @@ Pass the returned initial-lease tuple as `release_after=initial_leases`, so a
 successful materialization releases and unregisters `candidate_workspace`
 before returning the mask, while a factory or validation exception leaves both
 leases live for the candidate finalizer. This ordering ensures a state
-rejection records no unperformed source work, every accepted source pass is
+rejection records no unperformed source work, every completed source pass is
 included in `work_examined`, and the candidate remains the sole owner of every
 accepted lease.
 

@@ -129,6 +129,47 @@ def test_scan_uses_actual_source_filename_for_input_limitation(
     }]
 
 
+def test_none_sheet_uses_only_structural_limitation_as_skip_reason(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "source.csv").write_text("a\n1\n", encoding="utf-8")
+    result = TableLoadResult(
+        sheets={"Stats": None},
+        limitations=[
+            InputLimitation(
+                scope="sheet",
+                reason="formula_cache_missing",
+                sheet="Stats",
+                details={"count": 1, "cells": ["A3"]},
+            ),
+            InputLimitation(
+                scope="sheet",
+                reason="cell_limit",
+                sheet="Stats",
+                details={"cells": 12, "max_cells": 10},
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        audit, "load_table_result", lambda _path: result
+    )
+
+    scan = audit.scan_dir(
+        str(data),
+        str(tmp_path / "out"),
+        write_html=False,
+    )
+
+    assert [
+        item["reason"]
+        for item in scan["coverage"]["limitations"]
+    ] == ["formula_cache_missing", "cell_limit"]
+    assert scan["coverage"]["limitations"][1]["cells"] == 12
+    assert scan["scan_stats"]["sheets"][0]["oversized"] is True
+
+
 def test_extracted_table_result_defaults_to_no_limitations():
     result = ExtractedTableResult(tables={"Table 1": [[1, 2]]})
 

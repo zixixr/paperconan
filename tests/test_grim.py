@@ -9,7 +9,9 @@ from __future__ import annotations
 import itertools
 import math
 
+import paperconan._audit as audit
 from paperconan._audit import _decimals_of, grim_consistent, grimmer_consistent
+from paperconan._resources import BoundedFindingCollector
 
 
 def test_decimals_of_counts_displayed_places():
@@ -87,6 +89,87 @@ def test_detector_flags_impossible_mean_with_integer_keyword():
     assert grim["severity"] == "high"
     assert grim["n_failed"] == 1
     assert grim["failed_rows"][0]["row"] == 2  # 1-based sheet row of group A
+
+
+def test_detector_retains_only_bounded_failure_samples(
+    monkeypatch,
+):
+    row_count = 10_000
+    header = [
+        "score mean A",
+        "sd A",
+        "n A",
+        "score mean B",
+        "sd B",
+        "n B",
+    ]
+
+    class VirtualSheet:
+        def cell(self, _row, col):
+            return (3.45, 1.0, 10, 2.1, 1.05, 3)[col]
+
+    monkeypatch.setattr(
+        audit,
+        "grim_consistent",
+        lambda mean, _n, _decimals: mean != 3.45,
+    )
+    monkeypatch.setattr(
+        audit,
+        "grimmer_consistent",
+        lambda *_args: False,
+    )
+    sheet = VirtualSheet()
+
+    findings = detect_grim_grimmer(
+        sheet, 0, row_count, 0, len(header), header
+    )
+
+    assert [finding["n_failed"] for finding in findings] == [
+        row_count,
+        row_count,
+    ]
+    assert [len(finding["failed_rows"]) for finding in findings] == [
+        8,
+        8,
+    ]
+
+    collector = BoundedFindingCollector(
+        ("grim",),
+        cap=0,
+        severity_rank={"high": 0},
+    )
+    captured_builders = []
+    original_offer = collector.offer
+
+    def capture_offer(group, severity, builder):
+        captured_builders.append(builder)
+        return original_offer(group, severity, builder)
+
+    monkeypatch.setattr(collector, "offer", capture_offer)
+
+    assert detect_grim_grimmer(
+        sheet,
+        0,
+        row_count,
+        0,
+        len(header),
+        header,
+        _finding_sink=collector,
+    ) == []
+    assert collector.offered == 2
+    assert collector.retained == 0
+    assert len(captured_builders) == 2
+    for builder in captured_builders:
+        defaults = builder.__defaults__ or ()
+        assert not any(
+            isinstance(value, (list, dict, set))
+            for value in defaults
+        )
+        assert all(
+            len(value) <= 8
+            for value in defaults
+            if isinstance(value, tuple)
+        )
 
 
 def test_detector_skips_without_integer_keyword():

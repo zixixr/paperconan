@@ -72,6 +72,56 @@ def test_column_fingerprint_path_matches_compatibility_wrapper():
     assert compact == direct
 
 
+def test_direct_column_duplicate_call_has_no_default_column_limit(
+    monkeypatch,
+):
+    duplicate = [
+        3.0, 3.2, 2.5, 2.8, 2.9, 2.2, 5.0, 5.2,
+        4.5, 4.8, 4.9, 4.2, 6.1, 6.3, 5.7,
+    ]
+    rows_a = [["other", "duplicate"]]
+    rows_b = [["other", "duplicate"]]
+    for index, value in enumerate(duplicate):
+        rows_a.append([index * index + 0.123, value])
+        rows_b.append([index * index + 0.456, value])
+    monkeypatch.setattr(
+        audit, "_COLUMN_FINGERPRINT_MAX_COLUMNS", 1
+    )
+
+    findings = detect_cross_sheet_column_duplicates({
+        ("a.xlsx", "Figure 1"): Sheet.from_rows(rows_a),
+        ("b.xlsx", "Figure 2"): Sheet.from_rows(rows_b),
+    })
+
+    assert [
+        (finding["col_a"], finding["col_b"])
+        for finding in findings
+    ] == [("duplicate", "duplicate")]
+
+
+def test_direct_column_duplicate_call_has_no_default_distinct_limit(
+    monkeypatch,
+):
+    duplicate = [
+        3.0, 3.2, 2.5, 2.8, 2.9, 2.2, 5.0, 5.2,
+        4.5, 4.8, 4.9, 4.2, 6.1, 6.3, 5.7,
+    ]
+    monkeypatch.setattr(
+        audit, "_COLUMN_FINGERPRINT_DISTINCT_LIMIT", 5
+    )
+
+    findings = detect_cross_sheet_column_duplicates({
+        ("a.xlsx", "Figure 1"): Sheet.from_rows(
+            [["duplicate"]] + [[value] for value in duplicate]
+        ),
+        ("b.xlsx", "Figure 2"): Sheet.from_rows(
+            [["duplicate"]] + [[value] for value in duplicate]
+        ),
+    })
+
+    assert len(findings) == 1
+
+
 def test_summary_grid_and_label_context_are_bounded():
     source = Sheet.from_rows([
         [f"label-{row}", row + 0.1234, row + 0.5678]
@@ -378,6 +428,7 @@ def test_column_fingerprint_distinct_aggregation_is_bounded_and_disclosed(
         "large.csv",
         "Figure 1",
         source,
+        column_distinct_limit=limit,
     )
 
     assert summary.columns == ()
@@ -445,6 +496,8 @@ def test_column_fingerprint_sheet_budget_is_fixed_exact_and_deterministic(
         source,
         blocks,
         min_column_length=12,
+        distinct_limit=distinct_limit,
+        column_limit=column_limit,
     )
     second = audit._column_fingerprints(
         "wide.csv",
@@ -452,6 +505,8 @@ def test_column_fingerprint_sheet_budget_is_fixed_exact_and_deterministic(
         source,
         blocks,
         min_column_length=12,
+        distinct_limit=distinct_limit,
+        column_limit=column_limit,
     )
 
     assert first == second
@@ -944,13 +999,19 @@ def test_scan_uses_compact_cross_sheet_state(tmp_path, monkeypatch):
         profile="review",
         min_cells=10,
         *,
+        pair_budget=None,
+        cell_budget=None,
         with_coverage=False,
     ):
         within_sizes.append(len(sheets))
+        assert pair_budget == audit._FRACTION_REUSE_PAIR_BUDGET
+        assert cell_budget == audit._FRACTION_REUSE_CELL_BUDGET
         return original_within(
             sheets,
             profile=profile,
             min_cells=min_cells,
+            pair_budget=pair_budget,
+            cell_budget=cell_budget,
             with_coverage=with_coverage,
         )
 
@@ -1073,6 +1134,123 @@ def test_summary_reservation_rejection_precedes_final_object_construction(
         "label_bytes": 0,
         "column_fingerprints": 0,
     }
+
+
+def test_grid_rejection_skips_label_and_fingerprint_builders(monkeypatch):
+    budget = audit.CrossSheetSummaryBudget(
+        summary_limit=10,
+        grid_cell_limit=0,
+        label_cell_limit=100_000,
+        label_byte_limit=100_000,
+        column_fingerprint_limit=10,
+    )
+    monkeypatch.setattr(
+        audit,
+        "_bounded_sparse_label_context",
+        lambda *_args, **_kwargs: pytest.fail(
+            "grid-rejected summary built labels"
+        ),
+    )
+    monkeypatch.setattr(
+        audit,
+        "_column_fingerprints",
+        lambda *_args, **_kwargs: pytest.fail(
+            "grid-rejected summary scanned fingerprints"
+        ),
+    )
+
+    summary, limitations = build_cross_sheet_summary(
+        "a.xlsx", "Figure 1", _sheet(), budget=budget
+    )
+
+    assert summary is None
+    assert limitations == []
+    assert budget.limitation_metadata()["exhausted_dimensions"] == [
+        "grid_cells"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("dimension", "limit_overrides"),
+    [
+        ("label_cells", {"label_cell_limit": 0}),
+        ("label_bytes", {"label_byte_limit": 0}),
+    ],
+)
+def test_label_rejection_skips_fingerprint_builder(
+    monkeypatch, dimension, limit_overrides
+):
+    limits = {
+        "summary_limit": 10,
+        "grid_cell_limit": 100_000,
+        "label_cell_limit": 100_000,
+        "label_byte_limit": 100_000,
+        "column_fingerprint_limit": 10,
+    }
+    limits.update(limit_overrides)
+    budget = audit.CrossSheetSummaryBudget(**limits)
+    monkeypatch.setattr(
+        audit,
+        "_column_fingerprints",
+        lambda *_args, **_kwargs: pytest.fail(
+            "label-rejected summary scanned fingerprints"
+        ),
+    )
+
+    summary, limitations = build_cross_sheet_summary(
+        "a.xlsx", "Figure 1", _sheet(), budget=budget
+    )
+
+    assert summary is None
+    assert limitations == []
+    assert budget.limitation_metadata()["exhausted_dimensions"] == [
+        dimension
+    ]
+
+
+def test_large_label_byte_rejection_uses_bounded_utf8_counting():
+    class GuardedLabel(str):
+        def encode(self, *_args, **_kwargs):
+            raise AssertionError(
+                "rejected label materialized its complete UTF-8 payload"
+            )
+
+    source = Sheet.from_rows([["seed"]])
+    source._text[(0, 0)] = GuardedLabel("x" * 1_000_000)
+
+    labels, metrics = audit._bounded_sparse_label_context(
+        source,
+        row_limit=1,
+        retained_cell_limit=1,
+        retained_byte_limit=0,
+    )
+
+    assert labels.text == {}
+    assert metrics["label_bytes"] == 1
+    assert metrics["label_bytes_is_lower_bound"] is True
+
+    budget = audit.CrossSheetSummaryBudget(
+        summary_limit=1,
+        grid_cell_limit=1,
+        label_cell_limit=1,
+        label_byte_limit=0,
+        column_fingerprint_limit=0,
+    )
+    summary, limitations = build_cross_sheet_summary(
+        "large.xlsx",
+        "Figure 1",
+        source,
+        blocks=[],
+        budget=budget,
+    )
+
+    assert summary is None
+    assert limitations == []
+    exhausted = budget.limitation_metadata()["dimensions"][
+        "label_bytes"
+    ]
+    assert exhausted["skipped_items"] == 1
+    assert exhausted["skipped_items_is_lower_bound"] is True
 
 
 @pytest.mark.parametrize(
