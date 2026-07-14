@@ -277,6 +277,80 @@ def test_wide_integer_block_index_exhaustion_skips_before_state_grows(
     assert state.findings_omitted_is_lower_bound is True
 
 
+def test_wide_integer_state_rejection_does_not_traverse_coordinates():
+    class RejectIteration(dict):
+        def __iter__(self):
+            raise AssertionError(
+                "state rejection traversed wide-integer coordinates"
+            )
+
+    sheet = Sheet(
+        1,
+        1,
+        audit.np.full((1, 1), audit.np.nan),
+        {},
+        audit.np.zeros((1, 1), dtype=audit.np.bool_),
+        RejectIteration({(0, 0): 10**100}),
+    )
+
+    counts, metadata = audit._wide_integer_counts_by_block(
+        sheet,
+        [(0, 1, 0, 1)],
+        state_limit=0,
+        with_coverage=True,
+    )
+
+    assert counts is None
+    assert metadata["coordinates_total"] == 1
+    assert metadata["coordinate_visits"] == 0
+    assert metadata["state_units_required"] == (
+        audit._wide_integer_index_state_required(
+            1, 1, ordered=False
+        )
+    )
+    assert metadata["peak_state_units"] == 0
+    assert metadata["state_exhausted"] is True
+
+
+def test_direct_sheet_subclass_uses_conservative_wide_integer_ordering():
+    class DirectSheet(Sheet):
+        pass
+
+    wide_ints = {
+        (2, 1): 10**100 + 2,
+        (0, 0): 10**100,
+    }
+    sheet = DirectSheet(
+        3,
+        2,
+        audit.np.full((3, 2), audit.np.nan),
+        {},
+        audit.np.zeros((3, 2), dtype=audit.np.bool_),
+        wide_ints,
+    )
+    blocks = [
+        (0, 2, 0, 2),
+        (2, 3, 0, 2),
+    ]
+
+    counts, metadata = audit._wide_integer_counts_by_block(
+        sheet,
+        blocks,
+        state_limit=1_000,
+        with_coverage=True,
+    )
+
+    assert counts.tolist() == [1, 1]
+    assert metadata["state_units_required"] == (
+        audit._wide_integer_index_state_required(
+            len(blocks), len(wide_ints), ordered=False
+        )
+    )
+    assert metadata["coordinate_visits"] <= 2 * len(wide_ints)
+    assert metadata["coordinate_copy_cells"] == 2 * len(wide_ints)
+    assert metadata["state_exhausted"] is False
+
+
 def test_dense_row_limit_rejects_inside_every_real_detector(
     monkeypatch,
 ):
@@ -831,6 +905,41 @@ def test_scan_wide_summary_limit_is_aggregated_and_truthful(
     assert scan["findings_omitted"] == 0
     assert scan["findings_omitted_is_lower_bound"] is True
     assert scan["scan_status"] == "partial"
+
+
+def test_scan_zero_recurring_budget_reports_zero_lower_bound_as_partial(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "Figure 1.csv").write_text(
+        "a,b,c,d,e\n"
+        "11.25,7.5,19.75,3.125,14.5\n"
+        "21.25,17.5,29.75,13.125,24.5\n"
+        "31.25,27.5,39.75,23.125,34.5\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        audit, "_RECURRING_ROW_VECTOR_BUDGET", 0, raising=False
+    )
+
+    scan = audit.scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    assert _limitations(scan, "recurring_row_vector_budget") == [{
+        "scope": "sheet",
+        "reason": "recurring_row_vector_budget",
+        "file": "Figure 1.csv",
+        "sheet": "Figure 1",
+        "windows_skipped": 0,
+        "windows_skipped_is_lower_bound": True,
+        "limit": 0,
+    }]
+    assert scan["findings_omitted"] == 0
+    assert scan["findings_omitted_is_lower_bound"] is True
+    assert scan["scan_status"] == "partial"
+    assert scan["coverage"]["truncated"] is True
 
 
 def test_scan_cross_sheet_work_limit_feeds_omission_lower_bound(

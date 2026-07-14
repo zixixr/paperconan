@@ -48,7 +48,12 @@ from ._input import (
     discover_supported_inputs,
     inspect_ooxml_formula_cache,
 )
-from ._numeric import integer_shift_close, relation_close
+from ._numeric import (
+    integer_shift_close,
+    max_ulp_tolerance,
+    relation_close,
+    scalar_ulp_tolerance,
+)
 from ._profiles import apply_profile_to_findings, normalize_profile
 from ._resources import (
     BoundedFindingCollector,
@@ -1822,7 +1827,6 @@ def detect_relations(
         "mask": bool_units,
         "mask_rhs_workspace": bool_units,
         "filtered_values": 2 * row_count,
-        "abs_scale_workspace": 2 * row_count,
         "diff": row_count,
         "nonzero_workspace": bool_units,
         "relation_close_workspace": 12 * row_count,
@@ -1966,23 +1970,37 @@ def detect_relations(
                 x_sample = tuple(_sample(x))
                 y_sample = tuple(_sample(y))
 
-                abs_scale_workspace = candidate.reserve(
-                    "abs_scale_workspace",
-                    2 * n,
-                )
-                tol = 1e-9 * max(
-                    float(np.max(np.abs(x))),
-                    float(np.max(np.abs(y))),
-                    1e-300,
-                )
-                candidate.release(abs_scale_workspace)
-
                 diff, diff_lease = candidate.allocate(
                     "diff",
                     n,
                     lambda: y - x,
                 )
                 mean_diff = float(np.mean(diff))
+                lo = int(np.argmin(x))
+                hi = int(np.argmax(x))
+                dx = x[hi] - x[lo]
+                varying_x = dx != 0
+                if varying_x:
+                    slope = (y[hi] - y[lo]) / dx
+                    intercept_product = slope * x[lo]
+                    intercept = y[lo] - intercept_product
+                    intercept_tolerance = (
+                        scalar_ulp_tolerance(
+                            y[lo], intercept_product
+                        )
+                        + 1e-9
+                        * max(
+                            abs(slope * dx),
+                            abs(y[hi] - y[lo]),
+                        )
+                    )
+                    intercept_is_zero = (
+                        abs(intercept) <= intercept_tolerance
+                    )
+                else:
+                    slope = 0.0
+                    intercept = 0.0
+                    intercept_is_zero = True
                 relation_workspace = candidate.reserve(
                     "relation_close_workspace",
                     12 * n,
@@ -2049,6 +2067,7 @@ def detect_relations(
                         stable_ratio
                         and abs(mean_ratio - 1) > 1e-9
                         and abs(mean_ratio) > 1e-9
+                        and intercept_is_zero
                     ):
                         ratio_close_workspace = candidate.reserve(
                             "relation_close_workspace",
@@ -2138,11 +2157,7 @@ def detect_relations(
                         "linear_fit_workspace",
                         12 * n,
                     )
-                    varying_x = np.ptp(x) > 0
                     if varying_x:
-                        lo = int(np.argmin(x))
-                        hi = int(np.argmax(x))
-                        dx = x[hi] - x[lo]
                         try:
                             (
                                 _fit_slope,
@@ -2164,9 +2179,7 @@ def detect_relations(
                         dx = 0
                         y_has_variation = False
                     candidate.release(linear_fit_workspace)
-                    if varying_x and dx != 0:
-                        slope = (y[hi] - y[lo]) / dx
-                        intercept = y[lo] - slope * x[lo]
+                    if varying_x:
                         fitted_build_workspace = candidate.reserve(
                             "fitted_build_workspace",
                             2 * n,
@@ -2200,9 +2213,6 @@ def detect_relations(
                                 fitted_close
                                 and abs(r) > 0.99
                             ):
-                                intercept_is_zero = (
-                                    abs(intercept) < tol
-                                )
                                 is_identity = (
                                     abs(slope - 1) < 1e-9
                                     and intercept_is_zero
@@ -2251,17 +2261,48 @@ def detect_relations(
                 if n >= 24:
                     best_len = cur_len = 1
                     best_val = float(diff[0])
+                    best_tolerance = (
+                        scalar_ulp_tolerance(x[0], y[0])
+                        + 1e-9 * abs(best_val)
+                    )
+                    current_tolerance = best_tolerance
                     for t in range(1, len(diff)):
-                        if abs(diff[t] - diff[t - 1]) < tol:
+                        pair_tolerance = (
+                            scalar_ulp_tolerance(
+                                x[t - 1],
+                                y[t - 1],
+                                x[t],
+                                y[t],
+                            )
+                            + 1e-9
+                            * max(
+                                abs(diff[t - 1]),
+                                abs(diff[t]),
+                            )
+                        )
+                        if (
+                            abs(diff[t] - diff[t - 1])
+                            <= pair_tolerance
+                        ):
                             cur_len += 1
+                            current_tolerance = max(
+                                current_tolerance,
+                                pair_tolerance,
+                            )
                         else:
                             if cur_len > best_len:
                                 best_len = cur_len
                                 best_val = float(diff[t - 1])
+                                best_tolerance = current_tolerance
                             cur_len = 1
+                            current_tolerance = (
+                                scalar_ulp_tolerance(x[t], y[t])
+                                + 1e-9 * abs(diff[t])
+                            )
                     if cur_len > best_len:
                         best_len = cur_len
                         best_val = float(diff[-1])
+                        best_tolerance = current_tolerance
                     run_floor = max(20, int(round(0.5 * n)))
                     col_hp = (
                         sum(
@@ -2272,7 +2313,13 @@ def detect_relations(
                         >= 0.6 * len(x)
                     )
                     off_is_small_integer = (
-                        abs(best_val - round(best_val)) < tol
+                        abs(best_val - round(best_val))
+                        <= max(
+                            best_tolerance,
+                            scalar_ulp_tolerance(
+                                best_val, round(best_val)
+                            ),
+                        )
                         and abs(round(best_val)) >= 1
                     )
                     non_trivial_offset = (
@@ -2281,7 +2328,7 @@ def detect_relations(
                     if (
                         best_len >= run_floor
                         and best_len < n
-                        and abs(best_val) > tol
+                        and abs(best_val) > best_tolerance
                         and non_trivial_offset
                     ):
                         candidate.offer(
@@ -2922,7 +2969,6 @@ def detect_arithmetic_progression(
         "numeric_mask": state_units_for_nbytes(row_count),
         "values": row_count,
         "diffs": max(0, row_count - 1),
-        "progression_abs_workspace": row_count,
         "progression_close_workspace": 4 * row_count,
     }
     if not resources.begin(
@@ -2975,14 +3021,7 @@ def detect_arithmetic_progression(
                 max(0, n - 1),
                 lambda: np.diff(values),
             )
-            abs_workspace = candidate.reserve(
-                "progression_abs_workspace",
-                n,
-            )
-            tol = 1e-9 * max(
-                float(np.max(np.abs(values))), 1e-300
-            )
-            candidate.release(abs_workspace)
+            source_ulp_tolerance = max_ulp_tolerance(values)
             close_workspace = candidate.reserve(
                 "progression_close_workspace",
                 4 * n,
@@ -2990,7 +3029,7 @@ def detect_arithmetic_progression(
             closes = np.allclose(
                 diffs,
                 diffs[0],
-                atol=tol,
+                atol=source_ulp_tolerance,
                 rtol=1e-9,
             )
             candidate.release(close_workspace)
@@ -2999,7 +3038,7 @@ def detect_arithmetic_progression(
             del diffs, values
             candidate.release(diffs_lease)
             candidate.release(values_lease)
-            if closes and abs(step) > tol:
+            if closes and abs(step) > source_ulp_tolerance:
                 sev = (
                     "medium"
                     if abs(step - round(step)) < 1e-9
@@ -6558,9 +6597,17 @@ def _column_axis_like(a):
         return True
     if len({round(float(v), 9) for v in a}) <= 1:
         return True                                   # constant
-    scale = max(float(np.max(np.abs(a))), 1e-300)
+    source_ulp_tolerance = max_ulp_tolerance(a)
     diffs = np.diff(a)
-    if np.allclose(diffs, diffs[0], atol=1e-9 * scale, rtol=1e-9) and abs(diffs[0]) > 1e-9 * scale:
+    if (
+        np.allclose(
+            diffs,
+            diffs[0],
+            atol=source_ulp_tolerance,
+            rtol=1e-9,
+        )
+        and abs(diffs[0]) > source_ulp_tolerance
+    ):
         return True                                   # arithmetic ladder
     if np.all(np.abs(a) > 1e-12):                     # geometric ladder (serial dilution)
         ratios = a[1:] / a[:-1]
@@ -6645,7 +6692,7 @@ def _stream_column_fingerprint(
     float_all_nonzero = True
     float_first_ratio = None
     float_ratio_error = 0.0
-    float_scale = 1e-300
+    float_source_ulp_tolerance = 0.0
 
     for row_idx in range(r0, r1):
         value = source.exact_numeric(row_idx, col_idx)
@@ -6695,7 +6742,10 @@ def _stream_column_fingerprint(
             numeric = float(value)
             rounded_value = round(numeric, 9)
             rounded_distinct.add(rounded_value)
-            float_scale = max(float_scale, abs(numeric))
+            float_source_ulp_tolerance = max(
+                float_source_ulp_tolerance,
+                scalar_ulp_tolerance(numeric),
+            )
             if float_first_rounded is None:
                 float_first_rounded = rounded_value
             elif rounded_value != float_first_rounded:
@@ -6750,7 +6800,10 @@ def _stream_column_fingerprint(
         )
         qualification_distinct = exact_distinct
     else:
-        difference_tolerance = 1e-9 * float_scale
+        difference_tolerance = (
+            float_source_ulp_tolerance
+            + 1e-9 * abs(float_first_difference or 0.0)
+        )
         arithmetic = (
             float_first_difference is not None
             and abs(float_first_difference) > difference_tolerance
@@ -8578,14 +8631,13 @@ def _wide_integer_counts_by_block(
         if state_limit is None
         else state_limit
     ))
-    previous = None
-    ordered = True
+    ordered_hint = getattr(sheet, "_wide_ints_ordered", None)
+    ordered = (
+        bool(ordered_hint)
+        if ordered_hint is not None
+        else False
+    )
     coordinate_visits = 0
-    for coordinate in coordinates:
-        coordinate_visits += 1
-        if previous is not None and coordinate < previous:
-            ordered = False
-        previous = coordinate
     state_required = _wide_integer_index_state_required(
         block_count,
         coordinate_count,
@@ -8613,11 +8665,30 @@ def _wide_integer_counts_by_block(
         block_counts = np.zeros(block_count, dtype=np.int64)
         tracker.retain("block_counts", block_counts)
 
-        column_values = np.fromiter(
-            (col for _row, col in coordinates),
-            dtype=np.int64,
-            count=coordinate_count,
-        )
+        coordinate_array = None
+        if ordered:
+            def coordinate_columns():
+                nonlocal coordinate_visits
+                for _row, col in coordinates:
+                    coordinate_visits += 1
+                    yield col
+
+            column_values = np.fromiter(
+                coordinate_columns(),
+                dtype=np.int64,
+                count=coordinate_count,
+            )
+        else:
+            coordinate_array = np.empty(
+                (coordinate_count, 2), dtype=np.int64
+            )
+            for index, coordinate in enumerate(coordinates):
+                coordinate_visits += 1
+                coordinate_array[index] = coordinate
+            tracker.retain(
+                "coordinate_copy", coordinate_array
+            )
+            column_values = coordinate_array[:, 1].copy()
         tracker.retain("coordinate_columns", column_values)
         tracker.retain_units(
             "column_unique_workspace", 4 * coordinate_count
@@ -8647,18 +8718,14 @@ def _wide_integer_counts_by_block(
         tracker.retain("event_order", event_order)
         tracker.release("event_sort_workspace")
 
-        coordinate_copy_cells = 0
+        coordinate_copy_cells = (
+            0
+            if coordinate_array is None
+            else int(coordinate_array.size)
+        )
         if ordered:
             coordinate_iterator = iter(coordinates)
         else:
-            coordinate_array = np.empty(
-                (coordinate_count, 2), dtype=np.int64
-            )
-            for index, coordinate in enumerate(coordinates):
-                coordinate_array[index] = coordinate
-            tracker.retain(
-                "coordinate_copy", coordinate_array
-            )
             tracker.retain_units(
                 "coordinate_sort_workspace",
                 4 * coordinate_count,
@@ -8671,7 +8738,6 @@ def _wide_integer_counts_by_block(
                 "coordinate_order", coordinate_order
             )
             tracker.release("coordinate_sort_workspace")
-            coordinate_copy_cells = int(coordinate_array.size)
             coordinate_iterator = (
                 (
                     int(coordinate_array[position, 0]),
@@ -9210,15 +9276,36 @@ def _process_loaded_sheet(
         blocks=blocks,
         figure_id=figure_key(sheet_name),
     )
-    if recurring_meta["windows_skipped"] > 0:
+    recurring_windows_skipped = recurring_meta.get(
+        "windows_skipped", 0
+    )
+    recurring_windows_lower_bound = bool(
+        recurring_meta.get(
+            "windows_skipped_is_lower_bound", False
+        )
+    )
+    recurring_budget_exhausted = bool(
+        recurring_meta.get(
+            "budget_exhausted",
+            recurring_windows_skipped > 0,
+        )
+    )
+    if recurring_budget_exhausted:
         state.coverage.add_limitation(
             "sheet",
             "recurring_row_vector_budget",
             file=file_name,
             sheet=sheet_name,
-            windows_skipped=recurring_meta["windows_skipped"],
+            windows_skipped=recurring_windows_skipped,
+            **(
+                {"windows_skipped_is_lower_bound": True}
+                if recurring_windows_lower_bound
+                else {}
+            ),
             limit=state.recurring_index.initial_budget,
         )
+        if recurring_windows_lower_bound:
+            state.findings_omitted_is_lower_bound = True
 
     summary, summary_limitations = build_cross_sheet_summary(
         file_name,

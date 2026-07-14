@@ -365,7 +365,7 @@ class SheetBuilder:
             self.max_width,
             False,
         )
-        return Sheet(
+        sheet = Sheet(
             self.nrows,
             self.max_width,
             self.numeric,
@@ -373,6 +373,8 @@ class SheetBuilder:
             self.int_mask,
             self._wide_ints,
         )
+        sheet._wide_ints_ordered = True
+        return sheet
 
 
 class Sheet:
@@ -383,6 +385,7 @@ class Sheet:
         "_text",
         "_ints",
         "_wide_ints",
+        "_wide_ints_ordered",
     )
 
     def __init__(
@@ -407,6 +410,7 @@ class Sheet:
                     mask[row, col] = True
             self._ints = mask
         self._wide_ints = wide_ints or {}
+        self._wide_ints_ordered = None
 
     @classmethod
     def from_rows(

@@ -155,3 +155,8 @@ fingerprint candidate capacity 在扫描 source rows 前 reservation；不足时
 旧版 archived scan/verdict 仍按既有兼容路径读取。本轮没有新增环境控制。
 
 上述 dense-block 与跨表控制都按文件、sheet、block 及 detector 的稳定输入顺序确定性选择，并在超过预算前停止工作或状态增长。只有完整候选或完整 summary 能进入下游检测；不会把前缀当作完整覆盖，也不会静默截断。`coverage.limitations` 会给出配置上限、已完成工作/已保留状态，以及可知时的精确遗漏数；无法证明精确 finding 数时，顶层 `findings_omitted_is_lower_bound` 会明确标记下界语义。
+
+`recurring_row_vector_budget` 中的 `windows_skipped` 在所有候选行都已检查时是
+exact；若预算耗尽后仍有未读取行，则
+`windows_skipped_is_lower_bound: true` 表示该值是 lower-bound，只精确计入已检查行
+中跳过的窗口。即使已知下界为 0，扫描覆盖也会标记为 partial。

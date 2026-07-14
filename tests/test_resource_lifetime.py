@@ -8,6 +8,7 @@ from dataclasses import fields, is_dataclass
 import numpy as np
 import paperconan._audit as audit
 import paperconan._extract as extract
+import paperconan._numeric as numeric_module
 import pytest
 from paperconan._coverage import ScanCoverage
 from paperconan._input import TableLoadResult
@@ -23,6 +24,14 @@ class _WeakNumericList(list):
 
 class _WeakSheet(Sheet):
     pass
+
+
+def test_max_ulp_tolerance_streams_single_pass_values():
+    values = iter([1e12, 1e12 + 1.0, 1e12 + 2.0])
+
+    assert numeric_module.max_ulp_tolerance(values) == (
+        16 * np.spacing(1e12)
+    )
 
 
 def _walk(value, seen=None):
@@ -431,7 +440,6 @@ EXPECTED_DENSE_STATES = {
         "mask",
         "mask_rhs_workspace",
         "filtered_values",
-        "abs_scale_workspace",
         "diff",
         "nonzero_workspace",
         "relation_close_workspace",
@@ -463,7 +471,6 @@ EXPECTED_DENSE_STATES = {
         "numeric_mask",
         "values",
         "diffs",
-        "progression_abs_workspace",
         "progression_close_workspace",
     },
     "within_column": {
@@ -680,7 +687,6 @@ WORKSPACE_GUARDS = {
             ("mask", {"mask", "mask_rhs_workspace"}),
         ),
         "abs": (
-            ("abs_scale", {"abs_scale_workspace"}),
             ("fractional", {"frac_x", "hp_rows", "fractional_workspace"}),
             ("fitted_build", {"fitted", "fitted_build_workspace"}),
             ("integer_shift", {"diff_is_int", "integer_shift_workspace"}),
@@ -752,7 +758,6 @@ WORKSPACE_GUARDS = {
             ("numeric_mask", {"column", "numeric_mask"}),
         ),
         "abs": (
-            ("scale", {"values", "progression_abs_workspace"}),
             ("close", {"diffs", "progression_close_workspace"}),
         ),
         "allclose": (
@@ -3180,7 +3185,7 @@ def test_scan_maps_collision_grid_cell_limit_with_counts(
     }]
 
 
-def test_scan_reports_exact_recurring_window_budget_once(
+def test_scan_reports_recurring_window_budget_lower_bound_once(
     tmp_path, monkeypatch
 ):
     data = tmp_path / "data"
@@ -3210,9 +3215,12 @@ def test_scan_reports_exact_recurring_window_budget_once(
         "reason": "recurring_row_vector_budget",
         "file": "Figure 1.csv",
         "sheet": "Figure 1",
-        "windows_skipped": 8,
+        "windows_skipped": 2,
+        "windows_skipped_is_lower_bound": True,
         "limit": 1,
     }]
+    assert scan["findings_omitted"] == 0
+    assert scan["findings_omitted_is_lower_bound"] is True
     assert scan["coverage"]["truncated"] is True
 
 

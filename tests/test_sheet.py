@@ -94,6 +94,15 @@ def test_wide_integer_cells_remain_numeric_in_mask():
     assert sheet.numeric_mask()[:, 0].tolist() == [True, True, True]
 
 
+def test_streaming_builder_records_wide_integer_coordinate_order():
+    sheet = Sheet.from_rows([
+        [2**53 + 1, 1.25],
+        [2.5, 10**100],
+    ])
+
+    assert sheet._wide_ints_ordered is True
+
+
 def test_integer_dense_sheet_uses_geometry_bounded_type_mask():
     sheet = Sheet.from_rows(
         ([row * 100 + col for col in range(100)] for row in range(100))

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from itertools import combinations
 
+import numpy as np
 import pytest
 
 from paperconan import _audit as audit
@@ -846,6 +847,14 @@ def test_b1_no_flag_on_shared_axis_column():
     f = _run_b1(panels)
     assert not [x for x in f if x["severity"] == "high"]
     assert _b1_oracle(panels) == set()
+
+
+def test_column_axis_classification_is_translation_invariant():
+    base = np.arange(15, dtype=float)
+    translated = base + 1e12
+
+    assert audit._column_axis_like(base) is True
+    assert audit._column_axis_like(translated) is True
 
 
 def test_b1_same_figure_is_low_not_high():

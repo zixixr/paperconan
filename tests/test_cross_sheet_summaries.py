@@ -611,6 +611,29 @@ def test_float_convertible_wide_integers_use_exact_qualification():
     assert detect_cross_sheet_column_duplicates([summary_a, summary_c]) == []
 
 
+def test_streamed_fingerprint_excludes_translated_arithmetic_axis():
+    for baseline in (0.0, 1e12):
+        source = Sheet.from_rows(
+            [["axis"]]
+            + [[baseline + float(row)] for row in range(14)]
+        )
+
+        fingerprint, limitation = audit._stream_column_fingerprint(
+            "a.xlsx",
+            "Figure 1",
+            source,
+            r0=1,
+            r1=source.nrows,
+            col_idx=0,
+            label="axis",
+            min_column_length=12,
+            distinct_limit=100,
+        )
+
+        assert fingerprint is None
+        assert limitation is None
+
+
 def test_recurring_index_reports_budget_exhaustion():
     source = Sheet.from_rows([
         ["a", "b", "c", "d", "e"],
@@ -643,7 +666,7 @@ def test_recurring_index_does_not_spend_budget_on_invalid_windows():
     assert meta == {"budget_exhausted": False, "windows_skipped": 0}
 
 
-def test_recurring_budget_stops_window_materialization_but_counts_skips(
+def test_recurring_budget_stops_source_reads_and_reports_skip_lower_bound(
     monkeypatch,
 ):
     class CountingSource:
@@ -690,10 +713,14 @@ def test_recurring_budget_stops_window_materialization_but_counts_skips(
         figure_id="main:1",
     )
 
-    assert source.cell_calls == 20
+    assert source.cell_calls == 10
     assert len(materialized) == 3
     assert iterator_limits == [3]
-    assert meta == {"budget_exhausted": True, "windows_skipped": 47}
+    assert meta == {
+        "budget_exhausted": True,
+        "windows_skipped": 22,
+        "windows_skipped_is_lower_bound": True,
+    }
 
 
 def test_recurring_unique_vector_budget_bounds_keys_and_reports_lower_bound():

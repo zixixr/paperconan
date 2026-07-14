@@ -40,6 +40,20 @@ def test_arithmetic_progression_not_fp_on_tiny_noise():
     s2 = _sheet([[2.0,4.0,6.0,8.0,10.0,12.0]])
     assert any(x['kind']=='arithmetic_progression' for x in detect_arithmetic_progression(s2,1,7,0,1,["c0"]))
 
+
+def test_arithmetic_progression_is_translation_invariant():
+    base = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    translated = [value + 1e12 for value in base]
+
+    for values in (base, translated):
+        findings = detect_arithmetic_progression(
+            _sheet([values]), 1, 7, 0, 1, ["c0"]
+        )
+        assert [finding["kind"] for finding in findings] == [
+            "arithmetic_progression"
+        ]
+
+
 def test_nearby_genomic_position_does_not_create_constant_ratio_with_maf():
     position = [
         26030666.0, 26030328.0, 26531117.0, 26030701.0, 26030654.0,
@@ -308,6 +322,33 @@ def test_b4_flags_partial_offset_run_and_matches_oracle():
     assert not any(x["kind"] == "constant_offset" for x in f)
 
 
+def test_b4_partial_offset_run_is_translation_invariant():
+    base = [
+        round(0.13 * i + (i * i % 7) * 0.31, 4)
+        for i in range(40)
+    ]
+    shifted = list(base)
+    for i in range(25):
+        shifted[i] = round(base[i] - 0.3, 4)
+    for i in range(25, 40):
+        shifted[i] = round(base[i] + 0.4 + 0.05 * i, 4)
+
+    ordinary = _kinds(base, shifted)
+    translated = _kinds(
+        [value + 1e12 for value in base],
+        [value + 1e12 for value in shifted],
+    )
+
+    assert any(
+        finding["kind"] == "partial_constant_offset"
+        for finding in ordinary
+    )
+    assert any(
+        finding["kind"] == "partial_constant_offset"
+        for finding in translated
+    )
+
+
 def test_b4_whole_column_offset_is_constant_not_partial():
     base = [round(0.13 * i + 1.0, 4) for i in range(40)]
     b = [round(v - 0.3, 4) for v in base]
@@ -413,6 +454,27 @@ def test_genuine_nonzero_intercept_still_flags_exact_linear_at_normal_scale():
     assert any(k["kind"] == "exact_linear" for k in f), f
     assert not any(k["kind"] == "constant_ratio" for k in f), \
         f"an affine offset is not a pure ratio: {f}"
+
+
+def test_affine_linear_classification_is_translation_invariant():
+    x = [12.0, 45.0, 7.0, 88.0, 33.0, 61.0, 19.0, 50.0, 27.0, 6.0]
+    y = [2 * value + 0.25 for value in x]
+
+    ordinary = _kinds(x, y)
+    translated = _kinds(
+        [value + 1e9 for value in x],
+        [value + 2e9 for value in y],
+    )
+
+    for findings in (ordinary, translated):
+        assert any(
+            finding["kind"] == "exact_linear"
+            for finding in findings
+        ), findings
+        assert not any(
+            finding["kind"] == "constant_ratio"
+            for finding in findings
+        ), findings
 
 
 def test_pure_scaling_with_zero_in_x_still_detected():

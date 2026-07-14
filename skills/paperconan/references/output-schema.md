@@ -117,6 +117,27 @@ list these limitations before findings. A partial report keeps all retained
 findings; a failed report never presents an empty finding list as a completed
 scan.
 
+Recurring-row source-window exhaustion uses:
+
+```json
+{
+  "scope": "sheet",
+  "reason": "recurring_row_vector_budget",
+  "file": "table.xlsx",
+  "sheet": "Data",
+  "windows_skipped": 22,
+  "windows_skipped_is_lower_bound": true,
+  "limit": 3
+}
+```
+
+`windows_skipped` is exact when every candidate row was inspected. When the
+budget stops later source-row reads, `windows_skipped_is_lower_bound: true`
+states that the serialized count is only a lower-bound: it includes exact
+skipped windows from inspected rows, while unread rows may contain more.
+This limitation makes scan coverage partial even when the known lower bound is
+zero.
+
 When recurring-row-vector finalization exhausts a retained-state or work
 budget, `coverage.limitations` contains this complete shape:
 

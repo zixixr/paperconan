@@ -211,6 +211,23 @@ def test_complete_output_schema_documents_recurring_lower_bounds() -> None:
     )
 
 
+def test_public_docs_explain_recurring_window_exactness() -> None:
+    schema_text = (REF_DIR / "output-schema.md").read_text(
+        encoding="utf-8"
+    )
+    cli_text = (ROOT / "docs" / "cli.md").read_text(
+        encoding="utf-8"
+    )
+
+    for text in (schema_text, cli_text):
+        assert "windows_skipped_is_lower_bound" in text
+        assert re.search(
+            r"windows_skipped.+exact.+lower[- ]bound",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        )
+
+
 def test_cli_documents_fetch_state_and_work_controls() -> None:
     text = (ROOT / "docs" / "cli.md").read_text(
         encoding="utf-8"

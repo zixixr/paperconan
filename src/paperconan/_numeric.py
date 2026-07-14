@@ -1,6 +1,25 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
+
+
+def max_ulp_tolerance(values, *, ulps=16):
+    spacing = max(
+        (
+            abs(math.ulp(float(value)))
+            for value in values
+        ),
+        default=np.finfo(float).smallest_subnormal,
+    )
+    return ulps * max(
+        spacing, np.finfo(float).smallest_subnormal
+    )
+
+
+def scalar_ulp_tolerance(*values, ulps=16):
+    return max_ulp_tolerance(values, ulps=ulps)
 
 
 def ulp_tolerance(actual, expected, *, ulps=16):

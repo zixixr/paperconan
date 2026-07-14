@@ -384,9 +384,16 @@ class RecurringRowIndex:
         self._sheet_sequence += 1
         sheet_sequence = self._sheet_sequence
         windows_skipped = 0
-        for row_idx, c0, c1 in _iter_block_rows(
-            blocks, max_rows
-        ):
+        windows_skipped_is_lower_bound = False
+        row_specs = iter(_iter_block_rows(blocks, max_rows))
+        while True:
+            try:
+                row_idx, c0, c1 = next(row_specs)
+            except StopIteration:
+                break
+            if self._budget <= 0:
+                windows_skipped_is_lower_bound = True
+                break
             row = [
                 _numeric_value(source.cell(row_idx, col_idx))
                 for col_idx in range(c0, c1)
@@ -434,10 +441,16 @@ class RecurringRowIndex:
                     _record_figure(record, figure_id)
                 if len(record.sites) < 16 and site not in record.sites:
                     record.sites.append(site)
-        return {
-            "budget_exhausted": windows_skipped > 0,
+        metadata = {
+            "budget_exhausted": (
+                windows_skipped > 0
+                or windows_skipped_is_lower_bound
+            ),
             "windows_skipped": windows_skipped,
         }
+        if windows_skipped_is_lower_bound:
+            metadata["windows_skipped_is_lower_bound"] = True
+        return metadata
 
     def findings(
         self, profile="review", max_findings=20
