@@ -71,6 +71,19 @@ def _distill_relations(scan: dict[str, Any]) -> list[dict[str, Any]]:
         for r in relations:
             if str(r.get("severity")).lower() != "high":
                 continue
+            relation_extra = {
+                "sheet": block.get("sheet"),
+                "file": block.get("file"),
+                "figure_label": block.get("figure_label"),
+                "headers": (r.get("evidence") or {}).get("headers"),
+                "slope": r.get("slope"),
+                "intercept": r.get("intercept"),
+            }
+            if r.get("relation_model_ambiguous") is True:
+                relation_extra["relation_model_ambiguous"] = True
+                relation_extra["relation_model_alternatives"] = list(
+                    r.get("relation_model_alternatives") or []
+                )
             findings.append(_relation_finding(
                 r.get("kind"),
                 r.get("col_a"),
@@ -80,12 +93,7 @@ def _distill_relations(scan: dict[str, Any]) -> list[dict[str, Any]]:
                 r.get("rule"),
                 r.get("col_a_sample"),
                 r.get("col_b_sample"),
-                sheet=block.get("sheet"),
-                file=block.get("file"),
-                figure_label=block.get("figure_label"),
-                headers=(r.get("evidence") or {}).get("headers"),
-                slope=r.get("slope"),
-                intercept=r.get("intercept"),
+                **relation_extra,
             ))
     return findings
 

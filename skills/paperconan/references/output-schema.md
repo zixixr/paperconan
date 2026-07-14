@@ -268,6 +268,11 @@ shape use these rules:
 - Every additional legacy `finding_refs` selector is bound independently, so
   matched and unmatched entries remain visible in their original order.
 
+These additive relation-model fields do not change `finding_ref` matching and
+do not require a `schema_version` increment. An archived verdict remains bound
+to its archived scan; rerunning a changed detector can still produce a
+different primary `kind`.
+
 An explicit primary `"findings": []` remains an empty primary verdict. The
 renderer does not synthesize a legacy finding from top-level `report_md` or
 `finding_refs` in that case. Profile-hidden scan findings remain unavailable for
@@ -280,6 +285,13 @@ ordering.
 - `severity`: `"high"` | `"medium"` | `"low"`
 - `rule`: human-readable rule string e.g. `col[27] ≡ col[28] in 9/10 rows`
 - `n`: sample size for the rule
+- `relation_model_ambiguous` (optional): `true` when float representation and
+  intercept uncertainty leave both a proportional and nonzero-intercept
+  affine model compatible with the stored values. This qualifies the
+  statistical signal; it is not a final judgment.
+- `relation_model_alternatives` (optional): deterministic compatible kinds,
+  currently `["constant_ratio", "exact_linear"]`. It appears only with
+  `relation_model_ambiguous: true`.
 - `evidence`: block snippet `{headers, rows, highlight_cols, ...}` — used by report.html, but you can also surface a few highlighted values if useful
 - `likely_benign` (optional): a common innocent explanation for this kind — surface it to the user alongside the finding so a signal is never reported as a verdict
 - `profile_action`: `"kept"` | `"demoted"` | `"hidden"` — what the active profile did to this finding. `"demoted"`/`"hidden"` means the current `severity` is the **filter's** downgrade, not the detector's raw verdict (always `"kept"` under `--profile forensic`). See the Profiles section in SKILL.md.

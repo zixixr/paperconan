@@ -211,6 +211,18 @@ def test_complete_output_schema_documents_recurring_lower_bounds() -> None:
     )
 
 
+def test_output_schema_documents_relation_model_ambiguity():
+    text = (REF_DIR / "output-schema.md").read_text(
+        encoding="utf-8"
+    )
+    assert "relation_model_ambiguous" in text
+    assert "relation_model_alternatives" in text
+    assert "constant_ratio" in text
+    assert "exact_linear" in text
+    assert "schema_version" in text
+    assert "finding_ref" in text
+
+
 def test_public_docs_explain_recurring_window_exactness() -> None:
     schema_text = (REF_DIR / "output-schema.md").read_text(
         encoding="utf-8"

@@ -23,6 +23,8 @@ class Finding(TypedDict, total=False):
     kind: str
     severity: str
     rule: str
+    relation_model_ambiguous: bool
+    relation_model_alternatives: list[str]
     profile_action: ProfileAction
     false_positive_context: list[str]
     likely_benign: str

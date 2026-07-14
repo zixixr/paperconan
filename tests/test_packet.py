@@ -86,6 +86,58 @@ def test_distill_review_findings_includes_relation_samples_and_within_col():
     assert findings[1]["prefilter"] == "keep"
 
 
+def test_distill_relations_preserves_optional_model_ambiguity():
+    scan = {
+        "cross_sheet_findings": [],
+        "relations_blocks": [{
+            "file": "source.csv",
+            "sheet": "Data",
+            "relations": [
+                {
+                    "kind": "constant_ratio",
+                    "severity": "high",
+                    "col_a": "x",
+                    "col_b": "y",
+                    "n": 12,
+                    "ratio": 1.23456789035,
+                    "rule": "col[1] = col[0] * 1.23457",
+                    "col_a_sample": [1.0, 2.0],
+                    "col_b_sample": [1.2, 2.4],
+                    "relation_model_ambiguous": True,
+                    "relation_model_alternatives": [
+                        "constant_ratio",
+                        "exact_linear",
+                    ],
+                },
+                {
+                    "kind": "exact_linear",
+                    "severity": "high",
+                    "col_a": "a",
+                    "col_b": "b",
+                    "n": 12,
+                    "slope": 2.0,
+                    "intercept": 0.25,
+                    "rule": "col[3] = 2 * col[2] + 0.25",
+                    "col_a_sample": [1.0, 2.0],
+                    "col_b_sample": [2.25, 4.25],
+                },
+            ],
+            "equal_pairs": [],
+            "within_col": [],
+        }],
+    }
+
+    findings = distill_findings_for_review(scan)
+
+    assert findings[0]["relation_model_ambiguous"] is True
+    assert findings[0]["relation_model_alternatives"] == [
+        "constant_ratio",
+        "exact_linear",
+    ]
+    assert "relation_model_ambiguous" not in findings[1]
+    assert "relation_model_alternatives" not in findings[1]
+
+
 def test_decimal_tail_reuse_keeps_identity_and_is_protected():
     # A long fractional-tail match is near-impossible by chance, so even a SMALL fraction /
     # small n must keep its identity and survive (not be relabeled to value_tweaked nor
