@@ -1979,8 +1979,9 @@ def detect_relations(
                 mean_diff = float(np.mean(diff))
                 lo = int(np.argmin(x))
                 hi = int(np.argmax(x))
-                dx = x[hi] - x[lo]
-                varying_x = dx != 0
+                dx = float(x[hi]) - float(x[lo])
+                varying_x = dx != 0 and math.isfinite(dx)
+                fit_valid = False
                 if varying_x:
                     fit_count = 0
                     x_center = 0.0
@@ -1999,51 +2000,74 @@ def detect_relations(
                         centered_xy += x_delta * (
                             float(y_value) - y_center
                         )
-                    slope = centered_xy / centered_xx
-                    centered_radius = 0.0
-                    centered_residual = 0.0
-                    intercept_x = float(x[0])
-                    intercept_y = float(y[0])
-                    y_min = intercept_y
-                    y_max = intercept_y
-                    for x_value, y_value in zip(x, y):
-                        x_scalar = float(x_value)
-                        y_scalar = float(y_value)
-                        centered_x = x_scalar - x_center
-                        centered_y = y_scalar - y_center
-                        centered_radius = max(
-                            centered_radius, abs(centered_x)
+                    if (
+                        centered_xx > 0
+                        and math.isfinite(centered_xx)
+                        and math.isfinite(centered_xy)
+                    ):
+                        slope = centered_xy / centered_xx
+                    elif centered_xx == 0:
+                        # Finite centered products can underflow at tiny
+                        # scales; the widest secant remains bounded.
+                        slope = (
+                            float(y[hi]) - float(y[lo])
+                        ) / dx
+                    else:
+                        slope = 0.0
+                    fit_valid = math.isfinite(slope)
+                    if fit_valid:
+                        centered_radius = 0.0
+                        centered_residual = 0.0
+                        intercept_x = float(x[0])
+                        intercept_y = float(y[0])
+                        y_min = intercept_y
+                        y_max = intercept_y
+                        for x_value, y_value in zip(x, y):
+                            x_scalar = float(x_value)
+                            y_scalar = float(y_value)
+                            centered_x = x_scalar - x_center
+                            centered_y = y_scalar - y_center
+                            centered_radius = max(
+                                centered_radius, abs(centered_x)
+                            )
+                            centered_residual = max(
+                                centered_residual,
+                                abs(
+                                    centered_y
+                                    - slope * centered_x
+                                ),
+                            )
+                            y_min = min(y_min, y_scalar)
+                            y_max = max(y_max, y_scalar)
+                            if abs(x_scalar) < abs(intercept_x):
+                                intercept_x = x_scalar
+                                intercept_y = y_scalar
+                        intercept_product = slope * intercept_x
+                        intercept = intercept_y - intercept_product
+                        intercept_assessment = (
+                            assess_relation_intercept(
+                                slope=slope,
+                                intercept=intercept,
+                                x_center=x_center,
+                                centered_radius=centered_radius,
+                                centered_residual=centered_residual,
+                                transformed_span=max(
+                                    abs(slope * dx),
+                                    abs(y_max - y_min),
+                                ),
+                                anchor_y=intercept_y,
+                                intercept_product=intercept_product,
+                            )
                         )
-                        centered_residual = max(
-                            centered_residual,
-                            abs(centered_y - slope * centered_x),
+                        relation_intercept_state = (
+                            None
+                            if intercept_assessment is None
+                            else intercept_assessment.state
                         )
-                        y_min = min(y_min, y_scalar)
-                        y_max = max(y_max, y_scalar)
-                        if abs(x_scalar) < abs(intercept_x):
-                            intercept_x = x_scalar
-                            intercept_y = y_scalar
-                    intercept_product = slope * intercept_x
-                    intercept = intercept_y - intercept_product
-                    intercept_assessment = assess_relation_intercept(
-                        slope=slope,
-                        intercept=intercept,
-                        x_center=x_center,
-                        centered_radius=centered_radius,
-                        centered_residual=centered_residual,
-                        transformed_span=max(
-                            abs(slope * float(dx)),
-                            abs(y_max - y_min),
-                        ),
-                        anchor_y=intercept_y,
-                        intercept_product=intercept_product,
-                    )
-                    relation_intercept_state = (
-                        None
-                        if intercept_assessment is None
-                        else intercept_assessment.state
-                    )
-                else:
+                    else:
+                        intercept = 0.0
+                        relation_intercept_state = None
+                if not fit_valid:
                     slope = 0.0
                     intercept = 0.0
                     relation_intercept_state = None
@@ -2088,6 +2112,7 @@ def detect_relations(
 
                 ratio_emitted = False
                 ratio_compatible = False
+                mean_ratio = 0.0
                 nonzero_workspace = candidate.reserve(
                     "nonzero_workspace",
                     state_units_for_nbytes(n),
@@ -2123,53 +2148,114 @@ def detect_relations(
                             relation_close(y, mean_ratio * x).all()
                         )
                         candidate.release(ratio_close_workspace)
-                    if (
-                        ratio_compatible
-                        and relation_intercept_state
-                        in {"proportional", "ambiguous"}
-                    ):
-                        relation_model_ambiguous = (
-                            relation_intercept_state == "ambiguous"
-                        )
-                        candidate.offer(
-                            "high",
-                            lambda ci=ci, cj=cj, n=n,
-                            mean_ratio=mean_ratio,
-                            x_sample=x_sample,
-                            y_sample=y_sample,
-                            relation_model_ambiguous=(
-                                relation_model_ambiguous
-                            ): {
-                                "kind": "constant_ratio",
-                                "col_a": header[ci - c0],
-                                "col_b": header[cj - c0],
-                                "col_a_idx": ci,
-                                "col_b_idx": cj,
-                                "n": n,
-                                "ratio": mean_ratio,
-                                "severity": "high",
-                                "col_a_sample": list(x_sample),
-                                "col_b_sample": list(y_sample),
-                                "rule": (
-                                    f"col[{cj}] = col[{ci}] * "
-                                    f"{mean_ratio:.6g}"
-                                ),
-                                **(
-                                    {
-                                        "relation_model_ambiguous": True,
-                                        "relation_model_alternatives": [
-                                            "constant_ratio",
-                                            "exact_linear",
-                                        ],
-                                    }
-                                    if relation_model_ambiguous
-                                    else {}
-                                ),
-                            },
-                        )
-                        ratio_emitted = True
                     del ratio
                     candidate.release(ratio_lease)
+
+                affine_compatible = False
+                if n >= 5 and fit_valid:
+                    linear_fit_workspace = candidate.reserve(
+                        "linear_fit_workspace",
+                        12 * n,
+                    )
+                    try:
+                        (
+                            _fit_slope,
+                            _fit_intercept,
+                            r,
+                            _p,
+                            _se,
+                        ) = stats.linregress(x, y)
+                    except ValueError:
+                        candidate.release(linear_fit_workspace)
+                        del diff, x, y
+                        candidate.release(diff_lease)
+                        candidate.release(filtered_lease)
+                        return
+                    y_has_variation = np.std(y) > 0
+                    candidate.release(linear_fit_workspace)
+                    fitted_build_workspace = candidate.reserve(
+                        "fitted_build_workspace",
+                        2 * n,
+                    )
+                    fitted, fitted_lease = candidate.allocate(
+                        "fitted",
+                        n,
+                        lambda: slope * x + intercept,
+                    )
+                    candidate.release(fitted_build_workspace)
+                    if y_has_variation:
+                        fitted_relation_workspace = (
+                            candidate.reserve(
+                                "fitted_relation_workspace",
+                                12 * n,
+                            )
+                        )
+                        fitted_close = bool(
+                            relation_close(
+                                y, fitted, rtol=1e-7
+                            ).all()
+                        )
+                        candidate.release(
+                            fitted_relation_workspace
+                        )
+                        affine_compatible = (
+                            fitted_close
+                            and abs(r) > 0.99
+                            and relation_intercept_state is not None
+                        )
+                    del fitted
+                    candidate.release(fitted_lease)
+
+                if (
+                    ratio_compatible
+                    and (
+                        relation_intercept_state == "proportional"
+                        or (
+                            relation_intercept_state == "ambiguous"
+                            and affine_compatible
+                        )
+                    )
+                ):
+                    relation_model_ambiguous = (
+                        relation_intercept_state == "ambiguous"
+                    )
+                    candidate.offer(
+                        "high",
+                        lambda ci=ci, cj=cj, n=n,
+                        mean_ratio=mean_ratio,
+                        x_sample=x_sample,
+                        y_sample=y_sample,
+                        relation_model_ambiguous=(
+                            relation_model_ambiguous
+                        ): {
+                            "kind": "constant_ratio",
+                            "col_a": header[ci - c0],
+                            "col_b": header[cj - c0],
+                            "col_a_idx": ci,
+                            "col_b_idx": cj,
+                            "n": n,
+                            "ratio": mean_ratio,
+                            "severity": "high",
+                            "col_a_sample": list(x_sample),
+                            "col_b_sample": list(y_sample),
+                            "rule": (
+                                f"col[{cj}] = col[{ci}] * "
+                                f"{mean_ratio:.6g}"
+                            ),
+                            **(
+                                {
+                                    "relation_model_ambiguous": True,
+                                    "relation_model_alternatives": [
+                                        "constant_ratio",
+                                        "exact_linear",
+                                    ],
+                                }
+                                if relation_model_ambiguous
+                                else {}
+                            ),
+                        },
+                    )
+                    ratio_emitted = True
 
                 csum, sum_lease = candidate.allocate(
                     "sum",
@@ -2217,110 +2303,47 @@ def detect_relations(
                 del csum
                 candidate.release(sum_lease)
 
-                if n >= 5:
-                    linear_fit_workspace = candidate.reserve(
-                        "linear_fit_workspace",
-                        12 * n,
+                if affine_compatible:
+                    is_identity = (
+                        abs(slope - 1) < 1e-9
+                        and relation_intercept_state
+                        == "proportional"
                     )
-                    if varying_x:
-                        try:
-                            (
-                                _fit_slope,
-                                _fit_intercept,
-                                r,
-                                _p,
-                                _se,
-                            ) = stats.linregress(x, y)
-                        except ValueError:
-                            candidate.release(
-                                linear_fit_workspace
-                            )
-                            del diff, x, y
-                            candidate.release(diff_lease)
-                            candidate.release(filtered_lease)
-                            return
-                        y_has_variation = np.std(y) > 0
-                    else:
-                        dx = 0
-                        y_has_variation = False
-                    candidate.release(linear_fit_workspace)
-                    if varying_x:
-                        fitted_build_workspace = candidate.reserve(
-                            "fitted_build_workspace",
-                            2 * n,
+                    redundant_scaling = ratio_emitted
+                    if not (
+                        is_identity
+                        or redundant_scaling
+                    ):
+                        candidate.offer(
+                            "high",
+                            lambda ci=ci, cj=cj, n=n,
+                            slope=slope,
+                            intercept=intercept,
+                            x_sample=x_sample,
+                            y_sample=y_sample: dict(
+                                kind="exact_linear",
+                                col_a=header[ci - c0],
+                                col_b=header[cj - c0],
+                                col_a_idx=ci,
+                                col_b_idx=cj,
+                                n=n,
+                                slope=float(slope),
+                                intercept=float(intercept),
+                                severity="high",
+                                col_a_sample=list(
+                                    x_sample
+                                ),
+                                col_b_sample=list(
+                                    y_sample
+                                ),
+                                rule=(
+                                    f"col[{cj}] = "
+                                    f"{slope:.4g} * "
+                                    f"col[{ci}] + "
+                                    f"{intercept:.4g}"
+                                ),
+                            ),
                         )
-                        fitted, fitted_lease = candidate.allocate(
-                            "fitted",
-                            n,
-                            lambda: slope * x + intercept,
-                        )
-                        candidate.release(
-                            fitted_build_workspace
-                        )
-                        if (
-                            y_has_variation
-                        ):
-                            fitted_relation_workspace = (
-                                candidate.reserve(
-                                    "fitted_relation_workspace",
-                                    12 * n,
-                                )
-                            )
-                            fitted_close = bool(
-                                relation_close(
-                                    y, fitted, rtol=1e-7
-                                ).all()
-                            )
-                            candidate.release(
-                                fitted_relation_workspace
-                            )
-                            if (
-                                fitted_close
-                                and abs(r) > 0.99
-                                and relation_intercept_state is not None
-                            ):
-                                is_identity = (
-                                    abs(slope - 1) < 1e-9
-                                    and relation_intercept_state
-                                    == "proportional"
-                                )
-                                redundant_scaling = ratio_emitted
-                                if not (
-                                    is_identity
-                                    or redundant_scaling
-                                ):
-                                    candidate.offer(
-                                        "high",
-                                        lambda ci=ci, cj=cj, n=n,
-                                        slope=slope,
-                                        intercept=intercept,
-                                        x_sample=x_sample,
-                                        y_sample=y_sample: dict(
-                                            kind="exact_linear",
-                                            col_a=header[ci - c0],
-                                            col_b=header[cj - c0],
-                                            col_a_idx=ci,
-                                            col_b_idx=cj,
-                                            n=n,
-                                            slope=float(slope),
-                                            intercept=float(intercept),
-                                            severity="high",
-                                            col_a_sample=list(
-                                                x_sample
-                                            ),
-                                            col_b_sample=list(
-                                                y_sample
-                                            ),
-                                            rule=(
-                                                f"col[{cj}] = "
-                                                f"{slope:.4g} * "
-                                                f"col[{ci}] + "
-                                                f"{intercept:.4g}"
-                                            ),
-                                        ),
-                                    )
-                        del fitted
-                        candidate.release(fitted_lease)
 
                 if n >= 24:
                     best_len = cur_len = 1

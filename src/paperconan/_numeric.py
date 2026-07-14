@@ -64,6 +64,8 @@ def assess_relation_intercept(
         scalar_ulp_tolerance(anchor_y, intercept_product)
         + abs(x_center) * scalar_ulp_tolerance(slope)
     )
+    if not math.isfinite(propagated_roundoff):
+        return None
     zero_tolerance = (
         propagated_roundoff
         + 1e-9
@@ -72,6 +74,8 @@ def assess_relation_intercept(
             np.finfo(float).smallest_subnormal,
         )
     )
+    if not math.isfinite(zero_tolerance):
+        return None
     uncertainty = (
         propagated_roundoff
         + centered_residual
@@ -79,8 +83,15 @@ def assess_relation_intercept(
         * centered_residual
         / centered_radius
     )
+    if not math.isfinite(uncertainty):
+        return None
     intercept_lower = intercept - uncertainty
     intercept_upper = intercept + uncertainty
+    if not all(
+        math.isfinite(value)
+        for value in (intercept_lower, intercept_upper)
+    ):
+        return None
 
     if (
         intercept_lower >= -zero_tolerance

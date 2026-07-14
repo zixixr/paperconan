@@ -580,69 +580,62 @@ if all_nonzero:
             relation_close(y, mean_ratio * x).all()
         )
         candidate.release(ratio_close_workspace)
-    if (
-        ratio_compatible
-        and relation_intercept_state
-        in {"proportional", "ambiguous"}
-    ):
-        relation_model_ambiguous = (
-            relation_intercept_state == "ambiguous"
-        )
-        candidate.offer(
-            "high",
-            lambda ci=ci, cj=cj, n=n,
-            mean_ratio=mean_ratio,
-            x_sample=x_sample,
-            y_sample=y_sample,
-            relation_model_ambiguous=(
-                relation_model_ambiguous
-            ): {
-                "kind": "constant_ratio",
-                "col_a": header[ci - c0],
-                "col_b": header[cj - c0],
-                "col_a_idx": ci,
-                "col_b_idx": cj,
-                "n": n,
-                "ratio": mean_ratio,
-                "severity": "high",
-                "col_a_sample": list(x_sample),
-                "col_b_sample": list(y_sample),
-                "rule": (
-                    f"col[{cj}] = col[{ci}] * "
-                    f"{mean_ratio:.6g}"
-                ),
-                **(
-                    {
-                        "relation_model_ambiguous": True,
-                        "relation_model_alternatives": [
-                            "constant_ratio",
-                            "exact_linear",
-                        ],
-                    }
-                    if relation_model_ambiguous
-                    else {}
-                ),
-            },
-        )
-        ratio_emitted = True
     del ratio
     candidate.release(ratio_lease)
 ```
 
-This preserves the existing ratio finding position and creates the alternatives
-list only when the lazy finding builder is materialized.
+Do not offer the ratio finding yet. Preserve the scalar `mean_ratio` and
+`ratio_compatible` values until the fitted-line predicate has run. This keeps
+the existing ratio finding position without claiming ambiguity before the
+standalone `exact_linear` predicate is available and compatible.
 
-- [ ] **Step 6: Update affine deduplication**
+- [ ] **Step 6: Evaluate affine compatibility before selection**
 
-In the fitted-line branch, require a valid assessment and replace the identity
-and redundancy checks with:
+Run the existing fitted-line predicate only for `n >= 5`, preserving the
+standalone `exact_linear` minimum-sample contract, and record its result before
+offering either primary relation:
 
 ```python
-if (
+affine_compatible = (
     fitted_close
     and abs(r) > 0.99
     and relation_intercept_state is not None
-):
+)
+ratio_selected = (
+    ratio_compatible
+    and (
+        relation_intercept_state == "proportional"
+        or (
+            relation_intercept_state == "ambiguous"
+            and affine_compatible
+        )
+    )
+)
+if ratio_selected:
+    relation_model_ambiguous = (
+        relation_intercept_state == "ambiguous"
+    )
+    candidate.offer(
+        "high",
+        lambda: {
+            "kind": "constant_ratio",
+            **(
+                {
+                    "relation_model_ambiguous": True,
+                    "relation_model_alternatives": [
+                        "constant_ratio",
+                        "exact_linear",
+                    ],
+                }
+                if relation_model_ambiguous
+                else {}
+            ),
+            # Existing columns, samples, severity, ratio, and rule.
+        },
+    )
+    ratio_emitted = True
+
+if affine_compatible:
     is_identity = (
         abs(slope - 1) < 1e-9
         and relation_intercept_state == "proportional"

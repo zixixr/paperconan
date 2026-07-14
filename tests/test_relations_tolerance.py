@@ -1,7 +1,10 @@
 """Scale-relative tolerances: a fixed absolute atol (1e-9) falsely flagged tiny-magnitude
 data (e.g. MEG fields ~1e-14 T) as identical/linear/arithmetic. The relation detectors must
 use relative precision so small-magnitude columns aren't trivially 'equal'."""
+import math
+
 import numpy as np
+import paperconan._audit as audit
 import pytest
 from paperconan._sheet import Sheet
 from paperconan._audit import detect_relations, detect_arithmetic_progression, detect_equal_pairs
@@ -65,6 +68,89 @@ def test_relation_intercept_assessment_distinguishes_three_states():
 def test_relation_intercept_assessment_rejects_degenerate_inputs():
     assert _assess_intercept(centered_radius=0.0) is None
     assert _assess_intercept(centered_residual=float("inf")) is None
+
+
+@pytest.mark.parametrize(
+    ("sign", "position", "expected_state"),
+    [
+        (sign, position, expected_state)
+        for sign in (1.0, -1.0)
+        for position, expected_state in (
+            ("inside", "proportional"),
+            ("touching", "proportional"),
+            ("overlap", "ambiguous"),
+            ("outside", "affine"),
+        )
+    ],
+)
+def test_relation_intercept_assessment_uses_closed_zero_band_boundaries(
+    sign, position, expected_state
+):
+    residual = 1e-12
+    seed = _assess_intercept(centered_residual=residual)
+    assert seed is not None
+    boundary = seed.zero_tolerance
+    uncertainty = seed.uncertainty
+    positive_centers = {
+        "inside": math.nextafter(
+            boundary - uncertainty, 0.0
+        ),
+        "touching": boundary - uncertainty,
+        "overlap": boundary,
+        "outside": math.nextafter(
+            boundary + uncertainty, math.inf
+        ),
+    }
+
+    assessment = _assess_intercept(
+        intercept=sign * positive_centers[position],
+        centered_residual=residual,
+    )
+
+    assert assessment is not None
+    assert assessment.state == expected_state
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "slope": 1e308,
+            "x_center": 1e308,
+        },
+        {
+            "x_center": 1e308,
+            "centered_residual": 1e308,
+            "centered_radius": 1.0,
+        },
+        {
+            "intercept": 1e308,
+            "centered_residual": 1e308,
+            "centered_radius": 1e308,
+        },
+    ],
+    ids=[
+        "propagated-roundoff",
+        "uncertainty",
+        "interval-bound",
+    ],
+)
+def test_relation_intercept_assessment_rejects_derived_overflow(
+    overrides,
+):
+    assert _assess_intercept(**overrides) is None
+
+
+def test_tiny_finite_pure_scaling_uses_bounded_fit():
+    x = [1e-170, 2e-170, 3e-170, 4e-170]
+    y = [2.0 * value for value in x]
+
+    relations = _primary_linear_relation(_kinds(x, y))
+
+    assert [finding["kind"] for finding in relations] == [
+        "constant_ratio"
+    ]
+    assert relations[0]["ratio"] == 2.0
 
 
 def test_no_fp_on_femtotesla_scale():
@@ -250,6 +336,60 @@ def test_translated_high_precision_relation_exposes_model_ambiguity(
         "constant_ratio",
         "exact_linear",
     ]
+
+
+def test_four_row_ambiguous_relation_requires_affine_predicate():
+    source = RELATION_X[:4]
+    x = [value + 1e9 for value in source]
+    y = [
+        HIGH_PRECISION_SLOPE * value
+        + 0.25
+        + HIGH_PRECISION_SLOPE * 1e9
+        for value in source
+    ]
+
+    assert _primary_linear_relation(_kinds(x, y)) == []
+
+
+def test_four_row_identifiable_proportional_relation_remains_ratio():
+    x = RELATION_X[:4]
+    y = [2.0 * value for value in x]
+
+    relations = _primary_linear_relation(_kinds(x, y))
+
+    assert [finding["kind"] for finding in relations] == [
+        "constant_ratio"
+    ]
+    assert "relation_model_ambiguous" not in relations[0]
+
+
+def test_ambiguous_relation_requires_compatible_affine_predicate(
+    monkeypatch,
+):
+    original_linregress = audit.stats.linregress
+
+    def incompatible_linregress(*args, **kwargs):
+        fit = original_linregress(*args, **kwargs)
+        return (
+            fit.slope,
+            fit.intercept,
+            0.0,
+            fit.pvalue,
+            fit.stderr,
+        )
+
+    monkeypatch.setattr(
+        audit.stats, "linregress", incompatible_linregress
+    )
+    x = [value + 1e9 for value in RELATION_X]
+    y = [
+        HIGH_PRECISION_SLOPE * value
+        + 0.25
+        + HIGH_PRECISION_SLOPE * 1e9
+        for value in RELATION_X
+    ]
+
+    assert _primary_linear_relation(_kinds(x, y)) == []
 
 
 def test_b5_flags_shared_fraction_integer_diff_and_matches_oracle():

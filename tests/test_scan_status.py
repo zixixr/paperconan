@@ -27,6 +27,33 @@ def test_complete_scan_status(tmp_path):
     assert scan["coverage"]["sheets_succeeded"] == 1
 
 
+def test_tiny_finite_relation_is_not_reported_as_parse_failure(
+    tmp_path,
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "tiny.csv").write_text(
+        "x,y\n"
+        "1e-170,2e-170\n"
+        "2e-170,4e-170\n"
+        "3e-170,6e-170\n"
+        "4e-170,8e-170\n",
+        encoding="utf-8",
+    )
+
+    scan = scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    assert scan["scan_status"] == "complete"
+    assert scan["coverage"]["files_succeeded"] == 1
+    assert scan["coverage"]["files_failed"] == 0
+    assert all(
+        item["reason"] != "parse_error"
+        for item in scan["coverage"]["limitations"]
+    )
+
+
 def test_text_only_sheet_fails_with_no_numeric_data_reason(tmp_path):
     data = tmp_path / "data"
     data.mkdir()

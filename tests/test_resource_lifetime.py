@@ -1697,6 +1697,40 @@ def test_relation_model_ambiguity_preserves_dense_resource_contract():
     assert resources.state.live_units == 0
 
 
+def test_tiny_relation_preserves_budgeted_parity_and_releases_state():
+    x = [1e-170, 2e-170, 3e-170, 4e-170]
+    rows = [[value, 2.0 * value] for value in x]
+    sheet = Sheet.from_rows([["left", "right"], *rows])
+    resources = audit._DenseFamilyResources(
+        family="relations",
+        max_rows=100,
+        work_limit=100_000,
+        state_limit=100_000,
+    )
+
+    baseline = audit.detect_relations(
+        sheet, 1, sheet.nrows, 0, 2, ["left", "right"]
+    )
+    instrumented = audit.detect_relations(
+        sheet,
+        1,
+        sheet.nrows,
+        0,
+        2,
+        ["left", "right"],
+        _resources=resources,
+    )
+    result = resources.result()
+
+    assert instrumented == baseline
+    assert [finding["kind"] for finding in instrumented] == [
+        "constant_ratio"
+    ]
+    assert result.candidates_examined == 1
+    assert result.work_examined == 2 * len(rows)
+    assert resources.state.live_units == 0
+
+
 def test_relation_proportional_arrays_die_before_candidate_finalizer(
     monkeypatch
 ):
