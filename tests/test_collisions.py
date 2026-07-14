@@ -245,6 +245,7 @@ def test_cross_sheet_value_work_counts_known_passes_exactly():
     assert metadata["values_examined"] == (
         4 * (9 + 8)
         + 4 * 2
+        + 2
         + (9 + 8)
         + (9 + 8)
     )
@@ -258,7 +259,7 @@ def test_pair_value_budget_stops_before_any_uncharged_pass():
         ("a.xlsx", "Figure 1"): left,
         ("b.xlsx", "Figure 2"): right,
     }
-    axis_work = 4 * (len(left) + len(right)) + 4 * 2
+    axis_work = 4 * (len(left) + len(right)) + 5 * 2
     family_work = len(left) + len(right)
     rejected = CrossSheetWorkBudget(
         pair_limit=2,
@@ -295,7 +296,7 @@ def test_pair_stop_reports_exact_remaining_family_and_value_work():
     metadata = budget.limitation_metadata()
     assert metadata["pairs_examined"] == 1
     assert metadata["pairs_skipped"] == 3
-    assert metadata["values_examined"] == 4 * 23 + 4 * 3 + 14
+    assert metadata["values_examined"] == 4 * 23 + 5 * 3 + 14
     assert metadata["values_skipped"] == 49
     assert metadata["limits_reached"] == ["pair"]
 
@@ -324,6 +325,7 @@ def test_impossible_families_do_not_displace_later_viable_pair():
         3 * (5 + 5 + 2 * len(viable))
         + 2 * len(viable)
         + 4 * 4
+        + 4
         + 16
     )
     assert metadata["values_skipped"] == 16
@@ -370,7 +372,7 @@ def test_pair_setup_is_linear_and_remaining_work_is_exact(
     assert metadata["pairs_skipped"] == family_pairs - pair_limit
     assert metadata["values_examined"] == (
         4 * summary_count * grid_size
-        + 4 * summary_count
+        + 5 * summary_count
         + examined_work
     )
     assert metadata["values_skipped"] == (
@@ -1066,6 +1068,7 @@ def test_axis_work_matches_concrete_passes_for_feasible_grids_only():
             "axis_recurrence_order_visits",
             "axis_recurrence_group_visits",
             "axis_recurrence_comparison_visits",
+            "axis_recurrence_support_visits",
             "axis_recurrence_mark_visits",
             "axis_output_visits",
             "axis_value_visits",
@@ -1083,9 +1086,10 @@ def test_axis_work_matches_concrete_passes_for_feasible_grids_only():
         "axis_recurrence_order_visits": 3,
         "axis_recurrence_group_visits": 3,
         "axis_recurrence_comparison_visits": 3,
+        "axis_recurrence_support_visits": 3,
         "axis_recurrence_mark_visits": 0,
         "axis_output_visits": 3,
-        "axis_value_visits": 91,
+        "axis_value_visits": 94,
         "axis_context_available": True,
     }
     assert coverage["axis_state_unit_limit"] == (
@@ -1094,7 +1098,7 @@ def test_axis_work_matches_concrete_passes_for_feasible_grids_only():
     assert 0 < coverage["axis_peak_state_units"] <= (
         coverage["axis_state_unit_limit"]
     )
-    assert budget.values_examined == 91
+    assert budget.values_examined == 94
     assert set(axis) == {
         ("left.csv", "Figure 1"),
         ("right.csv", "Figure 2"),
@@ -1173,6 +1177,86 @@ def _axis_finalization_grids():
     }
 
 
+def _distinct_summary_recurrence_grids():
+    recurring_values = (
+        1.125,
+        4.875,
+        2.250,
+        7.625,
+        1.125,
+        4.875,
+    )
+    return {
+        ("duplicates.csv", "Figure 1"): _CountingGrid({
+            (row, column): value
+            for column in range(2)
+            for row, value in enumerate(recurring_values)
+        }),
+        ("support-a.csv", "Figure 2"): _CountingGrid({
+            (row, 0): value
+            for row, value in enumerate(recurring_values)
+        }),
+        ("support-b.csv", "Figure 3"): _CountingGrid({
+            (row, 0): value
+            for row, value in enumerate(recurring_values)
+        }),
+    }
+
+
+def test_axis_distinct_summary_duplicates_do_not_meet_recurrence():
+    recurring_values = (
+        1.125,
+        4.875,
+        2.250,
+        7.625,
+    )
+    distinct_values = (
+        3.375,
+        8.125,
+        5.625,
+        11.875,
+    )
+    duplicate_key = ("duplicates.csv", "Figure 1")
+    distinct_key = ("distinct.csv", "Figure 2")
+    grids = {
+        duplicate_key: {
+            (row, column): value
+            for column in range(3)
+            for row, value in enumerate(recurring_values)
+        },
+        distinct_key: {
+            (row, column): value
+            for column in range(2)
+            for row, value in enumerate(distinct_values)
+        },
+    }
+
+    axis = audit._axis_columns(grids, recur_min=3)
+
+    assert axis == {
+        duplicate_key: set(),
+        distinct_key: set(),
+    }
+
+
+def test_axis_distinct_summary_threshold_marks_all_matching_columns():
+    grids = _distinct_summary_recurrence_grids()
+
+    axis, coverage = audit._axis_columns(
+        grids,
+        recur_min=3,
+        with_coverage=True,
+    )
+
+    assert axis == {
+        ("duplicates.csv", "Figure 1"): {0, 1},
+        ("support-a.csv", "Figure 2"): {0},
+        ("support-b.csv", "Figure 3"): {0},
+    }
+    assert coverage["axis_recurrence_support_visits"] == 4
+    assert coverage["axis_recurrence_mark_visits"] == 4
+
+
 def test_axis_compact_finalization_matches_concrete_processing(
     monkeypatch
 ):
@@ -1214,6 +1298,7 @@ def test_axis_compact_finalization_matches_concrete_processing(
     assert coverage["axis_recurrence_order_visits"] == 5
     assert coverage["axis_recurrence_group_visits"] == 5
     assert coverage["axis_recurrence_comparison_visits"] == 5
+    assert coverage["axis_recurrence_support_visits"] == 5
     assert coverage["axis_recurrence_mark_visits"] == 3
     assert coverage["axis_output_visits"] == 5
     assert coverage["axis_work_skipped_lower_bound"] == 0
@@ -1326,6 +1411,7 @@ def test_axis_comparison_budget_stops_before_uncharged_compare(
     before_comparisons = (
         baseline_coverage["axis_value_visits"]
         - baseline_coverage["axis_recurrence_comparison_visits"]
+        - baseline_coverage["axis_recurrence_support_visits"]
         - baseline_coverage["axis_recurrence_mark_visits"]
         - baseline_coverage["axis_output_visits"]
     )
@@ -1346,6 +1432,7 @@ def test_axis_comparison_budget_stops_before_uncharged_compare(
     assert limited == {}
     assert comparison_calls == 2
     assert coverage["axis_recurrence_comparison_visits"] == 2
+    assert coverage["axis_recurrence_support_visits"] == 0
     assert coverage["axis_recurrence_mark_visits"] == 0
     assert coverage["axis_output_visits"] == 0
     assert coverage["axis_work_skipped_lower_bound"] > 0
@@ -1584,6 +1671,7 @@ def test_axis_work_stops_before_the_rejected_stage(
     assert coverage["axis_recurrence_order_visits"] == 0
     assert coverage["axis_recurrence_group_visits"] == 0
     assert coverage["axis_recurrence_comparison_visits"] == 0
+    assert coverage["axis_recurrence_support_visits"] == 0
     assert coverage["axis_recurrence_mark_visits"] == 0
     assert coverage["axis_output_visits"] == 0
     assert coverage["axis_value_visits"] == sum(expected_stage_visits)
@@ -1645,6 +1733,7 @@ def test_axis_state_rejection_at_fingerprint_after_grouping_counts_known_work(
     ) == (8, 8, 8, 0)
     assert coverage["axis_recurrence_order_visits"] == 0
     assert coverage["axis_recurrence_group_visits"] == 0
+    assert coverage["axis_recurrence_support_visits"] == 0
     assert coverage["axis_output_visits"] == 0
     assert coverage["axis_value_visits"] == 24
     assert coverage["axis_work_skipped_lower_bound"] == 35
@@ -1713,6 +1802,108 @@ def test_axis_state_rejection_precedes_grid_loading():
     ]
 
 
+def test_axis_distinct_summary_state_rejection_precedes_grid_loading(
+    monkeypatch,
+):
+    grids = _distinct_summary_recurrence_grids()
+    states = []
+    rejected_names = []
+    original_try_reserve = audit.StateBudget.try_reserve
+
+    def reject_distinct_summary_state(state, name, units):
+        if state not in states:
+            states.append(state)
+        if name == "axis_distinct_summary_markers":
+            rejected_names.append(name)
+            return None
+        return original_try_reserve(state, name, units)
+
+    monkeypatch.setattr(
+        audit.StateBudget,
+        "try_reserve",
+        reject_distinct_summary_state,
+    )
+
+    axis, coverage = audit._axis_columns(
+        grids,
+        with_coverage=True,
+    )
+
+    assert axis == {}
+    assert rejected_names == ["axis_distinct_summary_markers"]
+    assert sum(grid.item_visits for grid in grids.values()) == 0
+    assert coverage["axis_context_available"] is False
+    assert coverage["axis_value_visits"] == 0
+    assert states
+    assert all(state.live_units == 0 for state in states)
+    assert all(not state.live_names for state in states)
+
+
+def test_axis_distinct_summary_work_rejection_is_atomic(
+    monkeypatch,
+):
+    grids = _distinct_summary_recurrence_grids()
+    _baseline, baseline_coverage = audit._axis_columns(
+        grids,
+        with_coverage=True,
+    )
+    support_visits = baseline_coverage[
+        "axis_recurrence_support_visits"
+    ]
+    before_support = (
+        baseline_coverage["axis_value_visits"]
+        - support_visits
+        - baseline_coverage["axis_recurrence_mark_visits"]
+        - baseline_coverage["axis_output_visits"]
+    )
+    support_inspections = 0
+    original_count = audit._axis_distinct_summary_count
+
+    def tracked_count(*args, **kwargs):
+        nonlocal support_inspections
+        support_inspections += 1
+        return original_count(*args, **kwargs)
+
+    monkeypatch.setattr(
+        audit,
+        "_axis_distinct_summary_count",
+        tracked_count,
+    )
+    budget = CrossSheetWorkBudget(
+        pair_limit=100,
+        value_limit=before_support,
+        tail_match_limit=100,
+        finding_limit=100,
+    )
+
+    axis, coverage = audit._axis_columns(
+        grids,
+        budget=budget,
+        with_coverage=True,
+    )
+
+    assert axis == {}
+    assert support_inspections == 0
+    assert coverage["axis_recurrence_support_visits"] == 0
+    assert coverage["axis_recurrence_mark_visits"] == 0
+    assert coverage["axis_output_visits"] == 0
+    assert coverage["axis_context_available"] is False
+    assert coverage["axis_work_skipped_lower_bound"] == (
+        support_visits
+        + baseline_coverage["axis_output_visits"]
+    )
+    assert coverage["axis_work_skipped_is_lower_bound"] is True
+    assert budget.values_examined == before_support
+    metadata = budget.limitation_metadata()
+    assert metadata["axis_recurrence_support_visits"] == 0
+    assert metadata["axis_work_skipped_lower_bound"] == (
+        support_visits
+        + baseline_coverage["axis_output_visits"]
+    )
+    assert metadata["axis_work_skipped_is_lower_bound"] is True
+    assert metadata["limits_reached"] == ["value", "axis"]
+
+
 def test_axis_state_multiplier_covers_many_column_worst_case(
     monkeypatch
 ):
@@ -1737,6 +1928,7 @@ def test_axis_state_multiplier_covers_many_column_worst_case(
         "axis_fingerprint_temp",
         "axis_fingerprint_order",
         "axis_fingerprint_order_workspace",
+        "axis_distinct_summary_markers",
         "axis_output_capacity",
     }
     seen_names = set()

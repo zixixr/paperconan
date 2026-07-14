@@ -5092,6 +5092,7 @@ class CrossSheetWorkBudget:
     axis_recurrence_order_visits: int = 0
     axis_recurrence_group_visits: int = 0
     axis_recurrence_comparison_visits: int = 0
+    axis_recurrence_support_visits: int = 0
     axis_recurrence_mark_visits: int = 0
     axis_output_visits: int = 0
     axis_work_skipped_lower_bound: int = 0
@@ -5202,6 +5203,7 @@ class CrossSheetWorkBudget:
         work_skipped_is_lower_bound,
         state_unit_limit,
         peak_state_units,
+        recurrence_support_visits=0,
     ):
         self.axis_context_available = (
             self.axis_context_available and bool(available)
@@ -5222,6 +5224,9 @@ class CrossSheetWorkBudget:
         )
         self.axis_recurrence_comparison_visits += max(
             0, int(recurrence_comparison_visits)
+        )
+        self.axis_recurrence_support_visits += max(
+            0, int(recurrence_support_visits)
         )
         self.axis_recurrence_mark_visits += max(
             0, int(recurrence_mark_visits)
@@ -5295,6 +5300,9 @@ class CrossSheetWorkBudget:
             ),
             "axis_recurrence_comparison_visits": (
                 self.axis_recurrence_comparison_visits
+            ),
+            "axis_recurrence_support_visits": (
+                self.axis_recurrence_support_visits
             ),
             "axis_recurrence_mark_visits": (
                 self.axis_recurrence_mark_visits
@@ -5925,6 +5933,29 @@ def _axis_payload_equal(
     )
 
 
+def _axis_distinct_summary_count(
+    table,
+    fingerprint_order,
+    start,
+    stop,
+    summary_markers,
+    generation,
+):
+    distinct_count = 0
+    for match_position in range(start, stop):
+        candidate_index = int(
+            fingerprint_order[match_position]
+        )
+        summary_index = int(
+            table["summary_index"][candidate_index]
+        )
+        if summary_markers[summary_index] == generation:
+            continue
+        summary_markers[summary_index] = generation
+        distinct_count += 1
+    return distinct_count
+
+
 def _axis_columns(
     grids,
     recur_min=3,
@@ -5977,6 +6008,7 @@ def _axis_columns(
         "recurrence_order": 0,
         "recurrence_group": 0,
         "recurrence_comparison": 0,
+        "recurrence_support": 0,
         "recurrence_mark": 0,
         "output": 0,
     }
@@ -6069,6 +6101,9 @@ def _axis_columns(
             "axis_recurrence_comparison_visits": (
                 stage_visits["recurrence_comparison"]
             ),
+            "axis_recurrence_support_visits": (
+                stage_visits["recurrence_support"]
+            ),
             "axis_recurrence_mark_visits": (
                 stage_visits["recurrence_mark"]
             ),
@@ -6104,6 +6139,9 @@ def _axis_columns(
                 ],
                 recurrence_comparison_visits=stage_visits[
                     "recurrence_comparison"
+                ],
+                recurrence_support_visits=stage_visits[
+                    "recurrence_support"
                 ],
                 recurrence_mark_visits=stage_visits[
                     "recurrence_mark"
@@ -6180,12 +6218,19 @@ def _axis_columns(
                 * len(position_keys)
             ),
         )
+        distinct_summary_markers_lease = reserve_axis_state(
+            "axis_distinct_summary_markers",
+            state_units_for_nbytes(
+                len(support_keys) * np.dtype(np.int64).itemsize
+            ),
+        )
         if any(
             lease is None
             for lease in (
                 column_table_lease,
                 fingerprint_payload_lease,
                 output_capacity_lease,
+                distinct_summary_markers_lease,
             )
         ):
             return unavailable_result()
@@ -6202,6 +6247,13 @@ def _axis_columns(
         )
         fingerprint_payload_lease.validate_nbytes(
             len(fingerprint_payload)
+        )
+        distinct_summary_markers = np.zeros(
+            len(support_keys),
+            dtype=np.int64,
+        )
+        distinct_summary_markers_lease.validate_nbytes(
+            distinct_summary_markers.nbytes
         )
         column_count = 0
         fingerprint_bytes_used = 0
@@ -6456,6 +6508,7 @@ def _axis_columns(
 
         if not admit_stage("recurrence_group", column_count):
             return unavailable_result()
+        summary_marker_generation = 0
         position = 0
         while position < column_count:
             first_index = int(fingerprint_order[position])
@@ -6516,7 +6569,23 @@ def _axis_columns(
                     raise AssertionError(
                         "axis fingerprint class made no progress"
                     )
-                if match_count >= recur_min:
+                if not admit_dynamic_stage(
+                    "recurrence_support",
+                    match_count,
+                ):
+                    return unavailable_result()
+                summary_marker_generation += 1
+                distinct_summary_count = (
+                    _axis_distinct_summary_count(
+                        table,
+                        fingerprint_order,
+                        class_start,
+                        match_stop,
+                        distinct_summary_markers,
+                        summary_marker_generation,
+                    )
+                )
+                if distinct_summary_count >= recur_min:
                     if not admit_dynamic_stage("recurrence_mark", match_count):
                         return unavailable_result()
                     for match_position in range(
@@ -6554,6 +6623,7 @@ def _axis_columns(
                 )
 
         release_axis_state(fingerprint_order_lease)
+        release_axis_state(distinct_summary_markers_lease)
         release_axis_state(output_capacity_lease)
         release_axis_state(fingerprint_payload_lease)
         release_axis_state(column_table_lease)
