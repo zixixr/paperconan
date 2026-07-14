@@ -7361,6 +7361,7 @@ class CrossSheetSummaryBudget:
         self._record_rejection(dimensions)
 
     def limitation_metadata(self):
+        retained = self.retained_metadata()
         unavailable_pairs = (
             self.summaries_considered
             * (self.summaries_considered - 1)
@@ -7379,7 +7380,10 @@ class CrossSheetSummaryBudget:
                 if dimension in self._exhausted
             ],
             "dimensions": {
-                dimension: dict(self._exhausted[dimension])
+                dimension: {
+                    **self._exhausted[dimension],
+                    "retained": retained[dimension],
+                }
                 for dimension in _SUMMARY_DIMENSIONS
                 if dimension in self._exhausted
             },

@@ -204,6 +204,46 @@ def test_scan_summary_budget_rejects_whole_later_summary(
     assert exhausted["skipped_items"] >= 1
 
 
+def test_summary_limitation_reports_retained_after_later_commit():
+    budget = audit.CrossSheetSummaryBudget(
+        summary_limit=10,
+        grid_cell_limit=10,
+        label_cell_limit=0,
+        label_byte_limit=0,
+        column_fingerprint_limit=0,
+    )
+
+    def commit_grid_cells(count):
+        reservation = budget.start_summary()
+        assert reservation is not None
+        assert reservation.reserve_capacity("grid_cells", count)
+        metrics = {
+            "grid_cells": count,
+            "label_cells": 0,
+            "label_bytes": 0,
+            "column_fingerprints": 0,
+        }
+        assert reservation.validate_metrics(metrics)
+        assert reservation.commit(metrics)
+
+    commit_grid_cells(8)
+    rejected = budget.start_summary()
+    assert rejected is not None
+    assert not rejected.reserve_capacity("grid_cells", 5)
+    commit_grid_cells(2)
+
+    assert budget.coverage_limitations() == [{
+        "reason": "cross_sheet_grid_cell_limit",
+        "dimension": "grid_cells",
+        "limit": 10,
+        "retained": 10,
+        "skipped_sheets": 1,
+        "skipped_items": 5,
+        "summary_pairs_unavailable": 2,
+        "omitted_findings_lower_bound": 0,
+    }]
+
+
 def test_scan_summary_budget_selection_is_deterministic_and_bounded():
     def run():
         budget = audit.CrossSheetSummaryBudget(
