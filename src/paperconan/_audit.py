@@ -1999,16 +1999,27 @@ def detect_relations(
                             float(y_value) - y_center
                         )
                     slope = centered_xy / centered_xx
-                    centered_radius = 0.0
+                    slope_tolerance = (
+                        scalar_ulp_tolerance(slope)
+                        + 1e-9 * max(abs(slope), 1e-300)
+                    )
+                    if math.isfinite(slope):
+                        for significant_digits in range(1, 18):
+                            simplified_slope = float(
+                                f"{slope:.{significant_digits}g}"
+                            )
+                            if (
+                                abs(simplified_slope - slope)
+                                <= slope_tolerance
+                            ):
+                                slope = simplified_slope
+                                break
                     centered_residual = 0.0
                     intercept_x = float(x[0])
                     intercept_y = float(y[0])
                     for x_value, y_value in zip(x, y):
                         centered_x = float(x_value) - x_center
                         centered_y = float(y_value) - y_center
-                        centered_radius = max(
-                            centered_radius, abs(centered_x)
-                        )
                         centered_residual = max(
                             centered_residual,
                             abs(centered_y - slope * centered_x),
@@ -2023,10 +2034,6 @@ def detect_relations(
                             intercept_y, intercept_product
                         )
                         + centered_residual
-                        * (
-                            1.0
-                            + abs(x_center) / centered_radius
-                        )
                     )
                     intercept_is_zero = (
                         abs(intercept) <= intercept_tolerance
