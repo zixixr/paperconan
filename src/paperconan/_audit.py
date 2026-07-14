@@ -49,6 +49,7 @@ from ._input import (
     inspect_ooxml_formula_cache,
 )
 from ._numeric import (
+    assess_relation_intercept,
     integer_shift_close,
     max_ulp_tolerance,
     relation_close,
@@ -1999,49 +2000,53 @@ def detect_relations(
                             float(y_value) - y_center
                         )
                     slope = centered_xy / centered_xx
-                    slope_tolerance = (
-                        scalar_ulp_tolerance(slope)
-                        + 1e-9 * max(abs(slope), 1e-300)
-                    )
-                    if math.isfinite(slope):
-                        for significant_digits in range(1, 18):
-                            simplified_slope = float(
-                                f"{slope:.{significant_digits}g}"
-                            )
-                            if (
-                                abs(simplified_slope - slope)
-                                <= slope_tolerance
-                            ):
-                                slope = simplified_slope
-                                break
+                    centered_radius = 0.0
                     centered_residual = 0.0
                     intercept_x = float(x[0])
                     intercept_y = float(y[0])
+                    y_min = intercept_y
+                    y_max = intercept_y
                     for x_value, y_value in zip(x, y):
-                        centered_x = float(x_value) - x_center
-                        centered_y = float(y_value) - y_center
+                        x_scalar = float(x_value)
+                        y_scalar = float(y_value)
+                        centered_x = x_scalar - x_center
+                        centered_y = y_scalar - y_center
+                        centered_radius = max(
+                            centered_radius, abs(centered_x)
+                        )
                         centered_residual = max(
                             centered_residual,
                             abs(centered_y - slope * centered_x),
                         )
-                        if abs(float(x_value)) < abs(intercept_x):
-                            intercept_x = float(x_value)
-                            intercept_y = float(y_value)
+                        y_min = min(y_min, y_scalar)
+                        y_max = max(y_max, y_scalar)
+                        if abs(x_scalar) < abs(intercept_x):
+                            intercept_x = x_scalar
+                            intercept_y = y_scalar
                     intercept_product = slope * intercept_x
                     intercept = intercept_y - intercept_product
-                    intercept_tolerance = (
-                        scalar_ulp_tolerance(
-                            intercept_y, intercept_product
-                        )
-                        + centered_residual
+                    intercept_assessment = assess_relation_intercept(
+                        slope=slope,
+                        intercept=intercept,
+                        x_center=x_center,
+                        centered_radius=centered_radius,
+                        centered_residual=centered_residual,
+                        transformed_span=max(
+                            abs(slope * float(dx)),
+                            abs(y_max - y_min),
+                        ),
+                        anchor_y=intercept_y,
+                        intercept_product=intercept_product,
                     )
-                    intercept_is_zero = (
-                        abs(intercept) <= intercept_tolerance
+                    relation_intercept_state = (
+                        None
+                        if intercept_assessment is None
+                        else intercept_assessment.state
                     )
                 else:
                     slope = 0.0
                     intercept = 0.0
-                    intercept_is_zero = True
+                    relation_intercept_state = None
                 relation_workspace = candidate.reserve(
                     "relation_close_workspace",
                     12 * n,
@@ -2082,6 +2087,7 @@ def detect_relations(
                     return
 
                 ratio_emitted = False
+                ratio_compatible = False
                 nonzero_workspace = candidate.reserve(
                     "nonzero_workspace",
                     state_units_for_nbytes(n),
@@ -2108,42 +2114,60 @@ def detect_relations(
                         stable_ratio
                         and abs(mean_ratio - 1) > 1e-9
                         and abs(mean_ratio) > 1e-9
-                        and intercept_is_zero
                     ):
                         ratio_close_workspace = candidate.reserve(
                             "relation_close_workspace",
                             12 * n,
                         )
-                        closes = bool(
-                            relation_close(
-                                y, mean_ratio * x
-                            ).all()
+                        ratio_compatible = bool(
+                            relation_close(y, mean_ratio * x).all()
                         )
                         candidate.release(ratio_close_workspace)
-                        if closes:
-                            candidate.offer(
-                                "high",
-                                lambda ci=ci, cj=cj, n=n,
-                                mean_ratio=mean_ratio,
-                                x_sample=x_sample,
-                                y_sample=y_sample: dict(
-                                    kind="constant_ratio",
-                                    col_a=header[ci - c0],
-                                    col_b=header[cj - c0],
-                                    col_a_idx=ci,
-                                    col_b_idx=cj,
-                                    n=n,
-                                    ratio=mean_ratio,
-                                    severity="high",
-                                    col_a_sample=list(x_sample),
-                                    col_b_sample=list(y_sample),
-                                    rule=(
-                                        f"col[{cj}] = col[{ci}] * "
-                                        f"{mean_ratio:.6g}"
-                                    ),
+                    if (
+                        ratio_compatible
+                        and relation_intercept_state
+                        in {"proportional", "ambiguous"}
+                    ):
+                        relation_model_ambiguous = (
+                            relation_intercept_state == "ambiguous"
+                        )
+                        candidate.offer(
+                            "high",
+                            lambda ci=ci, cj=cj, n=n,
+                            mean_ratio=mean_ratio,
+                            x_sample=x_sample,
+                            y_sample=y_sample,
+                            relation_model_ambiguous=(
+                                relation_model_ambiguous
+                            ): {
+                                "kind": "constant_ratio",
+                                "col_a": header[ci - c0],
+                                "col_b": header[cj - c0],
+                                "col_a_idx": ci,
+                                "col_b_idx": cj,
+                                "n": n,
+                                "ratio": mean_ratio,
+                                "severity": "high",
+                                "col_a_sample": list(x_sample),
+                                "col_b_sample": list(y_sample),
+                                "rule": (
+                                    f"col[{cj}] = col[{ci}] * "
+                                    f"{mean_ratio:.6g}"
                                 ),
-                            )
-                            ratio_emitted = True
+                                **(
+                                    {
+                                        "relation_model_ambiguous": True,
+                                        "relation_model_alternatives": [
+                                            "constant_ratio",
+                                            "exact_linear",
+                                        ],
+                                    }
+                                    if relation_model_ambiguous
+                                    else {}
+                                ),
+                            },
+                        )
+                        ratio_emitted = True
                     del ratio
                     candidate.release(ratio_lease)
 
@@ -2253,15 +2277,14 @@ def detect_relations(
                             if (
                                 fitted_close
                                 and abs(r) > 0.99
+                                and relation_intercept_state is not None
                             ):
                                 is_identity = (
                                     abs(slope - 1) < 1e-9
-                                    and intercept_is_zero
+                                    and relation_intercept_state
+                                    == "proportional"
                                 )
-                                redundant_scaling = (
-                                    intercept_is_zero
-                                    and ratio_emitted
-                                )
+                                redundant_scaling = ratio_emitted
                                 if not (
                                     is_identity
                                     or redundant_scaling

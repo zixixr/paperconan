@@ -2,12 +2,21 @@
 data (e.g. MEG fields ~1e-14 T) as identical/linear/arithmetic. The relation detectors must
 use relative precision so small-magnitude columns aren't trivially 'equal'."""
 import numpy as np
+import pytest
 from paperconan._sheet import Sheet
 from paperconan._audit import detect_relations, detect_arithmetic_progression, detect_equal_pairs
 from paperconan._numeric import (
     assess_relation_intercept,
     integer_shift_close,
 )
+
+HIGH_PRECISION_SLOPE = 1.2345678901
+RELATION_X = [
+    467.61905, 453.14286, 404.38095, 364.0,
+    598.66667, 538.47619, 532.38095, 510.28571,
+    544.57143, 375.42857, 619.2381, 715.2381,
+]
+
 
 def _sheet(cols):
     rows = [[f"c{j}" for j in range(len(cols))]]
@@ -193,6 +202,54 @@ def _b5_oracle(a, b):
 def _kinds(a, b, labels=("c0", "c1")):
     s = _sheet([a, b])
     return detect_relations(s, 1, len(a) + 1, 0, 2, list(labels))
+
+
+def _primary_linear_relation(findings):
+    return [
+        finding
+        for finding in findings
+        if finding["kind"] in {"constant_ratio", "exact_linear"}
+    ]
+
+
+def test_high_precision_affine_coefficient_is_not_decimal_canonicalized():
+    y = [
+        HIGH_PRECISION_SLOPE * value + 0.25
+        for value in RELATION_X
+    ]
+    relations = _primary_linear_relation(_kinds(RELATION_X, y))
+
+    assert len(relations) == 1
+    finding = relations[0]
+    assert finding["kind"] == "exact_linear"
+    assert abs(finding["slope"] - HIGH_PRECISION_SLOPE) < 1e-12
+    assert finding["slope"] != 1.23456789
+    assert abs(finding["intercept"] - 0.25) < 1e-9
+    assert "1.235" in finding["rule"]
+    assert "relation_model_ambiguous" not in finding
+
+
+@pytest.mark.parametrize("source_intercept", [0.0, 0.25])
+def test_translated_high_precision_relation_exposes_model_ambiguity(
+    source_intercept,
+):
+    x = [value + 1e9 for value in RELATION_X]
+    y = [
+        HIGH_PRECISION_SLOPE * value
+        + source_intercept
+        + HIGH_PRECISION_SLOPE * 1e9
+        for value in RELATION_X
+    ]
+    relations = _primary_linear_relation(_kinds(x, y))
+
+    assert len(relations) == 1
+    finding = relations[0]
+    assert finding["kind"] == "constant_ratio"
+    assert finding["relation_model_ambiguous"] is True
+    assert finding["relation_model_alternatives"] == [
+        "constant_ratio",
+        "exact_linear",
+    ]
 
 
 def test_b5_flags_shared_fraction_integer_diff_and_matches_oracle():
@@ -514,26 +571,24 @@ def test_pure_scaling_classification_is_inverse_translation_invariant():
         ), findings
 
 
-def test_nonbinary_affine_classification_is_inverse_translation_invariant():
-    x = [467.61905, 453.14286, 404.38095, 364.0, 598.66667, 538.47619,
-         532.38095, 510.28571, 544.57143, 375.42857, 619.2381, 715.2381]
+def test_nonbinary_affine_translation_exposes_model_ambiguity():
+    x = RELATION_X
     y = [2.39 * value + 0.25 for value in x]
 
-    ordinary = _kinds(x, y)
-    translated = _kinds(
+    ordinary = _primary_linear_relation(_kinds(x, y))
+    translated = _primary_linear_relation(_kinds(
         [value + 1e9 for value in x],
         [value + 2.39e9 for value in y],
-    )
+    ))
 
-    for findings in (ordinary, translated):
-        assert any(
-            finding["kind"] == "exact_linear"
-            for finding in findings
-        ), findings
-        assert not any(
-            finding["kind"] == "constant_ratio"
-            for finding in findings
-        ), findings
+    assert [finding["kind"] for finding in ordinary] == [
+        "exact_linear"
+    ]
+    assert "relation_model_ambiguous" not in ordinary[0]
+    assert [finding["kind"] for finding in translated] == [
+        "constant_ratio"
+    ]
+    assert translated[0]["relation_model_ambiguous"] is True
 
 
 def test_genuine_nonzero_intercept_still_flags_exact_linear_at_normal_scale():
@@ -565,6 +620,12 @@ def test_affine_linear_classification_is_translation_invariant():
             finding["kind"] == "constant_ratio"
             for finding in findings
         ), findings
+        finding = next(
+            finding
+            for finding in findings
+            if finding["kind"] == "exact_linear"
+        )
+        assert "relation_model_ambiguous" not in finding
 
 
 def test_pure_scaling_with_zero_in_x_still_detected():

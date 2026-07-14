@@ -1653,6 +1653,50 @@ def test_relation_normal_exits_complete_candidate_once(
     assert resources.state.live_units == 0
 
 
+def test_relation_model_ambiguity_preserves_dense_resource_contract():
+    slope = 1.2345678901
+    source = [
+        467.61905, 453.14286, 404.38095, 364.0,
+        598.66667, 538.47619, 532.38095, 510.28571,
+        544.57143, 375.42857, 619.2381, 715.2381,
+    ]
+    rows = [
+        [value + 1e9, slope * value + 0.25 + slope * 1e9]
+        for value in source
+    ]
+    sheet = Sheet.from_rows([["left", "right"], *rows])
+    baseline = audit.detect_relations(
+        sheet, 1, sheet.nrows, 0, 2, ["left", "right"]
+    )
+    resources = audit._DenseFamilyResources(
+        family="relations",
+        max_rows=100,
+        work_limit=100_000,
+        state_limit=100_000,
+    )
+
+    instrumented = audit.detect_relations(
+        sheet,
+        1,
+        sheet.nrows,
+        0,
+        2,
+        ["left", "right"],
+        _resources=resources,
+    )
+    result = resources.result()
+
+    assert instrumented == baseline
+    relation = next(
+        finding for finding in instrumented
+        if finding["kind"] in {"constant_ratio", "exact_linear"}
+    )
+    assert relation["relation_model_ambiguous"] is True
+    assert result.candidates_examined == 1
+    assert result.work_examined == 2 * len(rows)
+    assert resources.state.live_units == 0
+
+
 def test_relation_proportional_arrays_die_before_candidate_finalizer(
     monkeypatch
 ):
