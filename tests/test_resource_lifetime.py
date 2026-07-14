@@ -704,11 +704,6 @@ WORKSPACE_GUARDS = {
             ("sum_compare", {"sum_compare_workspace"}),
             ("fitted_relation", {"fitted_relation_workspace"}),
         ),
-        "std": (
-            ("ratio_stats", {"ratio", "ratio_stats_workspace"}),
-            ("fitted_build", {"fitted", "fitted_build_workspace"}),
-            ("linear_fit", {"linear_fit_workspace"}),
-        ),
         "full_like": (
             ("relation_close", {"relation_close_workspace"}),
             ("sum_compare", {"sum_compare_workspace"}),

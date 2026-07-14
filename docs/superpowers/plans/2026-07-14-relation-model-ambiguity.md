@@ -14,6 +14,8 @@ a nonzero-intercept affine model.
 transaction, evaluates ratios with finite scalar division and normalized
 statistics, and evaluates affine compatibility with radius-scaled scalar
 correlation. Affine work stops when intercept assessment is unrepresentable.
+The shared relation comparator treats exact values as equal and conservatively
+rejects non-exact comparisons whose residual or tolerance range is not finite.
 The detector emits one ratio-first finding with additive ambiguity metadata
 when both models remain compatible. Schema, compact packet, and public output
 docs preserve the metadata without changing verdict selector rules.

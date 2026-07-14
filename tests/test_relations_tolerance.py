@@ -11,6 +11,7 @@ from paperconan._audit import detect_relations, detect_arithmetic_progression, d
 from paperconan._numeric import (
     assess_relation_intercept,
     integer_shift_close,
+    relation_close,
 )
 
 HIGH_PRECISION_SLOPE = 1.2345678901
@@ -229,6 +230,32 @@ def test_finite_extreme_difference_mean_is_warning_safe():
     assert _primary_linear_relation(findings) == []
 
 
+def test_finite_signed_extreme_offset_comparison_is_warning_safe():
+    x = [0.0, 0.0, 0.0, 0.0, 0.0]
+    y = [1.7e308, 1.7e308, 1.7e308, 1.7e308, -1.7e308]
+
+    findings = _kinds(x, y)
+
+    assert not any(
+        finding["kind"] in {
+            "constant_offset",
+            "constant_ratio",
+            "exact_linear",
+            "sum_constant",
+        }
+        for finding in findings
+    )
+
+
+def test_relation_close_rejects_unrepresentable_signed_extreme_range():
+    actual = np.asarray(
+        [1.7e308, 1.7e308, 1.7e308, 1.7e308, -1.7e308]
+    )
+    expected = np.full_like(actual, 1.02e308)
+
+    assert not relation_close(actual, expected).any()
+
+
 def test_unrepresentable_finite_difference_skips_relation_checks():
     x = [-1e308, -9e307, -8e307, -7e307, -6e307]
     y = [1e308, 9e307, 8e307, 7e307, 6e307]
@@ -247,14 +274,29 @@ def test_unrepresentable_finite_difference_skips_relation_checks():
             [9e307, 8e307, 7e307, 6e307, 5e307],
             [5e307, 6e307, 7.5e307, 8e307, 9e307],
         ),
+        (
+            [8e307, 8e307, 9e307, 9e307, -8.5e307],
+            [9e307, 9e307, 8e307, 8e307, -8.5e307],
+        ),
     ],
-    ids=["unrepresentable-sum", "overflowing-sum-mean"],
+    ids=[
+        "unrepresentable-sum",
+        "overflowing-sum-mean",
+        "signed-extreme-sum-comparison",
+    ],
 )
 def test_finite_extreme_sum_is_warning_safe(x, y):
 
     findings = _kinds(x, y)
 
-    assert isinstance(findings, list)
+    assert not any(
+        finding["kind"] in {
+            "constant_ratio",
+            "exact_linear",
+            "sum_constant",
+        }
+        for finding in findings
+    )
 
 
 def test_no_fp_on_femtotesla_scale():

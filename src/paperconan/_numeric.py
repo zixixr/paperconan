@@ -142,9 +142,28 @@ def _local_variation(values):
 def relation_close(actual, expected, *, rtol=1e-10, ulps=16):
     actual = np.asarray(actual, dtype=float)
     expected = np.asarray(expected, dtype=float)
-    scale = np.maximum(_local_variation(actual), _local_variation(expected))
-    tolerance = ulp_tolerance(actual, expected, ulps=ulps) + rtol * scale
-    return np.abs(actual - expected) <= tolerance
+    exact = actual == expected
+    with np.errstate(
+        divide="ignore",
+        invalid="ignore",
+        over="ignore",
+        under="ignore",
+    ):
+        scale = np.maximum(
+            _local_variation(actual),
+            _local_variation(expected),
+        )
+        tolerance = (
+            ulp_tolerance(actual, expected, ulps=ulps)
+            + rtol * scale
+        )
+        residual = np.abs(actual - expected)
+    representable = (
+        np.isfinite(scale)
+        & np.isfinite(tolerance)
+        & np.isfinite(residual)
+    )
+    return exact | (representable & (residual <= tolerance))
 
 
 def integer_shift_close(left, right, *, ulps=16):
