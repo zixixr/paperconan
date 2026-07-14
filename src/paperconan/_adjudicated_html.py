@@ -104,25 +104,94 @@ def _finding_score(item: dict[str, Any]) -> tuple[int, int]:
     return (sev_rank, scope_rank)
 
 
-def _finding_matches_ref(item: dict[str, Any], ref: dict[str, Any]) -> bool:
-    """Whether a finding item satisfies a verdict finding_ref selector.
+_FINDING_REF_FIELDS = ("file", "sheet", "rows", "kind", "rule")
 
-    A ref may specify any subset of file/sheet/rows/kind/rule; every field it
-    specifies must match. An empty ref matches nothing (so it never selects all).
-    """
+
+def _matches_non_location_constraints(
+    item: dict[str, Any],
+    ref: dict[str, Any],
+) -> bool:
     f = item["finding"]
-    checks = []
-    if ref.get("file"):
-        checks.append(str(ref["file"]) in str(item["file"]))
-    if ref.get("sheet"):
-        checks.append(str(ref["sheet"]) == str(item["sheet"]))
     if ref.get("rows"):
-        checks.append(str(ref["rows"]) == str(item["block_rows"]))
+        if str(ref["rows"]) != str(item["block_rows"]):
+            return False
     if ref.get("kind"):
-        checks.append(str(ref["kind"]) == str(f.get("kind")))
+        if str(ref["kind"]) != str(f.get("kind")):
+            return False
     if ref.get("rule"):
-        checks.append(str(ref["rule"]) in str(f.get("rule") or ""))
-    return bool(checks) and all(checks)
+        if str(ref["rule"]) not in str(f.get("rule") or ""):
+            return False
+    return True
+
+
+def _cross_table_endpoints(item: dict[str, Any]) -> list[tuple[str, str]]:
+    finding = item["finding"]
+    endpoints = []
+    for suffix in ("a", "b"):
+        file_name = finding.get(f"file_{suffix}")
+        sheet_name = finding.get(f"sheet_{suffix}")
+        if file_name not in (None, "") and sheet_name not in (None, ""):
+            endpoints.append((str(file_name), str(sheet_name)))
+    return endpoints
+
+
+def _matches_exact_location(item: dict[str, Any], ref: dict[str, Any]) -> bool:
+    file_ref = str(ref["file"]) if ref.get("file") else None
+    sheet_ref = str(ref["sheet"]) if ref.get("sheet") else None
+
+    if item["scope"] == "block":
+        if file_ref is not None and file_ref != str(item["file"]):
+            return False
+        if sheet_ref is not None and sheet_ref != str(item["sheet"]):
+            return False
+        return True
+
+    endpoints = _cross_table_endpoints(item)
+    if endpoints:
+        if file_ref is not None and sheet_ref is not None:
+            return any(
+                file_ref == file_name and sheet_ref == sheet_name
+                for file_name, sheet_name in endpoints
+            )
+        if file_ref is not None:
+            return any(file_ref == file_name for file_name, _ in endpoints)
+        return any(sheet_ref == sheet_name for _, sheet_name in endpoints)
+
+    if file_ref is not None and file_ref != str(item["file"]):
+        return False
+    if sheet_ref is not None and sheet_ref != str(item["sheet"]):
+        return False
+    return True
+
+
+def _matches_legacy_location(item: dict[str, Any], ref: dict[str, Any]) -> bool:
+    if not ref.get("file"):
+        return False
+    file_ref = str(ref["file"])
+    sheet_ref = str(ref["sheet"]) if ref.get("sheet") else None
+
+    if item["scope"] == "block":
+        return (
+            file_ref in str(item["file"])
+            and (sheet_ref is None or sheet_ref == str(item["sheet"]))
+        )
+
+    endpoints = _cross_table_endpoints(item)
+    if endpoints:
+        if sheet_ref is not None:
+            return any(
+                file_ref in file_name and sheet_ref == sheet_name
+                for file_name, sheet_name in endpoints
+            )
+        return (
+            any(file_ref in file_name for file_name, _ in endpoints)
+            or file_ref in str(item["file"])
+        )
+
+    return (
+        file_ref in str(item["file"])
+        and (sheet_ref is None or sheet_ref == str(item["sheet"]))
+    )
 
 
 def _render_key_finding(item: dict[str, Any], idx: int) -> str:
@@ -288,7 +357,26 @@ def _paper_badges(verdict: dict[str, Any], top_tier: int | None) -> str:
 
 
 def _match_finding(scan_findings: list[dict[str, Any]], ref: dict[str, Any]) -> dict[str, Any] | None:
-    return next((it for it in scan_findings if _finding_matches_ref(it, ref)), None)
+    """Resolve an explicit selector only when it identifies one visible finding."""
+    if not any(ref.get(field) for field in _FINDING_REF_FIELDS):
+        return None
+
+    candidates = [
+        item
+        for item in scan_findings
+        if _matches_non_location_constraints(item, ref)
+    ]
+    if not ref.get("file") and not ref.get("sheet"):
+        return candidates[0] if len(candidates) == 1 else None
+
+    exact = [item for item in candidates if _matches_exact_location(item, ref)]
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        return None
+
+    legacy = [item for item in candidates if _matches_legacy_location(item, ref)]
+    return legacy[0] if len(legacy) == 1 else None
 
 
 class _EvidenceBinding(NamedTuple):

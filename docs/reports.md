@@ -63,8 +63,10 @@ paperconan report audit/scan.json --verdict verdict.json --out adjudication.html
 证据绑定有三种明确状态，两种 verdict JSON 形态遵循同一规则：
 
 - 省略 `finding_ref` 或将它设为 `null`：可以自动选择当前 profile 下最强的可见统计信号，页面会明确标注为 automatic evidence selection。
-- 显式 selector 命中：只展示命中的 scan finding。
-- 显式 selector 未命中（包括 `{}`）：展示未命中的 selector，不补入无关 evidence 表。
+- 显式 selector 唯一命中：优先使用精确的 file/sheet 身份；跨表 finding 会按同一
+  `file_a`/`sheet_a` 或 `file_b`/`sheet_b` 端点绑定。仅在没有精确候选时保留旧版 file
+  子串匹配，而且也必须唯一命中。
+- 显式 selector 未命中或存在多个候选（包括 `{}`）：展示未命中的 selector，不补入无关 evidence 表。
 
 旧形态的每个 `finding_refs` selector 都会按原顺序独立绑定，额外的未命中 selector 也会显示。主形态若显式提供 `"findings": []`，会保留为空，不会根据顶层 `report_md` / `finding_refs` 合成旧形态 finding。渲染器只读取 `scan.json` 中的 findings 作为 evidence，不会改写 `scan.json`；profile-hidden finding 仍不会进入判定后报告。
 

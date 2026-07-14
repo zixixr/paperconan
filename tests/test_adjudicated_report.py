@@ -171,6 +171,258 @@ def _scan_two_findings() -> dict:
     }
 
 
+def _selector_block(
+    file_name: str,
+    marker: str,
+    *,
+    sheet: str = "Data",
+    rows: str = "2-8",
+    kind: str = "constant_offset",
+    rule: str = "shared selector rule",
+) -> dict:
+    return {
+        "file": file_name,
+        "sheet": sheet,
+        "block": {"rows": rows, "cols": "A-B", "header": ["x", "y"]},
+        "relations": [{
+            "kind": kind,
+            "severity": "high",
+            "rule": rule,
+            "evidence": {
+                "headers": ["marker"],
+                "rows": [{"row_idx": 2, "values": [marker]}],
+            },
+        }],
+    }
+
+
+def _selector_scan(*blocks: dict, cross_sheet_findings: list[dict] | None = None) -> dict:
+    return {
+        "relations_blocks": list(blocks),
+        "cross_sheet_findings": cross_sheet_findings or [],
+    }
+
+
+def test_primary_selector_prefers_exact_identity_over_earlier_file_substring():
+    scan = _selector_scan(
+        _selector_block("prefix-target.xlsx", "substring-marker"),
+        _selector_block("target.xlsx", "exact-marker"),
+    )
+    verdict = {
+        "verdict": "KEEP",
+        "findings": [{
+            "finding_ref": {"file": "target.xlsx", "sheet": "Data"},
+        }],
+    }
+
+    html = render_adjudicated_report(scan, verdict)
+
+    assert html.count('class="finding-card"') == 1
+    assert "exact-marker" in html
+    assert "substring-marker" not in html
+
+
+def test_legacy_selector_rejects_ambiguous_file_substring_binding():
+    scan = _selector_scan(
+        _selector_block("one-target.xlsx", "first-marker"),
+        _selector_block("two-target.xlsx", "second-marker"),
+    )
+    verdict = {
+        "verdict": "KEEP",
+        "report_md": "## t",
+        "finding_refs": [{"file": "target.xlsx", "sheet": "Data"}],
+    }
+
+    html = render_adjudicated_report(scan, verdict)
+
+    assert "unmatched" in html.lower()
+    assert html.count('class="finding-card"') == 0
+    assert "first-marker" not in html
+    assert "second-marker" not in html
+
+
+def test_legacy_selector_keeps_unique_file_substring_binding():
+    scan = _selector_scan(
+        _selector_block("prefix-target.xlsx", "unique-substring-marker"),
+    )
+    verdict = {
+        "verdict": "KEEP",
+        "report_md": "## t",
+        "finding_refs": [{"file": "target.xlsx", "sheet": "Data"}],
+    }
+
+    html = render_adjudicated_report(scan, verdict)
+
+    assert html.count('class="finding-card"') == 1
+    assert "unique-substring-marker" in html
+
+
+def test_primary_selector_rejects_duplicate_exact_identity_binding():
+    scan = _selector_scan(
+        _selector_block("target.xlsx", "first-marker"),
+        _selector_block("target.xlsx", "second-marker"),
+    )
+    verdict = {
+        "verdict": "KEEP",
+        "findings": [{
+            "finding_ref": {
+                "file": "target.xlsx",
+                "sheet": "Data",
+                "rows": "2-8",
+                "kind": "constant_offset",
+                "rule": "selector rule",
+            },
+        }],
+    }
+
+    html = render_adjudicated_report(scan, verdict)
+
+    assert "unmatched" in html.lower()
+    assert html.count('class="finding-card"') == 0
+    assert "first-marker" not in html
+    assert "second-marker" not in html
+
+
+def test_primary_selector_applies_non_location_constraints_before_binding():
+    scan = _selector_scan(
+        _selector_block(
+            "target.xlsx",
+            "other-marker",
+            rows="2-8",
+            kind="constant_offset",
+            rule="other rule",
+        ),
+        _selector_block(
+            "target.xlsx",
+            "selected-marker",
+            rows="9-12",
+            kind="constant_ratio",
+            rule="selected rule detail",
+        ),
+    )
+    verdict = {
+        "verdict": "KEEP",
+        "findings": [{
+            "finding_ref": {
+                "file": "target.xlsx",
+                "sheet": "Data",
+                "rows": "9-12",
+                "kind": "constant_ratio",
+                "rule": "selected rule",
+            },
+        }],
+    }
+
+    html = render_adjudicated_report(scan, verdict)
+
+    assert html.count('class="finding-card"') == 1
+    assert "selected-marker" in html
+    assert "other-marker" not in html
+
+
+def test_primary_cross_table_endpoint_selector_binding_requires_same_endpoint():
+    scan = _selector_scan(
+        cross_sheet_findings=[{
+            "kind": "cross_sheet_decimal_tail_reuse",
+            "severity": "high",
+            "file": "a.xlsx + b.xlsx",
+            "file_a": "a.xlsx",
+            "sheet_a": "Panel A",
+            "file_b": "b.xlsx",
+            "sheet_b": "Panel B",
+            "rule": "endpoint-selector-marker",
+            "examples": [],
+        }],
+    )
+    verdict = {
+        "verdict": "KEEP",
+        "findings": [
+            {
+                "title": "Endpoint A",
+                "finding_ref": {
+                    "file": "a.xlsx",
+                    "sheet": "Panel A",
+                    "kind": "cross_sheet_decimal_tail_reuse",
+                },
+            },
+            {
+                "title": "Endpoint B",
+                "finding_ref": {
+                    "file": "b.xlsx",
+                    "sheet": "Panel B",
+                    "kind": "cross_sheet_decimal_tail_reuse",
+                },
+            },
+            {
+                "title": "Mixed endpoint",
+                "finding_ref": {
+                    "file": "a.xlsx",
+                    "sheet": "Panel B",
+                    "kind": "cross_sheet_decimal_tail_reuse",
+                },
+            },
+        ],
+    }
+
+    html = render_adjudicated_report(scan, verdict)
+    endpoint_a, endpoint_b, mixed = html.split('<section class="finding-block">')[1:]
+
+    assert 'class="finding-card"' in endpoint_a
+    assert 'class="finding-card"' in endpoint_b
+    assert 'class="finding-card"' not in mixed
+    assert "unmatched" in mixed.lower()
+
+
+def test_primary_kind_rule_only_selector_requires_unique_binding():
+    scan = _selector_scan(
+        _selector_block("a.xlsx", "first-marker", rule="shared fragment alpha"),
+        _selector_block("b.xlsx", "second-marker", rule="shared fragment beta"),
+    )
+    verdict = {
+        "verdict": "KEEP",
+        "findings": [{
+            "finding_ref": {
+                "kind": "constant_offset",
+                "rule": "shared fragment",
+            },
+        }],
+    }
+
+    html = render_adjudicated_report(scan, verdict)
+
+    assert "unmatched" in html.lower()
+    assert html.count('class="finding-card"') == 0
+    assert "first-marker" not in html
+    assert "second-marker" not in html
+
+
+def test_legacy_cross_table_selector_reads_exact_archived_display_identity():
+    scan = _selector_scan(
+        cross_sheet_findings=[{
+            "kind": "cross_sheet_decimal_tail_reuse",
+            "severity": "high",
+            "file": "legacy-a.xlsx + legacy-b.xlsx",
+            "sheet_a": "Old A",
+            "sheet_b": "Old B",
+            "rule": "legacy-display-marker",
+            "examples": [],
+        }],
+    )
+    verdict = {
+        "verdict": "KEEP",
+        "report_md": "## t",
+        "finding_refs": [{
+            "file": "legacy-a.xlsx + legacy-b.xlsx",
+            "sheet": "Old A ↔ Old B",
+        }],
+    }
+
+    html = render_adjudicated_report(scan, verdict)
+
+    assert html.count('class="finding-card"') == 1
+    assert "legacy-display-marker" in html
+
+
 def test_finding_refs_scope_key_evidence_to_the_selected_finding():
     scan = _scan_two_findings()
     verdict = {

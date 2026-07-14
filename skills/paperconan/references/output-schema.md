@@ -262,9 +262,17 @@ shape use these rules:
 
 - An omitted or `null` `finding_ref` may select the strongest visible scan
   finding automatically. The HTML labels this as automatic evidence selection.
-- A matching explicit selector shows only the matched scan finding.
-- An unmatched explicit selector, including `{}`, shows the selector and does
-  not substitute an unrelated evidence table.
+- Every explicit selector must resolve to exactly one visible scan finding.
+  `kind` and `rows` match exactly, while `rule` retains substring matching.
+- Canonical exact location identities have priority. Block selectors use exact
+  `file` and `sheet`; cross-table generic `file` / `sheet` selectors match exact
+  `file_a` / `sheet_a` or `file_b` / `sheet_b` endpoints, and a supplied file
+  and sheet must belong to the same endpoint.
+- Legacy file substring matching is attempted only when there are zero
+  canonical exact candidates, and it binds only when the remaining visible
+  candidate is unique. A supplied sheet still matches exactly.
+- An unmatched or ambiguous explicit selector, including `{}`, shows the
+  selector and does not substitute an unrelated evidence table.
 - Every additional legacy `finding_refs` selector is bound independently, so
   matched and unmatched entries remain visible in their original order.
 
