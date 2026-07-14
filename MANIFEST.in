@@ -25,6 +25,7 @@ include docs/superpowers/plans/2026-07-11-release-governance.md
 include docs/superpowers/plans/2026-07-11-resource-and-input-fidelity.md
 include docs/superpowers/plans/2026-07-11-scan-coverage-and-reports.md
 include docs/superpowers/plans/2026-07-13-detector-owned-resource-budgets.md
+include docs/superpowers/plans/2026-07-14-relation-model-ambiguity.md
 include docs/superpowers/specs/2026-05-28-paperconan-data-fetch-design.md
 include docs/superpowers/specs/2026-06-03-grim-grimmer-detector-design.md
 include docs/superpowers/specs/2026-06-13-skillhub-upload-design.md
@@ -33,6 +34,7 @@ include docs/superpowers/specs/2026-07-02-multi-finding-adjudicated-report-desig
 include docs/superpowers/specs/2026-07-08-report-fidelity-and-dispersed-repeat-detector-design.md
 include docs/superpowers/specs/2026-07-10-project-hardening-design.md
 include docs/superpowers/specs/2026-07-13-detector-owned-resource-budgets-design.md
+include docs/superpowers/specs/2026-07-14-relation-model-ambiguity-design.md
 include examples/README.md
 include examples/demo_paper/ED_Fig2_tumor_volume.xlsx
 include examples/demo_paper/ED_Fig4_qPCR.xlsx
