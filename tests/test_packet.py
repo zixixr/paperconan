@@ -126,10 +126,21 @@ def test_distill_relations_preserves_optional_model_ambiguity():
             "within_col": [],
         }],
     }
+    source_alternatives = (
+        scan["relations_blocks"][0]["relations"][0][
+            "relation_model_alternatives"
+        ]
+    )
 
     findings = distill_findings_for_review(scan)
 
     assert findings[0]["relation_model_ambiguous"] is True
+    assert findings[0]["relation_model_alternatives"] is not source_alternatives
+    assert findings[0]["relation_model_alternatives"] == [
+        "constant_ratio",
+        "exact_linear",
+    ]
+    source_alternatives.append("source_mutation")
     assert findings[0]["relation_model_alternatives"] == [
         "constant_ratio",
         "exact_linear",
