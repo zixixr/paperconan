@@ -446,6 +446,28 @@ def test_pure_scaling_not_double_reported_as_exact_linear():
         f"pure scaling must not also be reported as exact_linear (redundant, b~=0): {f}"
 
 
+def test_pure_scaling_classification_is_inverse_translation_invariant():
+    x = [467.61905, 453.14286, 404.38095, 364.0, 598.66667, 538.47619,
+         532.38095, 510.28571, 544.57143, 375.42857, 619.2381, 715.2381]
+    y = [2.39 * value for value in x]
+
+    ordinary = _kinds(x, y)
+    translated = _kinds(
+        [value + 1e9 for value in x],
+        [value + 2.39e9 for value in y],
+    )
+
+    for findings in (ordinary, translated):
+        assert any(
+            finding["kind"] == "constant_ratio"
+            for finding in findings
+        ), findings
+        assert not any(
+            finding["kind"] == "exact_linear"
+            for finding in findings
+        ), findings
+
+
 def test_genuine_nonzero_intercept_still_flags_exact_linear_at_normal_scale():
     # a real affine offset (y = 3x + 7) is a DISTINCT signal constant_ratio cannot express.
     x = [12.0, 45.0, 7.0, 88.0, 33.0, 61.0, 19.0, 50.0, 27.0, 6.0]

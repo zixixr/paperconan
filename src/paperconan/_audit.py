@@ -1981,17 +1981,51 @@ def detect_relations(
                 dx = x[hi] - x[lo]
                 varying_x = dx != 0
                 if varying_x:
-                    slope = (y[hi] - y[lo]) / dx
-                    intercept_product = slope * x[lo]
-                    intercept = y[lo] - intercept_product
+                    fit_count = 0
+                    x_center = 0.0
+                    y_center = 0.0
+                    centered_xx = 0.0
+                    centered_xy = 0.0
+                    for x_value, y_value in zip(x, y):
+                        fit_count += 1
+                        x_delta = float(x_value) - x_center
+                        x_center += x_delta / fit_count
+                        y_delta = float(y_value) - y_center
+                        y_center += y_delta / fit_count
+                        centered_xx += x_delta * (
+                            float(x_value) - x_center
+                        )
+                        centered_xy += x_delta * (
+                            float(y_value) - y_center
+                        )
+                    slope = centered_xy / centered_xx
+                    centered_radius = 0.0
+                    centered_residual = 0.0
+                    intercept_x = float(x[0])
+                    intercept_y = float(y[0])
+                    for x_value, y_value in zip(x, y):
+                        centered_x = float(x_value) - x_center
+                        centered_y = float(y_value) - y_center
+                        centered_radius = max(
+                            centered_radius, abs(centered_x)
+                        )
+                        centered_residual = max(
+                            centered_residual,
+                            abs(centered_y - slope * centered_x),
+                        )
+                        if abs(float(x_value)) < abs(intercept_x):
+                            intercept_x = float(x_value)
+                            intercept_y = float(y_value)
+                    intercept_product = slope * intercept_x
+                    intercept = intercept_y - intercept_product
                     intercept_tolerance = (
                         scalar_ulp_tolerance(
-                            y[lo], intercept_product
+                            intercept_y, intercept_product
                         )
-                        + 1e-9
-                        * max(
-                            abs(slope * dx),
-                            abs(y[hi] - y[lo]),
+                        + centered_residual
+                        * (
+                            1.0
+                            + abs(x_center) / centered_radius
                         )
                     )
                     intercept_is_zero = (

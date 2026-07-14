@@ -666,6 +666,33 @@ def test_recurring_index_does_not_spend_budget_on_invalid_windows():
     assert meta == {"budget_exhausted": False, "windows_skipped": 0}
 
 
+def test_recurring_zero_budget_skips_known_ineligible_rows_without_reads():
+    class UnreadableSource:
+        nrows = 4
+        ncols = 3
+
+        def cell(self, row, col):
+            raise AssertionError(
+                f"geometrically ineligible cell was read: ({row}, {col})"
+            )
+
+    index = RecurringRowIndex(budget=0)
+
+    meta = index.add_sheet(
+        "a.xlsx",
+        "Figure 1",
+        UnreadableSource(),
+        blocks=[(0, 4, 0, 3)],
+        figure_id="main:1",
+        min_k=4,
+    )
+
+    assert meta == {
+        "budget_exhausted": False,
+        "windows_skipped": 0,
+    }
+
+
 def test_recurring_budget_stops_source_reads_and_reports_skip_lower_bound(
     monkeypatch,
 ):

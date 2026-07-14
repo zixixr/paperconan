@@ -391,6 +391,8 @@ class RecurringRowIndex:
                 row_idx, c0, c1 = next(row_specs)
             except StopIteration:
                 break
+            if c1 - c0 < min_k:
+                continue
             if self._budget <= 0:
                 windows_skipped_is_lower_bound = True
                 break
