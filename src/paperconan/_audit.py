@@ -1807,6 +1807,53 @@ def _compact_high_precision_fractions(frac_x, hp_rows):
     return count
 
 
+def _bounded_relation_correlation(
+    x,
+    y,
+    x_center,
+    y_center,
+    x_radius,
+    y_radius,
+):
+    if (
+        x_radius <= 0
+        or y_radius <= 0
+        or not all(
+            math.isfinite(value)
+            for value in (
+                x_center,
+                y_center,
+                x_radius,
+                y_radius,
+            )
+        )
+    ):
+        return None
+
+    xx = 0.0
+    xy = 0.0
+    yy = 0.0
+    for x_value, y_value in zip(x, y):
+        x_scaled = (float(x_value) - x_center) / x_radius
+        y_scaled = (float(y_value) - y_center) / y_radius
+        if not (
+            math.isfinite(x_scaled)
+            and math.isfinite(y_scaled)
+        ):
+            return None
+        xx += x_scaled * x_scaled
+        xy += x_scaled * y_scaled
+        yy += y_scaled * y_scaled
+
+    denominator = math.sqrt(xx) * math.sqrt(yy)
+    if denominator <= 0 or not math.isfinite(denominator):
+        return None
+    correlation = xy / denominator
+    if not math.isfinite(correlation):
+        return None
+    return max(-1.0, min(1.0, correlation))
+
+
 def detect_relations(
     sheet,
     r0,
@@ -2017,6 +2064,7 @@ def detect_relations(
                     fit_valid = math.isfinite(slope)
                     if fit_valid:
                         centered_radius = 0.0
+                        centered_y_radius = 0.0
                         centered_residual = 0.0
                         intercept_x = float(x[0])
                         intercept_y = float(y[0])
@@ -2029,6 +2077,10 @@ def detect_relations(
                             centered_y = y_scalar - y_center
                             centered_radius = max(
                                 centered_radius, abs(centered_x)
+                            )
+                            centered_y_radius = max(
+                                centered_y_radius,
+                                abs(centered_y),
                             )
                             centered_residual = max(
                                 centered_residual,
@@ -2123,55 +2175,111 @@ def detect_relations(
                     ratio, ratio_lease = candidate.allocate(
                         "ratio",
                         n,
-                        lambda: y / x,
+                        lambda: np.empty(n, dtype=float),
                     )
-                    mean_ratio = float(np.mean(ratio))
-                    ratio_tol = 1e-9 * max(
-                        abs(mean_ratio), 1e-300
-                    )
-                    ratio_stats_workspace = candidate.reserve(
-                        "ratio_stats_workspace",
-                        2 * n,
-                    )
-                    stable_ratio = np.std(ratio) < ratio_tol
-                    candidate.release(ratio_stats_workspace)
-                    if (
-                        stable_ratio
-                        and abs(mean_ratio - 1) > 1e-9
-                        and abs(mean_ratio) > 1e-9
+                    ratio_scale = 0.0
+                    ratio_representable = True
+                    for index, (x_value, y_value) in enumerate(
+                        zip(x, y)
                     ):
-                        ratio_close_workspace = candidate.reserve(
-                            "relation_close_workspace",
-                            12 * n,
+                        ratio_value = (
+                            float(y_value) / float(x_value)
                         )
-                        ratio_compatible = bool(
-                            relation_close(y, mean_ratio * x).all()
+                        if not math.isfinite(ratio_value):
+                            ratio_representable = False
+                            break
+                        ratio[index] = ratio_value
+                        ratio_scale = max(
+                            ratio_scale, abs(ratio_value)
                         )
-                        candidate.release(ratio_close_workspace)
+                    if ratio_representable:
+                        ratio_stats_workspace = candidate.reserve(
+                            "ratio_stats_workspace",
+                            2 * n,
+                        )
+                        if ratio_scale == 0:
+                            mean_ratio = 0.0
+                            stable_ratio = True
+                        else:
+                            normalized_mean = (
+                                sum(
+                                    float(value) / ratio_scale
+                                    for value in ratio
+                                )
+                                / n
+                            )
+                            mean_ratio = (
+                                normalized_mean * ratio_scale
+                            )
+                            normalized_variance = (
+                                sum(
+                                    (
+                                        float(value)
+                                        / ratio_scale
+                                        - normalized_mean
+                                    )
+                                    ** 2
+                                    for value in ratio
+                                )
+                                / n
+                            )
+                            normalized_tolerance = 1e-9 * max(
+                                abs(normalized_mean),
+                                1e-300 / ratio_scale,
+                            )
+                            stable_ratio = (
+                                math.sqrt(normalized_variance)
+                                < normalized_tolerance
+                            )
+                        candidate.release(ratio_stats_workspace)
+                        if (
+                            stable_ratio
+                            and abs(mean_ratio - 1) > 1e-9
+                            and abs(mean_ratio) > 1e-9
+                        ):
+                            fitted_ratio_representable = True
+                            for index, x_value in enumerate(x):
+                                fitted_ratio = (
+                                    mean_ratio * float(x_value)
+                                )
+                                if not math.isfinite(fitted_ratio):
+                                    fitted_ratio_representable = False
+                                    break
+                                ratio[index] = fitted_ratio
+                            if fitted_ratio_representable:
+                                ratio_close_workspace = (
+                                    candidate.reserve(
+                                        "relation_close_workspace",
+                                        12 * n,
+                                    )
+                                )
+                                ratio_compatible = bool(
+                                    relation_close(y, ratio).all()
+                                )
+                                candidate.release(
+                                    ratio_close_workspace
+                                )
                     del ratio
                     candidate.release(ratio_lease)
 
                 affine_compatible = False
-                if n >= 5 and fit_valid:
+                if (
+                    n >= 5
+                    and fit_valid
+                    and relation_intercept_state is not None
+                ):
                     linear_fit_workspace = candidate.reserve(
                         "linear_fit_workspace",
                         12 * n,
                     )
-                    try:
-                        (
-                            _fit_slope,
-                            _fit_intercept,
-                            r,
-                            _p,
-                            _se,
-                        ) = stats.linregress(x, y)
-                    except ValueError:
-                        candidate.release(linear_fit_workspace)
-                        del diff, x, y
-                        candidate.release(diff_lease)
-                        candidate.release(filtered_lease)
-                        return
-                    y_has_variation = np.std(y) > 0
+                    r = _bounded_relation_correlation(
+                        x,
+                        y,
+                        x_center,
+                        y_center,
+                        centered_radius,
+                        centered_y_radius,
+                    )
                     candidate.release(linear_fit_workspace)
                     fitted_build_workspace = candidate.reserve(
                         "fitted_build_workspace",
@@ -2180,10 +2288,19 @@ def detect_relations(
                     fitted, fitted_lease = candidate.allocate(
                         "fitted",
                         n,
-                        lambda: slope * x + intercept,
+                        lambda: np.empty(n, dtype=float),
                     )
+                    fitted_representable = True
+                    for index, x_value in enumerate(x):
+                        fitted_value = (
+                            slope * float(x_value) + intercept
+                        )
+                        if not math.isfinite(fitted_value):
+                            fitted_representable = False
+                            break
+                        fitted[index] = fitted_value
                     candidate.release(fitted_build_workspace)
-                    if y_has_variation:
+                    if r is not None and fitted_representable:
                         fitted_relation_workspace = (
                             candidate.reserve(
                                 "fitted_relation_workspace",
@@ -2201,7 +2318,6 @@ def detect_relations(
                         affine_compatible = (
                             fitted_close
                             and abs(r) > 0.99
-                            and relation_intercept_state is not None
                         )
                     del fitted
                     candidate.release(fitted_lease)

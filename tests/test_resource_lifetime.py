@@ -1698,7 +1698,7 @@ def test_relation_model_ambiguity_preserves_dense_resource_contract():
 
 
 def test_tiny_relation_preserves_budgeted_parity_and_releases_state():
-    x = [1e-170, 2e-170, 3e-170, 4e-170]
+    x = [1e-170, 2e-170, 3e-170, 4e-170, 5e-170]
     rows = [[value, 2.0 * value] for value in x]
     sheet = Sheet.from_rows([["left", "right"], *rows])
     resources = audit._DenseFamilyResources(
@@ -1728,6 +1728,49 @@ def test_tiny_relation_preserves_budgeted_parity_and_releases_state():
     ]
     assert result.candidates_examined == 1
     assert result.work_examined == 2 * len(rows)
+    assert resources.state.live_units == 0
+
+
+def test_invalid_relation_assessment_skips_affine_state(
+    monkeypatch,
+):
+    rows = [
+        [value, 3.0 * value + 7.0]
+        for value in (1.125, 2.25, 3.375, 4.5, 5.625)
+    ]
+    sheet = Sheet.from_rows([["left", "right"], *rows])
+    resources = audit._DenseFamilyResources(
+        family="relations",
+        max_rows=100,
+        work_limit=100_000,
+        state_limit=100_000,
+    )
+    monkeypatch.setattr(
+        audit,
+        "assess_relation_intercept",
+        lambda **_kwargs: None,
+    )
+
+    findings = audit.detect_relations(
+        sheet,
+        1,
+        sheet.nrows,
+        0,
+        2,
+        ["left", "right"],
+        _resources=resources,
+    )
+
+    assert not any(
+        finding["kind"] in {"constant_ratio", "exact_linear"}
+        for finding in findings
+    )
+    assert {
+        "linear_fit_workspace",
+        "fitted",
+        "fitted_build_workspace",
+        "fitted_relation_workspace",
+    }.isdisjoint(resources.state.seen_names)
     assert resources.state.live_units == 0
 
 

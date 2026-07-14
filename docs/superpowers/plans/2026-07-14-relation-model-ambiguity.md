@@ -11,10 +11,12 @@ a nonzero-intercept affine model.
 
 **Architecture:** Add a scalar-only intercept assessment to `_numeric.py`.
 `detect_relations()` keeps its centered fit and existing candidate/resource
-transaction, but evaluates ratio compatibility separately from intercept model
-state and emits one ratio-first finding with additive ambiguity metadata when
-both models remain compatible. Schema, compact packet, and public output docs
-preserve the metadata without changing verdict selector rules.
+transaction, evaluates ratios with finite scalar division and normalized
+statistics, and evaluates affine compatibility with radius-scaled scalar
+correlation. Affine work stops when intercept assessment is unrepresentable.
+The detector emits one ratio-first finding with additive ambiguity metadata
+when both models remain compatible. Schema, compact packet, and public output
+docs preserve the metadata without changing verdict selector rules.
 
 **Tech Stack:** Python 3.10-3.14, NumPy, SciPy, pytest, uv, setuptools.
 
@@ -542,47 +544,14 @@ Delete `slope_tolerance`, the significant-digit loop, and
 
 - [ ] **Step 5: Evaluate the ratio predicate independently**
 
-Replace `ratio_emitted = False` and the current ratio gate with:
-
-```python
-ratio_emitted = False
-ratio_compatible = False
-nonzero_workspace = candidate.reserve(
-    "nonzero_workspace",
-    state_units_for_nbytes(n),
-)
-all_nonzero = bool((x != 0).all())
-candidate.release(nonzero_workspace)
-if all_nonzero:
-    ratio, ratio_lease = candidate.allocate(
-        "ratio",
-        n,
-        lambda: y / x,
-    )
-    mean_ratio = float(np.mean(ratio))
-    ratio_tol = 1e-9 * max(abs(mean_ratio), 1e-300)
-    ratio_stats_workspace = candidate.reserve(
-        "ratio_stats_workspace",
-        2 * n,
-    )
-    stable_ratio = np.std(ratio) < ratio_tol
-    candidate.release(ratio_stats_workspace)
-    if (
-        stable_ratio
-        and abs(mean_ratio - 1) > 1e-9
-        and abs(mean_ratio) > 1e-9
-    ):
-        ratio_close_workspace = candidate.reserve(
-            "relation_close_workspace",
-            12 * n,
-        )
-        ratio_compatible = bool(
-            relation_close(y, mean_ratio * x).all()
-        )
-        candidate.release(ratio_close_workspace)
-    del ratio
-    candidate.release(ratio_lease)
-```
+Keep the existing `ratio` lease, but allocate an empty buffer and fill it with
+Python scalar `float(y_value) / float(x_value)` operations. Reject any
+non-finite result before ratio statistics. Compute mean and population
+variance after dividing each finite ratio by the maximum absolute ratio, so
+subnormal or extreme finite inputs cannot trigger NumPy divide, reduction, or
+variance warnings. Reuse the leased ratio buffer for fitted proportional
+values, filling it with checked scalar multiplication before calling
+`relation_close()`.
 
 Do not offer the ratio finding yet. Preserve the scalar `mean_ratio` and
 `ratio_compatible` values until the fitted-line predicate has run. This keeps
@@ -591,15 +560,18 @@ standalone `exact_linear` predicate is available and compatible.
 
 - [ ] **Step 6: Evaluate affine compatibility before selection**
 
-Run the existing fitted-line predicate only for `n >= 5`, preserving the
-standalone `exact_linear` minimum-sample contract, and record its result before
-offering either primary relation:
+Run the fitted-line predicate only for `n >= 5`, a valid centered fit, and a
+non-`None` intercept assessment, preserving the standalone `exact_linear`
+minimum-sample contract. Compute Pearson correlation from centered values
+scaled by their finite radii instead of calling `scipy.stats.linregress`.
+Preserve the existing linear-fit and fitted-array leases; fill fitted values
+with checked scalar operations and conservatively reject non-finite results.
+Record compatibility before offering either primary relation:
 
 ```python
 affine_compatible = (
     fitted_close
     and abs(r) > 0.99
-    and relation_intercept_state is not None
 )
 ratio_selected = (
     ratio_compatible

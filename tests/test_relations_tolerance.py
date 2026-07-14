@@ -111,6 +111,53 @@ def test_relation_intercept_assessment_uses_closed_zero_band_boundaries(
     assert assessment.state == expected_state
 
 
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+@pytest.mark.parametrize(
+    ("position", "expected_state"),
+    [
+        ("inside", "ambiguous"),
+        ("touching", "ambiguous"),
+        ("outside", "affine"),
+    ],
+)
+def test_relation_intercept_assessment_uses_strict_affine_boundaries(
+    sign, position, expected_state
+):
+    residual = 1e-12
+    seed = _assess_intercept(centered_residual=residual)
+    assert seed is not None
+    affine_boundary = sign * (
+        seed.zero_tolerance + seed.uncertainty
+    )
+    positions = {
+        "inside": math.nextafter(affine_boundary, 0.0),
+        "touching": affine_boundary,
+        "outside": math.nextafter(
+            affine_boundary,
+            math.copysign(math.inf, sign),
+        ),
+    }
+
+    assessment = _assess_intercept(
+        intercept=positions[position],
+        centered_residual=residual,
+    )
+
+    assert assessment is not None
+    assert assessment.state == expected_state
+    if position == "touching":
+        if sign > 0:
+            assert (
+                assessment.intercept_lower
+                == assessment.zero_tolerance
+            )
+        else:
+            assert (
+                assessment.intercept_upper
+                == -assessment.zero_tolerance
+            )
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -142,7 +189,7 @@ def test_relation_intercept_assessment_rejects_derived_overflow(
 
 
 def test_tiny_finite_pure_scaling_uses_bounded_fit():
-    x = [1e-170, 2e-170, 3e-170, 4e-170]
+    x = [1e-170, 2e-170, 3e-170, 4e-170, 5e-170]
     y = [2.0 * value for value in x]
 
     relations = _primary_linear_relation(_kinds(x, y))
@@ -151,6 +198,26 @@ def test_tiny_finite_pure_scaling_uses_bounded_fit():
         "constant_ratio"
     ]
     assert relations[0]["ratio"] == 2.0
+
+
+@pytest.mark.parametrize(
+    ("x", "y"),
+    [
+        (
+            [1e-320, 2e-320, 3e-320, 4e-320, 5e-320],
+            [1e-10, 2e-10, 3e-10, 4e-10, 5e-10],
+        ),
+        (
+            [1e100, 2e100, 3e100, 4e100, 5e100],
+            [1e-320, 2e-320, 3e-320, 4e-320, 5e-320],
+        ),
+    ],
+    ids=["overflowing-ratio", "underflowing-ratio"],
+)
+def test_unrepresentable_finite_relation_emits_no_primary_relation(
+    x, y
+):
+    assert _primary_linear_relation(_kinds(x, y)) == []
 
 
 def test_no_fp_on_femtotesla_scale():
@@ -366,20 +433,10 @@ def test_four_row_identifiable_proportional_relation_remains_ratio():
 def test_ambiguous_relation_requires_compatible_affine_predicate(
     monkeypatch,
 ):
-    original_linregress = audit.stats.linregress
-
-    def incompatible_linregress(*args, **kwargs):
-        fit = original_linregress(*args, **kwargs)
-        return (
-            fit.slope,
-            fit.intercept,
-            0.0,
-            fit.pvalue,
-            fit.stderr,
-        )
-
     monkeypatch.setattr(
-        audit.stats, "linregress", incompatible_linregress
+        audit,
+        "_bounded_relation_correlation",
+        lambda *_args: 0.0,
     )
     x = [value + 1e9 for value in RELATION_X]
     y = [
