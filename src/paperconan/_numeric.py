@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Literal, NamedTuple
 
 import numpy as np
 
@@ -20,6 +21,87 @@ def max_ulp_tolerance(values, *, ulps=16):
 
 def scalar_ulp_tolerance(*values, ulps=16):
     return max_ulp_tolerance(values, ulps=ulps)
+
+
+class RelationInterceptAssessment(NamedTuple):
+    state: Literal["proportional", "affine", "ambiguous"]
+    zero_tolerance: float
+    uncertainty: float
+    intercept_lower: float
+    intercept_upper: float
+
+
+def assess_relation_intercept(
+    *,
+    slope: float,
+    intercept: float,
+    x_center: float,
+    centered_radius: float,
+    centered_residual: float,
+    transformed_span: float,
+    anchor_y: float,
+    intercept_product: float,
+) -> RelationInterceptAssessment | None:
+    scalars = (
+        slope,
+        intercept,
+        x_center,
+        centered_radius,
+        centered_residual,
+        transformed_span,
+        anchor_y,
+        intercept_product,
+    )
+    if (
+        centered_radius <= 0
+        or centered_residual < 0
+        or transformed_span < 0
+        or not all(math.isfinite(value) for value in scalars)
+    ):
+        return None
+
+    propagated_roundoff = (
+        scalar_ulp_tolerance(anchor_y, intercept_product)
+        + abs(x_center) * scalar_ulp_tolerance(slope)
+    )
+    zero_tolerance = (
+        propagated_roundoff
+        + 1e-9
+        * max(
+            transformed_span,
+            np.finfo(float).smallest_subnormal,
+        )
+    )
+    uncertainty = (
+        propagated_roundoff
+        + centered_residual
+        + abs(x_center)
+        * centered_residual
+        / centered_radius
+    )
+    intercept_lower = intercept - uncertainty
+    intercept_upper = intercept + uncertainty
+
+    if (
+        intercept_lower >= -zero_tolerance
+        and intercept_upper <= zero_tolerance
+    ):
+        state = "proportional"
+    elif (
+        intercept_lower > zero_tolerance
+        or intercept_upper < -zero_tolerance
+    ):
+        state = "affine"
+    else:
+        state = "ambiguous"
+
+    return RelationInterceptAssessment(
+        state=state,
+        zero_tolerance=zero_tolerance,
+        uncertainty=uncertainty,
+        intercept_lower=intercept_lower,
+        intercept_upper=intercept_upper,
+    )
 
 
 def ulp_tolerance(actual, expected, *, ulps=16):

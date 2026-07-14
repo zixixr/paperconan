@@ -4,13 +4,59 @@ use relative precision so small-magnitude columns aren't trivially 'equal'."""
 import numpy as np
 from paperconan._sheet import Sheet
 from paperconan._audit import detect_relations, detect_arithmetic_progression, detect_equal_pairs
-from paperconan._numeric import integer_shift_close
+from paperconan._numeric import (
+    assess_relation_intercept,
+    integer_shift_close,
+)
 
 def _sheet(cols):
     rows = [[f"c{j}" for j in range(len(cols))]]
     for k in range(len(cols[0])):
         rows.append([cols[j][k] for j in range(len(cols))])
     return Sheet.from_rows(rows)
+
+
+def _assess_intercept(**overrides):
+    values = {
+        "slope": 2.0,
+        "intercept": 0.0,
+        "x_center": 0.0,
+        "centered_radius": 1.0,
+        "centered_residual": 0.0,
+        "transformed_span": 1.0,
+        "anchor_y": 0.0,
+        "intercept_product": 0.0,
+    }
+    values.update(overrides)
+    return assess_relation_intercept(**values)
+
+
+def test_relation_intercept_assessment_distinguishes_three_states():
+    proportional = _assess_intercept()
+    affine = _assess_intercept(intercept=1e-6, anchor_y=1e-6)
+    ambiguous = _assess_intercept(
+        x_center=100.0,
+        centered_residual=1e-8,
+    )
+
+    assert proportional is not None
+    assert proportional.state == "proportional"
+    assert proportional.uncertainty <= proportional.zero_tolerance
+
+    assert affine is not None
+    assert affine.state == "affine"
+    assert affine.intercept_lower > affine.zero_tolerance
+
+    assert ambiguous is not None
+    assert ambiguous.state == "ambiguous"
+    assert ambiguous.intercept_lower < ambiguous.zero_tolerance
+    assert ambiguous.intercept_upper > -ambiguous.zero_tolerance
+
+
+def test_relation_intercept_assessment_rejects_degenerate_inputs():
+    assert _assess_intercept(centered_radius=0.0) is None
+    assert _assess_intercept(centered_residual=float("inf")) is None
+
 
 def test_no_fp_on_femtotesla_scale():
     # two GENUINELY DIFFERENT columns at ~1e-14: a fixed atol=1e-9 wrongly called these identical
