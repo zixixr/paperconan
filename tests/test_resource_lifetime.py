@@ -1736,6 +1736,49 @@ def test_tiny_relation_preserves_budgeted_parity_and_releases_state():
     assert resources.state.live_units == 0
 
 
+@pytest.mark.parametrize("row_count", [8, 24])
+def test_extreme_relation_preserves_budgeted_parity_and_releases_state(
+    row_count,
+):
+    rows = [
+        [0.1, 1e308 if index % 2 == 0 else -1e308]
+        for index in range(row_count)
+    ]
+    sheet = Sheet.from_rows([["left", "right"], *rows])
+    resources = audit._DenseFamilyResources(
+        family="relations",
+        max_rows=100,
+        work_limit=100_000,
+        state_limit=100_000,
+    )
+
+    baseline = audit.detect_relations(
+        sheet, 1, sheet.nrows, 0, 2, ["left", "right"]
+    )
+    instrumented = audit.detect_relations(
+        sheet,
+        1,
+        sheet.nrows,
+        0,
+        2,
+        ["left", "right"],
+        _resources=resources,
+    )
+    result = resources.result()
+
+    assert instrumented == baseline
+    assert not any(
+        finding["kind"] in {
+            "partial_constant_offset",
+            "small_diff_set",
+        }
+        for finding in instrumented
+    )
+    assert result.candidates_examined == 1
+    assert result.work_examined == 2 * row_count
+    assert resources.state.live_units == 0
+
+
 def test_invalid_relation_assessment_skips_affine_state(
     monkeypatch,
 ):

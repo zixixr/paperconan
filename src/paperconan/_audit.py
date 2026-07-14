@@ -1867,6 +1867,12 @@ def _bounded_scaled_mean(values, scale):
     return mean if math.isfinite(mean) else None
 
 
+def _finite_numpy_mean(values):
+    with np.errstate(over="ignore", invalid="ignore"):
+        mean = float(np.mean(values))
+    return mean if math.isfinite(mean) else None
+
+
 def detect_relations(
     sheet,
     r0,
@@ -2054,9 +2060,11 @@ def detect_relations(
                     candidate.release(diff_lease)
                     candidate.release(filtered_lease)
                     return
-                mean_diff = _bounded_scaled_mean(
-                    diff, diff_scale
-                )
+                mean_diff = _finite_numpy_mean(diff)
+                if mean_diff is None:
+                    mean_diff = _bounded_scaled_mean(
+                        diff, diff_scale
+                    )
                 if mean_diff is None:
                     del diff, x, y
                     candidate.release(diff_lease)
@@ -2250,7 +2258,31 @@ def detect_relations(
                             "ratio_stats_workspace",
                             2 * n,
                         )
-                        if ratio_scale == 0:
+                        with np.errstate(
+                            over="ignore",
+                            invalid="ignore",
+                            under="ignore",
+                            divide="ignore",
+                        ):
+                            legacy_mean_ratio = float(
+                                np.mean(ratio)
+                            )
+                            legacy_ratio_std = float(
+                                np.std(ratio)
+                            )
+                        ratio_stats_representable = True
+                        if (
+                            math.isfinite(legacy_mean_ratio)
+                            and math.isfinite(legacy_ratio_std)
+                        ):
+                            mean_ratio = legacy_mean_ratio
+                            ratio_tol = 1e-9 * max(
+                                abs(mean_ratio), 1e-300
+                            )
+                            stable_ratio = (
+                                legacy_ratio_std < ratio_tol
+                            )
+                        elif ratio_scale == 0:
                             mean_ratio = 0.0
                             stable_ratio = True
                         else:
@@ -2261,7 +2293,7 @@ def detect_relations(
                                 )
                                 / n
                             )
-                            mean_ratio = (
+                            fallback_mean_ratio = (
                                 normalized_mean * ratio_scale
                             )
                             normalized_variance = (
@@ -2276,17 +2308,52 @@ def detect_relations(
                                 )
                                 / n
                             )
+                            normalized_std = math.sqrt(
+                                normalized_variance
+                            )
                             normalized_tolerance = 1e-9 * max(
                                 abs(normalized_mean),
                                 1e-300 / ratio_scale,
                             )
-                            stable_ratio = (
-                                math.sqrt(normalized_variance)
-                                < normalized_tolerance
+                            ratio_stats_representable = all(
+                                math.isfinite(value)
+                                for value in (
+                                    normalized_mean,
+                                    fallback_mean_ratio,
+                                    normalized_variance,
+                                    normalized_std,
+                                    normalized_tolerance,
+                                )
                             )
+                            if ratio_stats_representable:
+                                mean_ratio = (
+                                    legacy_mean_ratio
+                                    if math.isfinite(
+                                        legacy_mean_ratio
+                                    )
+                                    else fallback_mean_ratio
+                                )
+                                stable_ratio = (
+                                    (
+                                        legacy_ratio_std
+                                        < 1e-9
+                                        * max(
+                                            abs(mean_ratio),
+                                            1e-300,
+                                        )
+                                    )
+                                    if math.isfinite(
+                                        legacy_ratio_std
+                                    )
+                                    else (
+                                        normalized_std
+                                        < normalized_tolerance
+                                    )
+                                )
                         candidate.release(ratio_stats_workspace)
                         if (
-                            stable_ratio
+                            ratio_stats_representable
+                            and stable_ratio
                             and abs(mean_ratio - 1) > 1e-9
                             and abs(mean_ratio) > 1e-9
                         ):
@@ -2443,7 +2510,11 @@ def detect_relations(
                     csum[index] = sum_value
                     sum_scale = max(sum_scale, abs(sum_value))
                 if n >= 5 and sum_representable:
-                    K = _bounded_scaled_mean(csum, sum_scale)
+                    K = _finite_numpy_mean(csum)
+                    if K is None:
+                        K = _bounded_scaled_mean(
+                            csum, sum_scale
+                        )
                     sum_compare_workspace = candidate.reserve(
                         "sum_compare_workspace",
                         13 * n,
@@ -2548,8 +2619,13 @@ def detect_relations(
                                 abs(diff[t]),
                             )
                         )
+                        adjacent_step = (
+                            float(diff[t])
+                            - float(diff[t - 1])
+                        )
                         if (
-                            abs(diff[t] - diff[t - 1])
+                            math.isfinite(adjacent_step)
+                            and abs(adjacent_step)
                             <= pair_tolerance
                         ):
                             cur_len += 1
@@ -2773,14 +2849,38 @@ def detect_relations(
                         return
 
                 if n >= 8:
-                    (
-                        diff_rounded,
-                        diff_rounded_lease,
-                    ) = candidate.allocate(
-                        "diff_rounded",
-                        n,
-                        lambda: np.round(diff, 4),
+                    with np.errstate(
+                        over="ignore", invalid="ignore"
+                    ):
+                        (
+                            diff_rounded,
+                            diff_rounded_lease,
+                        ) = candidate.allocate(
+                            "diff_rounded",
+                            n,
+                            lambda: np.round(diff, 4),
+                        )
+                    difference_rounding_representable = all(
+                        math.isfinite(float(value))
+                        for value in diff_rounded
                     )
+                    if not difference_rounding_representable:
+                        scalar_rounding_representable = True
+                        for index, value in enumerate(diff):
+                            rounded_value = round(
+                                float(value), 4
+                            )
+                            if not math.isfinite(rounded_value):
+                                scalar_rounding_representable = False
+                                break
+                            diff_rounded[index] = rounded_value
+                        if not scalar_rounding_representable:
+                            del diff_rounded
+                            candidate.release(diff_rounded_lease)
+                            del diff, x, y
+                            candidate.release(diff_lease)
+                            candidate.release(filtered_lease)
+                            return
                     diff_unique_workspace = candidate.reserve(
                         "diff_unique_workspace",
                         4 * n,
@@ -2801,7 +2901,8 @@ def detect_relations(
                     candidate.release(diff_unique_workspace)
                     candidate.release(diff_rounded_lease)
                     if (
-                        2 <= unique_diff_count
+                        difference_rounding_representable
+                        and 2 <= unique_diff_count
                         <= min(6, n // 3)
                     ):
                         candidate.offer(

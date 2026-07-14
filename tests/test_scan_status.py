@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 
+import paperconan._audit as audit
 import pytest
 
 from paperconan._audit import scan_dir
@@ -38,6 +39,46 @@ def test_tiny_finite_relation_is_not_reported_as_parse_failure(
         "2e-170,4e-170\n"
         "3e-170,6e-170\n"
         "4e-170,8e-170\n",
+        encoding="utf-8",
+    )
+
+    scan = scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    assert scan["scan_status"] == "complete"
+    assert scan["coverage"]["files_succeeded"] == 1
+    assert scan["coverage"]["files_failed"] == 0
+    assert all(
+        item["reason"] != "parse_error"
+        for item in scan["coverage"]["limitations"]
+    )
+
+
+@pytest.mark.parametrize("row_count", [8, 24])
+def test_extreme_relation_is_not_reported_as_parse_failure(
+    tmp_path, row_count, monkeypatch
+):
+    # Other finite-extreme detector paths belong to separate hardening work.
+    for detector_name in (
+        "detect_arithmetic_progression",
+        "detect_within_column_patterns",
+        "detect_dispersed_repeats",
+        "detect_identical_after_rounding",
+    ):
+        monkeypatch.setattr(
+            audit,
+            detector_name,
+            lambda *_args, **_kwargs: [],
+        )
+    data = tmp_path / "data"
+    data.mkdir()
+    rows = "\n".join(
+        f"0.1,{'1e308' if index % 2 == 0 else '-1e308'}"
+        for index in range(row_count)
+    )
+    (data / "extreme.csv").write_text(
+        f"x,y\n{rows}\n",
         encoding="utf-8",
     )
 

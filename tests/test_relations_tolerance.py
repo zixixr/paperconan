@@ -299,6 +299,107 @@ def test_finite_extreme_sum_is_warning_safe(x, y):
     )
 
 
+def test_extreme_partial_offset_step_is_warning_safe():
+    x = [0.1] * 24
+    y = [1e308, -1e308] * 12
+
+    findings = _kinds(x, y)
+
+    assert not any(
+        finding["kind"] in {
+            "partial_constant_offset",
+            "small_diff_set",
+        }
+        for finding in findings
+    )
+
+
+def test_extreme_difference_rounding_is_warning_safe():
+    x = [0.1] * 8
+    y = [1e308, -1e308] * 4
+
+    findings = _kinds(x, y)
+
+    assert not any(
+        finding["kind"] == "small_diff_set"
+        for finding in findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "field", "x", "y", "expected"),
+    [
+        (
+            "constant_offset",
+            "offset",
+            [
+                -682687.0083086678,
+                -706947.051679411,
+                -822178.2806164335,
+                -464695.66909631493,
+                984155.5942261224,
+            ],
+            [
+                -682172.024466338,
+                -706432.0678370812,
+                -821663.2967741037,
+                -464180.68525398505,
+                984670.5780684522,
+            ],
+            514.9838423298322,
+        ),
+        (
+            "constant_ratio",
+            "ratio",
+            [
+                -430108.7700382364,
+                -81674.36576194607,
+                -980716.2366046638,
+                -319054.7838331576,
+                847882.1743034215,
+            ],
+            [
+                -178214454.48770475,
+                -33841561.84167207,
+                -406357231.67931986,
+                -132199523.03568214,
+                351317782.127298,
+            ],
+            414.34740907947906,
+        ),
+        (
+            "sum_constant",
+            "sum",
+            [
+                -182425.1315034984,
+                954178.4485608349,
+                -809235.7344193438,
+                335807.768219071,
+                456384.5849955911,
+            ],
+            [
+                668972.5541288913,
+                -467631.02593544195,
+                1295783.1570447367,
+                150739.65440632193,
+                30162.837629801827,
+            ],
+            486547.42262539285,
+        ),
+    ],
+    ids=["offset", "ratio", "sum"],
+)
+def test_legacy_reduction_preserves_exact_binary64_result(
+    kind, field, x, y, expected
+):
+    finding = next(
+        item for item in _kinds(x, y)
+        if item["kind"] == kind
+    )
+
+    assert finding[field] == expected
+
+
 def test_no_fp_on_femtotesla_scale():
     # two GENUINELY DIFFERENT columns at ~1e-14: a fixed atol=1e-9 wrongly called these identical
     a = [1.0e-14, 2.0e-14, 3.0e-14, 4.0e-14, 5.0e-14, 6.0e-14, 7.0e-14]
