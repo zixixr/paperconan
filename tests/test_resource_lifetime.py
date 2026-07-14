@@ -641,6 +641,7 @@ def _guard_callable_workspace(
     monkeypatch, owner, function_name, resources, required_variants
 ):
     original = getattr(owner, function_name)
+    observed = []
     variants = tuple(
         frozenset(required) for required in required_variants
     )
@@ -655,9 +656,11 @@ def _guard_callable_workspace(
             f"{function_name} required one complete lease variant, "
             f"got {matches}"
         )
+        observed.append(matches[0])
         return original(*args, **kwargs)
 
     monkeypatch.setattr(owner, function_name, guarded)
+    return observed
 
 
 WORKSPACE_GUARDS = {
@@ -1396,6 +1399,7 @@ def test_relation_allocations_are_reserved_and_released(
         resources,
         WORKSPACE_GUARDS["relations"],
     )
+    observed_callable_calls = {}
     for owner, function_name, required_variants in (
         (
             audit,
@@ -1412,17 +1416,19 @@ def test_relation_allocations_are_reserved_and_released(
             ({"integer_shift_workspace", "diff_is_int"},),
         ),
         (
-            audit.stats,
-            "linregress",
+            audit,
+            "_bounded_relation_correlation",
             ({"linear_fit_workspace"},),
         ),
     ):
-        _guard_callable_workspace(
-            monkeypatch,
-            owner,
-            function_name,
-            resources,
-            required_variants,
+        observed_callable_calls[function_name] = (
+            _guard_callable_workspace(
+                monkeypatch,
+                owner,
+                function_name,
+                resources,
+                required_variants,
+            )
         )
 
     instrumented = audit.detect_relations(
@@ -1454,6 +1460,10 @@ def test_relation_allocations_are_reserved_and_released(
     } <= observed_numpy_calls
     if branch_state == "high_precision_unique_workspace":
         assert ("unique", "high_precision") in observed_numpy_calls
+    if "linear_fit_workspace" in resources.state.seen_names:
+        assert observed_callable_calls[
+            "_bounded_relation_correlation"
+        ]
 
 
 def test_relation_branch_inventory_reserves_every_declared_state(

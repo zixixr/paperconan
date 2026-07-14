@@ -1854,6 +1854,19 @@ def _bounded_relation_correlation(
     return max(-1.0, min(1.0, correlation))
 
 
+def _bounded_scaled_mean(values, scale):
+    if scale == 0:
+        return 0.0
+    normalized_total = 0.0
+    for value in values:
+        normalized = float(value) / scale
+        if not math.isfinite(normalized):
+            return None
+        normalized_total += normalized
+    mean = normalized_total / len(values) * scale
+    return mean if math.isfinite(mean) else None
+
+
 def detect_relations(
     sheet,
     r0,
@@ -2021,9 +2034,34 @@ def detect_relations(
                 diff, diff_lease = candidate.allocate(
                     "diff",
                     n,
-                    lambda: y - x,
+                    lambda: np.empty(n, dtype=float),
                 )
-                mean_diff = float(np.mean(diff))
+                diff_scale = 0.0
+                diff_representable = True
+                for index, (x_value, y_value) in enumerate(
+                    zip(x, y)
+                ):
+                    diff_value = float(y_value) - float(x_value)
+                    if not math.isfinite(diff_value):
+                        diff_representable = False
+                        break
+                    diff[index] = diff_value
+                    diff_scale = max(
+                        diff_scale, abs(diff_value)
+                    )
+                if not diff_representable:
+                    del diff, x, y
+                    candidate.release(diff_lease)
+                    candidate.release(filtered_lease)
+                    return
+                mean_diff = _bounded_scaled_mean(
+                    diff, diff_scale
+                )
+                if mean_diff is None:
+                    del diff, x, y
+                    candidate.release(diff_lease)
+                    candidate.release(filtered_lease)
+                    return
                 lo = int(np.argmin(x))
                 hi = int(np.argmax(x))
                 dx = float(x[hi]) - float(x[lo])
@@ -2127,12 +2165,27 @@ def detect_relations(
                     "relation_close_workspace",
                     12 * n,
                 )
-                offset_close = (
-                    mean_diff != 0
-                    and bool(
-                        relation_close(y, x + mean_diff).all()
-                    )
-                )
+                offset_close = False
+                if mean_diff != 0:
+                    offset_representable = True
+                    for index, x_value in enumerate(x):
+                        offset_value = (
+                            float(x_value) + mean_diff
+                        )
+                        if not math.isfinite(offset_value):
+                            offset_representable = False
+                            break
+                        diff[index] = offset_value
+                    if offset_representable:
+                        offset_close = bool(
+                            relation_close(y, diff).all()
+                        )
+                    for index, (x_value, y_value) in enumerate(
+                        zip(x, y)
+                    ):
+                        diff[index] = (
+                            float(y_value) - float(x_value)
+                        )
                 candidate.release(relation_workspace)
                 if offset_close:
                     candidate.offer(
@@ -2376,16 +2429,28 @@ def detect_relations(
                 csum, sum_lease = candidate.allocate(
                     "sum",
                     n,
-                    lambda: x + y,
+                    lambda: np.empty(n, dtype=float),
                 )
-                if n >= 5:
-                    K = float(np.mean(csum))
+                sum_scale = 0.0
+                sum_representable = True
+                for index, (x_value, y_value) in enumerate(
+                    zip(x, y)
+                ):
+                    sum_value = float(x_value) + float(y_value)
+                    if not math.isfinite(sum_value):
+                        sum_representable = False
+                        break
+                    csum[index] = sum_value
+                    sum_scale = max(sum_scale, abs(sum_value))
+                if n >= 5 and sum_representable:
+                    K = _bounded_scaled_mean(csum, sum_scale)
                     sum_compare_workspace = candidate.reserve(
                         "sum_compare_workspace",
                         13 * n,
                     )
                     sum_close = (
-                        K != 0
+                        K is not None
+                        and K != 0
                         and bool(
                             relation_close(
                                 csum,

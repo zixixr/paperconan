@@ -220,6 +220,43 @@ def test_unrepresentable_finite_relation_emits_no_primary_relation(
     assert _primary_linear_relation(_kinds(x, y)) == []
 
 
+def test_finite_extreme_difference_mean_is_warning_safe():
+    x = [1e-320, 2e-320, 3e-320, 4e-320, 5e-320]
+    y = [1e308, 1e308, 1e308, 1e308, 1e308]
+
+    findings = _kinds(x, y)
+
+    assert _primary_linear_relation(findings) == []
+
+
+def test_unrepresentable_finite_difference_skips_relation_checks():
+    x = [-1e308, -9e307, -8e307, -7e307, -6e307]
+    y = [1e308, 9e307, 8e307, 7e307, 6e307]
+
+    assert _kinds(x, y) == []
+
+
+@pytest.mark.parametrize(
+    ("x", "y"),
+    [
+        (
+            [1e308, 9e307, 8e307, 7e307, 6e307],
+            [9e307, 1e308, 7e307, 8e307, 6.5e307],
+        ),
+        (
+            [9e307, 8e307, 7e307, 6e307, 5e307],
+            [5e307, 6e307, 7.5e307, 8e307, 9e307],
+        ),
+    ],
+    ids=["unrepresentable-sum", "overflowing-sum-mean"],
+)
+def test_finite_extreme_sum_is_warning_safe(x, y):
+
+    findings = _kinds(x, y)
+
+    assert isinstance(findings, list)
+
+
 def test_no_fp_on_femtotesla_scale():
     # two GENUINELY DIFFERENT columns at ~1e-14: a fixed atol=1e-9 wrongly called these identical
     a = [1.0e-14, 2.0e-14, 3.0e-14, 4.0e-14, 5.0e-14, 6.0e-14, 7.0e-14]
