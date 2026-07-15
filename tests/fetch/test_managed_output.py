@@ -99,6 +99,17 @@ def _archive_cleanup_pending_record(archive_kind):
     }
 
 
+def _explicit_cause_chain(error):
+    chain = []
+    seen = {id(error)}
+    current = error.__cause__
+    while current is not None and id(current) not in seen:
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__
+    return chain
+
+
 def test_second_fetch_removes_only_previous_managed_files(
     tmp_path, monkeypatch
 ):
@@ -2763,8 +2774,8 @@ def test_unexpected_archive_failure_chains_cleanup_failure(
     skipped = []
 
     with pytest.raises(
-        PermissionError,
-        match="persistent archive cleanup failure",
+        _download._TransientCleanupError,
+        match="^transient file cleanup failed$",
     ) as raised:
         if archive_kind == "zip":
             _download._download_supplementary_archive(
@@ -2783,12 +2794,337 @@ def test_unexpected_archive_failure_chains_cleanup_failure(
                 _download._DEFAULT_MAX,
             )
 
-    assert raised.value.__cause__ is primary
+    error = raised.value
+    assert error.transient_path == str(cleanup_attempts[0])
+    assert error.cleanup_error is error.__cause__
+    assert str(error.cleanup_error) == (
+        "persistent archive cleanup failure"
+    )
+    assert error.operation_error is primary
+    assert error.cleanup_error.__cause__ is primary
     assert downloaded == []
     assert skipped == []
     assert len(cleanup_attempts) == 2
     assert len(set(cleanup_attempts)) == 1
     assert cleanup_attempts[0].exists()
+    top_level = f"{error!s} {error!r}"
+    assert str(tmp_path) not in top_level
+    assert cleanup_attempts[0].name not in top_level
+    assert "persistent archive cleanup failure" not in top_level
+    assert "unexpected archive operation" not in top_level
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+def test_archive_download_propagates_part_cleanup_without_skip(
+    tmp_path, monkeypatch, archive_kind
+):
+    class BrokenArchiveResponse(io.BytesIO):
+        headers = {"Content-Type": "application/octet-stream"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+        def info(self):
+            return self.headers
+
+        def read(self, size=-1):
+            raise OSError("private archive stream detail")
+
+    network_attempts = 0
+
+    def urlopen(req, timeout=None):
+        nonlocal network_attempts
+        network_attempts += 1
+        return BrokenArchiveResponse(b"partial")
+
+    original_remove = _download.os.remove
+    cleanup_attempts = []
+
+    def fail_part_cleanup(path):
+        if str(path).endswith(".part"):
+            cleanup_attempts.append(Path(path))
+            raise PermissionError("private archive cleanup detail")
+        return original_remove(path)
+
+    monkeypatch.setattr(
+        _download.urllib.request, "urlopen", urlopen
+    )
+    monkeypatch.setattr(
+        _download.os, "remove", fail_part_cleanup
+    )
+    monkeypatch.setattr(_download.time, "sleep", lambda *_: None)
+
+    with pytest.raises(
+        _download._TransientCleanupError,
+        match="^transient file cleanup failed$",
+    ) as raised:
+        _download.download_candidate({
+            "cand_id": "source:1",
+            "source": "source",
+            "tabular_files": [],
+            **_archive_fields(archive_kind),
+        }, str(tmp_path))
+
+    error = raised.value
+    assert network_attempts == 1
+    assert len(cleanup_attempts) == 2
+    assert len(set(cleanup_attempts)) == 1
+    orphan = cleanup_attempts[0]
+    assert orphan.exists()
+    assert error.transient_path == str(orphan)
+    assert error.cleanup_error is error.__cause__
+    assert str(error.cleanup_error) == (
+        "private archive cleanup detail"
+    )
+    assert error.operation_error is error.cleanup_error.__cause__
+    assert str(error.operation_error) == (
+        "private archive stream detail"
+    )
+    top_level = f"{error!s} {error!r}"
+    assert str(tmp_path) not in top_level
+    assert orphan.name not in top_level
+    assert "private archive cleanup detail" not in top_level
+    assert "private archive stream detail" not in top_level
+    assert not (tmp_path / _download.SOURCE_SIDECAR).exists()
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+def test_archive_member_cleanup_failure_bypasses_expected_catches(
+    tmp_path, monkeypatch, archive_kind
+):
+    payload = _archive_payload(
+        archive_kind,
+        [("nested/table.csv", b"member-data")],
+    )
+
+    def archive_download(url, dest, **kwargs):
+        Path(dest).write_bytes(payload)
+        return {
+            "ok": True,
+            "path": dest,
+            "size": len(payload),
+        }
+
+    class BrokenMemberStream:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def read(self, size=-1):
+            raise OSError("private member stream detail")
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+    monkeypatch.setattr(_download, "download_file", archive_download)
+    if archive_kind == "zip":
+        open_member = _download.zipfile.ZipFile.open
+
+        def open_broken(archive, member, *args, **kwargs):
+            return BrokenMemberStream(
+                open_member(archive, member, *args, **kwargs)
+            )
+
+        monkeypatch.setattr(
+            _download.zipfile.ZipFile, "open", open_broken
+        )
+    else:
+        open_member = _download.tarfile.TarFile.extractfile
+
+        def open_broken(archive, member, *args, **kwargs):
+            return BrokenMemberStream(
+                open_member(archive, member, *args, **kwargs)
+            )
+
+        monkeypatch.setattr(
+            _download.tarfile.TarFile,
+            "extractfile",
+            open_broken,
+        )
+
+    original_remove = _download.os.remove
+    cleanup_attempts = []
+
+    def fail_part_cleanup(path):
+        if str(path).endswith(".part"):
+            cleanup_attempts.append(Path(path))
+            raise PermissionError("private member cleanup detail")
+        return original_remove(path)
+
+    monkeypatch.setattr(
+        _download.os, "remove", fail_part_cleanup
+    )
+
+    with pytest.raises(
+        _download._TransientCleanupError,
+        match="^transient file cleanup failed$",
+    ) as raised:
+        _download.download_candidate({
+            "cand_id": "source:1",
+            "source": "source",
+            "tabular_files": [],
+            **_archive_fields(archive_kind),
+        }, str(tmp_path))
+
+    error = raised.value
+    assert len(cleanup_attempts) == 2
+    assert len(set(cleanup_attempts)) == 1
+    orphan = cleanup_attempts[0]
+    assert orphan.exists()
+    assert error.transient_path == str(orphan)
+    assert error.cleanup_error is error.__cause__
+    assert str(error.cleanup_error) == (
+        "private member cleanup detail"
+    )
+    assert error.operation_error is error.cleanup_error.__cause__
+    assert str(error.operation_error) == (
+        "private member stream detail"
+    )
+    top_level = f"{error!s} {error!r}"
+    assert str(tmp_path) not in top_level
+    assert orphan.name not in top_level
+    assert "private member cleanup detail" not in top_level
+    assert "private member stream detail" not in top_level
+    assert not (tmp_path / "table.csv").exists()
+    assert not (tmp_path / _download.SOURCE_SIDECAR).exists()
+
+
+@pytest.mark.parametrize("persistent_restore", [False, True])
+def test_transient_cleanup_chain_survives_managed_restore_failures(
+    tmp_path, monkeypatch, persistent_restore
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    output = out_dir / "table.csv"
+    output.write_bytes(b"old-output")
+    _write_sidecar(out_dir, [output.name], doi="10.x/old")
+    sidecar = out_dir / _download.SOURCE_SIDECAR
+    original_sidecar = sidecar.read_bytes()
+
+    class BrokenSourceResponse(io.BytesIO):
+        headers = {"Content-Type": "text/csv"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+        def info(self):
+            return self.headers
+
+        def read(self, size=-1):
+            raise OSError("private source stream detail")
+
+    network_attempts = 0
+
+    def urlopen(req, timeout=None):
+        nonlocal network_attempts
+        network_attempts += 1
+        return BrokenSourceResponse(b"partial")
+
+    original_remove = _download.os.remove
+    cleanup_attempts = []
+
+    def fail_part_cleanup(path):
+        if str(path).endswith(".part"):
+            cleanup_attempts.append(Path(path))
+            raise PermissionError("private source cleanup detail")
+        return original_remove(path)
+
+    original_replace = _download.os.replace
+    restore_attempts = []
+
+    def fail_restore(src, dest):
+        is_restore = (
+            Path(src).parent.name.startswith(
+                ".paperconan-output-rollback-"
+            )
+            and os.path.abspath(dest) == os.path.abspath(output)
+        )
+        if is_restore and (
+            persistent_restore or not restore_attempts
+        ):
+            restore_attempts.append(
+                (os.fspath(src), os.fspath(dest))
+            )
+            raise PermissionError("private managed restore detail")
+        return original_replace(src, dest)
+
+    monkeypatch.setattr(
+        _download.urllib.request, "urlopen", urlopen
+    )
+    monkeypatch.setattr(
+        _download.os, "remove", fail_part_cleanup
+    )
+    monkeypatch.setattr(_download.os, "replace", fail_restore)
+    monkeypatch.setattr(_download.time, "sleep", lambda *_: None)
+
+    with pytest.raises(
+        _download._TransientCleanupError,
+        match="^transient file cleanup failed$",
+    ) as raised:
+        _download.download_candidate(
+            _candidate(output.name, "https://x/table.csv"),
+            str(out_dir),
+        )
+
+    error = raised.value
+    assert network_attempts == 1
+    assert len(cleanup_attempts) == 2
+    assert len(set(cleanup_attempts)) == 1
+    assert len(restore_attempts) == (
+        2 if persistent_restore else 1
+    )
+    assert error.transient_path == str(cleanup_attempts[0])
+    assert error.cleanup_error is error.__cause__
+    assert str(error.cleanup_error) == (
+        "private source cleanup detail"
+    )
+    assert error.operation_error is error.cleanup_error.__cause__
+    assert str(error.operation_error) == (
+        "private source stream detail"
+    )
+    assert len(error.rollback_errors) == (
+        2 if persistent_restore else 1
+    )
+    chain = _explicit_cause_chain(error)
+    assert chain[:2] == [
+        error.cleanup_error,
+        error.operation_error,
+    ]
+    assert chain[2:] == list(error.rollback_errors)
+    assert all(
+        isinstance(item, _download._ManagedOutputRollbackError)
+        for item in error.rollback_errors
+    )
+    top_level = f"{error!s} {error!r}"
+    assert str(tmp_path) not in top_level
+    assert cleanup_attempts[0].name not in top_level
+    assert "private source cleanup detail" not in top_level
+    assert "private source stream detail" not in top_level
+    assert "private managed restore detail" not in top_level
+    assert sidecar.read_bytes() == original_sidecar
+    if persistent_restore:
+        assert not output.exists()
+        rollback_dirs = list(
+            tmp_path.glob(".paperconan-output-rollback-*")
+        )
+        assert len(rollback_dirs) == 1
+        backups = list(rollback_dirs[0].iterdir())
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == b"old-output"
+    else:
+        assert output.read_bytes() == b"old-output"
+        assert not list(
+            tmp_path.glob(".paperconan-output-rollback-*")
+        )
 
 
 @pytest.mark.parametrize("archive_kind", ["zip", "tar"])

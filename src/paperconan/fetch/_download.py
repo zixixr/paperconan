@@ -108,6 +108,20 @@ class _SizeLimitExceeded(ValueError):
     pass
 
 
+class _TransientCleanupError(RuntimeError):
+    def __init__(
+        self,
+        transient_path,
+        cleanup_error,
+        operation_error,
+    ):
+        self.transient_path = os.fspath(transient_path)
+        self.cleanup_error = cleanup_error
+        self.operation_error = operation_error
+        self.rollback_errors = ()
+        super().__init__("transient file cleanup failed")
+
+
 def _dir_size(path, exclude_paths=()):
     excluded = {
         os.path.abspath(os.fspath(excluded_path))
@@ -151,6 +165,21 @@ def _remove_transient_file(path):
     raise last_error
 
 
+def _raise_transient_cleanup_error(
+    transient_path,
+    cleanup_error,
+    operation_error,
+):
+    cleanup_error.__cause__ = operation_error
+    cleanup_error.__suppress_context__ = True
+    error = _TransientCleanupError(
+        transient_path,
+        cleanup_error,
+        operation_error,
+    )
+    raise error from cleanup_error
+
+
 def _atomic_stream_write(src, dest_path, max_bytes):
     directory = os.path.dirname(os.path.abspath(dest_path)) or "."
     os.makedirs(directory, exist_ok=True)
@@ -170,7 +199,11 @@ def _atomic_stream_write(src, dest_path, max_bytes):
         try:
             _remove_transient_file(temp_path)
         except OSError as cleanup_error:
-            raise cleanup_error from operation_error
+            _raise_transient_cleanup_error(
+                temp_path,
+                cleanup_error,
+                operation_error,
+            )
         raise
 
 
@@ -239,6 +272,43 @@ class _ManagedOutputRestoreFailure(RuntimeError):
         self.operation_error = operation_error
         self.rollback_error = rollback_error
         super().__init__(str(rollback_error))
+
+
+def _append_explicit_cause(error, cause):
+    seen = set()
+    tail = error
+    while tail is not None and id(tail) not in seen:
+        seen.add(id(tail))
+        if tail.__cause__ is None:
+            cause_cursor = cause
+            while (
+                cause_cursor is not None
+                and id(cause_cursor) not in seen
+            ):
+                seen.add(id(cause_cursor))
+                cause_cursor = cause_cursor.__cause__
+            if cause_cursor is not None:
+                return
+            tail.__cause__ = cause
+            tail.__suppress_context__ = True
+            return
+        tail = tail.__cause__
+
+
+def _raise_operation_with_rollback_errors(
+    operation_error,
+    rollback_errors,
+):
+    rollback_errors = tuple(rollback_errors)
+    if isinstance(operation_error, _TransientCleanupError):
+        for rollback_error in rollback_errors:
+            _append_explicit_cause(
+                operation_error,
+                rollback_error,
+            )
+        operation_error.rollback_errors += rollback_errors
+        raise operation_error from operation_error.__cause__
+    raise operation_error from rollback_errors[-1]
 
 
 class _ManagedOutputJournal:
@@ -460,6 +530,8 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
                     return {"ok": False, "path": dest_path,
                             "skipped_reason": str(e)}
                 return {"ok": True, "path": dest_path, "size": size}
+        except _TransientCleanupError:
+            raise
         except urllib.error.HTTPError as e:
             try:
                 if e.code in (401, 403):
@@ -2532,6 +2604,8 @@ def _extract_archive_members(
                     src, dest, write_limit
                 )
                 committed = True
+        except _TransientCleanupError:
+            raise
         except _TarArchiveLimit as error:
             if output_journal is not None:
                 _restore_managed_output(output_journal, dest)
@@ -2787,7 +2861,11 @@ def _cleanup_transient_archive(
         _remove_transient_file(path)
     except OSError as cleanup_error:
         if operation_error is not None:
-            raise cleanup_error from operation_error
+            _raise_transient_cleanup_error(
+                path,
+                cleanup_error,
+                operation_error,
+            )
         skipped.append({
             "name": archive_name,
             "reason": "transient archive cleanup pending",
@@ -3531,11 +3609,15 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
             output_journal=output_journal,
         )
     except _ManagedOutputRestoreFailure as failure:
+        rollback_errors = [failure.rollback_error]
         try:
             output_journal.rollback()
         except _ManagedOutputRollbackError as rollback_error:
-            raise failure.operation_error from rollback_error
-        raise failure.operation_error from failure.rollback_error
+            rollback_errors.append(rollback_error)
+        _raise_operation_with_rollback_errors(
+            failure.operation_error,
+            rollback_errors,
+        )
     except _ManagedOutputRollbackError as primary_error:
         try:
             output_journal.rollback()
@@ -3546,5 +3628,8 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
         try:
             output_journal.rollback()
         except _ManagedOutputRollbackError as rollback_error:
-            raise operation_error from rollback_error
+            _raise_operation_with_rollback_errors(
+                operation_error,
+                [rollback_error],
+            )
         raise

@@ -443,7 +443,7 @@ def test_transient_cleanup_retries_once_then_succeeds(
 
 
 @pytest.mark.parametrize("failure_kind", ["stream", "size"])
-def test_atomic_stream_write_chains_persistent_part_cleanup_failure(
+def test_atomic_stream_write_wraps_persistent_part_cleanup_failure(
     monkeypatch, tmp_path, failure_kind
 ):
     if failure_kind == "stream":
@@ -476,19 +476,97 @@ def test_atomic_stream_write_chains_persistent_part_cleanup_failure(
     dest = tmp_path / "table.csv"
 
     with pytest.raises(
-        PermissionError,
-        match="persistent part cleanup failure",
+        _download._TransientCleanupError,
+        match="^transient file cleanup failed$",
     ) as raised:
         _download._atomic_stream_write(
             source, str(dest), max_bytes
         )
 
+    error = raised.value
     assert len(attempts) == 2
     assert len(set(attempts)) == 1
     assert not dest.exists()
     assert attempts[0].exists()
-    assert isinstance(raised.value.__cause__, primary_type)
-    assert primary_message in str(raised.value.__cause__)
+    assert error.transient_path == str(attempts[0])
+    assert isinstance(error.cleanup_error, PermissionError)
+    assert str(error.cleanup_error) == (
+        "persistent part cleanup failure"
+    )
+    assert isinstance(error.operation_error, primary_type)
+    assert primary_message in str(error.operation_error)
+    assert error.__cause__ is error.cleanup_error
+    assert error.cleanup_error.__cause__ is error.operation_error
+    top_level = f"{error!s} {error!r}"
+    assert str(tmp_path) not in top_level
+    assert attempts[0].name not in top_level
+    assert "persistent part cleanup failure" not in top_level
+    assert primary_message not in top_level
+
+
+def test_download_file_propagates_cleanup_failure_without_retry_or_skip(
+    monkeypatch, tmp_path
+):
+    class BrokenStream(_Resp):
+        def read(self, size=-1):
+            raise OSError("private stream operation detail")
+
+    network_attempts = 0
+
+    def urlopen(req, timeout=None):
+        nonlocal network_attempts
+        network_attempts += 1
+        return BrokenStream(b"partial", "text/csv")
+
+    original_remove = _download.os.remove
+    cleanup_attempts = []
+
+    def fail_part_cleanup(path):
+        if str(path).endswith(".part"):
+            cleanup_attempts.append(Path(path))
+            raise PermissionError("private cleanup OS detail")
+        return original_remove(path)
+
+    monkeypatch.setattr(
+        _download.urllib.request, "urlopen", urlopen
+    )
+    monkeypatch.setattr(
+        _download.os, "remove", fail_part_cleanup
+    )
+    dest = tmp_path / "table.csv"
+
+    with pytest.raises(
+        _download._TransientCleanupError,
+        match="^transient file cleanup failed$",
+    ) as raised:
+        _download.download_file(
+            "https://x/table.csv",
+            str(dest),
+            retries=3,
+            backoff=0,
+        )
+
+    error = raised.value
+    assert isinstance(error, Exception)
+    assert not isinstance(error, OSError)
+    assert network_attempts == 1
+    assert len(cleanup_attempts) == 2
+    assert len(set(cleanup_attempts)) == 1
+    orphan = cleanup_attempts[0]
+    assert orphan.exists()
+    assert error.transient_path == str(orphan)
+    assert error.cleanup_error is error.__cause__
+    assert str(error.cleanup_error) == "private cleanup OS detail"
+    assert error.operation_error is error.cleanup_error.__cause__
+    assert str(error.operation_error) == (
+        "private stream operation detail"
+    )
+    top_level = f"{error!s} {error!r}"
+    assert str(tmp_path) not in top_level
+    assert orphan.name not in top_level
+    assert "private cleanup OS detail" not in top_level
+    assert "private stream operation detail" not in top_level
+    assert not dest.exists()
 
 
 def test_zip_duplicate_basenames_are_both_preserved(tmp_path):
