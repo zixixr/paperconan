@@ -93,6 +93,10 @@ _MALFORMED_NUMERIC_CONTENT_LENGTHS = [
     pytest.param("９００００００", id="non-ascii-decimal"),
 ]
 
+_VERY_LARGE_CAP = 10**5000
+_VERY_LARGE_CAP_DECIMAL = "1" + ("0" * 5000)
+_VERY_LARGE_CAP_PLUS_ONE_DECIMAL = "1" + ("0" * 4999) + "1"
+
 
 def test_get_json_builds_query_and_parses(monkeypatch):
     seen = {}
@@ -304,6 +308,71 @@ def test_http_helpers_accept_very_long_zero_padded_equal_content_length(
     assert invoke(len(body)) == expected
 
     assert response.read_sizes[-1] == 1
+    assert response.closed
+
+
+@pytest.mark.parametrize(
+    "_name,invoke,body,expected",
+    _HELPER_CASES,
+    ids=[case[0] for case in _HELPER_CASES],
+)
+def test_http_helpers_accept_small_response_with_very_large_cap(
+    monkeypatch, _name, invoke, body, expected
+):
+    response = _StubResp(body, content_length=str(len(body)))
+    monkeypatch.setattr(
+        _http.urllib.request, "urlopen", lambda _req, timeout=None: response
+    )
+
+    assert invoke(_VERY_LARGE_CAP) == expected
+
+    assert len(response.read_sizes) == 2
+    assert all(0 < size <= 65536 for size in response.read_sizes)
+    assert response.closed
+
+
+@pytest.mark.parametrize(
+    "_name,invoke,body,expected",
+    _HELPER_CASES,
+    ids=[case[0] for case in _HELPER_CASES],
+)
+def test_http_helpers_stream_when_very_long_content_length_equals_very_large_cap(
+    monkeypatch, _name, invoke, body, expected
+):
+    response = _StubResp(body, content_length=_VERY_LARGE_CAP_DECIMAL)
+    monkeypatch.setattr(
+        _http.urllib.request, "urlopen", lambda _req, timeout=None: response
+    )
+
+    assert invoke(_VERY_LARGE_CAP) == expected
+
+    assert len(response.read_sizes) == 2
+    assert all(0 < size <= 65536 for size in response.read_sizes)
+    assert response.closed
+
+
+@pytest.mark.parametrize(
+    "_name,invoke,body,_expected",
+    _HELPER_CASES,
+    ids=[case[0] for case in _HELPER_CASES],
+)
+def test_http_helpers_reject_very_long_content_length_above_very_large_cap(
+    monkeypatch, _name, invoke, body, _expected
+):
+    response = _StubResp(
+        body,
+        content_length=_VERY_LARGE_CAP_PLUS_ONE_DECIMAL,
+    )
+    monkeypatch.setattr(
+        _http.urllib.request, "urlopen", lambda _req, timeout=None: response
+    )
+
+    with pytest.raises(_http.ResponseTooLargeError) as caught:
+        invoke(_VERY_LARGE_CAP)
+
+    assert type(caught.value) is _http.ResponseTooLargeError
+    assert len(str(caught.value)) < 200
+    assert response.read_sizes == []
     assert response.closed
 
 

@@ -1,5 +1,6 @@
 """Thin stdlib HTTP helpers returning parsed JSON. No third-party deps."""
 from __future__ import annotations
+from decimal import Decimal
 import json
 import operator
 import urllib.error
@@ -34,19 +35,13 @@ def _content_length_exceeds(content_length, max_bytes):
     ):
         return False
 
-    significant = content_length.lstrip("0") or "0"
-    limit = str(max_bytes)
-    return len(significant) > len(limit) or (
-        len(significant) == len(limit) and significant > limit
-    )
+    return Decimal(content_length) > max_bytes
 
 
 def _read_limited(resp, max_bytes):
     content_length = resp.headers.get("Content-Length")
     if _content_length_exceeds(content_length, max_bytes):
-        raise ResponseTooLargeError(
-            f"response exceeds max_bytes ({max_bytes})"
-        )
+        raise ResponseTooLargeError("response exceeds max_bytes")
 
     chunks = []
     total = 0
@@ -56,9 +51,7 @@ def _read_limited(resp, max_bytes):
             return b"".join(chunks)
         total += len(chunk)
         if total > max_bytes:
-            raise ResponseTooLargeError(
-                f"response exceeds max_bytes ({max_bytes})"
-            )
+            raise ResponseTooLargeError("response exceeds max_bytes")
         chunks.append(chunk)
 
 
