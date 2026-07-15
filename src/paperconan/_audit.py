@@ -9013,8 +9013,10 @@ def _attach_deferred_evidence(
         if ext in {".pdf", ".docx"}:
             try:
                 entry_iterator = iter(_iter_extracted_sheets(path))
-            except FileNotFoundError as exc:
-                raise EvidenceReloadSourceMissing from exc
+            except Exception as exc:
+                if not os.path.exists(path):
+                    raise EvidenceReloadSourceMissing from exc
+                raise
             attempted = set()
             try:
                 try:
@@ -9023,8 +9025,10 @@ def _attach_deferred_evidence(
                             entry = next(entry_iterator)
                         except StopIteration:
                             break
-                        except FileNotFoundError as exc:
-                            raise EvidenceReloadSourceMissing from exc
+                        except Exception as exc:
+                            if not os.path.exists(path):
+                                raise EvidenceReloadSourceMissing from exc
+                            raise
                         sheet_name, sheet, limitations = entry
                         if (
                             sheet_name in blocks_by_sheet
@@ -9065,8 +9069,10 @@ def _attach_deferred_evidence(
 
         try:
             load_result = load_table_result(path)
-        except FileNotFoundError as exc:
-            raise EvidenceReloadSourceMissing from exc
+        except Exception as exc:
+            if not os.path.exists(path):
+                raise EvidenceReloadSourceMissing from exc
+            raise
         sheets = load_result.sheets
         limitations = load_result.limitations
         try:

@@ -373,6 +373,49 @@ def test_deferred_reload_attaches_evidence_to_every_retained_finding(
     )
 
 
+def test_deferred_reload_processes_every_retained_block_and_target(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "source.xlsx"
+    path.write_bytes(b"placeholder")
+    alpha, alpha_finding = _deferred_block(
+        path, sheet_name="Alpha"
+    )
+    beta, beta_finding = _deferred_block(
+        path, sheet_name="Beta"
+    )
+    missing, missing_finding = _deferred_block(
+        path, sheet_name="Missing"
+    )
+    monkeypatch.setattr(
+        audit,
+        "load_table_result",
+        lambda _path: TableLoadResult({
+            "Alpha": _evidence_sheet(),
+            "Beta": _evidence_sheet(),
+        }),
+    )
+    coverage = ScanCoverage(files_discovered=1)
+
+    audit._attach_deferred_evidence(
+        [alpha, beta, missing], coverage
+    )
+
+    assert alpha_finding["evidence"]["rows"]
+    assert beta_finding["evidence"]["rows"]
+    assert "evidence" not in missing_finding
+    assert coverage.limitations == [{
+        "scope": "sheet",
+        "reason": "evidence_reload_missing_sheet",
+        "file": "source.xlsx",
+        "sheet": "Missing",
+    }]
+    assert all(
+        not any(key.startswith("_evidence_") for key in block)
+        for block in (alpha, beta, missing)
+    )
+
+
 @pytest.mark.parametrize(
     ("suffix", "reason"),
     [
@@ -478,6 +521,8 @@ def test_deferred_reload_exception_isolated_per_source_and_bounded(
 ):
     failed_path = tmp_path / "failed.xlsx"
     good_path = tmp_path / "good.xlsx"
+    failed_path.write_bytes(b"placeholder")
+    good_path.write_bytes(b"placeholder")
     failed_block, failed_finding = _deferred_block(failed_path)
     good_block, good_finding = _deferred_block(good_path)
     secret = "/private/source.xlsx?credential=not-for-output"
@@ -514,6 +559,7 @@ def test_deferred_loader_value_error_text_does_not_escape(
     tmp_path, monkeypatch
 ):
     path = tmp_path / "source.xlsx"
+    path.write_bytes(b"placeholder")
     block, finding = _deferred_block(path)
 
     def fail(_path):
@@ -537,6 +583,7 @@ def test_deferred_extractor_exception_does_not_require_stringification(
     tmp_path, monkeypatch
 ):
     path = tmp_path / "source.pdf"
+    path.write_bytes(b"placeholder")
     block, finding = _deferred_block(path)
 
     class UnprintableValueError(ValueError):
@@ -584,17 +631,10 @@ def test_deferred_reload_records_missing_file_without_path_detail(
     assert str(tmp_path) not in json.dumps(coverage.to_dict())
 
 
-def test_deferred_extractor_iteration_missing_file_uses_source_reason(
-    tmp_path, monkeypatch
-):
+def test_deferred_real_missing_pdf_uses_source_reason(tmp_path):
+    pytest.importorskip("pdfplumber")
     path = tmp_path / "missing.pdf"
     block, finding = _deferred_block(path)
-
-    def missing(_path):
-        raise FileNotFoundError(str(path))
-        yield
-
-    monkeypatch.setattr(audit, "_iter_extracted_sheets", missing)
     coverage = ScanCoverage(files_discovered=1)
 
     audit._attach_deferred_evidence([block], coverage)
@@ -604,6 +644,47 @@ def test_deferred_extractor_iteration_missing_file_uses_source_reason(
         "scope": "file",
         "reason": "evidence_reload_missing_file",
         "file": "missing.pdf",
+    }]
+
+
+def test_deferred_real_missing_docx_uses_source_reason(tmp_path):
+    pytest.importorskip("docx")
+    path = tmp_path / "missing.docx"
+    block, finding = _deferred_block(path)
+    coverage = ScanCoverage(files_discovered=1)
+
+    audit._attach_deferred_evidence([block], coverage)
+
+    assert "evidence" not in finding
+    assert coverage.limitations == [{
+        "scope": "file",
+        "reason": "evidence_reload_missing_file",
+        "file": "missing.docx",
+    }]
+
+
+def test_deferred_existing_extractor_internal_missing_file_is_reload_error(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "source.pdf"
+    path.write_bytes(b"placeholder")
+    block, finding = _deferred_block(path)
+
+    def fail(_path):
+        raise FileNotFoundError("extractor dependency unavailable")
+        yield
+
+    monkeypatch.setattr(audit, "_iter_extracted_sheets", fail)
+    coverage = ScanCoverage(files_discovered=1)
+
+    audit._attach_deferred_evidence([block], coverage)
+
+    assert "evidence" not in finding
+    assert coverage.limitations == [{
+        "scope": "file",
+        "reason": "evidence_reload_error",
+        "file": "source.pdf",
+        "error_type": "FileNotFoundError",
     }]
 
 

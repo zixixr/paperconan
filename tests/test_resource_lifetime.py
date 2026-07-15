@@ -3125,6 +3125,8 @@ def test_deferred_reload_closes_failed_extractor_before_next_source(
 ):
     pdf_path = tmp_path / "failed.pdf"
     csv_path = tmp_path / "good.csv"
+    pdf_path.write_bytes(b"placeholder")
+    csv_path.write_text("placeholder", encoding="utf-8")
     pdf_block = _deferred_report_block(pdf_path, "Target")
     csv_block = _deferred_report_block(csv_path, "Target")
     iterator_refs = []
@@ -3294,6 +3296,8 @@ def test_deferred_reload_settles_file_and_target_sheet_once(
         },
     )
 
+    assert first["relations"][0]["evidence"]["rows"]
+    assert second["relations"][0]["evidence"]["rows"]
     assert calls == [sheet_stat, file_stat]
 
 
