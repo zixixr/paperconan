@@ -3048,6 +3048,41 @@ def _longest_hp_ratio_run(a, b):
     return k, best_len, x_run
 
 
+def _longest_hp_offset_run(a, b):
+    """Longest contiguous run where b[c] == a[c] + c for a fixed NON-zero constant c, every
+    cell high-precision, c held to a tight absolute tolerance (a genuine copy+shift is exact).
+    The row twin of `constant_offset`. Returns (c, run_len, x_run) or None."""
+    best_len, best_start, best_c = 0, 0, None
+    cur_len, cur_c, cur_start, cur_scale = 0, None, 0, 1.0
+    for i in range(len(a)):
+        av, bv = a[i], b[i]
+        if not _is_short_hp(av) or not _is_short_hp(bv):
+            cur_len, cur_c = 0, None
+            continue
+        d = bv - av
+        # membership tolerance scales with the CELL magnitude (no fixed floor): for near-zero
+        # rows a fixed 1e-4 floor is huge relative to the values, so unrelated small rows read
+        # as a constant difference; a genuine copy+shift matches to read precision (~1e-9).
+        tol = _SHORT_ROW_RTOL * max(abs(av), abs(bv), 1e-300)
+        if cur_c is None or abs(d - cur_c) > tol:
+            cur_c, cur_len, cur_start = d, 1, i
+            cur_scale = max(abs(av), abs(bv), 1e-300)    # anchor magnitude, fixed for the run
+        else:
+            cur_len += 1
+        # non-triviality is anchored to the run START magnitude, not the current cell — a
+        # per-cell threshold flips as the run crosses magnitudes and truncates genuine runs
+        # when a large cell lands at the tail.
+        if cur_len > best_len and abs(cur_c) > _SHORT_ROW_RTOL * cur_scale:
+            best_len, best_start, best_c = cur_len, cur_start, cur_c
+    if best_len == 0 or best_c is None:
+        return None
+    x_run = a[best_start:best_start + best_len].astype(float)
+    c = float(np.mean(b[best_start:best_start + best_len].astype(float) - x_run))
+    if abs(c) <= 1e-9:
+        return None
+    return c, best_len, x_run
+
+
 def _short_row_candidates(grid_sheets):
     """Every data row carrying >=_SHORT_ROW_MIN_COLS high-precision values with >=3
     DISTINCT such values — including ISOLATED single rows that `_scaled_row_candidates`
@@ -3124,6 +3159,7 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60):
                     break
                 ident = _longest_hp_identical_run(a[:m], b[:m])
                 ratio = _longest_hp_ratio_run(a[:m], b[:m])
+                offset = _longest_hp_offset_run(a[:m], b[:m])
                 ident_ok = (ident is not None
                             and _SHORT_ROW_MIN_COLS <= ident[0] < _ROW_REL_MIN_COLS
                             and len(np.unique(ident[1])) >= 3
@@ -3134,14 +3170,28 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60):
                             and _rare(ratio[2])
                             and not _same_band(A["row"], B["row"])
                             and not _near_power_of_ten(ratio[0]))
-                if ident_ok and (not ratio_ok or ident[0] >= ratio[1]):
+                # Constant additive offset (B = A + c) — the row twin of constant_offset. Like
+                # the scaled case, an adjacent same-band offset is a smooth-curve step (a linear
+                # stretch of a curve), so it is suppressed.
+                offset_ok = (offset is not None
+                             and _SHORT_ROW_MIN_COLS <= offset[1] < _ROW_REL_MIN_COLS
+                             and len(np.unique(offset[2])) >= 3
+                             and _rare(offset[2])
+                             and not _same_band(A["row"], B["row"]))
+                # Prefer identical; among the two one-parameter relations pick the longer run.
+                if ident_ok and ident[0] >= max(ratio[1] if ratio_ok else 0,
+                                                offset[1] if offset_ok else 0):
                     kind, k, run_len, x_run = "identical_row_reuse", 1.0, ident[0], ident[1]
+                elif offset_ok and (not ratio_ok or offset[1] >= ratio[1]):
+                    kind, k, run_len, x_run = "offset_row_reuse", offset[0], offset[1], offset[2]
                 elif ratio_ok:
                     kind, k, run_len, x_run = "scaled_row_reuse", ratio[0], ratio[1], ratio[2]
                 else:
                     continue
-                rel = (f"== row '{B['label']}'" if kind == "identical_row_reuse"
-                       else f"= row '{B['label']}' * {k:.6g}")
+                rel = ("== row '{}'".format(B["label"]) if kind == "identical_row_reuse"
+                       else "= row '{}' + {:.6g}".format(B["label"], k)
+                       if kind == "offset_row_reuse"
+                       else "= row '{}' * {:.6g}".format(B["label"], k))
                 findings.append(dict(
                     kind=kind, short_run=True,
                     file=fname, file_a=fname, file_b=fname,
@@ -3149,10 +3199,13 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60):
                     sheet_a=sname, sheet_b=sname,
                     row_a=A["label"], row_b=B["label"],
                     size_a=run_len, size_b=run_len, same_position_count=run_len,
-                    fraction_of_smaller=1.0, ratio=k, run_length=run_len,
+                    fraction_of_smaller=1.0, run_length=run_len,
+                    ratio=(k if kind == "scaled_row_reuse" else None),
+                    offset=(k if kind == "offset_row_reuse" else None),
                     figure_a=fig, figure_b=fig, same_figure=fig is not None,
-                    delta={"pattern": "identical_row" if kind == "identical_row_reuse"
-                           else "scaled_row"},
+                    delta={"pattern": {"identical_row_reuse": "identical_row",
+                                       "offset_row_reuse": "offset_row",
+                                       "scaled_row_reuse": "scaled_row"}[kind]},
                     block_a=f"row {A['row'] + 1}", block_b=f"row {B['row'] + 1}",
                     examples=[{"row": A["label"], "col": None, "value": float(v)}
                               for v in x_run[:5]],
