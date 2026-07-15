@@ -1,6 +1,7 @@
 """Thin stdlib HTTP helpers returning parsed JSON. No third-party deps."""
 from __future__ import annotations
 import json
+import operator
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -14,8 +15,15 @@ class ResponseTooLargeError(ValueError):
 
 
 def _validate_max_bytes(max_bytes):
+    try:
+        max_bytes = operator.index(max_bytes)
+    except TypeError:
+        raise ResponseTooLargeError(
+            "max_bytes must be a non-negative integer"
+        ) from None
     if max_bytes < 0:
         raise ResponseTooLargeError("max_bytes must be non-negative")
+    return max_bytes
 
 
 def _read_limited(resp, max_bytes):
@@ -63,7 +71,7 @@ def get_json(
     timeout=15,
     max_bytes=_DEFAULT_MAX_RESPONSE_BYTES,
 ):
-    _validate_max_bytes(max_bytes)
+    max_bytes = _validate_max_bytes(max_bytes)
     if params:
         url = url + "?" + urllib.parse.urlencode(params)
     h = {"Accept": "application/json", "User-Agent": _UA}
@@ -84,7 +92,7 @@ def get_text(
     max_bytes=_DEFAULT_MAX_RESPONSE_BYTES,
 ):
     """GET a text resource (HTML/XML) and return the decoded body as str."""
-    _validate_max_bytes(max_bytes)
+    max_bytes = _validate_max_bytes(max_bytes)
     if params:
         url = url + "?" + urllib.parse.urlencode(params)
     h = {"Accept": "text/html,application/xml;q=0.9,*/*;q=0.8", "User-Agent": _UA}
@@ -102,7 +110,7 @@ def post_json(
     timeout=15,
     max_bytes=_DEFAULT_MAX_RESPONSE_BYTES,
 ):
-    _validate_max_bytes(max_bytes)
+    max_bytes = _validate_max_bytes(max_bytes)
     body = json.dumps(payload).encode("utf-8")
     h = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": _UA}
     if headers:
