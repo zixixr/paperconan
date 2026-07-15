@@ -267,6 +267,47 @@ def test_http_helpers_reject_advertised_oversize_before_read_and_close(
 
 
 @pytest.mark.parametrize(
+    "_name,invoke,body,_expected",
+    _HELPER_CASES,
+    ids=[case[0] for case in _HELPER_CASES],
+)
+def test_http_helpers_reject_very_long_overcap_content_length_before_read(
+    monkeypatch, _name, invoke, body, _expected
+):
+    response = _StubResp(body, content_length="9" * 5000)
+    monkeypatch.setattr(
+        _http.urllib.request, "urlopen", lambda _req, timeout=None: response
+    )
+
+    with pytest.raises(_http.ResponseTooLargeError) as caught:
+        invoke(len(body))
+
+    assert type(caught.value) is _http.ResponseTooLargeError
+    assert response.read_sizes == []
+    assert response.closed
+
+
+@pytest.mark.parametrize(
+    "_name,invoke,body,expected",
+    _HELPER_CASES,
+    ids=[case[0] for case in _HELPER_CASES],
+)
+def test_http_helpers_accept_very_long_zero_padded_equal_content_length(
+    monkeypatch, _name, invoke, body, expected
+):
+    content_length = ("0" * 5000) + str(len(body))
+    response = _StubResp(body, content_length=content_length)
+    monkeypatch.setattr(
+        _http.urllib.request, "urlopen", lambda _req, timeout=None: response
+    )
+
+    assert invoke(len(body)) == expected
+
+    assert response.read_sizes[-1] == 1
+    assert response.closed
+
+
+@pytest.mark.parametrize(
     "content_length",
     [None, "not-a-number", "-1", "1"],
     ids=["absent", "malformed", "negative", "understated"],

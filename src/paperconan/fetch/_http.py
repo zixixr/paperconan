@@ -26,17 +26,24 @@ def _validate_max_bytes(max_bytes):
     return max_bytes
 
 
-def _read_limited(resp, max_bytes):
-    content_length = resp.headers.get("Content-Length")
-    if (
+def _content_length_exceeds(content_length, max_bytes):
+    if not (
         isinstance(content_length, str)
         and content_length.isascii()
         and content_length.isdigit()
     ):
-        advertised_length = int(content_length)
-    else:
-        advertised_length = None
-    if advertised_length is not None and advertised_length > max_bytes:
+        return False
+
+    significant = content_length.lstrip("0") or "0"
+    limit = str(max_bytes)
+    return len(significant) > len(limit) or (
+        len(significant) == len(limit) and significant > limit
+    )
+
+
+def _read_limited(resp, max_bytes):
+    content_length = resp.headers.get("Content-Length")
+    if _content_length_exceeds(content_length, max_bytes):
         raise ResponseTooLargeError(
             f"response exceeds max_bytes ({max_bytes})"
         )
