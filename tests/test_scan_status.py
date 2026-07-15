@@ -7,6 +7,8 @@ import paperconan._audit as audit
 import pytest
 
 from paperconan._audit import scan_dir
+from paperconan._input import InputLimitation, TableLoadResult
+from paperconan._sheet import Sheet
 
 
 def _write_good_csv(path):
@@ -180,6 +182,87 @@ def test_partial_scan_status_when_one_file_fails(tmp_path):
     assert scan["scan_status"] == "partial"
     assert scan["coverage"]["files_succeeded"] == 1
     assert scan["coverage"]["files_failed"] == 1
+
+
+def test_missing_deferred_evidence_makes_scan_partial_deterministically(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    path = data / "source.csv"
+    path.write_text("placeholder", encoding="utf-8")
+    values = [
+        11.125,
+        7.375,
+        19.625,
+        3.875,
+        14.125,
+        8.625,
+        17.375,
+        5.125,
+        13.875,
+        9.625,
+        16.125,
+        6.375,
+        12.625,
+        10.875,
+    ]
+    calls = 0
+
+    def load_table(_path):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return TableLoadResult({
+                "source": Sheet.from_rows(
+                    [["left", "right"]]
+                    + [[value, value] for value in values]
+                )
+            })
+        return TableLoadResult(
+            {"source": None},
+            [InputLimitation(
+                scope="sheet",
+                reason="cell_limit",
+                sheet="source",
+                details={"cells": 30, "max_cells": 20},
+            )],
+        )
+
+    monkeypatch.setattr(audit, "load_table_result", load_table)
+
+    scan = scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    expected = {
+        "scope": "sheet",
+        "reason": "evidence_reload_cell_limit",
+        "file": "source.csv",
+        "sheet": "source",
+        "cells": 30,
+        "max_cells": 20,
+    }
+    assert scan["relations_blocks"]
+    assert scan["scan_status"] == "partial"
+    assert scan["coverage"]["limitations"] == [expected]
+    assert list(scan["coverage"]["limitations"][0]) == [
+        "scope",
+        "reason",
+        "file",
+        "sheet",
+        "cells",
+        "max_cells",
+    ]
+    serialized = json.loads(
+        (tmp_path / "out" / "scan.json").read_text(encoding="utf-8")
+    )
+    assert serialized["scan_status"] == "partial"
+    assert serialized["coverage"]["limitations"] == [expected]
+    assert all(
+        not any(key.startswith("_evidence_") for key in block)
+        for block in serialized["relations_blocks"]
+    )
 
 
 def test_failed_scan_status_when_every_file_fails(tmp_path):

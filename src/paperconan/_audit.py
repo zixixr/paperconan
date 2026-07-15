@@ -8902,6 +8902,167 @@ def _attach_deferred_evidence(
         if path is not None:
             blocks_by_path.setdefault(path, []).append(block)
 
+    def add_input_limitations(file_name, sheet_name, limitations):
+        added = False
+        for limitation in limitations:
+            details = limitation.to_dict()
+            scope = details.pop("scope")
+            reason = details.pop("reason")
+            details.pop("file", None)
+            limitation_sheet = details.pop("sheet", None)
+            if (
+                limitation_sheet is not None
+                and limitation_sheet != sheet_name
+            ):
+                continue
+            coverage.add_limitation(
+                scope,
+                f"evidence_reload_{reason}",
+                file=file_name,
+                sheet=(
+                    limitation_sheet
+                    if limitation_sheet is not None
+                    else sheet_name if scope == "sheet" else None
+                ),
+                **details,
+            )
+            added = True
+        return added
+
+    def close_iterator(iterator):
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            close()
+
+    def attach_path(path, retained_blocks, path_runtime):
+        blocks_by_sheet = {}
+        for block in retained_blocks:
+            blocks_by_sheet.setdefault(block["sheet"], []).append(block)
+        file_name = retained_blocks[0]["file"]
+
+        def attach_target(
+            sheet_name,
+            sheet,
+            limitations,
+            *,
+            missing_reason,
+        ):
+            sheet_stat = (
+                path_runtime["sheets"].get(sheet_name)
+                if path_runtime is not None
+                else None
+            )
+            sheet_start = (
+                time.perf_counter()
+                if sheet_stat is not None
+                else None
+            )
+            try:
+                if sheet is None:
+                    if not add_input_limitations(
+                        file_name, sheet_name, limitations
+                    ):
+                        coverage.add_limitation(
+                            "sheet",
+                            missing_reason,
+                            file=file_name,
+                            sheet=sheet_name,
+                        )
+                    return
+                if not isinstance(sheet, Sheet):
+                    sheet = Sheet.from_rows(
+                        sheet,
+                        max_cells=_MAX_CELLS,
+                        max_sparse_cells=_MAX_SPARSE_CELLS,
+                        max_sparse_bytes=_MAX_SPARSE_BYTES,
+                    )
+                evidence_truncated = False
+                for block in blocks_by_sheet[sheet_name]:
+                    r0, r1, c0, c1 = block["_evidence_context"]
+                    header = block["block"]["header"]
+                    for group_name in BLOCK_FINDING_GROUPS:
+                        evidence_truncated = _attach_evidence(
+                            block.get(group_name) or [],
+                            sheet,
+                            r0,
+                            r1,
+                            c0,
+                            c1,
+                            header,
+                        ) or evidence_truncated
+                    if evidence_truncated:
+                        coverage.add_limitation(
+                            "block",
+                            "evidence_limit",
+                            file=block["file"],
+                            sheet=sheet_name,
+                            rows=block["block"]["rows"],
+                            cols=block["block"]["cols"],
+                            max_rows=_MAX_EV_ROWS,
+                            max_cols=_MAX_EV_COLS,
+                        )
+                        evidence_truncated = False
+            finally:
+                _add_elapsed_ms(sheet_stat, sheet_start)
+                del sheet
+
+        ext = os.path.splitext(path)[1].lower()
+        if ext in {".pdf", ".docx"}:
+            entry_iterator = iter(_iter_extracted_sheets(path))
+            attempted = set()
+            try:
+                while True:
+                    try:
+                        entry = next(entry_iterator)
+                    except StopIteration:
+                        break
+                    sheet_name, sheet, limitations = entry
+                    if (
+                        sheet_name in blocks_by_sheet
+                        and sheet_name not in attempted
+                    ):
+                        attach_target(
+                            sheet_name,
+                            sheet,
+                            limitations,
+                            missing_reason=(
+                                "evidence_reload_missing_table"
+                            ),
+                        )
+                        attempted.add(sheet_name)
+                    del sheet
+                    del limitations
+                    del sheet_name
+                    del entry
+            finally:
+                close_iterator(entry_iterator)
+                del entry_iterator
+            for sheet_name in blocks_by_sheet:
+                if sheet_name not in attempted:
+                    attach_target(
+                        sheet_name,
+                        None,
+                        (),
+                        missing_reason="evidence_reload_missing_table",
+                    )
+            return
+
+        load_result = load_table_result(path)
+        sheets = load_result.sheets
+        limitations = load_result.limitations
+        try:
+            for sheet_name in blocks_by_sheet:
+                attach_target(
+                    sheet_name,
+                    sheets.get(sheet_name),
+                    limitations,
+                    missing_reason="evidence_reload_missing_sheet",
+                )
+        finally:
+            del limitations
+            del sheets
+            del load_result
+
     try:
         for path, path_blocks in blocks_by_path.items():
             retained_blocks = [
@@ -8921,99 +9082,34 @@ def _attach_deferred_evidence(
                 else None
             )
             try:
-                blocks_by_sheet = {}
-                for block in retained_blocks:
-                    blocks_by_sheet.setdefault(
-                        block["sheet"], []
-                    ).append(block)
-
-                def attach_sheet_blocks(sheet_name, sheet):
-                    for block in blocks_by_sheet.get(sheet_name, ()):
-                        sheet_stat = (
-                            path_runtime["sheets"].get(sheet_name)
-                            if path_runtime is not None
-                            else None
-                        )
-                        sheet_start = (
-                            time.perf_counter()
-                            if sheet_stat is not None
-                            else None
-                        )
-                        try:
-                            r0, r1, c0, c1 = (
-                                block["_evidence_context"]
-                            )
-                            header = block["block"]["header"]
-                            evidence_truncated = False
-                            for group_name in BLOCK_FINDING_GROUPS:
-                                evidence_truncated = _attach_evidence(
-                                    block.get(group_name) or [],
-                                    sheet,
-                                    r0,
-                                    r1,
-                                    c0,
-                                    c1,
-                                    header,
-                                ) or evidence_truncated
-                            if evidence_truncated:
-                                coverage.add_limitation(
-                                    "block",
-                                    "evidence_limit",
-                                    file=block["file"],
-                                    sheet=sheet_name,
-                                    rows=block["block"]["rows"],
-                                    cols=block["block"]["cols"],
-                                    max_rows=_MAX_EV_ROWS,
-                                    max_cols=_MAX_EV_COLS,
-                                )
-                        finally:
-                            _add_elapsed_ms(sheet_stat, sheet_start)
-
-                ext = os.path.splitext(path)[1].lower()
-                if ext in {".pdf", ".docx"}:
-                    entry_iterator = iter(_iter_extracted_sheets(path))
-                    while True:
-                        try:
-                            entry = next(entry_iterator)
-                        except StopIteration:
-                            break
-                        sheet_name, sheet, _limitations = entry
-                        if (
-                            sheet is not None
-                            and sheet_name in blocks_by_sheet
-                        ):
-                            attach_sheet_blocks(sheet_name, sheet)
-                        del sheet
-                        del _limitations
-                        del sheet_name
-                        del entry
-                    del entry_iterator
-                else:
-                    load_result = load_table_result(path)
-                    sheets = load_result.sheets
-                    try:
-                        for sheet_name, sheet_blocks in (
-                            blocks_by_sheet.items()
-                        ):
-                            sheet = sheets.get(sheet_name)
-                            if sheet is None:
-                                continue
-                            if not isinstance(sheet, Sheet):
-                                sheet = Sheet.from_rows(
-                                    sheet,
-                                    max_cells=_MAX_CELLS,
-                                    max_sparse_cells=(
-                                        _MAX_SPARSE_CELLS
-                                    ),
-                                    max_sparse_bytes=(
-                                        _MAX_SPARSE_BYTES
-                                    ),
-                                )
-                            attach_sheet_blocks(sheet_name, sheet)
-                            del sheet
-                    finally:
-                        del sheets
-                        del load_result
+                attach_path(path, retained_blocks, path_runtime)
+            except FileNotFoundError:
+                coverage.add_limitation(
+                    "file",
+                    "evidence_reload_missing_file",
+                    file=retained_blocks[0]["file"],
+                )
+            except Exception as exc:
+                if (
+                    isinstance(exc, ValueError)
+                    and str(exc).startswith(
+                        "details contains reserved key:"
+                    )
+                ):
+                    raise
+                error_type = type(exc).__name__
+                if (
+                    not error_type
+                    or len(error_type) > 80
+                    or not error_type.replace("_", "").isalnum()
+                ):
+                    error_type = "Exception"
+                coverage.add_limitation(
+                    "file",
+                    "evidence_reload_error",
+                    file=retained_blocks[0]["file"],
+                    error_type=error_type,
+                )
             finally:
                 _add_elapsed_ms(
                     (

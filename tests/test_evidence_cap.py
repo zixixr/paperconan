@@ -1,7 +1,10 @@
 import builtins
+import json
 
 import paperconan._audit as audit
+import pytest
 from paperconan._coverage import ScanCoverage
+from paperconan._input import InputLimitation, TableLoadResult
 from paperconan._sheet import Sheet
 from paperconan._summaries import RecurringRowIndex
 from paperconan._audit import _block_evidence, scan_dir
@@ -9,6 +12,40 @@ from paperconan._audit import _block_evidence, scan_dir
 
 def _grid(nr, nc):
     return Sheet.from_rows([[float(r * 1000 + c) for c in range(nc)] for r in range(nr)])
+
+
+def _deferred_block(path, *, file_name=None, sheet_name="Target"):
+    finding = {
+        "kind": "constant_offset",
+        "severity": "medium",
+        "rule": "deferred evidence",
+        "col_a_idx": 0,
+        "col_b_idx": 1,
+    }
+    groups = {name: [] for name in audit.BLOCK_FINDING_GROUPS}
+    groups["relations"] = [finding]
+    block = {
+        "file": file_name or path.name,
+        "sheet": sheet_name,
+        "block": {
+            "rows": "1-4",
+            "cols": "1-2",
+            "header": ["left", "right"],
+        },
+        **groups,
+        "_evidence_path": str(path),
+        "_evidence_context": (0, 4, 0, 2),
+    }
+    return block, finding
+
+
+def _evidence_sheet():
+    return Sheet.from_rows([
+        ["left", "right"],
+        [1.25, 2.25],
+        [2.5, 3.5],
+        [3.75, 4.75],
+    ])
 
 
 def test_small_block_untruncated():
@@ -277,6 +314,206 @@ def test_evidence_limit_is_recorded_once_per_affected_block(monkeypatch):
         finding["evidence"]["truncated"] is True
         for finding in findings
     )
+
+
+def test_deferred_spreadsheet_reload_attaches_evidence_and_cleans_keys(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "source.xlsx"
+    block, finding = _deferred_block(path)
+    monkeypatch.setattr(
+        audit,
+        "load_table_result",
+        lambda _path: TableLoadResult({"Target": _evidence_sheet()}),
+    )
+    coverage = ScanCoverage(files_discovered=1)
+
+    audit._attach_deferred_evidence([block], coverage)
+
+    assert finding["evidence"]["rows"]
+    assert coverage.limitations == []
+    assert "_evidence_path" not in block
+    assert "_evidence_context" not in block
+
+
+@pytest.mark.parametrize(
+    ("suffix", "reason"),
+    [
+        (".xlsx", "evidence_reload_missing_sheet"),
+        (".pdf", "evidence_reload_missing_table"),
+    ],
+)
+def test_deferred_reload_records_missing_target(
+    tmp_path, monkeypatch, suffix, reason
+):
+    path = tmp_path / f"source{suffix}"
+    block, finding = _deferred_block(path)
+    if suffix == ".pdf":
+        monkeypatch.setattr(
+            audit, "_iter_extracted_sheets", lambda _path: iter(())
+        )
+    else:
+        monkeypatch.setattr(
+            audit,
+            "load_table_result",
+            lambda _path: TableLoadResult({}),
+        )
+    coverage = ScanCoverage(files_discovered=1)
+
+    audit._attach_deferred_evidence([block], coverage)
+
+    assert "evidence" not in finding
+    assert coverage.limitations == [{
+        "scope": "sheet",
+        "reason": reason,
+        "file": path.name,
+        "sheet": "Target",
+    }]
+    assert not any(key.startswith("_evidence_") for key in block)
+
+
+def test_deferred_spreadsheet_reload_surfaces_loader_limitation(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "source.xlsx"
+    block, finding = _deferred_block(path)
+    limitation = InputLimitation(
+        scope="sheet",
+        reason="cell_limit",
+        sheet="Target",
+        details={"cells": 12, "max_cells": 10},
+    )
+    monkeypatch.setattr(
+        audit,
+        "load_table_result",
+        lambda _path: TableLoadResult(
+            {"Target": None}, [limitation]
+        ),
+    )
+    coverage = ScanCoverage(files_discovered=1)
+
+    audit._attach_deferred_evidence([block], coverage)
+
+    assert "evidence" not in finding
+    assert coverage.limitations == [{
+        "scope": "sheet",
+        "reason": "evidence_reload_cell_limit",
+        "file": "source.xlsx",
+        "sheet": "Target",
+        "cells": 12,
+        "max_cells": 10,
+    }]
+
+
+def test_deferred_extractor_reload_surfaces_table_limitation(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "source.pdf"
+    block, finding = _deferred_block(path)
+    limitation = InputLimitation(
+        scope="sheet",
+        reason="sparse_cell_limit",
+        sheet="Target",
+        details={"sparse_cells": 12, "max_sparse_cells": 10},
+    )
+    monkeypatch.setattr(
+        audit,
+        "_iter_extracted_sheets",
+        lambda _path: iter([("Target", None, [limitation])]),
+    )
+    coverage = ScanCoverage(files_discovered=1)
+
+    audit._attach_deferred_evidence([block], coverage)
+
+    assert "evidence" not in finding
+    assert coverage.limitations == [{
+        "scope": "sheet",
+        "reason": "evidence_reload_sparse_cell_limit",
+        "file": "source.pdf",
+        "sheet": "Target",
+        "max_sparse_cells": 10,
+        "sparse_cells": 12,
+    }]
+
+
+def test_deferred_reload_exception_isolated_per_source_and_bounded(
+    tmp_path, monkeypatch
+):
+    failed_path = tmp_path / "failed.xlsx"
+    good_path = tmp_path / "good.xlsx"
+    failed_block, failed_finding = _deferred_block(failed_path)
+    good_block, good_finding = _deferred_block(good_path)
+    secret = "/private/source.xlsx?credential=not-for-output"
+
+    def load(path):
+        if path == str(failed_path):
+            raise RuntimeError(secret)
+        return TableLoadResult({"Target": _evidence_sheet()})
+
+    monkeypatch.setattr(audit, "load_table_result", load)
+    coverage = ScanCoverage(files_discovered=2)
+
+    audit._attach_deferred_evidence(
+        [failed_block, good_block], coverage
+    )
+
+    assert "evidence" not in failed_finding
+    assert good_finding["evidence"]["rows"]
+    assert coverage.limitations == [{
+        "scope": "file",
+        "reason": "evidence_reload_error",
+        "file": "failed.xlsx",
+        "error_type": "RuntimeError",
+    }]
+    assert secret not in json.dumps(coverage.to_dict())
+    assert not any(
+        key.startswith("_evidence_")
+        for block in (failed_block, good_block)
+        for key in block
+    )
+
+
+def test_deferred_reload_records_missing_file_without_path_detail(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "missing.xlsx"
+    block, finding = _deferred_block(path)
+
+    def missing(_path):
+        raise FileNotFoundError(str(path))
+
+    monkeypatch.setattr(audit, "load_table_result", missing)
+    coverage = ScanCoverage(files_discovered=1)
+
+    audit._attach_deferred_evidence([block], coverage)
+
+    assert "evidence" not in finding
+    assert coverage.limitations == [{
+        "scope": "file",
+        "reason": "evidence_reload_missing_file",
+        "file": "missing.xlsx",
+    }]
+    assert str(tmp_path) not in json.dumps(coverage.to_dict())
+
+
+@pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit])
+def test_deferred_reload_propagates_base_exception_controls(
+    tmp_path, monkeypatch, control
+):
+    path = tmp_path / "source.xlsx"
+    block, _finding = _deferred_block(path)
+
+    def interrupt(_path):
+        raise control()
+
+    monkeypatch.setattr(audit, "load_table_result", interrupt)
+    coverage = ScanCoverage(files_discovered=1)
+
+    with pytest.raises(control):
+        audit._attach_deferred_evidence([block], coverage)
+
+    assert coverage.limitations == []
+    assert not any(key.startswith("_evidence_") for key in block)
 
 
 def test_write_json_false_skips_file(tmp_path):

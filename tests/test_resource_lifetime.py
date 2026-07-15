@@ -81,6 +81,29 @@ def _assert_compact(*roots):
     return retained
 
 
+def _deferred_report_block(path, sheet_name):
+    groups = {name: [] for name in audit.BLOCK_FINDING_GROUPS}
+    groups["relations"] = [{
+        "kind": "constant_offset",
+        "severity": "medium",
+        "rule": "deferred evidence lifetime",
+        "col_a_idx": 0,
+        "col_b_idx": 1,
+    }]
+    return {
+        "file": path.name,
+        "sheet": sheet_name,
+        "block": {
+            "rows": "1-4",
+            "cols": "1-2",
+            "header": ["left", "right"],
+        },
+        **groups,
+        "_evidence_path": str(path),
+        "_evidence_context": (0, 4, 0, 2),
+    }
+
+
 def test_scan_streams_numeric_values_and_releases_previous_sheet(
     tmp_path, monkeypatch
 ):
@@ -3060,16 +3083,21 @@ def test_deferred_reload_releases_each_source_before_next_load(
     def stub_load(path):
         if records:
             gc.collect()
-            assert records[-1]() is None
+            assert records[-1]["sheet"]() is None
+            assert records[-1]["result"]() is None
         sheet = _WeakSheet.from_rows(
             [["left", "right"]]
             + [[value, value] for value in values]
         )
-        records.append(weakref.ref(sheet))
-        calls.append(path)
-        return TableLoadResult({
+        result = TableLoadResult({
             os.path.splitext(os.path.basename(path))[0]: sheet
         })
+        records.append({
+            "sheet": weakref.ref(sheet),
+            "result": weakref.ref(result),
+        })
+        calls.append(path)
+        return result
 
     monkeypatch.setattr(audit, "load_table_result", stub_load)
 
@@ -3085,7 +3113,116 @@ def test_deferred_reload_releases_each_source_before_next_load(
     ]
     assert scan["coverage"]["files_succeeded"] == 2
     gc.collect()
-    assert all(record() is None for record in records)
+    assert all(
+        record[kind]() is None
+        for record in records
+        for kind in ("sheet", "result")
+    )
+
+
+def test_deferred_reload_closes_failed_extractor_before_next_source(
+    tmp_path, monkeypatch
+):
+    pdf_path = tmp_path / "failed.pdf"
+    csv_path = tmp_path / "good.csv"
+    pdf_block = _deferred_report_block(pdf_path, "Target")
+    csv_block = _deferred_report_block(csv_path, "Target")
+    iterator_refs = []
+    close_states = []
+
+    class FailingIterator:
+        def __init__(self):
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise RuntimeError("expected extractor reload failure")
+
+        def close(self):
+            self.closed = True
+            close_states.append(self.closed)
+
+    def iter_tables(_path):
+        iterator = FailingIterator()
+        iterator_refs.append(weakref.ref(iterator))
+        return iterator
+
+    def load_table(_path):
+        gc.collect()
+        assert close_states == [True]
+        assert iterator_refs[-1]() is None
+        return TableLoadResult({"Target": Sheet.from_rows([
+            ["left", "right"],
+            [1.25, 2.25],
+            [2.5, 3.5],
+            [3.75, 4.75],
+        ])})
+
+    monkeypatch.setattr(audit, "_iter_extracted_sheets", iter_tables)
+    monkeypatch.setattr(audit, "load_table_result", load_table)
+    coverage = ScanCoverage(files_discovered=2)
+
+    audit._attach_deferred_evidence(
+        [pdf_block, csv_block], coverage
+    )
+
+    assert coverage.limitations == [{
+        "scope": "file",
+        "reason": "evidence_reload_error",
+        "file": "failed.pdf",
+        "error_type": "RuntimeError",
+    }]
+    assert csv_block["relations"][0]["evidence"]["rows"]
+    assert close_states == [True]
+    assert not any(
+        key.startswith("_evidence_")
+        for block in (pdf_block, csv_block)
+        for key in block
+    )
+
+
+def test_deferred_reload_settles_file_and_target_sheet_once(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "source.xlsx"
+    first = _deferred_report_block(path, "Target")
+    second = _deferred_report_block(path, "Target")
+    file_stat = {"elapsed_ms": 0.0}
+    sheet_stat = {"elapsed_ms": 0.0}
+    calls = []
+    original_add_elapsed_ms = audit._add_elapsed_ms
+
+    def record_settlement(stat, start):
+        calls.append(stat)
+        original_add_elapsed_ms(stat, start)
+
+    monkeypatch.setattr(
+        audit,
+        "load_table_result",
+        lambda _path: TableLoadResult({"Target": Sheet.from_rows([
+            ["left", "right"],
+            [1.25, 2.25],
+            [2.5, 3.5],
+            [3.75, 4.75],
+        ])}),
+    )
+    monkeypatch.setattr(audit, "_add_elapsed_ms", record_settlement)
+    coverage = ScanCoverage(files_discovered=1)
+
+    audit._attach_deferred_evidence(
+        [first, second],
+        coverage,
+        runtime_stats={
+            str(path): {
+                "file": file_stat,
+                "sheets": {"Target": sheet_stat},
+            }
+        },
+    )
+
+    assert calls == [sheet_stat, file_stat]
 
 
 def test_compactness_walker_detects_attribute_closure_and_list_retention():
