@@ -98,6 +98,7 @@ _MANAGED_OUTPUT_COLLISION_PROBE_LIMIT = int(
         "128",
     )
 )
+_TRANSIENT_CLEANUP_ATTEMPTS = 2
 _ZIP_UTF8_FILENAME_FLAG = 1 << 11
 _ZIP64_EXTRA_FIELD = 0x0001
 _ZIP_UNICODE_PATH_EXTRA_FIELD = 0x7075
@@ -137,6 +138,19 @@ def _copy_limited(src, dest, max_bytes):
         dest.write(chunk)
 
 
+def _remove_transient_file(path):
+    last_error = None
+    for _attempt in range(_TRANSIENT_CLEANUP_ATTEMPTS):
+        try:
+            os.remove(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            last_error = error
+    raise last_error
+
+
 def _atomic_stream_write(src, dest_path, max_bytes):
     directory = os.path.dirname(os.path.abspath(dest_path)) or "."
     os.makedirs(directory, exist_ok=True)
@@ -152,11 +166,11 @@ def _atomic_stream_write(src, dest_path, max_bytes):
             os.fsync(dest.fileno())
         os.replace(temp_path, dest_path)
         return size
-    except BaseException:
+    except BaseException as operation_error:
         try:
-            os.remove(temp_path)
-        except OSError:
-            pass
+            _remove_transient_file(temp_path)
+        except OSError as cleanup_error:
+            raise cleanup_error from operation_error
         raise
 
 
@@ -2763,6 +2777,23 @@ def _temporary_archive_path(out_dir, suffix):
     return path
 
 
+def _cleanup_transient_archive(
+    path,
+    archive_name,
+    skipped,
+    operation_error,
+):
+    try:
+        _remove_transient_file(path)
+    except OSError as cleanup_error:
+        if operation_error is not None:
+            raise cleanup_error from operation_error
+        skipped.append({
+            "name": archive_name,
+            "reason": "transient archive cleanup pending",
+        })
+
+
 def _download_oa_package(
     pkg,
     out_dir,
@@ -2778,6 +2809,8 @@ def _download_oa_package(
 ):
     """Download the static PMC OA tar.gz, extract its tabular members, drop the tarball."""
     tmp = _temporary_archive_path(out_dir, ".tar.gz")
+    archive_name = pkg.get("name") or "PMC OA package"
+    operation_error = None
     try:
         res = download_file(pkg["url"], tmp, max_bytes=archive_max)
         if not res.get("ok"):
@@ -2813,11 +2846,16 @@ def _download_oa_package(
             })
             return False, set()
         return True, preserved
+    except BaseException as error:
+        operation_error = error
+        raise
     finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+        _cleanup_transient_archive(
+            tmp,
+            archive_name,
+            skipped,
+            operation_error,
+        )
 
 
 def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_bytes,
@@ -2831,6 +2869,10 @@ def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_byte
     The archive downloads with the larger ``archive_max`` cap; each extracted table is
     still capped at the per-file ``max_bytes``."""
     tmp_zip = _temporary_archive_path(out_dir, ".zip")
+    archive_name = (
+        arch.get("name") or "supplementary archive"
+    )
+    operation_error = None
     try:
         res = download_file(arch["url"], tmp_zip, max_bytes=archive_max)
         if not res.get("ok"):
@@ -2866,11 +2908,16 @@ def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_byte
             })
             return False, set()
         return True, preserved
+    except BaseException as error:
+        operation_error = error
+        raise
     finally:
-        try:
-            os.remove(tmp_zip)
-        except OSError:
-            pass
+        _cleanup_transient_archive(
+            tmp_zip,
+            archive_name,
+            skipped,
+            operation_error,
+        )
 
 
 def _source_sidecar_provenance(cand, managed_files):

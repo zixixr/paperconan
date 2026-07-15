@@ -88,6 +88,17 @@ def _archive_fields(archive_kind):
     }
 
 
+def _archive_cleanup_pending_record(archive_kind):
+    return {
+        "name": (
+            "supp.zip"
+            if archive_kind == "zip"
+            else "supp.tar.gz"
+        ),
+        "reason": "transient archive cleanup pending",
+    }
+
+
 def test_second_fetch_removes_only_previous_managed_files(
     tmp_path, monkeypatch
 ):
@@ -2596,6 +2607,188 @@ def test_archive_package_temporary_never_uses_candidate_basename(
     assert len(seen_destinations) == 1
     assert seen_destinations[0] != user
     assert not seen_destinations[0].exists()
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+def test_persistent_archive_cleanup_after_success_is_visible_and_unmanaged(
+    tmp_path, monkeypatch, archive_kind
+):
+    payload = _archive_payload(
+        archive_kind,
+        [("nested/table.csv", b"a\n1\n")],
+    )
+
+    def archive_download(url, dest, **kwargs):
+        Path(dest).write_bytes(payload)
+        return {"ok": True, "path": dest}
+
+    original_remove = _download.os.remove
+    cleanup_attempts = []
+
+    def fail_archive_cleanup(path):
+        if Path(path).name.startswith(".paperconan-archive-"):
+            cleanup_attempts.append(Path(path))
+            raise PermissionError("private cleanup detail")
+        return original_remove(path)
+
+    prepared = []
+    original_prepare = _download._ManagedOutputJournal.prepare
+
+    def record_prepare(journal, path):
+        prepared.append(Path(path))
+        return original_prepare(journal, path)
+
+    monkeypatch.setattr(_download, "download_file", archive_download)
+    monkeypatch.setattr(
+        _download.os, "remove", fail_archive_cleanup
+    )
+    monkeypatch.setattr(
+        _download._ManagedOutputJournal, "prepare", record_prepare
+    )
+
+    result = _download.download_candidate({
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+        **_archive_fields(archive_kind),
+    }, str(tmp_path))
+
+    assert result["downloaded"] == [str(tmp_path / "table.csv")]
+    assert result["skipped"] == [
+        _archive_cleanup_pending_record(archive_kind)
+    ]
+    assert "private cleanup detail" not in repr(result["skipped"])
+    assert len(cleanup_attempts) == 2
+    assert len(set(cleanup_attempts)) == 1
+    transient = cleanup_attempts[0]
+    assert transient.exists()
+    assert transient not in map(Path, result["downloaded"])
+    assert transient not in prepared
+    sidecar = json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert sidecar["managed_files"] == ["table.csv"]
+    assert transient.name not in sidecar["managed_files"]
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+def test_expected_archive_failure_keeps_primary_and_cleanup_records(
+    tmp_path, monkeypatch, archive_kind
+):
+    def unavailable_archive(url, dest, **kwargs):
+        return {
+            "ok": False,
+            "path": dest,
+            "skipped_reason": "archive unavailable",
+        }
+
+    original_remove = _download.os.remove
+    cleanup_attempts = []
+
+    def fail_archive_cleanup(path):
+        if Path(path).name.startswith(".paperconan-archive-"):
+            cleanup_attempts.append(Path(path))
+            raise PermissionError("private cleanup detail")
+        return original_remove(path)
+
+    monkeypatch.setattr(
+        _download, "download_file", unavailable_archive
+    )
+    monkeypatch.setattr(
+        _download.os, "remove", fail_archive_cleanup
+    )
+
+    result = _download.download_candidate({
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+        **_archive_fields(archive_kind),
+    }, str(tmp_path))
+
+    archive_name = (
+        "supp.zip" if archive_kind == "zip" else "supp.tar.gz"
+    )
+    assert result["downloaded"] == []
+    assert result["skipped"] == [
+        {
+            "name": archive_name,
+            "reason": "archive unavailable",
+        },
+        _archive_cleanup_pending_record(archive_kind),
+    ]
+    assert "private cleanup detail" not in repr(result["skipped"])
+    assert len(cleanup_attempts) == 2
+    assert len(set(cleanup_attempts)) == 1
+    assert cleanup_attempts[0].exists()
+    sidecar = json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert sidecar["managed_files"] == []
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+@pytest.mark.parametrize(
+    "primary_type",
+    [RuntimeError, _UnexpectedArchiveSignal],
+)
+def test_unexpected_archive_failure_chains_cleanup_failure(
+    tmp_path, monkeypatch, archive_kind, primary_type
+):
+    primary = primary_type("unexpected archive operation")
+
+    def fail_archive_operation(url, dest, **kwargs):
+        raise primary
+
+    original_remove = _download.os.remove
+    cleanup_attempts = []
+
+    def fail_archive_cleanup(path):
+        if Path(path).name.startswith(".paperconan-archive-"):
+            cleanup_attempts.append(Path(path))
+            raise PermissionError("persistent archive cleanup failure")
+        return original_remove(path)
+
+    monkeypatch.setattr(
+        _download, "download_file", fail_archive_operation
+    )
+    monkeypatch.setattr(
+        _download.os, "remove", fail_archive_cleanup
+    )
+    archive = _archive_fields(archive_kind)
+    downloaded = []
+    skipped = []
+
+    with pytest.raises(
+        PermissionError,
+        match="persistent archive cleanup failure",
+    ) as raised:
+        if archive_kind == "zip":
+            _download._download_supplementary_archive(
+                archive["supplementary_archive"],
+                str(tmp_path),
+                downloaded,
+                skipped,
+                _download._DEFAULT_MAX,
+            )
+        else:
+            _download._download_oa_package(
+                archive["oa_package"],
+                str(tmp_path),
+                downloaded,
+                skipped,
+                _download._DEFAULT_MAX,
+            )
+
+    assert raised.value.__cause__ is primary
+    assert downloaded == []
+    assert skipped == []
+    assert len(cleanup_attempts) == 2
+    assert len(set(cleanup_attempts)) == 1
+    assert cleanup_attempts[0].exists()
 
 
 @pytest.mark.parametrize("archive_kind", ["zip", "tar"])

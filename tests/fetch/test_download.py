@@ -401,6 +401,96 @@ def test_body_limit_preserves_existing_destination(monkeypatch, tmp_path):
     assert not list(tmp_path.glob("*.part"))
 
 
+def test_transient_cleanup_removes_file_immediately(tmp_path):
+    transient = tmp_path / "transient.part"
+    transient.write_bytes(b"partial")
+
+    _download._remove_transient_file(str(transient))
+
+    assert not transient.exists()
+
+
+def test_transient_cleanup_treats_missing_file_as_success(tmp_path):
+    transient = tmp_path / "missing.part"
+
+    _download._remove_transient_file(str(transient))
+
+    assert not transient.exists()
+
+
+def test_transient_cleanup_retries_once_then_succeeds(
+    monkeypatch, tmp_path
+):
+    transient = tmp_path / "transient.part"
+    transient.write_bytes(b"partial")
+    original_remove = _download.os.remove
+    attempts = 0
+
+    def fail_once(path):
+        nonlocal attempts
+        if Path(path) == transient:
+            attempts += 1
+            if attempts == 1:
+                raise PermissionError("temporary cleanup failure")
+        return original_remove(path)
+
+    monkeypatch.setattr(_download.os, "remove", fail_once)
+
+    _download._remove_transient_file(str(transient))
+
+    assert attempts == 2
+    assert not transient.exists()
+
+
+@pytest.mark.parametrize("failure_kind", ["stream", "size"])
+def test_atomic_stream_write_chains_persistent_part_cleanup_failure(
+    monkeypatch, tmp_path, failure_kind
+):
+    if failure_kind == "stream":
+        class BrokenStream(io.BytesIO):
+            def read(self, size=-1):
+                raise OSError("stream operation failed")
+
+        source = BrokenStream(b"partial")
+        max_bytes = 100
+        primary_type = OSError
+        primary_message = "stream operation failed"
+    else:
+        source = io.BytesIO(b"oversized")
+        max_bytes = 1
+        primary_type = _download._SizeLimitExceeded
+        primary_message = "file exceeds max_bytes"
+
+    original_remove = _download.os.remove
+    attempts = []
+
+    def fail_part_cleanup(path):
+        if str(path).endswith(".part"):
+            attempts.append(Path(path))
+            raise PermissionError("persistent part cleanup failure")
+        return original_remove(path)
+
+    monkeypatch.setattr(
+        _download.os, "remove", fail_part_cleanup
+    )
+    dest = tmp_path / "table.csv"
+
+    with pytest.raises(
+        PermissionError,
+        match="persistent part cleanup failure",
+    ) as raised:
+        _download._atomic_stream_write(
+            source, str(dest), max_bytes
+        )
+
+    assert len(attempts) == 2
+    assert len(set(attempts)) == 1
+    assert not dest.exists()
+    assert attempts[0].exists()
+    assert isinstance(raised.value.__cause__, primary_type)
+    assert primary_message in str(raised.value.__cause__)
+
+
 def test_zip_duplicate_basenames_are_both_preserved(tmp_path):
     archive = tmp_path / "supp.zip"
     with zipfile.ZipFile(archive, "w") as zf:
