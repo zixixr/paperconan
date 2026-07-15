@@ -161,6 +161,19 @@ def _render_cross_sheet_examples(cf: dict) -> str:
     examples = cf.get("examples") or []
     if not examples:
         return ""
+    # within-row shared-fraction form: each example is a shared tail with the values sharing it
+    if examples and isinstance(examples[0], dict) and "tail" in examples[0]:
+        rows = []
+        for ex in examples[:10]:
+            vals = " , ".join(f"{v:.10g}" for v in ex.get("values") or [])
+            rows.append(
+                f'<tr><td>.{_esc(ex.get("tail"))}</td><td>{_esc(vals)}</td></tr>'
+            )
+        return (
+            '<div class="ev-wrap"><table class="ev">'
+            '<thead><tr><th>shared fractional tail</th><th>values (integer part differs)</th></tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table></div>'
+        )
     if examples and isinstance(examples[0], dict):
         rows = []
         for ex in examples[:10]:
