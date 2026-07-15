@@ -85,6 +85,14 @@ _DEFAULT_HELPER_CASES = [
     ),
 ]
 
+_MALFORMED_NUMERIC_CONTENT_LENGTHS = [
+    pytest.param("9_000_000", id="underscore"),
+    pytest.param("+9000000", id="leading-plus"),
+    pytest.param(" 9000000", id="leading-whitespace"),
+    pytest.param("9000000 ", id="trailing-whitespace"),
+    pytest.param("９００００００", id="non-ascii-decimal"),
+]
+
 
 def test_get_json_builds_query_and_parses(monkeypatch):
     seen = {}
@@ -168,6 +176,53 @@ def test_http_helpers_accept_exact_cap_with_untrusted_content_length(
     assert invoke(len(body)) == expected
 
     assert response.read_sizes[-1] == 1
+    assert response.closed
+
+
+@pytest.mark.parametrize(
+    "content_length",
+    _MALFORMED_NUMERIC_CONTENT_LENGTHS,
+)
+@pytest.mark.parametrize(
+    "_name,invoke,body,expected",
+    _HELPER_CASES,
+    ids=[case[0] for case in _HELPER_CASES],
+)
+def test_http_helpers_stream_small_body_for_malformed_numeric_length(
+    monkeypatch, content_length, _name, invoke, body, expected
+):
+    response = _StubResp(body, content_length=content_length)
+    monkeypatch.setattr(
+        _http.urllib.request, "urlopen", lambda _req, timeout=None: response
+    )
+
+    assert invoke(len(body)) == expected
+
+    assert response.read_sizes[-1] == 1
+    assert response.closed
+
+
+@pytest.mark.parametrize(
+    "content_length",
+    _MALFORMED_NUMERIC_CONTENT_LENGTHS,
+)
+@pytest.mark.parametrize(
+    "_name,invoke,body,_expected",
+    _HELPER_CASES,
+    ids=[case[0] for case in _HELPER_CASES],
+)
+def test_http_helpers_stream_reject_oversize_for_malformed_numeric_length(
+    monkeypatch, content_length, _name, invoke, body, _expected
+):
+    response = _StubResp(body + b"x", content_length=content_length)
+    monkeypatch.setattr(
+        _http.urllib.request, "urlopen", lambda _req, timeout=None: response
+    )
+
+    with pytest.raises(_http.ResponseTooLargeError):
+        invoke(len(body))
+
+    assert response.read_sizes
     assert response.closed
 
 

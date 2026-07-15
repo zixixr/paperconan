@@ -28,11 +28,13 @@ def _validate_max_bytes(max_bytes):
 
 def _read_limited(resp, max_bytes):
     content_length = resp.headers.get("Content-Length")
-    try:
+    if (
+        isinstance(content_length, str)
+        and content_length.isascii()
+        and content_length.isdigit()
+    ):
         advertised_length = int(content_length)
-    except (TypeError, ValueError):
-        advertised_length = None
-    if advertised_length is not None and advertised_length < 0:
+    else:
         advertised_length = None
     if advertised_length is not None and advertised_length > max_bytes:
         raise ResponseTooLargeError(
