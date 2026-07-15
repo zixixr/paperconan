@@ -10394,7 +10394,14 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                input_dir=in_dir,
                paper=_load_provenance(in_dir, paper),
                n_files=len(files),
-               n_blocks_with_findings=len(report_blocks),
+               n_blocks_with_findings=sum(
+                   1
+                   for block in report_blocks
+                   if any(
+                       block.get(group)
+                       for group in BLOCK_FINDING_GROUPS
+                   )
+               ),
                findings_omitted=state.findings_omitted,
                scan_errors=scan_errors,
                scan_stats={**scan_stats,

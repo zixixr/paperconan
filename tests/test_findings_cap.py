@@ -379,6 +379,53 @@ def test_directory_budget_selects_by_severity_across_finding_families(
     }]
 
 
+def test_directory_budget_counts_only_blocks_with_retained_findings(
+    tmp_path, monkeypatch
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_two_sheet_blocks(data / "multi.xlsx")
+    _patch_scan_finding_sources(
+        monkeypatch,
+        block_findings=[{
+            "kind": "block_low",
+            "severity": "low",
+            "rule": "low block",
+        }],
+        cross_findings=[{
+            "kind": "cross_high",
+            "severity": "high",
+            "rule": "high cross-sheet",
+        }],
+    )
+    monkeypatch.setattr(A, "_MAX_FINDINGS_PER_BLOCK", 0)
+    monkeypatch.setattr(A, "_MAX_TOTAL_FINDINGS", 2)
+
+    scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+
+    blocks = scan["relations_blocks"]
+    empty_blocks = [
+        block for block in blocks if _block_finding_count(block) == 0
+    ]
+    assert len(blocks) == 4
+    assert len(empty_blocks) == 3
+    assert all(block["findings_omitted"] == 1 for block in empty_blocks)
+    assert scan["n_blocks_with_findings"] == 1
+    assert [finding["kind"] for finding in scan["cross_sheet_findings"]] == [
+        "cross_high",
+    ]
+    assert scan["findings_omitted"] == 3
+    assert [
+        item for item in scan["coverage"]["limitations"]
+        if item["reason"] == "global_finding_limit"
+    ] == [{
+        "scope": "scan",
+        "reason": "global_finding_limit",
+        "limit": 2,
+        "omitted_findings": 3,
+    }]
+
+
 def test_directory_budget_materializes_evidence_only_for_retained_findings(
     tmp_path, monkeypatch
 ):
