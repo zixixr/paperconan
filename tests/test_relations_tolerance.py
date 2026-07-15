@@ -379,3 +379,27 @@ def test_ratio_emitted_flag_does_not_leak_across_column_pairs():
     assert ("c0", "c1") not in el, f"first pair's redundant exact_linear must be deduped: {f}"
     assert ("c2", "c3") in el, \
         f"later zero-in-x pair's exact_linear must NOT be suppressed by an earlier pair's flag: {f}"
+
+
+def test_integer_diff_shared_fraction_excludes_small_denominator_column():
+    # Two columns where col_b = col_a + a varied integer, and col_a's fractions are k/13
+    # residues (0.076923, 0.153846, …). Those recur across integers as a quantization
+    # artifact, not a copy — the >=3-distinct-fraction gate alone lets k/13 through (it has
+    # 12 distinct residues), so the shared small-denominator gate must exclude it.
+    a = [10 + i + (i % 13) / 13 for i in range(26)]
+    b = [a[i] + (3 if i % 2 else 7) for i in range(26)]   # integer diffs {3, 7}
+    s = _sheet([a, b])
+    f = detect_relations(s, 1, 27, 0, 2, ["c0", "c1"])
+    assert not [x for x in f if x["kind"] == "integer_diff_shared_fraction"], \
+        "k/13 residue column wrongly flagged as shared-fraction copy"
+
+
+def test_integer_diff_shared_fraction_still_flags_arbitrary_tails():
+    # Arbitrary high-entropy shared fractions (not any small p/q) must STILL flag.
+    fr = [0.316768, 0.849559, 0.647899, 0.173653, 0.508241, 0.930517]
+    a = [10 + i + fr[i % len(fr)] for i in range(24)]
+    b = [a[i] + (2 if i % 3 else 9) for i in range(24)]
+    s = _sheet([a, b])
+    f = detect_relations(s, 1, 25, 0, 2, ["c0", "c1"])
+    assert [x for x in f if x["kind"] == "integer_diff_shared_fraction"], \
+        "genuine arbitrary shared-fraction copy was lost"

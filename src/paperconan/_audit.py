@@ -825,7 +825,12 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                 frac_x = x - np.round(x)                       # signed distance to nearest integer
                 hp_rows = diff_is_int & (np.abs(frac_x) > 1e-6)
                 hp_fracs = [float(v) for v in frac_x[hp_rows] if _sig_frac_digits(v) >= 4]
-                distinct_hp = len({round(v, 6) for v in hp_fracs})
+                # Exclude shared fractions that are a small-denominator residue (k/13, k/19,
+                # …): those recur across integers as a quantization artifact, not a copy. The
+                # distinct-count then reflects only arbitrary high-entropy fractions. (Shared
+                # helper with the row-oriented shared-fraction detectors.)
+                distinct_hp = len({round(v, 6) for v in hp_fracs
+                                   if not _shared_frac_is_small_denominator(v)})
                 int_diffs = np.unique(np.round(diff[diff_is_int]))
                 n_real_frac = int(hp_rows.sum())        # rows sharing a genuine (non-.0) fraction
                 if (int(diff_is_int.sum()) >= max(5, int(round(0.8 * n)))
@@ -3171,16 +3176,53 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60):
 # parts differ, is ~1e-6 by chance per pair — low enough that a single pair is worth a look
 # and a multi-pair segment (a copied row-slice with integers rewritten) is near-certain.
 _WITHIN_ROW_FRAC_MIN_DIGITS = int(os.environ.get("PAPERCONAN_WITHIN_ROW_FRAC_MIN_DIGITS", "6"))
+# Row-PAIR shared fraction: a RUN of aligned columns corroborates the match, so each cell's
+# tail can be shorter (>=4 digits) than the single-cell within-row bar (>=6) — a >=3 column
+# run of distinct shared tails is ~(1e-4)^3 by chance.
+_ROW_PAIR_FRAC_MIN_DIGITS = int(os.environ.get("PAPERCONAN_ROW_PAIR_FRAC_MIN_DIGITS", "4"))
+_ROW_PAIR_MIN_RUN = int(os.environ.get("PAPERCONAN_ROW_PAIR_MIN_RUN", "3"))
+# Per-sheet candidate-row cap bounds the O(rows^2) pair loop so one huge sheet cannot
+# starve the rest (the budget is also reset per sheet, so sheet order never matters).
+_ROW_PAIR_MAX_ROWS_PER_SHEET = int(os.environ.get("PAPERCONAN_ROW_PAIR_MAX_ROWS", "400"))
 
 
-def _shared_frac_is_small_denominator(frac_str, max_q=128):
-    """True if the shared fractional VALUE 0.<frac_str> is a simple fraction p/q for some
-    small q. Any two values x + p/q and y + p/q (same residue, different integer) trivially
-    share that tail — a small-denominator artifact (triplicate means .333/.667, k/13 .923076,
-    k/19 …), NOT a copied fraction. A genuine copy-then-shift tail is an arbitrary
+# --- shared-fraction primitives -------------------------------------------------------
+# "Same high-precision decimal tail, different integer part" (copy-then-integer-shift) is
+# one fingerprint that shows up in several orientations: two COLUMNS
+# (integer_diff_shared_fraction / round_shift_shared_fraction), two BLOCKS
+# (within_table_fraction_reuse), one ROW's cells (within_row_shared_fraction), and a ROW
+# PAIR (detect_row_pair_shared_fraction). These two helpers are the shared substrate — a
+# magnitude-safe tail extractor and the small-denominator/quantization gate — so the tail
+# semantics and the false-positive gate are defined once.
+
+def _reliable_frac_tail(av):
+    """Fractional-digit string of |av| at a precision the magnitude can actually carry.
+    float64 holds ~15 significant figures, so formatting the WHOLE value at a fixed 10
+    decimals when the integer part is large prints representation NOISE as real tail digits
+    (5000000.137 -> '1370000001'). Cap decimals at 15 - integer-digits so a short real tail
+    stays short. Returns '' for an integer / no fractional part / non-finite input."""
+    av = abs(float(av))
+    if not math.isfinite(av):
+        return ""
+    prec = min(10, max(0, 15 - len(str(int(av)))))
+    s = f"{av:.{prec}f}".rstrip("0")
+    return s.split(".")[1] if "." in s else ""
+
+
+def _shared_frac_is_small_denominator(frac, max_q=128):
+    """True if the shared fractional VALUE is a simple fraction p/q for some small q. Any two
+    values x + p/q and y + p/q (same residue, different integer) trivially share that tail —
+    a small-denominator artifact (triplicate means .333/.667, k/13 .923076, k/19, dyadic
+    1/128 …), NOT a copied fraction. A genuine copy-then-shift tail is an arbitrary
     high-entropy decimal with no small denominator. Guards the same trap as the tail-cluster
-    and short-row detectors, per shared tail."""
-    f = float("0." + frac_str)
+    and short-row detectors, per shared tail. `frac` may be the digit-string after the decimal
+    point or the fractional value itself (any float; its |·| mod 1 is used)."""
+    if isinstance(frac, str):
+        f = float("0." + frac) if frac else 0.0
+    else:
+        f = abs(float(frac)) % 1.0
+    if f == 0.0:
+        return False
     for q in range(2, max_q + 1):
         if abs(f * q - round(f * q)) < 2e-6:
             return True
@@ -3213,16 +3255,7 @@ def detect_within_row_shared_fraction(grid_sheets, profile="review", max_finding
                 av = abs(float(v))
                 if av >= 1e7:                         # read-precision noise reaches the tail
                     continue
-                # Extract the tail at a precision the magnitude can actually carry: float64
-                # holds ~15 significant figures, so formatting the WHOLE value at a fixed 10
-                # decimals when the integer part is large prints representation NOISE as real
-                # tail digits (5000000.137 -> ...1370000001). Cap decimals at 15 - integer
-                # digits so a short real tail stays short and the 6-digit gate keeps meaning.
-                prec = min(10, max(0, 15 - len(str(int(av)))))
-                s = f"{av:.{prec}f}".rstrip("0")
-                if "." not in s:
-                    continue
-                frac = s.split(".")[1]
+                frac = _reliable_frac_tail(av)
                 if len(frac) < _WITHIN_ROW_FRAC_MIN_DIGITS:
                     continue
                 by_frac.setdefault(frac, []).append((c, float(v), int(av)))
@@ -3266,6 +3299,115 @@ def detect_within_row_shared_fraction(grid_sheets, profile="review", max_finding
     if budget <= 0:
         print("[paperconan] detect_within_row_shared_fraction: coverage bounded "
               "(budget exhausted)", file=sys.stderr)
+    apply_profile_to_findings(findings, profile)
+    return findings
+
+
+def detect_row_pair_shared_fraction(grid_sheets, profile="review", max_findings=60):
+    """Two ROWS that share the same high-precision decimal fraction at a contiguous run of
+    aligned columns while their integer parts differ — the row-oriented twin of
+    `integer_diff_shared_fraction` (which only compares two COLUMNS). A concentration row
+    reused at another concentration with the integer parts rewritten (JCI201090 C4-2: 20 nM
+    and 100 nM share .27037/.85351/.86076 over 3 columns, integers 95/85, 90/88, 91/87) has
+    no other detector. The run corroborates each cell match, so a >=3 column run of >=3
+    DISTINCT non-small-denominator shared tails is near-zero chance. Signal, not verdict."""
+    by_sheet = {}
+    for (fname, sname), sheet in grid_sheets.items():
+        rows = []
+        for r in range(sheet.nrows):
+            a = sheet.numeric[r, :]
+            cells, hp = [], 0
+            for c in range(sheet.ncols):
+                v = a[c]
+                av = abs(float(v)) if not math.isnan(v) else float("nan")
+                if math.isnan(av) or av >= 1e7:
+                    cells.append(None)
+                    continue
+                tail = _reliable_frac_tail(av)
+                if len(tail) < _ROW_PAIR_FRAC_MIN_DIGITS:
+                    cells.append(None)
+                    continue
+                cells.append((tail, int(av), float(v)))
+                hp += 1
+            if hp >= _ROW_PAIR_MIN_RUN:
+                rows.append((r, _row_label(sheet, r, 1), cells))
+                if len(rows) >= _ROW_PAIR_MAX_ROWS_PER_SHEET:
+                    print(f"[paperconan] detect_row_pair_shared_fraction: {sname} candidate "
+                          f"rows capped at {_ROW_PAIR_MAX_ROWS_PER_SHEET} — later rows not "
+                          "compared", file=sys.stderr)
+                    break
+        if len(rows) >= 2:
+            by_sheet[(fname, sname)] = rows
+    findings = []
+    budget = 40_000_000                       # global compute bound across all sheets
+    for (fname, sname), rows in by_sheet.items():
+        fig = figure_key(sname)
+        for i in range(len(rows)):
+            ri, la, ca = rows[i]
+            for j in range(i + 1, len(rows)):
+                rj, lb, cb = rows[j]
+                m = min(len(ca), len(cb))
+                budget -= m
+                if budget <= 0:
+                    break
+                # ALL maximal contiguous runs of columns sharing a tail with different
+                # integers (evaluating only the longest would let a benign long run mask a
+                # genuine shorter one).
+                runs, cur = [], []
+                for c in range(m):
+                    A, B = ca[c], cb[c]
+                    if A is not None and B is not None and A[0] == B[0] and A[1] != B[1]:
+                        cur.append((c, A[0], A[2], B[2]))
+                    else:
+                        if len(cur) >= _ROW_PAIR_MIN_RUN:
+                            runs.append(cur)
+                        cur = []
+                if len(cur) >= _ROW_PAIR_MIN_RUN:
+                    runs.append(cur)
+                # keep the longest run that PASSES the gate: >=3 distinct non-small-
+                # denominator shared tails AND >=2 distinct integer differences (the latter
+                # matches the column twin integer_diff_shared_fraction so a pure constant
+                # offset B = A + k stays with constant_offset, not a copy-shift).
+                best = None
+                for run in sorted(runs, key=len, reverse=True):
+                    distinct_nonsd = {t for _, t, _, _ in run
+                                      if not _shared_frac_is_small_denominator(t)}
+                    int_diffs = {int(round(vb - va)) for _, _, va, vb in run}
+                    if len(distinct_nonsd) >= 3 and len(int_diffs) >= 2:
+                        best = run
+                        break
+                if best is None:
+                    continue
+                sample = ", ".join(f"{va:.10g}/{vb:.10g}" for _, _, va, vb in best[:3])
+                findings.append(dict(
+                    kind="shared_fraction_row_pair",
+                    file=fname, file_a=fname, file_b=fname,
+                    same_file=True, same_sheet=True,
+                    sheet_a=sname, sheet_b=sname,
+                    row_a=la, row_b=lb,
+                    run_length=len(best),
+                    size_a=len(best), same_position_count=len(best),
+                    fraction_of_smaller=1.0,
+                    figure_a=fig, figure_b=fig, same_figure=fig is not None,
+                    delta={"pattern": "shared_fraction"},
+                    block_a=f"row {ri + 1}", block_b=f"row {rj + 1}",
+                    examples=[{"row": f"{la} / {lb}", "col": None, "tail": t,
+                               "values": [float(va), float(vb)]}
+                              for _, t, va, vb in best[:5]],
+                    severity="high",
+                    rule=(f"rows '{la}' and '{lb}' share the same decimal fraction at "
+                          f"{len(best)} aligned columns while the integer part differs "
+                          f"(e.g. {sample}) — a copy-then-integer-shift across two rows "
+                          f"in {sname}")))
+                if len(findings) >= max_findings:
+                    break
+            if budget <= 0 or len(findings) >= max_findings:
+                break
+        if budget <= 0 or len(findings) >= max_findings:
+            break
+    if budget <= 0:
+        print("[paperconan] detect_row_pair_shared_fraction: coverage bounded "
+              "(global budget exhausted)", file=sys.stderr)
     apply_profile_to_findings(findings, profile)
     return findings
 
@@ -3549,6 +3691,9 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     # with different integer parts (the column- and block-pair shared-fraction detectors
     # never look across the columns of a single row).
     cross_sheet_findings += detect_within_row_shared_fraction(grid_sheets, profile=profile)
+    # B6d: the row-PAIR twin of integer_diff_shared_fraction — two rows sharing a decimal
+    # fraction at aligned columns with different integer parts (copy-then-shift across rows).
+    cross_sheet_findings += detect_row_pair_shared_fraction(grid_sheets, profile=profile)
     _attach_benign(cross_sheet_findings)
 
     digit_reports, decimal_reports, tail_cluster_reports = [], [], []
