@@ -130,6 +130,15 @@ def _is_derived_relation(f: dict) -> bool:
     if f.get("kind") not in {"constant_ratio", "exact_linear", "sum_constant",
                              "constant_ratio_row", "scaled_row_reuse"}:
         return False
+    # Two rows carrying the SAME label related by an arbitrary scalar is a duplicate, not a
+    # unit/normalization derivation: a real unit conversion or %-restatement RELABELS the row
+    # (e.g. "ng/mL" -> "µg/mL"). A unit token in a shared label (e.g. "TNF-α (pg/mL)" in two
+    # panels) must not be read as evidence of derivation and must not downgrade the finding.
+    if f.get("kind") in {"constant_ratio_row", "scaled_row_reuse"}:
+        a = " ".join(str(f.get("row_a") or "").split()).casefold()
+        b = " ".join(str(f.get("row_b") or "").split()).casefold()
+        if a and a == b:
+            return False
     return bool(_DERIVED_RE.search(_names_for(f)))
 
 

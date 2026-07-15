@@ -90,6 +90,48 @@ def test_min_n_boundary():
     assert detect_decimal_tail_clustering(_clustered(100, tails), "b") is not None
 
 
+def _triplicate_means(n):
+    # n DISTINCT means of three limited-precision readings: mean = (a+b+c)/3.
+    # Reporting a mean of 3 replicates mechanically concentrates the 3-digit
+    # fractional tail on the residues of 1/3 (.333 / .667) — a benign averaging
+    # artifact, NOT a copied-fraction fingerprint. Real JCI panels (JCI195538
+    # Fig1D/4A, JCI200564 Fig.2) trip the raw share test this way.
+    out = []
+    for i in range(n):
+        a = 10 + (i * 7 % 53) + (i % 100) / 100          # 2-decimal readings
+        b = 12 + (i * 13 % 47) + ((i * 3) % 100) / 100
+        c = 9 + (i * 17 % 41) + ((i * 5 + 1) % 100) / 100
+        out.append((a + b + c) / 3)
+    return out
+
+
+def _dfold_means(n, d):
+    # n distinct means of d limited-precision readings (mean = sum/d).
+    out = []
+    for i in range(n):
+        s = sum(20 + (i * (k * 7 + 3) % 60) + ((i * (k + 2)) % 100) / 100 for k in range(d))
+        out.append(s / d)
+    return out
+
+
+def test_no_false_positive_on_triplicate_means():
+    # .333/.667 dominate because these are means of 3 readings, not copied tails.
+    vals = _triplicate_means(300)
+    assert detect_decimal_tail_clustering(vals, "Fig triplicate") is None
+
+
+def test_no_false_positive_on_sextuplet_means():
+    vals = _dfold_means(300, 6)
+    assert detect_decimal_tail_clustering(vals, "Fig /6 means") is None
+
+
+def test_genuine_cluster_still_fires_despite_averaging_gate():
+    # Copied tails that are NOT the residues of any small denominator must still fire.
+    vals = _clustered(160, ["714", "286", "572", "428", "143", "857"])
+    r = detect_decimal_tail_clustering(vals, "Fig genuine")
+    assert r is not None and r["top_share"] >= 0.9
+
+
 def test_tail_cluster_flows_into_review_packet(tmp_path):
     from paperconan.packet import distill_findings_for_review
     vals = _clustered(160, ["714", "286", "572", "428", "143", "857"])

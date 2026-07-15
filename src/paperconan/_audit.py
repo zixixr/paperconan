@@ -893,6 +893,24 @@ _ROW_PAIR_MAX_FINDINGS_PER_BLOCK = 25
 # firing on too few cells to be distinctive.
 _ROW_REL_MAX_ROWS = int(os.environ.get("PAPERCONAN_ROW_REL_MAX_ROWS", "60"))
 _ROW_REL_MIN_COLS = int(os.environ.get("PAPERCONAN_ROW_REL_MIN_COLS", "12"))
+# Short-run row reuse (detect_short_row_reuse): the long-run detectors above miss the
+# JCI "Supporting Data Values" layout, where each sub-panel is its own 1-4 row block and
+# the copied/scaled segment is only 3-8 columns. A short run is safe from chance only if
+# every value carries enough significant figures — so this path requires >=5 sig figs per
+# cell and a shorter minimum run. FP math: two independent >=5-sig-fig cells collide at
+# ~1e-4, so a 3-cell identical/ratio run is ~1e-8..1e-12 by chance.
+_SHORT_ROW_MIN_COLS = int(os.environ.get("PAPERCONAN_SHORT_ROW_MIN_COLS", "3"))
+_SHORT_ROW_MIN_SIGFIGS = int(os.environ.get("PAPERCONAN_SHORT_ROW_MIN_SIGFIGS", "5"))
+# Tighter than _ROW_REL_RTOL: a short ratio run has fewer cells to corroborate the
+# constant, so the constancy must be crisp to stay clear of chance.
+_SHORT_ROW_RTOL = float(os.environ.get("PAPERCONAN_SHORT_ROW_RTOL", "1e-4"))
+# Per-sheet cap on high-precision candidate rows (bounds the O(rows^2) pair loop).
+_SHORT_ROW_MAX_ROWS_PER_SHEET = int(os.environ.get("PAPERCONAN_SHORT_ROW_MAX_ROWS", "400"))
+# A run value that recurs often across the sheet is QUANTIZED (a k/19 normalization grid,
+# a dose-response plateau), so two rows sharing it is not distinctive — the same trap
+# `detect_decimal_tail_clustering` guards. A genuine reuse duplicates values that are
+# otherwise unique to the two rows (freq 2-4); anything above this is a common-pool match.
+_SHORT_ROW_MAX_VALUE_FREQ = int(os.environ.get("PAPERCONAN_SHORT_ROW_MAX_VALUE_FREQ", "8"))
 # Ratio-run membership tolerance (relative). A genuine exact scaling read back from
 # stored source data wobbles by ~2x the per-cell rounding: ~1e-6 at 6 sig figs but
 # ~1e-4 for the very common 2-3 sig-fig bench readouts (percent, viability, OD). 1e-3
@@ -1672,7 +1690,7 @@ def detect_decimal_tail_clustering(values, label, top_k=6):
     must be MOSTLY DISTINCT — otherwise a quantized / common-denominator column (values
     like k/7 or eighths) trivially shares tails and would false-positive. Large-magnitude
     values (>=1e7) are skipped: read-precision noise there reaches the captured digits."""
-    tails, full = [], []
+    tails, full, hp_vals = [], [], []
     for v in values:
         av = abs(float(v))
         if av >= 1e7:
@@ -1684,6 +1702,7 @@ def detect_decimal_tail_clustering(values, label, top_k=6):
         if len(frac) >= 3:
             tails.append(frac[-3:])
             full.append(frac)
+            hp_vals.append(av)
     n = len(tails)
     if n < _TAIL_CLUSTER_MIN_N:
         return None
@@ -1699,6 +1718,20 @@ def detect_decimal_tail_clustering(values, label, top_k=6):
     if share < _TAIL_CLUSTER_SHARE:
         return None
     top_tails = [t for t, _ in top]
+    # Averaging artifact: a reported MEAN of d replicates is (sum of d limited-precision
+    # readings) / d, so its fractional tail is mechanically pinned to the residues of 1/d
+    # (division by 3 -> .333/.667, by 6 -> .167/.333/.667/.833, ...). That concentration is
+    # a benign consequence of averaging, not a copied-fraction fingerprint. If the values
+    # carrying the dominant tails are almost all d-fold "terminating" for one small d — i.e.
+    # value*d lands back on a short (<=4 dp) decimal — the cluster is an averaging artifact.
+    # (Real JCI panels JCI195538 Fig1D/4A and JCI200564 Fig.2 false-positive exactly here.)
+    carriers = [av for av, t in zip(hp_vals, tails) if t in set(top_tails)]
+    if carriers:
+        for d in range(2, 13):
+            terminating = sum(1 for av in carriers
+                              if abs(av * d - round(av * d, 4)) < 1e-6)
+            if terminating >= 0.9 * len(carriers):
+                return None
     # complementary pairs (t + t' = 1000) among the dominant tails — a stronger sub-signal
     comp = sum(1 for t in top_tails if int(t) < 500 and f"{1000 - int(t):03d}" in top_tails)
     return dict(label=label, n=n, n_unique=len(counts), n_distinct_fraction=len(set(full)),
@@ -2925,6 +2958,214 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
     return findings
 
 
+def _sigfigs_and_frac(v):
+    """(significant-figure count, fractional-digit count) of |v| at 10-decimal read
+    precision. 169.8665 -> (7, 4); 0.95705 -> (5, 5); a 5-digit INTEGER 10234 -> (5, 0)."""
+    av = abs(float(v))
+    if not math.isfinite(av) or av == 0.0:
+        return 0, 0
+    s = f"{av:.10f}".rstrip("0")
+    ip, _, fr = s.partition(".")
+    sig = len(fr.lstrip("0")) if ip == "0" else len(ip) + len(fr)
+    return sig, len(fr)
+
+
+def _is_short_hp(v):
+    """A value is 'high-precision' for short-run matching only if it carries real
+    FRACTIONAL precision — >=3 fractional digits AND >=5 significant figures. Requiring a
+    fractional part is what keeps collision-prone INTEGER data (read counts, IDs, genomic
+    coordinates) — where a 3-cell match is easy chance — out of the detector entirely."""
+    if math.isnan(v):
+        return False
+    sig, frac = _sigfigs_and_frac(v)
+    return frac >= 3 and sig >= _SHORT_ROW_MIN_SIGFIGS
+
+
+def _near_power_of_ten(k):
+    """True if k is a whole power of ten to the SAME relative tolerance a short ratio run is
+    accepted at. `_is_round_power_of_ten` only matches to 1e-9, but a run holds to
+    _SHORT_ROW_RTOL, so a unit conversion between two panels stored at different decimal
+    precision yields a mean ratio ~1e-5 off an exact power of ten — still a benign
+    restatement, not two independent measurements. Checked both k and 1/k directions."""
+    ak = abs(float(k))
+    if ak <= 1e-300 or not math.isfinite(ak):
+        return False
+    e = round(math.log10(ak))
+    return abs(ak - 10.0 ** e) <= _SHORT_ROW_RTOL * (10.0 ** e)
+
+
+def _longest_hp_identical_run(a, b):
+    """Longest contiguous run where a[c] == b[c] (tight tol) AND both cells are
+    high-precision (>=5 sig figs). A low-precision or NaN column breaks the run, so a
+    coincidental match on small integers can never extend one. Returns (run_len, x_run)."""
+    best_len, best_start = 0, 0
+    cur_len, cur_start = 0, 0
+    for i in range(len(a)):
+        av, bv = a[i], b[i]
+        if (not _is_short_hp(av) or not _is_short_hp(bv)
+                or abs(av - bv) > 1e-9 * max(abs(av), abs(bv), 1e-300)):
+            cur_len = 0
+            continue
+        if cur_len == 0:
+            cur_start = i
+        cur_len += 1
+        if cur_len > best_len:
+            best_len, best_start = cur_len, cur_start
+    if best_len == 0:
+        return None
+    return best_len, a[best_start:best_start + best_len].astype(float)
+
+
+def _longest_hp_ratio_run(a, b):
+    """Longest contiguous run where b[c] == k * a[c] for a fixed k != 1, every cell
+    high-precision, k held to _SHORT_ROW_RTOL. Returns (k, run_len, x_run) or None."""
+    best_len, best_start, best_k = 0, 0, None
+    cur_len, cur_k, cur_start = 0, None, 0
+    for i in range(len(a)):
+        av, bv = a[i], b[i]
+        if not _is_short_hp(av) or not _is_short_hp(bv) or abs(av) <= 1e-12:
+            cur_len, cur_k = 0, None
+            continue
+        r = bv / av
+        if cur_k is None or abs(r - cur_k) > _SHORT_ROW_RTOL * max(abs(cur_k), 1e-300):
+            cur_k, cur_len, cur_start = r, 1, i
+        else:
+            cur_len += 1
+        if cur_len > best_len and abs(cur_k - 1.0) > _SHORT_ROW_RTOL:
+            best_len, best_start, best_k = cur_len, cur_start, cur_k
+    if best_len == 0 or best_k is None:
+        return None
+    x_run = a[best_start:best_start + best_len].astype(float)
+    k = float(np.mean(b[best_start:best_start + best_len].astype(float) / x_run))
+    if abs(k - 1.0) <= _SHORT_ROW_RTOL or abs(k) <= 1e-9:
+        return None
+    return k, best_len, x_run
+
+
+def _short_row_candidates(grid_sheets):
+    """Every data row carrying >=_SHORT_ROW_MIN_COLS high-precision values with >=3
+    DISTINCT such values — including ISOLATED single rows that `_scaled_row_candidates`
+    drops (its bands need >=2 rows of >=12 finite cells). Grouped by sheet downstream."""
+    cands = []
+    for (fname, sname), sheet in grid_sheets.items():
+        rows = []
+        for r in range(sheet.nrows):
+            a = sheet.numeric[r, :]
+            hp = [v for v in a if _is_short_hp(v)]
+            if len(hp) < _SHORT_ROW_MIN_COLS or len(set(hp)) < 3:
+                continue
+            if _vector_is_patterned(hp):
+                continue
+            label = _row_label(sheet, r, 1)
+            if _AXIS_CONTEXT_LABEL_RE.search(label):
+                continue
+            rows.append(dict(file=fname, sheet=sname, row=r, label=label, a=a))
+            if len(rows) >= _SHORT_ROW_MAX_ROWS_PER_SHEET:
+                break
+        cands.extend(rows)
+    return cands
+
+
+def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60):
+    """SHORT high-precision identical or constant-ratio runs (3..11 columns) between two
+    data rows of one sheet — the JCI "Supporting Data Values" fingerprint that the >=12
+    column `detect_scaled_row_reuse` and `detect_row_relations` cannot see: a control
+    block copied verbatim across two sub-panels, a whole condition row shared by two
+    different genes, or one panel's row = another's * a constant (e.g. Group B = 0.8409 *
+    Group A). Every run cell must be >=5 significant figures so a short run is not chance.
+    A whole power-of-ten ratio is a unit restatement (benign) and is skipped. Signal, not
+    verdict — confirm against the legend/Methods before drawing any conclusion."""
+    by_sheet = {}
+    for c in _short_row_candidates(grid_sheets):
+        by_sheet.setdefault((c["file"], c["sheet"]), []).append(c)
+    findings = []
+    budget = 4_000_000
+    for (fname, sname), rows in by_sheet.items():
+        fig = figure_key(sname)
+        # Sheet-wide frequency of each high-precision value, BUCKETED to 5 significant
+        # figures: a value shared by many rows is a quantized grid (k/19) or a fitted-curve
+        # plateau (a saturated asymptote repeats across many consecutive rows, wobbling in
+        # the last digit) — not a distinctive duplicate. The coarse bucket keeps a plateau's
+        # 24.670713/24.670714 wobble in ONE bin so it is counted as common, not many rares.
+        def _freq_key(v):
+            return float(f"{float(v):.5g}")
+        freq = Counter(_freq_key(v) for R in rows for v in R["a"] if _is_short_hp(v))
+
+        def _rare(run):
+            return all(freq.get(_freq_key(v), 0) <= _SHORT_ROW_MAX_VALUE_FREQ for v in run)
+
+        # A smooth fitted curve (dose-response, binding) sampled along an axis makes every
+        # consecutive row an approximate scalar multiple of the next — a benign ~1.01 step,
+        # not a copied panel. Those rows sit in ONE contiguous data band; a genuine cross-
+        # panel scaling (Group B = 0.84 * Group A) is separated by a header/blank row, i.e.
+        # a DIFFERENT band. So a SCALED (ratio) pair with no non-data row between them is a
+        # curve step and is dropped. Identical pairs are kept (a curve never repeats a row
+        # verbatim; plateaus are already removed by the frequency gate).
+        cand_idx = {R["row"] for R in rows}
+
+        def _same_band(ra, rb):
+            lo, hi = (ra, rb) if ra < rb else (rb, ra)
+            return all(k in cand_idx for k in range(lo + 1, hi))
+
+        for i in range(len(rows)):
+            A = rows[i]
+            for j in range(i + 1, len(rows)):
+                B = rows[j]
+                a, b = A["a"], B["a"]
+                m = min(len(a), len(b))
+                budget -= m
+                if budget <= 0:
+                    break
+                ident = _longest_hp_identical_run(a[:m], b[:m])
+                ratio = _longest_hp_ratio_run(a[:m], b[:m])
+                ident_ok = (ident is not None
+                            and _SHORT_ROW_MIN_COLS <= ident[0] < _ROW_REL_MIN_COLS
+                            and len(np.unique(ident[1])) >= 3
+                            and _rare(ident[1]))
+                ratio_ok = (ratio is not None
+                            and _SHORT_ROW_MIN_COLS <= ratio[1] < _ROW_REL_MIN_COLS
+                            and len(np.unique(ratio[2])) >= 3
+                            and _rare(ratio[2])
+                            and not _same_band(A["row"], B["row"])
+                            and not _near_power_of_ten(ratio[0]))
+                if ident_ok and (not ratio_ok or ident[0] >= ratio[1]):
+                    kind, k, run_len, x_run = "identical_row_reuse", 1.0, ident[0], ident[1]
+                elif ratio_ok:
+                    kind, k, run_len, x_run = "scaled_row_reuse", ratio[0], ratio[1], ratio[2]
+                else:
+                    continue
+                rel = (f"== row '{B['label']}'" if kind == "identical_row_reuse"
+                       else f"= row '{B['label']}' * {k:.6g}")
+                findings.append(dict(
+                    kind=kind, short_run=True,
+                    file=fname, file_a=fname, file_b=fname,
+                    same_file=True, same_sheet=True,
+                    sheet_a=sname, sheet_b=sname,
+                    row_a=A["label"], row_b=B["label"],
+                    size_a=run_len, size_b=run_len, same_position_count=run_len,
+                    fraction_of_smaller=1.0, ratio=k, run_length=run_len,
+                    figure_a=fig, figure_b=fig, same_figure=fig is not None,
+                    delta={"pattern": "identical_row" if kind == "identical_row_reuse"
+                           else "scaled_row"},
+                    block_a=f"row {A['row'] + 1}", block_b=f"row {B['row'] + 1}",
+                    examples=[{"row": A["label"], "col": None, "value": float(v)}
+                              for v in x_run[:5]],
+                    severity="high",
+                    rule=(f"row '{A['label']}' {rel} over a short run of {run_len} "
+                          f"high-precision columns in {sname}")))
+                if len(findings) >= max_findings:
+                    break
+            if budget <= 0 or len(findings) >= max_findings:
+                break
+        if budget <= 0 or len(findings) >= max_findings:
+            break
+    if budget <= 0:
+        print("[paperconan] detect_short_row_reuse: coverage bounded (budget exhausted)",
+              file=sys.stderr)
+    apply_profile_to_findings(findings, profile)
+    return findings
+
+
 def _load_provenance(in_dir, paper):
     """Resolve scan provenance: an explicit `paper` override wins; otherwise read a
     paperconan_source.json sidecar left by `fetch`; otherwise None."""
@@ -3174,6 +3415,11 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     # B6: a condition ROW that is an exact scalar multiple of a row in another block /
     # sheet (cross-block sibling of detect_row_relations; the Extended Data Fig. 5B case).
     cross_sheet_findings += detect_scaled_row_reuse(grid_sheets, profile=profile)
+    # B6b: the SHORT high-precision variant — a 3-11 column identical/scaled run between two
+    # rows (incl. isolated single-row panels) that the >=12 column detectors above miss. No
+    # dedup against the long-run detector is needed: it only emits runs >=12 columns and this
+    # one only runs <12, so the two never report the same relation on the same pair.
+    cross_sheet_findings += detect_short_row_reuse(grid_sheets, profile=profile)
     _attach_benign(cross_sheet_findings)
 
     digit_reports, decimal_reports, tail_cluster_reports = [], [], []
