@@ -2769,6 +2769,7 @@ def _download_oa_package(
     downloaded,
     skipped,
     max_bytes,
+    archive_max=_ARCHIVE_MAX,
     *,
     reusable_names=(),
     managed_name_accounting=None,
@@ -2778,7 +2779,7 @@ def _download_oa_package(
     """Download the static PMC OA tar.gz, extract its tabular members, drop the tarball."""
     tmp = _temporary_archive_path(out_dir, ".tar.gz")
     try:
-        res = download_file(pkg["url"], tmp, max_bytes=_ARCHIVE_MAX)
+        res = download_file(pkg["url"], tmp, max_bytes=archive_max)
         if not res.get("ok"):
             skipped.append({
                 "name": pkg.get("name"),
@@ -3349,6 +3350,7 @@ def _download_candidate(
             downloaded,
             skipped,
             max_bytes,
+            archive_max=archive_max,
             reusable_names=reusable_names,
             managed_name_accounting=managed_name_accounting,
             cap_state=cap_state,

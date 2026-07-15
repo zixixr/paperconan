@@ -174,6 +174,119 @@ def test_supplementary_archive_extraction_still_caps_each_table(monkeypatch, tmp
     assert not (tmp_path / "huge.csv").exists()
 
 
+def test_oa_package_uses_default_archive_cap(monkeypatch, tmp_path):
+    archive = tmp_path / "source.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        body = b"a,b\n1,2\n"
+        info = tarfile.TarInfo("table.csv")
+        info.size = len(body)
+        tf.addfile(info, io.BytesIO(body))
+    archive_bytes = archive.read_bytes()
+    calls = []
+
+    def stub_dl(url, dest, **kw):
+        calls.append({"url": url, "max_bytes": kw.get("max_bytes")})
+        Path(dest).write_bytes(archive_bytes)
+        return {"ok": True, "path": dest}
+
+    monkeypatch.setattr(_download, "download_file", stub_dl)
+    cand = {
+        "cand_id": "europepmc:PMC1",
+        "source": "europepmc",
+        "tabular_files": [],
+        "oa_package": {
+            "url": "https://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_package.tar.gz",
+            "name": "oa_package.tar.gz",
+        },
+    }
+
+    _download.download_candidate(cand, str(tmp_path / "out"))
+
+    assert calls == [{
+        "url": cand["oa_package"]["url"],
+        "max_bytes": _download._ARCHIVE_MAX,
+    }]
+
+
+def test_oa_package_uses_custom_archive_cap(monkeypatch, tmp_path):
+    archive = tmp_path / "source.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        body = b"a,b\n1,2\n"
+        info = tarfile.TarInfo("table.csv")
+        info.size = len(body)
+        tf.addfile(info, io.BytesIO(body))
+    archive_bytes = archive.read_bytes()
+    calls = []
+
+    def stub_dl(url, dest, **kw):
+        calls.append({"url": url, "max_bytes": kw.get("max_bytes")})
+        Path(dest).write_bytes(archive_bytes)
+        return {"ok": True, "path": dest}
+
+    monkeypatch.setattr(_download, "download_file", stub_dl)
+    cand = {
+        "cand_id": "europepmc:PMC1",
+        "source": "europepmc",
+        "tabular_files": [],
+        "oa_package": {
+            "url": "https://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_package.tar.gz",
+            "name": "oa_package.tar.gz",
+        },
+    }
+
+    _download.download_candidate(
+        cand,
+        str(tmp_path / "out"),
+        archive_max=12345,
+    )
+
+    assert calls == [{
+        "url": cand["oa_package"]["url"],
+        "max_bytes": 12345,
+    }]
+
+
+def test_oa_package_extraction_still_caps_each_table(monkeypatch, tmp_path):
+    archive = tmp_path / "source.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        for name, body in (
+            ("small.csv", b"a,b\n1,2\n"),
+            ("huge.csv", b"x" * 500),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(body)
+            tf.addfile(info, io.BytesIO(body))
+    archive_bytes = archive.read_bytes()
+
+    def stub_dl(url, dest, **kw):
+        Path(dest).write_bytes(archive_bytes)
+        return {"ok": True, "path": dest}
+
+    monkeypatch.setattr(_download, "download_file", stub_dl)
+    cand = {
+        "cand_id": "europepmc:PMC1",
+        "source": "europepmc",
+        "tabular_files": [],
+        "oa_package": {
+            "url": "https://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_package.tar.gz",
+            "name": "oa_package.tar.gz",
+        },
+    }
+    out_dir = tmp_path / "out"
+
+    summary = _download.download_candidate(
+        cand,
+        str(out_dir),
+        max_bytes=100,
+        archive_max=12345,
+    )
+
+    assert [Path(path).name for path in summary["downloaded"]] == [
+        "small.csv"
+    ]
+    assert not (out_dir / "huge.csv").exists()
+
+
 def test_download_file_rejects_non_http_scheme(tmp_path):
     res = _download.download_file("file:///etc/passwd", str(tmp_path / "x.csv"))
     assert res["ok"] is False
