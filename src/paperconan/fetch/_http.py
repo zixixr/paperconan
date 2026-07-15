@@ -1,6 +1,7 @@
 """Thin stdlib HTTP helpers returning parsed JSON. No third-party deps."""
 from __future__ import annotations
 from decimal import Decimal
+import http.client
 import json
 import operator
 import urllib.error
@@ -27,12 +28,16 @@ def _validate_max_bytes(max_bytes):
     return max_bytes
 
 
-def _content_length_exceeds(content_length, max_bytes):
-    if not (
+def _is_trusted_content_length(content_length):
+    return (
         isinstance(content_length, str)
         and content_length.isascii()
         and content_length.isdigit()
-    ):
+    )
+
+
+def _content_length_exceeds(content_length, max_bytes):
+    if not _is_trusted_content_length(content_length):
         return False
 
     return Decimal(content_length) > max_bytes
@@ -40,6 +45,7 @@ def _content_length_exceeds(content_length, max_bytes):
 
 def _read_limited(resp, max_bytes):
     content_length = resp.headers.get("Content-Length")
+    trusted_content_length = _is_trusted_content_length(content_length)
     if _content_length_exceeds(content_length, max_bytes):
         raise ResponseTooLargeError("response exceeds max_bytes")
 
@@ -48,7 +54,11 @@ def _read_limited(resp, max_bytes):
     while True:
         chunk = resp.read(min(65536, max_bytes - total + 1))
         if not chunk:
-            return b"".join(chunks)
+            body = b"".join(chunks)
+            remaining = getattr(resp, "length", None)
+            if trusted_content_length and remaining:
+                raise http.client.IncompleteRead(body, remaining)
+            return body
         total += len(chunk)
         if total > max_bytes:
             raise ResponseTooLargeError("response exceeds max_bytes")

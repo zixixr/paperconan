@@ -1,3 +1,4 @@
+import http.client
 import io
 import json
 import math
@@ -29,6 +30,28 @@ class _StubResp(io.BytesIO):
 
     def __exit__(self, *args):
         self.close()
+
+
+class _HTTPResponseSocket:
+    def __init__(self, wire_bytes):
+        self._stream = io.BytesIO(wire_bytes)
+
+    def makefile(self, _mode, _buffering=None):
+        return self._stream
+
+
+def _real_http_response(body, content_length):
+    wire_bytes = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Connection: close\r\n"
+        b"Content-Length: "
+        + content_length.encode("ascii")
+        + b"\r\n\r\n"
+        + body
+    )
+    response = http.client.HTTPResponse(_HTTPResponseSocket(wire_bytes))
+    response.begin()
+    return response
 
 
 class _IndexOnlyLimit:
@@ -137,6 +160,68 @@ def test_post_json_sends_body(monkeypatch):
     assert seen["method"] == "POST"
     assert json.loads(seen["data"]) == {"search_for": "x"}
     assert seen["headers"]["content-type"] == "application/json"
+
+
+@pytest.mark.parametrize(
+    "_name,invoke,body,_expected",
+    _HELPER_CASES,
+    ids=[case[0] for case in _HELPER_CASES],
+)
+def test_http_helpers_raise_incomplete_read_for_truncated_real_http_response(
+    monkeypatch, _name, invoke, body, _expected
+):
+    response = _real_http_response(body, "100")
+    monkeypatch.setattr(
+        _http.urllib.request, "urlopen", lambda _req, timeout=None: response
+    )
+
+    with pytest.raises(http.client.IncompleteRead) as caught:
+        invoke(100)
+
+    assert type(caught.value) is http.client.IncompleteRead
+    assert caught.value.partial == body
+    assert caught.value.expected == 100 - len(body)
+    assert body.decode("ascii") not in str(caught.value)
+    assert response.closed
+
+
+@pytest.mark.parametrize(
+    "_name,invoke,body,expected",
+    _HELPER_CASES,
+    ids=[case[0] for case in _HELPER_CASES],
+)
+def test_http_helpers_use_eof_for_untrusted_real_http_response(
+    monkeypatch, _name, invoke, body, expected
+):
+    response = _real_http_response(body, "+100")
+    assert response.length == 100
+    monkeypatch.setattr(
+        _http.urllib.request, "urlopen", lambda _req, timeout=None: response
+    )
+
+    assert invoke(len(body)) == expected
+
+    assert response.closed
+
+
+@pytest.mark.parametrize(
+    "_name,invoke,body,_expected",
+    _HELPER_CASES,
+    ids=[case[0] for case in _HELPER_CASES],
+)
+def test_http_helpers_enforce_cap_for_untrusted_real_http_response(
+    monkeypatch, _name, invoke, body, _expected
+):
+    response = _real_http_response(body + b"x", "+100")
+    assert response.length == 100
+    monkeypatch.setattr(
+        _http.urllib.request, "urlopen", lambda _req, timeout=None: response
+    )
+
+    with pytest.raises(_http.ResponseTooLargeError):
+        invoke(len(body))
+
+    assert response.closed
 
 
 @pytest.mark.parametrize(
