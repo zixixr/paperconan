@@ -387,16 +387,33 @@ def test_directory_budget_counts_only_blocks_with_retained_findings(
     _write_two_sheet_blocks(data / "multi.xlsx")
     _patch_scan_finding_sources(
         monkeypatch,
-        block_findings=[{
-            "kind": "block_low",
-            "severity": "low",
-            "rule": "low block",
-        }],
+        block_findings=[],
         cross_findings=[{
             "kind": "cross_high",
             "severity": "high",
             "rule": "high cross-sheet",
         }],
+    )
+    row_pair_marker = {
+        "kind": "row_pair_low",
+        "severity": "low",
+        "rule": "low row pair",
+    }
+
+    def emit_row_pair_marker(
+        *_args, _finding_sink=None, **_kwargs
+    ):
+        _finding_sink.offer(
+            "row_pairs",
+            row_pair_marker["severity"],
+            lambda: dict(row_pair_marker),
+        )
+        return [], {"findings_omitted": 0}
+
+    monkeypatch.setattr(
+        A,
+        "detect_row_pair_digit_coupling",
+        emit_row_pair_marker,
     )
     monkeypatch.setattr(A, "_MAX_FINDINGS_PER_BLOCK", 0)
     monkeypatch.setattr(A, "_MAX_TOTAL_FINDINGS", 2)
@@ -404,12 +421,24 @@ def test_directory_budget_counts_only_blocks_with_retained_findings(
     scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
 
     blocks = scan["relations_blocks"]
+    counted_blocks = [
+        block for block in blocks if _block_finding_count(block) > 0
+    ]
     empty_blocks = [
         block for block in blocks if _block_finding_count(block) == 0
     ]
     assert len(blocks) == 4
+    assert len(counted_blocks) == 1
     assert len(empty_blocks) == 3
     assert all(block["findings_omitted"] == 1 for block in empty_blocks)
+    assert counted_blocks[0]["relations"] == []
+    assert [
+        {
+            key: finding[key]
+            for key in row_pair_marker
+        }
+        for finding in counted_blocks[0]["row_pairs"]
+    ] == [row_pair_marker]
     assert scan["n_blocks_with_findings"] == 1
     assert [finding["kind"] for finding in scan["cross_sheet_findings"]] == [
         "cross_high",
