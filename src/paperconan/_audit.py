@@ -8896,6 +8896,9 @@ def _apply_global_finding_budget(report_blocks, cross_sheet_findings, cap):
 def _attach_deferred_evidence(
     report_blocks, coverage, runtime_stats=None
 ):
+    class EvidenceReloadSourceMissing(Exception):
+        pass
+
     blocks_by_path = {}
     for block in report_blocks:
         path = block.get("_evidence_path")
@@ -9008,34 +9011,47 @@ def _attach_deferred_evidence(
 
         ext = os.path.splitext(path)[1].lower()
         if ext in {".pdf", ".docx"}:
-            entry_iterator = iter(_iter_extracted_sheets(path))
+            try:
+                entry_iterator = iter(_iter_extracted_sheets(path))
+            except FileNotFoundError as exc:
+                raise EvidenceReloadSourceMissing from exc
             attempted = set()
             try:
-                while True:
+                try:
+                    while True:
+                        try:
+                            entry = next(entry_iterator)
+                        except StopIteration:
+                            break
+                        except FileNotFoundError as exc:
+                            raise EvidenceReloadSourceMissing from exc
+                        sheet_name, sheet, limitations = entry
+                        if (
+                            sheet_name in blocks_by_sheet
+                            and sheet_name not in attempted
+                        ):
+                            attach_target(
+                                sheet_name,
+                                sheet,
+                                limitations,
+                                missing_reason=(
+                                    "evidence_reload_missing_table"
+                                ),
+                            )
+                            attempted.add(sheet_name)
+                        del sheet
+                        del limitations
+                        del sheet_name
+                        del entry
+                except BaseException:
                     try:
-                        entry = next(entry_iterator)
-                    except StopIteration:
-                        break
-                    sheet_name, sheet, limitations = entry
-                    if (
-                        sheet_name in blocks_by_sheet
-                        and sheet_name not in attempted
-                    ):
-                        attach_target(
-                            sheet_name,
-                            sheet,
-                            limitations,
-                            missing_reason=(
-                                "evidence_reload_missing_table"
-                            ),
-                        )
-                        attempted.add(sheet_name)
-                    del sheet
-                    del limitations
-                    del sheet_name
-                    del entry
+                        close_iterator(entry_iterator)
+                    except Exception:
+                        pass
+                    raise
+                else:
+                    close_iterator(entry_iterator)
             finally:
-                close_iterator(entry_iterator)
                 del entry_iterator
             for sheet_name in blocks_by_sheet:
                 if sheet_name not in attempted:
@@ -9047,7 +9063,10 @@ def _attach_deferred_evidence(
                     )
             return
 
-        load_result = load_table_result(path)
+        try:
+            load_result = load_table_result(path)
+        except FileNotFoundError as exc:
+            raise EvidenceReloadSourceMissing from exc
         sheets = load_result.sheets
         limitations = load_result.limitations
         try:
@@ -9083,20 +9102,13 @@ def _attach_deferred_evidence(
             )
             try:
                 attach_path(path, retained_blocks, path_runtime)
-            except FileNotFoundError:
+            except EvidenceReloadSourceMissing:
                 coverage.add_limitation(
                     "file",
                     "evidence_reload_missing_file",
                     file=retained_blocks[0]["file"],
                 )
             except Exception as exc:
-                if (
-                    isinstance(exc, ValueError)
-                    and str(exc).startswith(
-                        "details contains reserved key:"
-                    )
-                ):
-                    raise
                 error_type = type(exc).__name__
                 if (
                     not error_type
@@ -9121,8 +9133,12 @@ def _attach_deferred_evidence(
                 )
     finally:
         for block in report_blocks:
-            block.pop("_evidence_path", None)
-            block.pop("_evidence_context", None)
+            for key in tuple(block):
+                if (
+                    isinstance(key, str)
+                    and key.startswith("_evidence_")
+                ):
+                    block.pop(key, None)
 
 
 _WIDE_INTEGER_BLOCK_DETECTORS = [

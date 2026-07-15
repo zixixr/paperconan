@@ -321,6 +321,7 @@ def test_deferred_spreadsheet_reload_attaches_evidence_and_cleans_keys(
 ):
     path = tmp_path / "source.xlsx"
     block, finding = _deferred_block(path)
+    block["_evidence_sentinel"] = object()
     monkeypatch.setattr(
         audit,
         "load_table_result",
@@ -332,8 +333,44 @@ def test_deferred_spreadsheet_reload_attaches_evidence_and_cleans_keys(
 
     assert finding["evidence"]["rows"]
     assert coverage.limitations == []
-    assert "_evidence_path" not in block
-    assert "_evidence_context" not in block
+    assert not any(key.startswith("_evidence_") for key in block)
+
+
+def test_deferred_reload_attaches_evidence_to_every_retained_finding(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "source.xlsx"
+    block, first = _deferred_block(path)
+    second = {
+        "kind": "constant_ratio",
+        "severity": "medium",
+        "rule": "second retained finding",
+        "col_a_idx": 0,
+        "col_b_idx": 1,
+    }
+    third = {
+        "kind": "identical_column",
+        "severity": "medium",
+        "rule": "retained finding in another group",
+        "col_a_idx": 0,
+        "col_b_idx": 1,
+    }
+    block["relations"].append(second)
+    block["equal_pairs"].append(third)
+    monkeypatch.setattr(
+        audit,
+        "load_table_result",
+        lambda _path: TableLoadResult({"Target": _evidence_sheet()}),
+    )
+    coverage = ScanCoverage(files_discovered=1)
+
+    audit._attach_deferred_evidence([block], coverage)
+
+    assert coverage.limitations == []
+    assert all(
+        finding["evidence"]["rows"]
+        for finding in (first, second, third)
+    )
 
 
 @pytest.mark.parametrize(
@@ -473,6 +510,57 @@ def test_deferred_reload_exception_isolated_per_source_and_bounded(
     )
 
 
+def test_deferred_loader_value_error_text_does_not_escape(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "source.xlsx"
+    block, finding = _deferred_block(path)
+
+    def fail(_path):
+        raise ValueError("details contains reserved key: ordinary reload")
+
+    monkeypatch.setattr(audit, "load_table_result", fail)
+    coverage = ScanCoverage(files_discovered=1)
+
+    audit._attach_deferred_evidence([block], coverage)
+
+    assert "evidence" not in finding
+    assert coverage.limitations == [{
+        "scope": "file",
+        "reason": "evidence_reload_error",
+        "file": "source.xlsx",
+        "error_type": "ValueError",
+    }]
+
+
+def test_deferred_extractor_exception_does_not_require_stringification(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "source.pdf"
+    block, finding = _deferred_block(path)
+
+    class UnprintableValueError(ValueError):
+        def __str__(self):
+            raise RuntimeError("exception text must not be inspected")
+
+    def fail(_path):
+        raise UnprintableValueError()
+        yield
+
+    monkeypatch.setattr(audit, "_iter_extracted_sheets", fail)
+    coverage = ScanCoverage(files_discovered=1)
+
+    audit._attach_deferred_evidence([block], coverage)
+
+    assert "evidence" not in finding
+    assert coverage.limitations == [{
+        "scope": "file",
+        "reason": "evidence_reload_error",
+        "file": "source.pdf",
+        "error_type": "UnprintableValueError",
+    }]
+
+
 def test_deferred_reload_records_missing_file_without_path_detail(
     tmp_path, monkeypatch
 ):
@@ -496,12 +584,103 @@ def test_deferred_reload_records_missing_file_without_path_detail(
     assert str(tmp_path) not in json.dumps(coverage.to_dict())
 
 
+def test_deferred_extractor_iteration_missing_file_uses_source_reason(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "missing.pdf"
+    block, finding = _deferred_block(path)
+
+    def missing(_path):
+        raise FileNotFoundError(str(path))
+        yield
+
+    monkeypatch.setattr(audit, "_iter_extracted_sheets", missing)
+    coverage = ScanCoverage(files_discovered=1)
+
+    audit._attach_deferred_evidence([block], coverage)
+
+    assert "evidence" not in finding
+    assert coverage.limitations == [{
+        "scope": "file",
+        "reason": "evidence_reload_missing_file",
+        "file": "missing.pdf",
+    }]
+
+
+def test_deferred_attachment_missing_file_is_reload_error(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "source.xlsx"
+    block, finding = _deferred_block(path)
+    monkeypatch.setattr(
+        audit,
+        "load_table_result",
+        lambda _path: TableLoadResult({"Target": _evidence_sheet()}),
+    )
+
+    def fail_attachment(*_args, **_kwargs):
+        raise FileNotFoundError("attachment dependency unavailable")
+
+    monkeypatch.setattr(audit, "_attach_evidence", fail_attachment)
+    coverage = ScanCoverage(files_discovered=1)
+
+    audit._attach_deferred_evidence([block], coverage)
+
+    assert "evidence" not in finding
+    assert coverage.limitations == [{
+        "scope": "file",
+        "reason": "evidence_reload_error",
+        "file": "source.xlsx",
+        "error_type": "FileNotFoundError",
+    }]
+
+
+def test_deferred_extractor_close_missing_file_is_reload_error(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "source.pdf"
+    block, finding = _deferred_block(path)
+
+    class CloseMissingIterator:
+        def __init__(self):
+            self._entries = iter([
+                ("Target", _evidence_sheet(), []),
+            ])
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._entries)
+
+        def close(self):
+            raise FileNotFoundError("cleanup dependency unavailable")
+
+    monkeypatch.setattr(
+        audit,
+        "_iter_extracted_sheets",
+        lambda _path: CloseMissingIterator(),
+    )
+    coverage = ScanCoverage(files_discovered=1)
+
+    audit._attach_deferred_evidence([block], coverage)
+
+    assert finding["evidence"]["rows"]
+    assert coverage.limitations == [{
+        "scope": "file",
+        "reason": "evidence_reload_error",
+        "file": "source.pdf",
+        "error_type": "FileNotFoundError",
+    }]
+
+
 @pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit])
 def test_deferred_reload_propagates_base_exception_controls(
     tmp_path, monkeypatch, control
 ):
     path = tmp_path / "source.xlsx"
     block, _finding = _deferred_block(path)
+    block["_evidence_sentinel"] = object()
 
     def interrupt(_path):
         raise control()

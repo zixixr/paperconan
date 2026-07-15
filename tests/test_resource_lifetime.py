@@ -3183,6 +3183,78 @@ def test_deferred_reload_closes_failed_extractor_before_next_source(
     )
 
 
+def test_deferred_reload_preserves_iteration_control_when_close_fails(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "source.pdf"
+    block = _deferred_report_block(path, "Target")
+
+    class ReloadControl(BaseException):
+        pass
+
+    control = ReloadControl()
+
+    class ControlledIterator:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise control
+
+        def close(self):
+            raise RuntimeError("cleanup failure")
+
+    monkeypatch.setattr(
+        audit,
+        "_iter_extracted_sheets",
+        lambda _path: ControlledIterator(),
+    )
+    coverage = ScanCoverage(files_discovered=1)
+
+    with pytest.raises(ReloadControl) as caught:
+        audit._attach_deferred_evidence([block], coverage)
+
+    assert caught.value is control
+    assert coverage.limitations == []
+    assert not any(key.startswith("_evidence_") for key in block)
+
+
+def test_deferred_reload_does_not_swallow_close_control(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "source.pdf"
+    block = _deferred_report_block(path, "Target")
+
+    class ReloadControl(BaseException):
+        pass
+
+    control = ReloadControl()
+
+    class ControlledIterator:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise RuntimeError("iteration failure")
+
+        def close(self):
+            raise control
+
+    monkeypatch.setattr(
+        audit,
+        "_iter_extracted_sheets",
+        lambda _path: ControlledIterator(),
+    )
+    coverage = ScanCoverage(files_discovered=1)
+
+    with pytest.raises(ReloadControl) as caught:
+        audit._attach_deferred_evidence([block], coverage)
+
+    assert caught.value is control
+    assert coverage.limitations == []
+    assert not any(key.startswith("_evidence_") for key in block)
+
+
 def test_deferred_reload_settles_file_and_target_sheet_once(
     tmp_path, monkeypatch
 ):
