@@ -1,5 +1,6 @@
 import gc
 import os
+import tracemalloc
 import types
 import weakref
 from collections.abc import Mapping, Sequence, Set
@@ -1190,6 +1191,129 @@ def test_dense_detector_owned_state_covers_actual_live_arrays(
         EXPECTED_MULTI_OUTPUT_CALLS.get(family, set())
         <= observed_numpy_calls
     )
+
+
+def test_rounding_detector_avoids_full_noncontiguous_block_copy(
+    monkeypatch,
+):
+    class NoRavelArray(np.ndarray):
+        def ravel(self, *_args, **_kwargs):
+            raise AssertionError(
+                "non-contiguous detector block was fully raveled"
+            )
+
+        def flatten(self, *_args, **_kwargs):
+            raise AssertionError(
+                "non-contiguous detector block was fully flattened"
+            )
+
+        def __array_ufunc__(
+            self, ufunc, method, *inputs, **kwargs
+        ):
+            converted = tuple(
+                value.view(np.ndarray)
+                if isinstance(value, NoRavelArray)
+                else value
+                for value in inputs
+            )
+            outputs = kwargs.get("out")
+            if outputs is not None:
+                kwargs["out"] = tuple(
+                    value.view(np.ndarray)
+                    if isinstance(value, NoRavelArray)
+                    else value
+                    for value in outputs
+                )
+            return getattr(ufunc, method)(*converted, **kwargs)
+
+    rows = 2_000
+    columns = 20
+    values = np.full((rows, columns), 200.0)
+    values.flat[:20] = np.linspace(1.001, 2.001, 20)
+    storage = np.full((rows, columns * 2), np.nan)
+    numeric = storage[:, 1::2]
+    numeric[:] = values
+    numeric = numeric.view(NoRavelArray)
+    assert not numeric.flags.c_contiguous
+    measured_allocations = []
+    original_materialize = audit._DenseCandidate.materialize
+
+    def tracked_materialize(
+        self,
+        lease,
+        factory,
+        *,
+        release_after=(),
+        completes_source=False,
+    ):
+        if lease is None or lease.name != "values":
+            return original_materialize(
+                self,
+                lease,
+                factory,
+                release_after=release_after,
+                completes_source=completes_source,
+            )
+
+        def measured_factory():
+            assert not tracemalloc.is_tracing()
+            tracemalloc.start()
+            before = tracemalloc.get_traced_memory()[0]
+            try:
+                result = factory()
+                _current, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            measured_allocations.append({
+                "output_bytes": result.nbytes,
+                "peak_bytes": peak - before,
+            })
+            return result
+
+        return original_materialize(
+            self,
+            lease,
+            measured_factory,
+            release_after=release_after,
+            completes_source=completes_source,
+        )
+
+    expected = audit.detect_identical_after_rounding(
+        Sheet.from_rows(values.tolist()),
+        0,
+        rows,
+        0,
+        columns,
+        [f"c{index}" for index in range(columns)],
+    )
+    monkeypatch.setattr(
+        audit._DenseCandidate,
+        "materialize",
+        tracked_materialize,
+    )
+    sheet = Sheet(
+        rows,
+        columns,
+        numeric,
+        {},
+        np.zeros((rows, columns), dtype=np.bool_),
+    )
+
+    actual = audit.detect_identical_after_rounding(
+        sheet,
+        0,
+        rows,
+        0,
+        columns,
+        [f"c{index}" for index in range(columns)],
+    )
+
+    assert actual == expected
+    assert len(measured_allocations) == 1
+    assert measured_allocations[0]["output_bytes"] == (
+        20 * np.dtype(float).itemsize
+    )
+    assert measured_allocations[0]["peak_bytes"] < numeric.nbytes // 4
 
 
 @pytest.mark.parametrize(

@@ -57,6 +57,80 @@ def test_tiny_finite_relation_is_not_reported_as_parse_failure(
     )
 
 
+def test_non_float_convertible_integer_does_not_abort_full_scan(
+    tmp_path,
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    wide = 10**400
+    first_block = [
+        f"{wide},1.125",
+        *[
+            f"{index + 0.125},{index + 1.375}"
+            for index in range(1, 13)
+        ],
+    ]
+    second_block = [
+        f"{wide + 1},2.625",
+        *[
+            f"{index + 10.234},{index + 20.456}"
+            for index in range(1, 13)
+        ],
+    ]
+    (data / "wide.csv").write_text(
+        "\n".join([
+            "a,b",
+            *first_block,
+            "",
+            "c,d",
+            *second_block,
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    scan = scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    affected_detectors = [
+        "relations",
+        "equal_pairs",
+        "row_pairs",
+        "arithmetic_progression",
+        "within_column",
+        "dispersed_repeats",
+        "identical_after_rounding",
+        "grim_grimmer",
+    ]
+    assert scan["scan_status"] == "partial"
+    assert scan["coverage"]["files_succeeded"] == 1
+    assert scan["coverage"]["files_failed"] == 0
+    assert scan["coverage"]["sheets_succeeded"] == 1
+    assert scan["coverage"]["limitations"] == [
+        {
+            "scope": "block",
+            "reason": "wide_integer_detector_limit",
+            "file": "wide.csv",
+            "sheet": "wide",
+            "rows": "2-14",
+            "cols": "1-2",
+            "affected_cells": 1,
+            "detectors": affected_detectors,
+        },
+        {
+            "scope": "block",
+            "reason": "wide_integer_detector_limit",
+            "file": "wide.csv",
+            "sheet": "wide",
+            "rows": "17-29",
+            "cols": "1-2",
+            "affected_cells": 1,
+            "detectors": affected_detectors,
+        },
+    ]
+
+
 @pytest.mark.parametrize("row_count", [8, 24])
 def test_extreme_relation_is_not_reported_as_parse_failure(
     tmp_path, row_count, monkeypatch

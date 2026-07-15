@@ -246,6 +246,14 @@ Detectors offer a severity plus a lazy payload factory, rather than appending a
 constructed dictionary directly. This bounds both the retained list and
 payload construction.
 
+Candidate-local findings commit as one atomic batch. A finite collector
+therefore reserves one additional `cap` of temporary payload capacity while
+the original retained set remains available for rollback. Before each
+replacement builder runs, the current working entry is removed; the rollback
+snapshot remains its sole owner. The exact live-payload bound during an atomic
+batch is therefore `2 * cap`, while the post-commit retained bound remains
+`cap`. Outside an atomic batch, evicted payloads are released immediately.
+
 ### Detector integration
 
 All block finding families use the same collector in scan execution:

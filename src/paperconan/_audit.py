@@ -107,23 +107,34 @@ def is_num(x):
 
 
 def to_float(x):
-    return float(x) if is_num(x) else None
+    if not is_num(x):
+        return None
+    try:
+        value = float(x)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
 
 
 def last_significant_digit(x):
     if x is None or x == 0:
         return None
-    s = f"{x:.10g}"
+    if isinstance(x, int) and not isinstance(x, bool):
+        return str(abs(x))[-1]
+    try:
+        s = f"{x:.10g}"
+    except (TypeError, ValueError, OverflowError):
+        return None
     digits = [c for c in s if c.isdigit()]
     return digits[-1] if digits else None
 
 
 def trailing_decimal_digits(x, k=2):
-    if x is None:
+    if x is None or isinstance(x, int):
         return None
     try:
         s = repr(float(x))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if "e" in s or "E" in s or "." not in s:
         return None
@@ -138,7 +149,12 @@ def _decimals_of(x, cap=6):
     Recovering decimals from the float repr therefore UNDER-counts precision for
     values like 2.50 -> 2.5. That is conservatively safe for GRIM: fewer decimals
     means a coarser grid and fewer flags, never a false flag."""
-    s = repr(float(x))
+    if isinstance(x, int) and not isinstance(x, bool):
+        return 0
+    value = to_float(x)
+    if value is None:
+        return cap
+    s = repr(value)
     if "e" in s or "E" in s:
         return cap  # scientific notation: assume high precision (conservative)
     if "." not in s:
@@ -4333,7 +4349,10 @@ def detect_identical_after_rounding(
         values, values_lease = candidate.allocate(
             "values",
             cell_count,
-            lambda: block.ravel()[flat_indices],
+            # ``block`` is normally a strided sheet slice. Its flat iterator
+            # indexes that view directly; ``ravel()`` would first copy the
+            # complete non-contiguous block outside the state budget.
+            lambda: block.flat[flat_indices],
         )
         value_count = len(values)
         rounded, rounded_lease = candidate.allocate(
@@ -8385,8 +8404,10 @@ def _fraction_reuse_pair_stats(sheet, block_a, block_b):
             if left is None or right is None:
                 continue
             common += 1
-            x = float(left)
-            y = float(right)
+            x = to_float(left)
+            y = to_float(right)
+            if x is None or y is None:
+                continue
             if not bool(integer_shift_close((x,), (y,))[0]):
                 continue
             shared += 1

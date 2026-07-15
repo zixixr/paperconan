@@ -183,6 +183,29 @@ def test_b3_no_flag_on_quarter_offsets_at_large_fraction_resolving_baseline():
                    for f in findings)
 
 
+def test_fraction_reuse_excludes_non_float_convertible_cells_from_shared_count():
+    wide = 10**400
+    sheet = Sheet.from_rows([
+        [wide],
+        [1.125],
+        [wide + 7],
+        [2.125],
+    ])
+
+    stats = audit._fraction_reuse_pair_stats(
+        sheet,
+        (0, 2, 0, 1),
+        (2, 4, 0, 1),
+    )
+
+    assert stats.common == 2
+    assert stats.shared == 1
+    assert stats.integer_differences == 1
+    assert stats.high_precision == 1
+    assert stats.fraction_representatives == (0.125,)
+    assert stats.difference_representatives == (1,)
+
+
 def test_process_file_runs_fraction_reuse_while_sheet_is_live(
     tmp_path, monkeypatch
 ):

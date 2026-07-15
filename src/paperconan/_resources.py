@@ -113,6 +113,7 @@ class BoundedFindingCollector:
         self.offered = 0
         self.evicted = 0
         self._building_depth = 0
+        self._batch_depth = 0
         self._group_sequences = {
             name: 0 for name in self.group_names
         }
@@ -127,6 +128,18 @@ class BoundedFindingCollector:
     @property
     def omitted(self) -> int:
         return self.offered - self.retained
+
+    @property
+    def transaction_payload_limit(self) -> int | None:
+        """Additional payload slots reserved for atomic batch replacement."""
+        return self.cap
+
+    @property
+    def max_live_payloads(self) -> int | None:
+        """Maximum retained plus rollback-staged payloads for a finite cap."""
+        if self.cap is None:
+            return None
+        return 2 * self.cap
 
     def offer(
         self,
@@ -165,6 +178,16 @@ class BoundedFindingCollector:
                 return False
             replacement_token = self._worst_heap[0][3]
 
+        replacement_removed = False
+        if replacement_token is not None and self._batch_depth:
+            _neg_rank, _neg_group, _neg_sequence, token = heapq.heappop(
+                self._worst_heap
+            )
+            if token != replacement_token:
+                raise AssertionError("finding replacement state changed")
+            del self._entries[token]
+            replacement_removed = True
+
         self._building_depth += 1
         try:
             payload = builder()
@@ -172,12 +195,15 @@ class BoundedFindingCollector:
             self._building_depth -= 1
 
         if replacement_token is not None:
-            _neg_rank, _neg_group, _neg_sequence, token = heapq.heappop(
-                self._worst_heap
-            )
-            if token != replacement_token:
-                raise AssertionError("finding replacement state changed")
-            del self._entries[token]
+            if not replacement_removed:
+                _neg_rank, _neg_group, _neg_sequence, token = (
+                    heapq.heappop(self._worst_heap)
+                )
+                if token != replacement_token:
+                    raise AssertionError(
+                        "finding replacement state changed"
+                    )
+                del self._entries[token]
             self.evicted += 1
 
         token = self._next_token
@@ -205,6 +231,15 @@ class BoundedFindingCollector:
             ]
         ],
     ) -> tuple[bool, ...]:
+        """Offer one atomic batch with at most ``2 * cap`` live payloads.
+
+        The rollback snapshot owns the original retained payloads. Before a
+        replacement payload is built, the current working entry is removed;
+        the snapshot can still restore the original batch state if any builder
+        fails. This keeps transaction-local payloads within one additional
+        retained-cap allocation instead of accumulating an unbudgeted third
+        set of intermediate replacements.
+        """
         snapshot = (
             self.offered,
             self.evicted,
@@ -215,22 +250,36 @@ class BoundedFindingCollector:
             list(self._worst_heap),
         )
         results = []
+        self._batch_depth += 1
         try:
-            for group, severity, builder in items:
-                results.append(
-                    self.offer(group, severity, builder)
-                )
-        except BaseException:
-            (
-                self.offered,
-                self.evicted,
-                self._building_depth,
-                self._group_sequences,
-                self._next_token,
-                self._entries,
-                self._worst_heap,
-            ) = snapshot
-            raise
+            try:
+                for group, severity, builder in items:
+                    results.append(
+                        self.offer(group, severity, builder)
+                    )
+                if (
+                    self.transaction_payload_limit is not None
+                    and sum(
+                        token >= snapshot[4]
+                        for token in self._entries
+                    ) > self.transaction_payload_limit
+                ):
+                    raise AssertionError(
+                        "finding batch exceeded transaction payload limit"
+                    )
+            except BaseException:
+                (
+                    self.offered,
+                    self.evicted,
+                    self._building_depth,
+                    self._group_sequences,
+                    self._next_token,
+                    self._entries,
+                    self._worst_heap,
+                ) = snapshot
+                raise
+        finally:
+            self._batch_depth -= 1
         return tuple(results)
 
     def materialize(self) -> dict[str, list[dict[str, Any]]]:

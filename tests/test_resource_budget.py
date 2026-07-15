@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import gc
+import weakref
+
 import pytest
 
 from paperconan._resources import (
@@ -240,3 +243,196 @@ def test_bounded_collector_unknown_severity_is_worse_than_configured_ranks():
     assert collector.materialize() == {
         "relations": [{"id": "known", "severity": "low"}],
     }
+
+
+def test_atomic_batch_has_an_explicit_live_payload_budget():
+    class Payload(dict):
+        pass
+
+    collector = BoundedFindingCollector(
+        ("relations",), cap=3, severity_rank=RANK
+    )
+    references = []
+    live_counts = []
+
+    def tracked_builder(identifier):
+        def build():
+            payload = Payload(id=identifier)
+            references.append(weakref.ref(payload))
+            gc.collect()
+            live_counts.append(
+                sum(ref() is not None for ref in references)
+            )
+            return payload
+
+        return build
+
+    for index in range(3):
+        assert collector.offer(
+            "relations",
+            "low",
+            tracked_builder(f"old-{index}"),
+        )
+
+    live_counts.clear()
+    assert collector.offer_batch(
+        [
+            *(
+                (
+                    "relations",
+                    "medium",
+                    tracked_builder(f"medium-{index}"),
+                )
+                for index in range(3)
+            ),
+            *(
+                (
+                    "relations",
+                    "high",
+                    tracked_builder(f"high-{index}"),
+                )
+                for index in range(3)
+            ),
+        ]
+    ) == (True, True, True, True, True, True)
+
+    gc.collect()
+    assert collector.transaction_payload_limit == 3
+    assert collector.max_live_payloads == 6
+    assert max(live_counts) <= collector.max_live_payloads
+    assert sum(ref() is not None for ref in references) == collector.retained
+
+
+def test_atomic_batch_failure_restores_payloads_counters_and_depths():
+    class BatchAbort(BaseException):
+        pass
+
+    class Payload(dict):
+        pass
+
+    collector = BoundedFindingCollector(
+        ("relations",), cap=2, severity_rank=RANK
+    )
+    old_references = []
+    staged_references = []
+
+    def old_builder(identifier):
+        def build():
+            payload = Payload(id=identifier)
+            old_references.append(weakref.ref(payload))
+            return payload
+
+        return build
+
+    for index in range(2):
+        assert collector.offer(
+            "relations",
+            "low",
+            old_builder(f"old-{index}"),
+        )
+
+    def staged_builder():
+        payload = Payload(id="staged")
+        staged_references.append(weakref.ref(payload))
+        return payload
+
+    def fail_builder():
+        payload = Payload(id="failed")
+        staged_references.append(weakref.ref(payload))
+        raise BatchAbort
+
+    with pytest.raises(BatchAbort):
+        collector.offer_batch([
+            ("relations", "medium", staged_builder),
+            ("relations", "high", fail_builder),
+        ])
+
+    gc.collect()
+    assert collector.materialize() == {
+        "relations": [
+            {"id": "old-0"},
+            {"id": "old-1"},
+        ],
+    }
+    assert collector.offered == 2
+    assert collector.evicted == 0
+    assert collector.retained == 2
+    assert collector.omitted == 0
+    assert collector._building_depth == 0
+    assert collector._batch_depth == 0
+    assert sum(ref() is not None for ref in old_references) == 2
+    assert all(ref() is None for ref in staged_references)
+    assert collector._group_sequences == {"relations": 2}
+
+    assert collector.offer(
+        "relations",
+        "medium",
+        lambda: {"id": "next-0"},
+    )
+    assert collector.offer(
+        "relations",
+        "medium",
+        lambda: {"id": "next-1"},
+    )
+    rejected_builds = []
+    assert not collector.offer(
+        "relations",
+        "medium",
+        lambda: rejected_builds.append("built") or {
+            "id": "next-2"
+        },
+    )
+    assert rejected_builds == []
+    assert collector.materialize() == {
+        "relations": [
+            {"id": "next-0"},
+            {"id": "next-1"},
+        ],
+    }
+    assert collector.offered == 5
+    assert collector.evicted == 2
+    assert collector.retained == 2
+    assert collector.omitted == 3
+
+
+def test_reentrant_atomic_batch_is_rejected_without_building_payload():
+    collector = BoundedFindingCollector(
+        ("relations",), cap=1, severity_rank=RANK
+    )
+    assert collector.offer(
+        "relations",
+        "low",
+        lambda: {"id": "seed"},
+    )
+    nested_results = []
+    nested_builds = []
+
+    def outer_builder():
+        nested_results.append(
+            collector.offer_batch([
+                (
+                    "relations",
+                    "high",
+                    lambda: nested_builds.append("built") or {
+                        "id": "nested"
+                    },
+                ),
+            ])
+        )
+        return {"id": "outer"}
+
+    assert collector.offer_batch([
+        ("relations", "high", outer_builder),
+    ]) == (True,)
+
+    assert nested_results == [(False,)]
+    assert nested_builds == []
+    assert collector.materialize() == {
+        "relations": [{"id": "outer"}],
+    }
+    assert collector.offered == 3
+    assert collector.evicted == 1
+    assert collector.retained == 1
+    assert collector.omitted == 2
+    assert collector._building_depth == 0
+    assert collector._batch_depth == 0
