@@ -631,6 +631,65 @@ def test_deferred_reload_records_missing_file_without_path_detail(
     assert str(tmp_path) not in json.dumps(coverage.to_dict())
 
 
+def test_deferred_inaccessible_source_is_reload_error(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "source.xlsx"
+    block, finding = _deferred_block(path)
+    real_stat = audit.os.stat
+
+    def inaccessible(_path):
+        raise PermissionError("source load denied")
+
+    def deny_stat(probed_path, *args, **kwargs):
+        if probed_path == str(path):
+            raise PermissionError("source metadata denied")
+        return real_stat(probed_path, *args, **kwargs)
+
+    monkeypatch.setattr(audit, "load_table_result", inaccessible)
+    monkeypatch.setattr(audit.os, "stat", deny_stat)
+    coverage = ScanCoverage(files_discovered=1)
+
+    audit._attach_deferred_evidence([block], coverage)
+
+    assert "evidence" not in finding
+    assert coverage.limitations == [{
+        "scope": "file",
+        "reason": "evidence_reload_error",
+        "file": "source.xlsx",
+        "error_type": "PermissionError",
+    }]
+
+
+def test_deferred_not_a_directory_source_is_missing_file(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "source.xlsx" / "table.xlsx"
+    block, finding = _deferred_block(path)
+    real_stat = audit.os.stat
+
+    def fail_load(_path):
+        raise RuntimeError("source load failed")
+
+    def fail_stat(probed_path, *args, **kwargs):
+        if probed_path == str(path):
+            raise NotADirectoryError("source parent is not a directory")
+        return real_stat(probed_path, *args, **kwargs)
+
+    monkeypatch.setattr(audit, "load_table_result", fail_load)
+    monkeypatch.setattr(audit.os, "stat", fail_stat)
+    coverage = ScanCoverage(files_discovered=1)
+
+    audit._attach_deferred_evidence([block], coverage)
+
+    assert "evidence" not in finding
+    assert coverage.limitations == [{
+        "scope": "file",
+        "reason": "evidence_reload_missing_file",
+        "file": "table.xlsx",
+    }]
+
+
 def test_deferred_real_missing_pdf_uses_source_reason(tmp_path):
     pytest.importorskip("pdfplumber")
     path = tmp_path / "missing.pdf"

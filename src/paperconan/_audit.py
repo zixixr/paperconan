@@ -8899,6 +8899,15 @@ def _attach_deferred_evidence(
     class EvidenceReloadSourceMissing(Exception):
         pass
 
+    def source_is_missing(path):
+        try:
+            os.stat(path)
+        except (FileNotFoundError, NotADirectoryError):
+            return True
+        except OSError:
+            return False
+        return False
+
     blocks_by_path = {}
     for block in report_blocks:
         path = block.get("_evidence_path")
@@ -9014,7 +9023,7 @@ def _attach_deferred_evidence(
             try:
                 entry_iterator = iter(_iter_extracted_sheets(path))
             except Exception as exc:
-                if not os.path.exists(path):
+                if source_is_missing(path):
                     raise EvidenceReloadSourceMissing from exc
                 raise
             attempted = set()
@@ -9026,7 +9035,7 @@ def _attach_deferred_evidence(
                         except StopIteration:
                             break
                         except Exception as exc:
-                            if not os.path.exists(path):
+                            if source_is_missing(path):
                                 raise EvidenceReloadSourceMissing from exc
                             raise
                         sheet_name, sheet, limitations = entry
@@ -9070,7 +9079,7 @@ def _attach_deferred_evidence(
         try:
             load_result = load_table_result(path)
         except Exception as exc:
-            if not os.path.exists(path):
+            if source_is_missing(path):
                 raise EvidenceReloadSourceMissing from exc
             raise
         sheets = load_result.sheets
