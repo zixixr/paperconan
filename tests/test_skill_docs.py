@@ -240,6 +240,24 @@ def test_public_docs_explain_recurring_window_exactness() -> None:
         )
 
 
+def test_cli_recurring_window_budget_table_row_documents_lower_bound() -> None:
+    cli_text = (ROOT / "docs" / "cli.md").read_text(
+        encoding="utf-8"
+    )
+    row_match = re.search(
+        r"^\| `PAPERCONAN_RECURRING_ROW_VECTOR_BUDGET` \|[^\n]+$",
+        cli_text,
+        re.MULTILINE,
+    )
+
+    assert row_match is not None
+    row = row_match.group(0)
+    assert "`windows_skipped`" in row
+    assert re.search(r"所有候选行.+已检查.+精确", row)
+    assert re.search(r"否则.+下界", row)
+    assert "耗尽时记录精确跳过窗口数" not in row
+
+
 def test_cli_documents_fetch_state_and_work_controls() -> None:
     text = (ROOT / "docs" / "cli.md").read_text(
         encoding="utf-8"

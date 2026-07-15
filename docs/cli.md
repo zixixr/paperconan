@@ -103,7 +103,7 @@ write_adjudicated_report(scan, verdict, "adjudication.html")  # scan/verdict 均
 | `PAPERCONAN_MAX_TOTAL_FINDINGS` | `5000` | 全部 block 合计 finding 上限（防病态语料把 `scan.json` / `report.html` 撑到 GB 级）；`0` 关闭 |
 | `PAPERCONAN_MAX_EVIDENCE_ROWS` | `50` | 单条 evidence 片段最多行数 |
 | `PAPERCONAN_MAX_EVIDENCE_COLS` | `30` | 单条 evidence 片段最多列数 |
-| `PAPERCONAN_RECURRING_ROW_VECTOR_BUDGET` | `3000000` | recurring-row detector 的全局窗口工作预算；耗尽时记录精确跳过窗口数 |
+| `PAPERCONAN_RECURRING_ROW_VECTOR_BUDGET` | `3000000` | recurring-row detector 的全局窗口工作预算；仅在所有候选行都已检查后，`windows_skipped` 才是精确值；否则为下界 |
 | `PAPERCONAN_RECURRING_ROW_VECTOR_UNIQUE_BUDGET` | `100000` | recurring-row detector 全局保留的唯一向量数；已知向量仍继续更新，新向量遗漏以明确下界记录 |
 | `PAPERCONAN_RECURRING_ROW_VECTOR_FINALIZATION_CANDIDATE_BUDGET` | `10000` | recurring-row finalization 最多保留的候选向量数；超限时记录候选遗漏数与 finding 遗漏下界 |
 | `PAPERCONAN_RECURRING_ROW_VECTOR_FINALIZATION_PAIR_BUDGET` | `200000` | recurring-row finalization 最多执行的 indexed overlap 候选比较数 |
