@@ -155,10 +155,10 @@
 - **常见误报**：固定分母比例、常数平移/缩放、按列换算、扫描轴或 log/dilution 阶梯。检测器会降级已识别的这些结构，但仍需结合列标签和 Methods 核对。
 
 ### `cross_sheet_column_duplicate`
-- **原理**：两个 panel（跨 sheet / 跨文件）某列**逐值顺序完全一致**（对齐到 6 位小数），列长 ≥ 12。补齐 `cross_sheet_position_identical` 因只 grid ≥3 位小数而漏掉的**整数 / 一位小数列**。
+- **原理**：两个 panel（跨 sheet / 跨文件）某列按顺序共享 **exact loader-preserved numeric identity**（加载器保留的精确数值身份），列长 ≥ 12。补齐 `cross_sheet_position_identical` 因只 grid ≥3 位小数而漏掉的**整数 / 一位小数列**。
 - **典型命中**：一张图的"No IR"基线列在另一张标注为独立的图里 60 个值全同。
 - **常见误报**：共享的轴 / 索引 / 剂量列（等差**和等比 / 系列稀释**都已排除）；同图号 panel（自动降为 low）；低基数 / 全整数列（要求更长且高基数）。
-- **解读时**：rule 说的是"match to 6 decimal places"（不是逐比特相同）；`same_file=false` 的跨文件命中优先核查。
+- **解读时**：rule 描述的是按加载器保留的数值身份逐值、按顺序精确一致；这是待人工复核的数据不一致统计信号。`same_file=false` 的跨文件命中优先核查。
 
 ### `within_table_fraction_reuse`
 - **原理**：**同一 sheet** 内两个数值矩阵块，逐格对应位置**共享高精度小数位**、整数部分只差整数（≥80% 格 + ≥5 种不同小数）。（这条虽然进 `cross_sheet_findings`，但 `same_file=true`、`figure_a/b` 为 null——两个块在同一 sheet 内。）

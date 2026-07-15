@@ -896,15 +896,16 @@ def test_b1_serial_dilution_axis_not_flagged():
     assert not [x for x in f if x["severity"] == "high"], "a shared serial-dilution axis is benign"
 
 
-def test_b1_rule_wording_is_honest_about_precision():
+def test_b1_rule_describes_exact_loader_preserved_numeric_identity():
     dup = [3.0, 3.2, 2.5, 2.8, 2.9, 2.2, 5.0, 5.2, 4.5, 4.8, 4.9, 4.2, 6.1, 6.3, 5.7]
     panels = {
         ("F3.xls", "Figure 3b"): {"x": dup},
         ("F9.xls", "Extended Data Fig. 9d"): {"y": list(dup)},
     }
     hi = [x for x in _run_b1(panels) if x["severity"] == "high"]
-    assert hi and "byte-identical" not in hi[0]["rule"]
-    assert "6 decimal places" in hi[0]["rule"]
+    assert hi
+    assert "exact loader-preserved numeric identity" in hi[0]["rule"]
+    assert "6 decimal places" not in hi[0]["rule"]
 
 
 def test_b1_single_sheet_early_exit():

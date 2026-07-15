@@ -8305,8 +8305,9 @@ def detect_cross_sheet_column_duplicates(
                         for value in first.sample
                     ],
                     severity=sev,
-                    rule=(f"column '{la}' ({sa_name}) and column '{lb}' ({sb_name}) match to 6 decimal "
-                          f"places over all {n} values across 2 {scope}"),
+                    rule=(f"column '{la}' ({sa_name}) and column '{lb}' ({sb_name}) share exact "
+                          f"loader-preserved numeric identity in the same order for all {n} "
+                          f"compared values across 2 {scope}"),
                 )
                 if budget is None or budget.retain_finding():
                     findings.append(finding)

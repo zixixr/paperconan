@@ -376,6 +376,14 @@ def test_agent_schema_describes_generic_cross_table_signal_family() -> None:
         assert kind in text
 
 
+def test_detector_reference_describes_exact_column_duplicate_identity() -> None:
+    text = (REF_DIR / "detectors.md").read_text(encoding="utf-8")
+
+    assert "exact loader-preserved numeric identity" in text
+    assert "match to 6 decimal places" not in text
+    assert "对齐到 6 位小数" not in text
+
+
 def test_new_judgment_docs_keep_signal_not_verdict_boundary() -> None:
     docs = [
         REF_DIR / "adjudication-tiers.md",
