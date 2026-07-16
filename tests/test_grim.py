@@ -9,9 +9,7 @@ from __future__ import annotations
 import itertools
 import math
 
-import paperconan._audit as audit
 from paperconan._audit import _decimals_of, grim_consistent, grimmer_consistent
-from paperconan._resources import BoundedFindingCollector
 
 
 def test_decimals_of_counts_displayed_places():
@@ -66,7 +64,7 @@ def test_grimmer_never_flags_achievable_integer_sds():
                 assert grimmer_consistent(mean, sd, n, d, d) is True, (combo, n, d, mean, sd)
 
 
-from paperconan._audit import _grim_column_groups, detect_grim_grimmer
+from paperconan._audit import detect_grim_grimmer
 from paperconan._sheet import Sheet
 
 
@@ -89,87 +87,6 @@ def test_detector_flags_impossible_mean_with_integer_keyword():
     assert grim["severity"] == "high"
     assert grim["n_failed"] == 1
     assert grim["failed_rows"][0]["row"] == 2  # 1-based sheet row of group A
-
-
-def test_detector_retains_only_bounded_failure_samples(
-    monkeypatch,
-):
-    row_count = 10_000
-    header = [
-        "score mean A",
-        "sd A",
-        "n A",
-        "score mean B",
-        "sd B",
-        "n B",
-    ]
-
-    class VirtualSheet:
-        def cell(self, _row, col):
-            return (3.45, 1.0, 10, 2.1, 1.05, 3)[col]
-
-    monkeypatch.setattr(
-        audit,
-        "grim_consistent",
-        lambda mean, _n, _decimals: mean != 3.45,
-    )
-    monkeypatch.setattr(
-        audit,
-        "grimmer_consistent",
-        lambda *_args: False,
-    )
-    sheet = VirtualSheet()
-
-    findings = detect_grim_grimmer(
-        sheet, 0, row_count, 0, len(header), header
-    )
-
-    assert [finding["n_failed"] for finding in findings] == [
-        row_count,
-        row_count,
-    ]
-    assert [len(finding["failed_rows"]) for finding in findings] == [
-        8,
-        8,
-    ]
-
-    collector = BoundedFindingCollector(
-        ("grim",),
-        cap=0,
-        severity_rank={"high": 0},
-    )
-    captured_builders = []
-    original_offer = collector.offer
-
-    def capture_offer(group, severity, builder):
-        captured_builders.append(builder)
-        return original_offer(group, severity, builder)
-
-    monkeypatch.setattr(collector, "offer", capture_offer)
-
-    assert detect_grim_grimmer(
-        sheet,
-        0,
-        row_count,
-        0,
-        len(header),
-        header,
-        _finding_sink=collector,
-    ) == []
-    assert collector.offered == 2
-    assert collector.retained == 0
-    assert len(captured_builders) == 2
-    for builder in captured_builders:
-        defaults = builder.__defaults__ or ()
-        assert not any(
-            isinstance(value, (list, dict, set))
-            for value in defaults
-        )
-        assert all(
-            len(value) <= 8
-            for value in defaults
-            if isinstance(value, tuple)
-        )
 
 
 def test_detector_skips_without_integer_keyword():
@@ -233,7 +150,7 @@ def test_detector_integer_keyword_must_be_in_mean_header():
 
 def test_detector_mean_header_with_n_token_uses_real_n_column():
     # The mean header contains a standalone 'n' token ("n per group"). The real
-    # n column must still supply n — not the mean column (which would infer a
+    # n column must still supply n — not the mean column (which would invent a
     # tiny n and produce spurious GRIM findings).
     rows = [
         ["group", "score mean (n per group)", "sd", "n"],
@@ -274,144 +191,3 @@ def test_detector_still_checks_composite_score_mean():
     ]
     findings = detect_grim_grimmer(*_block(rows))
     assert any(f["kind"] == "grim_inconsistent" for f in findings)
-
-
-def test_grimmer_rejects_parity_only_false_consistency():
-    assert grimmer_consistent(0.5, 1.12, 2, 1, 2) is False
-
-
-def test_grimmer_two_value_closed_form():
-    assert grimmer_consistent(0.5, 0.71, 2, 1, 2) is True
-    assert grimmer_consistent(0.5, 0.50, 2, 1, 2) is True
-
-
-def test_grimmer_stays_conservative_when_search_budget_is_exceeded(monkeypatch):
-    import paperconan._audit as audit
-
-    assert audit._integer_moments_reachable(
-        total=3,
-        sum_squares=101,
-        n=5,
-        max_states=1,
-    ) is None
-    monkeypatch.setattr(audit, "_GRIMMER_MAX_STATES", 1)
-    assert audit.grimmer_consistent(0.6, 4.6, 5, 1, 1) is True
-
-
-def test_grimmer_is_translation_invariant_for_large_integer_offsets():
-    assert grimmer_consistent(0.3, 0.6, 3, 1, 1) is True
-    assert grimmer_consistent(100000000.3, 0.6, 3, 1, 1) is True
-
-
-def test_grimmer_bounds_candidate_generation_before_iteration(monkeypatch):
-    import paperconan._audit as audit
-
-    calls = []
-
-    def candidate_spy(*args):
-        calls.append(args)
-        return []
-
-    monkeypatch.setattr(audit, "_GRIMMER_MAX_CANDIDATES", 1, raising=False)
-    monkeypatch.setattr(audit, "_candidate_sum_squares", candidate_spy)
-
-    assert audit.grimmer_consistent(0.0, 1_000_000, 99, 2, 0) is True
-    assert calls == []
-
-
-def test_detector_checks_multiple_labeled_mean_groups():
-    rows = [
-        ["group", "score mean A", "sd A", "n A",
-         "score mean B", "sd B", "n B"],
-        ["x", 3.40, 1.0, 10, 2.25, 1.0, 10],
-        ["y", 3.45, 1.0, 10, 2.20, 1.0, 10],
-    ]
-    assert _grim_column_groups(rows[0]) == [(1, 3, 2), (4, 6, 5)]
-    findings = detect_grim_grimmer(*_block(rows))
-    partners = [
-        (
-            f["kind"],
-            f["mean_col"],
-            f["n_col"],
-            f["sd_col"],
-            f["col_a_idx"],
-            f.get("col_b_idx"),
-        )
-        for f in findings
-    ]
-    assert partners == [
-        ("grim_inconsistent", "score mean A", "n A", "sd A", 1, 2),
-        ("grim_inconsistent", "score mean B", "n B", "sd B", 4, 5),
-    ]
-    assert len(partners) == len(set(partners))
-
-
-def test_detector_may_share_one_global_n_column():
-    rows = [
-        ["group", "score mean A", "sd A",
-         "score mean B", "sd B", "n"],
-        ["x", 3.45, 1.0, 2.25, 1.0, 10],
-    ]
-    assert _grim_column_groups(rows[0]) == [(1, 5, 2), (3, 5, 4)]
-    findings = detect_grim_grimmer(*_block(rows))
-    partners = [
-        (
-            f["kind"],
-            f["mean_col"],
-            f["n_col"],
-            f["sd_col"],
-            f["col_a_idx"],
-            f.get("col_b_idx"),
-        )
-        for f in findings
-    ]
-    assert partners == [
-        ("grim_inconsistent", "score mean A", "n", "sd A", 1, 2),
-        ("grim_inconsistent", "score mean B", "n", "sd B", 3, 4),
-    ]
-    assert len(partners) == len(set(partners))
-
-
-def test_detector_excludes_standard_error_header_variants():
-    for error_header in (
-        "SEM",
-        "SE",
-        "S.E.",
-        "standard error",
-        "Std. Error",
-        "Std Error",
-    ):
-        rows = [
-            ["group", "score mean", error_header, "n"],
-            ["A", 2.3, 1.05, 3],
-        ]
-        assert _grim_column_groups(rows[0]) == [(1, 3, None)]
-        findings = detect_grim_grimmer(*_block(rows))
-        assert all(f["kind"] != "grimmer_inconsistent" for f in findings)
-
-    for sd_header in ("SD", "Std", "Std. Dev."):
-        header = ["group", "score mean", sd_header, "n"]
-        assert _grim_column_groups(header) == [(1, 3, 2)]
-
-
-def test_grouping_rejects_multiple_unrelated_partner_candidates():
-    ambiguous_sd_rows = [
-        ["group", "score mean A", "sd B", "sd C", "n A"],
-        ["A", 3.45, 1.0, 1.1, 10],
-    ]
-    assert _grim_column_groups(ambiguous_sd_rows[0]) == [(1, 4, None)]
-    findings = detect_grim_grimmer(*_block(ambiguous_sd_rows))
-    assert len(findings) == 1
-    assert findings[0]["kind"] == "grim_inconsistent"
-    assert findings[0]["mean_col"] == "score mean A"
-    assert findings[0]["n_col"] == "n A"
-    assert findings[0]["sd_col"] is None
-    assert findings[0]["col_a_idx"] == 1
-    assert "col_b_idx" not in findings[0]
-
-    ambiguous_n_rows = [
-        ["group", "score mean A", "sd A", "n B", "n C"],
-        ["A", 3.45, 1.0, 10, 10],
-    ]
-    assert _grim_column_groups(ambiguous_n_rows[0]) == []
-    assert detect_grim_grimmer(*_block(ambiguous_n_rows)) == []

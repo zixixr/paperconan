@@ -561,4 +561,3 @@ git push origin codex/project-hardening
 ```
 
 Confirm PR 32 is no longer conflicting and targets the current `main`.
-

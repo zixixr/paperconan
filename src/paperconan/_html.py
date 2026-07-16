@@ -10,6 +10,18 @@ import html
 import os
 from typing import Any, Iterable
 
+from .image._budget import report_image_evidence_bytes
+from .image._evidence import (
+    _BoundedBytesIO,
+    EvidenceBudget,
+    _base64_encoded_size,
+    _max_image_bytes,
+    _max_image_pixels,
+    _max_raw_size_for_base64_budget,
+    registered_native_crop_data_uri,
+    registered_preview_data_uri,
+)
+
 
 # ---------- value formatting ----------
 
@@ -37,8 +49,16 @@ def _esc(s: Any) -> str:
 
 # ---------- finding extraction ----------
 
-_PER_BLOCK_GROUPS = ("relations", "progressions", "equal_pairs", "row_pairs",
-                     "within_col", "identical_after_rounding", "grim")
+_PER_BLOCK_GROUPS = (
+    "relations",
+    "progressions",
+    "equal_pairs",
+    "row_pairs",
+    "row_relations",
+    "within_col",
+    "identical_after_rounding",
+    "grim",
+)
 
 
 def _iter_block_findings(scan: dict) -> Iterable[tuple[dict, dict]]:
@@ -69,6 +89,35 @@ def _all_findings(scan: dict) -> list[dict]:
             "block_cols": "—",
             "header": [],
             "finding": cf,
+        })
+    assets = {
+        str(asset.get("asset_id")): asset
+        for asset in scan.get("image_assets", []) or []
+        if asset.get("asset_id")
+    }
+    for image_finding in scan.get("image_findings", []) or []:
+        asset_ids = [
+            str(value)
+            for value in image_finding.get("asset_ids", []) or []
+        ]
+        files = [
+            assets[asset_id].get("file", asset_id)
+            for asset_id in asset_ids
+            if asset_id in assets
+        ]
+        out.append({
+            "scope": "image",
+            "file": " / ".join(files) or "registered image asset",
+            "sheet": "image",
+            "block_rows": "native pixels",
+            "block_cols": "native pixels",
+            "header": [],
+            "finding": image_finding,
+            "image_assets": [
+                assets[asset_id]
+                for asset_id in asset_ids
+                if asset_id in assets
+            ],
         })
     return out
 
@@ -487,7 +536,115 @@ def _cross_sheet_locations(finding: dict) -> set[tuple[str, str]]:
 
 # ---------- per-section rendering ----------
 
-def _render_finding_card(item: dict) -> str:
+def _registered_pair_preview_data_uri(
+    item: dict,
+    artifact_dir: str | None,
+    budget: EvidenceBudget,
+) -> str | None:
+    import base64
+    import io
+
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    assets = {
+        str(asset.get("asset_id")): asset
+        for asset in item.get("image_assets", []) or []
+        if asset.get("asset_id")
+    }
+    regions = item["finding"].get("regions") or []
+    if not regions:
+        return None
+
+    remaining_encoded_bytes = max(
+        0,
+        budget.max_bytes - budget.used_bytes,
+    )
+    validation_budget = EvidenceBudget(remaining_encoded_bytes)
+    previews = []
+    canvas = None
+    try:
+        for region in regions:
+            if not isinstance(region, dict):
+                return None
+            asset = assets.get(str(region.get("asset_id")))
+            if asset is None:
+                return None
+            uri = registered_native_crop_data_uri(
+                asset,
+                region.get("box"),
+                artifact_dir,
+                validation_budget,
+            )
+            marker = "data:image/png;base64,"
+            if uri is None or not uri.startswith(marker):
+                return None
+            payload = base64.b64decode(
+                uri[len(marker):],
+                validate=True,
+            )
+            with Image.open(io.BytesIO(payload)) as crop:
+                crop.load()
+                preview = crop.copy()
+            preview.thumbnail((760, 760))
+            converted = preview.convert("RGB")
+            if converted is not preview:
+                preview.close()
+            previews.append(converted)
+
+        gap = 20
+        width = sum(image.width for image in previews)
+        width += gap * max(0, len(previews) - 1)
+        height = max(image.height for image in previews)
+        if (
+            width <= 0
+            or height <= 0
+            or width * height > _max_image_pixels()
+        ):
+            return None
+        canvas = Image.new("RGB", (width, height), "white")
+        offset = 0
+        for preview in previews:
+            canvas.paste(preview, (offset, 0))
+            offset += preview.width + gap
+
+        remaining_encoded_bytes = max(
+            0,
+            budget.max_bytes - budget.used_bytes,
+        )
+        payload_limit = min(
+            _max_image_bytes(),
+            _max_raw_size_for_base64_budget(remaining_encoded_bytes),
+        )
+        if payload_limit <= 0:
+            return None
+        output = _BoundedBytesIO(payload_limit)
+        canvas.save(output, format="JPEG", quality=88, optimize=True)
+        payload = output.getvalue()
+        encoded_size = _base64_encoded_size(len(payload))
+        if not budget.can_consume(encoded_size):
+            return None
+        encoded = base64.b64encode(payload).decode("ascii")
+        if len(encoded) != encoded_size or not budget.consume(encoded_size):
+            return None
+        return f"data:image/jpeg;base64,{encoded}"
+    except Exception:
+        return None
+    finally:
+        if canvas is not None:
+            canvas.close()
+        for preview in previews:
+            preview.close()
+
+
+def _render_finding_card(
+    item: dict,
+    *,
+    artifact_dir: str | None = None,
+    image_budget: EvidenceBudget | None = None,
+) -> str:
     f = item["finding"]
     sev = (f.get("severity") or "low").lower()
     kind = f.get("kind", "?")
@@ -498,7 +655,55 @@ def _render_finding_card(item: dict) -> str:
     block_rows = item["block_rows"]
     profile_action = (f.get("profile_action") or "kept").lower()
 
-    if item["scope"] == "cross_sheet":
+    if item["scope"] == "image":
+        regions = f.get("regions") or []
+        chips = "".join(
+            f'<span class="val-chip">{_esc(region.get("asset_id"))} '
+            f'{_esc(region.get("box"))}</span>'
+            for region in regions
+        )
+        preview_uri = None
+        if image_budget is not None:
+            if regions:
+                preview_uri = _registered_pair_preview_data_uri(
+                    item,
+                    artifact_dir,
+                    image_budget,
+                )
+            else:
+                for asset in item.get("image_assets", []) or []:
+                    preview_uri = registered_preview_data_uri(
+                        asset,
+                        artifact_dir,
+                        image_budget,
+                    )
+                    if preview_uri is not None:
+                        break
+        chips_html = (
+            f'<div class="shared-values">{chips}</div>'
+            if chips else ""
+        )
+        if preview_uri:
+            evidence_html = (
+                f'<img class="image-pair-preview" src="{_esc(preview_uri)}" '
+                f'alt="registered image pair evidence">{chips_html}'
+            )
+        else:
+            evidence_html = (
+                chips_html
+                + (
+                    '<p class="no-evidence">'
+                    "registered image evidence unavailable</p>"
+                    if regions else ""
+                )
+                or '<p class="no-evidence">no registered image region</p>'
+            )
+        loc = _esc(file_)
+        extra_meta = (
+            f' · score={_esc(f.get("score"))}'
+            f' · transform={_esc(f.get("transform"))}'
+        )
+    elif item["scope"] == "cross_sheet":
         evidence_html = _render_cross_sheet_examples(f)
         loc = f"{_esc(file_)} :: {_esc(sheet)}"
         extra_meta = ""
@@ -650,6 +855,38 @@ def _render_decimal_section(scan: dict) -> str:
     )
 
 
+def _render_tail_cluster_section(scan: dict) -> str:
+    items = scan.get("decimal_tail_clusters") or []
+    if not items:
+        return ""
+    rows = []
+    for item in items[:30]:
+        top = ", ".join(
+            f"...{tail} x {count}"
+            for tail, count in (item.get("top") or [])[:6]
+        )
+        rows.append(
+            f'<tr><td class="loc">{_esc(item.get("label"))}</td>'
+            f'<td>{_esc(item.get("n"))}</td>'
+            f'<td>{_esc(round(100 * (item.get("top_share") or 0)))}%</td>'
+            f'<td>{_esc(item.get("complementary_pairs") or 0)}</td>'
+            f'<td class="ends">{_esc(top)}</td></tr>'
+        )
+    return (
+        '<section id="sec-tail-cluster" class="section">'
+        f'<h2>Clustered high-precision fractional tails ({len(items)} sheets)</h2>'
+        '<p class="hint">A small set of multi-digit fractional tails is '
+        'over-represented across many distinct values. This statistical '
+        'signal requires contextual review.</p>'
+        '<div class="ev-wrap"><table class="ev meta-table">'
+        '<thead><tr><th>sheet</th><th>high-precision n</th>'
+        '<th>top share</th><th>complementary pairs</th>'
+        '<th>top tails</th></tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody></table></div>'
+        '</section>'
+    )
+
+
 # ---------- top-level template ----------
 
 _CSS = """
@@ -726,6 +963,8 @@ details.finding summary { padding:10px 14px; cursor:pointer; list-style:none;
   display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
 details.finding summary::-webkit-details-marker { display:none; }
 details.finding > p, details.finding > .ev-wrap, details.finding > .shared-values { margin:0 14px 14px; }
+.image-pair-preview { display:block; max-width:calc(100% - 28px); height:auto;
+  margin:0 14px 14px; border:1px solid var(--border); }
 .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px;
   font-weight:600; letter-spacing:.3px; text-transform:uppercase; }
 .badge.sev-high { background:rgba(220,38,38,.15); color:var(--high); border:1px solid rgba(220,38,38,.4); }
@@ -840,6 +1079,8 @@ _JS = """
 def write_html_report(scan: dict, out_path: str) -> None:
     input_dir = scan.get("input_dir", "")
     input_label = os.path.basename(os.path.normpath(input_dir)) or input_dir or "audit"
+    artifact_dir = os.path.dirname(os.path.abspath(out_path))
+    image_budget = EvidenceBudget(report_image_evidence_bytes())
     raw_scan_status = scan.get("scan_status")
     scan_status = (
         str(raw_scan_status).strip().lower()
@@ -861,6 +1102,7 @@ def write_html_report(scan: dict, out_path: str) -> None:
     sev = _severity_counts(findings)
 
     cross = [it for it in findings if it["scope"] == "cross_sheet"]
+    images = [it for it in findings if it["scope"] == "image"]
     high = [it for it in findings if it["scope"] == "block" and it["finding"].get("severity") == "high"]
     medium = [it for it in findings if it["scope"] == "block" and it["finding"].get("severity") == "medium"]
     low = [it for it in findings if it["scope"] == "block" and it["finding"].get("severity") == "low"]
@@ -868,7 +1110,14 @@ def write_html_report(scan: dict, out_path: str) -> None:
     def section(title: str, items: list[dict], id_: str, hint: str = "") -> str:
         if not items:
             return ""
-        body = "".join(_render_finding_card(it) for it in items)
+        body = "".join(
+            _render_finding_card(
+                item,
+                artifact_dir=artifact_dir,
+                image_budget=image_budget,
+            )
+            for item in items
+        )
         hint_html = f'<p class="hint">{_esc(hint)}</p>' if hint else ""
         return (
             f'<section id="{id_}" class="section">'
@@ -880,11 +1129,18 @@ def write_html_report(scan: dict, out_path: str) -> None:
     sections = "".join([
         section("Cross-table statistical signals", cross, "sec-cross",
                 "跨表信号可包括同位置数值、共享小数尾数、重复列或重复向量；需要结合表格语义和方法人工复核。"),
+        section(
+            "Optional deterministic image signals",
+            images,
+            "sec-images",
+            "Non-gating hints only; semantic image review remains external.",
+        ),
         section("High-severity findings", high, "sec-high"),
         section("Medium-severity findings", medium, "sec-medium"),
         section("Low-severity findings", low, "sec-low"),
         _render_digit_section(scan),
         _render_decimal_section(scan),
+        _render_tail_cluster_section(scan),
     ])
     if not sections:
         if scan_status == "failed":

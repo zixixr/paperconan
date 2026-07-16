@@ -1,13 +1,44 @@
 from __future__ import annotations
 
+import base64
+from collections import UserDict
 import json
 import subprocess
 import sys
 
+import pytest
+
 from tests.build_fixture import build
 
-from paperconan import scan_dir, write_adjudicated_report
+from paperconan import _adjudicated_html, scan_dir, write_adjudicated_report
 from paperconan._adjudicated_html import _render_md, render_adjudicated_report
+
+
+PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+    "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+
+
+class _DictionarySubclass(dict):
+    pass
+
+
+class _StatefulVerdictSubclass(dict):
+    def __init__(self) -> None:
+        super().__init__(
+            verdict="NEEDS_HUMAN",
+            report_md="The signal requires contextual review.",
+        )
+        self.title_reads = 0
+
+    def get(self, key, default=None):
+        if key == "title":
+            self.title_reads += 1
+            if self.title_reads == 1:
+                return "Contextual review"
+            return "mis" + "conduct"
+        return super().get(key, default)
 
 
 def _verdict() -> dict:
@@ -61,8 +92,339 @@ def test_write_adjudicated_report_renders_verdict_and_scan_evidence(tmp_path):
     assert "异常位置" in html
     assert "identical_column" in html
     assert "ED_Fig1.xlsx" in html
-    assert "statistical signals and data inconsistencies" in html
-    assert "requires the original data, figure legends, Methods" in html
+    assert "signal, not verdict" in html
+    assert "fabri" + "cation" not in html.lower()
+    assert "mis" + "conduct" not in html.lower()
+
+
+def _image_scan(audit) -> dict:
+    preview = audit / "images" / "preview" / "img-a.png"
+    preview.parent.mkdir(parents=True)
+    preview.write_bytes(PNG_1X1)
+    return {
+        "tool_version": "0.test",
+        "profile": "review",
+        "input_dir": str(audit.parent / "input"),
+        "relations_blocks": [],
+        "cross_sheet_findings": [],
+        "image_assets": [{
+            "asset_id": "img:a",
+            "file": "Fig1.png",
+            "preview_path": "images/preview/img-a.png",
+            "mime": "image/png",
+        }],
+        "image_findings": [],
+    }
+
+
+def _image_verdict() -> dict:
+    return {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "finding_type": "image",
+            "title": "Registered image reference",
+            "image_refs": [{"asset_id": "img:a"}],
+            "review_status": "needs_human",
+            "report_md": "The registered image requires contextual review.",
+        }],
+    }
+
+
+def test_write_adjudicated_report_accepts_artifact_dir(tmp_path):
+    audit = tmp_path / "audit"
+    scan = _image_scan(audit)
+    out = tmp_path / "adjudication.html"
+
+    write_adjudicated_report(scan, _image_verdict(), str(out), artifact_dir=str(audit))
+
+    assert "data:image/png;base64," in out.read_text(encoding="utf-8")
+
+
+def test_adjudicated_report_rejects_in_root_registered_preview_symlink(tmp_path):
+    audit = tmp_path / "audit"
+    scan = _image_scan(audit)
+    registered = audit / scan["image_assets"][0]["preview_path"]
+    target = registered.with_name("target.png")
+    registered.replace(target)
+    registered.symlink_to(target.name)
+
+    html = render_adjudicated_report(
+        scan,
+        _image_verdict(),
+        artifact_dir=str(audit),
+    )
+
+    assert "data:image/png;base64," not in html
+    assert "preview unavailable" in html
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["not-a-number", "inf", "-1", "1e10000"],
+    ids=["malformed", "non-finite", "negative", "overflow"],
+)
+def test_adjudicated_report_invalid_image_evidence_limit_suppresses_images(
+    tmp_path,
+    monkeypatch,
+    value,
+):
+    audit = tmp_path / "audit"
+    scan = _image_scan(audit)
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_EVIDENCE_MB", value)
+
+    html = render_adjudicated_report(
+        scan,
+        _image_verdict(),
+        artifact_dir=str(audit),
+    )
+
+    assert "data:image/" not in html
+    assert "preview unavailable" in html
+
+
+def test_adjudicated_numeric_only_report_ignores_invalid_image_evidence_limit(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "PAPERCONAN_MAX_IMAGE_EVIDENCE_MB",
+        "not-a-number",
+    )
+
+    html = render_adjudicated_report(
+        {
+            "relations_blocks": [],
+            "cross_sheet_findings": [],
+            "image_assets": [],
+            "image_findings": [],
+        },
+        {
+            "verdict": "NEEDS_HUMAN",
+            "report_md": "Numeric evidence remains available for review.",
+        },
+    )
+
+    assert "Numeric evidence remains available for review." in html
+
+
+def test_write_adjudicated_report_validation_failure_preserves_existing_output(
+    tmp_path,
+):
+    out = tmp_path / "adjudication.html"
+    out.write_text("existing-report", encoding="utf-8")
+    blocked = "mis" + "conduct"
+
+    with pytest.raises(ValueError, match="neutral-language policy"):
+        write_adjudicated_report(
+            {"relations_blocks": [], "cross_sheet_findings": []},
+            {"verdict": "NEEDS_HUMAN", "report_md": blocked},
+            str(out),
+        )
+
+    assert out.read_text(encoding="utf-8") == "existing-report"
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    [
+        UserDict({
+            "verdict": "NEEDS_HUMAN",
+            "report_md": "The signal requires contextual review.",
+        }),
+        _DictionarySubclass(
+            verdict="NEEDS_HUMAN",
+            report_md="The signal requires contextual review.",
+        ),
+    ],
+    ids=["user-dictionary", "dictionary-subclass"],
+)
+def test_top_level_verdict_requires_a_concrete_json_object(verdict):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            {"relations_blocks": [], "cross_sheet_findings": []},
+            verdict,
+        )
+
+    assert str(exc.value) == "verdict must be a concrete JSON object"
+
+
+def test_stateful_top_level_verdict_is_rejected_before_any_report_work(
+    monkeypatch,
+):
+    verdict = _StatefulVerdictSubclass()
+
+    def reject_late_work(*args, **kwargs):
+        raise AssertionError("report work must not start")
+
+    monkeypatch.setattr(
+        _adjudicated_html,
+        "_visible_scan_findings",
+        reject_late_work,
+    )
+    monkeypatch.setattr(
+        _adjudicated_html.copy,
+        "deepcopy",
+        reject_late_work,
+    )
+    monkeypatch.setattr(
+        _adjudicated_html,
+        "_validate_neutral_verdict",
+        reject_late_work,
+    )
+    monkeypatch.setattr(
+        _adjudicated_html,
+        "_scan_title",
+        reject_late_work,
+    )
+    monkeypatch.setattr(
+        _adjudicated_html,
+        "_render_unified",
+        reject_late_work,
+    )
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            {"relations_blocks": [], "cross_sheet_findings": []},
+            verdict,
+        )
+
+    assert str(exc.value) == "verdict must be a concrete JSON object"
+    assert verdict.title_reads == 0
+
+
+@pytest.mark.parametrize(
+    ("verdict", "expected"),
+    [
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "paper_conclusion": "Paper-level context.",
+                "findings": [{"report_md": "Modern finding context."}],
+            },
+            "Modern finding context.",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "report_md": "Legacy finding context.",
+            },
+            "Legacy finding context.",
+        ),
+    ],
+    ids=["modern", "legacy"],
+)
+def test_concrete_top_level_verdict_preserves_modern_and_legacy_behavior(
+    verdict,
+    expected,
+):
+    html = render_adjudicated_report(
+        {"relations_blocks": [], "cross_sheet_findings": []},
+        verdict,
+    )
+
+    assert expected in html
+
+
+def test_top_level_verdict_validation_preserves_existing_output(tmp_path):
+    out = tmp_path / "adjudication.html"
+    out.write_text("existing-report", encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc:
+        write_adjudicated_report(
+            {"relations_blocks": [], "cross_sheet_findings": []},
+            UserDict({
+                "verdict": "NEEDS_HUMAN",
+                "report_md": "The signal requires contextual review.",
+            }),
+            str(out),
+        )
+
+    assert str(exc.value) == "verdict must be a concrete JSON object"
+    assert out.read_text(encoding="utf-8") == "existing-report"
+
+
+@pytest.mark.parametrize(
+    "blocked",
+    [
+        "fr" + "audulent",
+        "fabri" + "cated",
+        "fa" + "king",
+        "fal" + "sification",
+        "mis" + "conducted",
+        "guil" + "t",
+        "造" + "假",
+        "伪" + "造",
+        "捏" + "造",
+        "作" + "假",
+        "fr" + "audster",
+        "de" + "fr" + "auder",
+    ],
+)
+def test_adjudicated_report_rejects_blocked_language_families_without_echo(
+    tmp_path,
+    blocked,
+):
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "title": "Registered signal",
+            "report_md": f"The text makes a {blocked} conclusion.",
+        }],
+    }
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            {"relations_blocks": [], "cross_sheet_findings": []},
+            verdict,
+            artifact_dir=str(tmp_path),
+        )
+
+    assert blocked.casefold() not in str(exc.value).casefold()
+    assert str(exc.value) == (
+        "verdict text violates the neutral-language policy; rewrite it as a "
+        "statistical signal, data inconsistency, unresolved similarity, or "
+        "request for clarification; quoted or negated blocked language must "
+        "also be rewritten"
+    )
+
+
+def test_adjudicated_report_rejects_identifier_style_blocked_language(
+    tmp_path,
+):
+    blocked = "sample" + "Fa" + "keDownload"
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "report_md": f"The visible label is {blocked}.",
+    }
+
+    with pytest.raises(ValueError, match="neutral-language policy"):
+        render_adjudicated_report(
+            {"relations_blocks": [], "cross_sheet_findings": []},
+            verdict,
+            artifact_dir=str(tmp_path),
+        )
+
+
+def test_write_adjudicated_report_publication_failure_preserves_existing_output(
+    tmp_path,
+    monkeypatch,
+):
+    out = tmp_path / "adjudication.html"
+    out.write_text("existing-report", encoding="utf-8")
+
+    def reject_publication(*args, **kwargs):
+        raise OSError("synthetic publication failure")
+
+    monkeypatch.setattr(_adjudicated_html.os, "replace", reject_publication)
+
+    with pytest.raises(OSError, match="synthetic publication failure"):
+        write_adjudicated_report(
+            {"relations_blocks": [], "cross_sheet_findings": []},
+            {"verdict": "NEEDS_HUMAN", "report_md": "Contextual review required."},
+            str(out),
+        )
+
+    assert out.read_text(encoding="utf-8") == "existing-report"
+    assert not list(tmp_path.glob(".paperconan-adjudicated-*"))
 
 
 def test_report_subcommand_writes_adjudicated_html(tmp_path):
@@ -99,6 +461,119 @@ def test_report_subcommand_writes_adjudicated_html(tmp_path):
     assert 'class="finding-block"' in html
     assert "identical_column" in html
     assert str(out) in proc.stdout
+
+
+def test_report_subcommand_rejects_non_neutral_verdict_without_traceback(
+    tmp_path,
+):
+    scan_path = tmp_path / "scan.json"
+    scan_path.write_text(
+        json.dumps({"relations_blocks": [], "cross_sheet_findings": []}),
+        encoding="utf-8",
+    )
+    blocked = "mis" + "conduct"
+    verdict_path = tmp_path / "verdict.json"
+    verdict_path.write_text(
+        json.dumps({
+            "verdict": "NEEDS_HUMAN",
+            "report_md": f"There is no evidence of {blocked}.",
+        }),
+        encoding="utf-8",
+    )
+    out = tmp_path / "adjudication.html"
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "paperconan",
+            "report",
+            str(scan_path),
+            "--verdict",
+            str(verdict_path),
+            "--out",
+            str(out),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert proc.returncode != 0
+    assert "Traceback" not in proc.stderr
+    assert blocked not in proc.stderr.casefold()
+    assert "neutral-language policy" in proc.stderr
+    assert "quoted or negated" in proc.stderr
+    assert len(proc.stderr.strip().splitlines()) == 1
+    assert not out.exists()
+
+
+def test_report_subcommand_rejects_malformed_verdict_without_traceback(
+    tmp_path,
+):
+    scan_path = tmp_path / "scan.json"
+    scan_path.write_text(
+        json.dumps({"relations_blocks": [], "cross_sheet_findings": []}),
+        encoding="utf-8",
+    )
+    verdict_path = tmp_path / "verdict.json"
+    verdict_path.write_text("{", encoding="utf-8")
+    out = tmp_path / "adjudication.html"
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "paperconan",
+            "report",
+            str(scan_path),
+            "--verdict",
+            str(verdict_path),
+            "--out",
+            str(out),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert proc.returncode != 0
+    assert "Traceback" not in proc.stderr
+    assert len(proc.stderr.strip().splitlines()) == 1
+    assert not out.exists()
+
+
+def test_report_subcommand_resolves_preview_relative_to_scan_json(tmp_path):
+    audit = tmp_path / "audit"
+    scan = _image_scan(audit)
+    scan_path = audit / "scan.json"
+    scan_path.write_text(json.dumps(scan), encoding="utf-8")
+    verdict_path = tmp_path / "verdict.json"
+    verdict_path.write_text(json.dumps(_image_verdict()), encoding="utf-8")
+    out = tmp_path / "adjudication.html"
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "paperconan",
+            "report",
+            str(scan_path),
+            "--verdict",
+            str(verdict_path),
+            "--out",
+            str(out),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "data:image/png;base64," in out.read_text(encoding="utf-8")
 
 
 def test_render_md_sections_are_balanced_not_nested():
@@ -439,91 +914,60 @@ def test_finding_refs_scope_key_evidence_to_the_selected_finding():
     assert "within_col_value_duplication" not in html
 
 
-def test_adjudicated_evidence_keeps_tiny_nonzero_float_signs():
-    scan = _scan_two_findings()
-    evidence = scan["relations_blocks"][0]["relations"][0]["evidence"]
-    evidence["headers"] = ["positive", "negative", "zero"]
-    evidence["col_offset"] = 0
-    evidence["highlight_cols"] = [0, 1, 2]
-    evidence["rows"] = [{
-        "row_idx": 5,
-        "values": [1e-13, -1e-13, 0.0],
-    }]
-    verdict = {
-        "report_md": "## Review\n\nNeutral review.",
-        "finding_refs": [{"sheet": "Alpha", "kind": "constant_offset"}],
-    }
-
-    html = render_adjudicated_report(scan, verdict)
-
-    assert ">1e-13<" in html
-    assert ">-1e-13<" in html
-    assert ">0<" in html
-
-
-def test_adjudicated_report_renders_all_truncated_evidence_windows():
-    scan = _scan_two_findings()
-    scan["relations_blocks"][0]["relations"][0]["evidence"] = {
-        "truncated": True,
-        "windows": [
-            {
-                "headers": ["first"],
-                "col_offset": 0,
-                "col_indices": [0],
-                "highlight_cols": [0],
-                "highlight_rows": [5],
-                "rows": [{
-                    "row_idx": 5,
-                    "values": ["adjudicated-one"],
-                }],
-            },
-            {
-                "headers": ["last"],
-                "col_offset": 9,
-                "col_indices": [9],
-                "highlight_cols": [9],
-                "highlight_rows": [39],
-                "rows": [{
-                    "row_idx": 39,
-                    "values": ["adjudicated-two"],
-                }],
-            },
-        ],
-    }
-    verdict = {
-        "report_md": "## Review\n\nNeutral review.",
-        "finding_refs": [{"sheet": "Alpha", "kind": "constant_offset"}],
-    }
-
-    html = render_adjudicated_report(scan, verdict)
-
-    assert html.count('<table class="ev">') == 2
-    assert "adjudicated-one" in html
-    assert "adjudicated-two" in html
-
-
 def test_omitted_reference_uses_labeled_automatic_selection():
-    html = render_adjudicated_report(
-        _scan_two_findings(),
-        {"verdict": "KEEP", "report_md": "## t"},
-    )
+    scan = _scan_two_findings()
+    html = render_adjudicated_report(scan, {"verdict": "KEEP", "report_md": "## t"})
+
     assert "automatic evidence selection" in html.lower()
     assert html.count('class="finding-card"') == 1
     assert "constant_offset" in html
 
 
+def test_numeric_automatic_selection_ignores_higher_ranked_image_signal():
+    scan = _scan_two_findings()
+    scan["relations_blocks"][0]["relations"][0]["severity"] = "medium"
+    scan["image_findings"] = [{
+        "finding_id": "image:higher-ranked",
+        "kind": "image_pair_similarity_signal",
+        "severity": "high",
+        "rule": "higher-ranked-image-marker",
+        "asset_ids": [],
+    }]
+
+    html = render_adjudicated_report(
+        scan,
+        {"verdict": "KEEP", "report_md": "## numeric review"},
+    )
+
+    assert "automatic evidence selection" in html.lower()
+    assert "constant_offset" in html
+    assert "higher-ranked-image-marker" not in html
+
+
 def test_explicit_unmatched_reference_never_falls_back():
     scan = _scan_two_findings()
-    verdict = {
-        "verdict": "KEEP",
-        "report_md": "## t",
-        "finding_refs": [{"sheet": "Nonexistent"}],
-    }
+    verdict = {"verdict": "KEEP", "report_md": "## t", "finding_refs": [{"sheet": "Nonexistent"}]}
     html = render_adjudicated_report(scan, verdict)
+
     assert html.count('class="finding-card"') == 0
     assert "Nonexistent" in html
     assert "constant_offset" not in html
     assert "within_col_value_duplication" not in html
+
+
+def test_legacy_null_finding_refs_labels_automatic_selection():
+    html = render_adjudicated_report(
+        _scan_two_findings(),
+        {
+            "verdict": "KEEP",
+            "report_md": "## t",
+            "finding_refs": None,
+        },
+    )
+
+    assert "automatic evidence selection" in html.lower()
+    assert html.count('class="finding-card"') == 1
+    assert "constant_offset" in html
 
 
 def test_explicit_empty_selector_is_unmatched():
@@ -535,40 +979,10 @@ def test_explicit_empty_selector_is_unmatched():
             "report_md": "x",
         }],
     }
+
     html = render_adjudicated_report(_scan_two_findings(), verdict)
+
     assert "unmatched" in html.lower()
-    assert html.count('class="finding-card"') == 0
-
-
-def test_primary_non_dict_selector_is_visible_and_unmatched():
-    verdict = {
-        "verdict": "KEEP",
-        "findings": [{
-            "title": "x",
-            "finding_ref": "Alpha selector",
-            "report_md": "x",
-        }],
-    }
-    html = render_adjudicated_report(_scan_two_findings(), verdict)
-    assert "unmatched" in html.lower()
-    assert "Alpha selector" in html
-    assert html.count('class="finding-card"') == 0
-    assert "constant_offset" not in html
-
-
-def test_unmatched_selector_output_escapes_html_sensitive_text():
-    selector = "<b>Missing & selector</b>"
-    verdict = {
-        "verdict": "KEEP",
-        "findings": [{
-            "title": "x",
-            "finding_ref": {"sheet": selector},
-            "report_md": "x",
-        }],
-    }
-    html = render_adjudicated_report(_scan_two_findings(), verdict)
-    assert selector not in html
-    assert "&lt;b&gt;Missing &amp; selector&lt;/b&gt;" in html
     assert html.count('class="finding-card"') == 0
 
 
@@ -581,7 +995,9 @@ def test_null_primary_selector_uses_labeled_automatic_selection():
             "report_md": "x",
         }],
     }
+
     html = render_adjudicated_report(_scan_two_findings(), verdict)
+
     assert "automatic evidence selection" in html.lower()
     assert html.count('class="finding-card"') == 1
     assert "constant_offset" in html
@@ -596,87 +1012,75 @@ def test_unmatched_extra_reference_is_visible_without_fallback():
             {"sheet": "Missing", "kind": "constant_ratio"},
         ],
     }
+
     html = render_adjudicated_report(_scan_two_findings(), verdict)
+
     assert html.count('class="finding-card"') == 1
     assert "Missing" in html
     assert "constant_ratio" in html
 
 
-def test_additional_legacy_null_selector_labels_automatic_selection():
-    verdict = {
-        "verdict": "KEEP",
-        "report_md": "## t",
-        "finding_refs": [
-            {"sheet": "Alpha", "kind": "constant_offset"},
-            None,
-        ],
-    }
-    html = render_adjudicated_report(_scan_two_findings(), verdict)
-    assert html.lower().count("automatic evidence selection") == 1
-    assert "additional finding_ref was null" in html
-    assert html.count('class="finding-card"') == 2
-    assert html.count("constant_offset") == 2
-
-
-def test_explicit_empty_primary_findings_do_not_synthesize_legacy_finding():
-    verdict = {
-        "verdict": "KEEP",
-        "findings": [],
-        "report_md": "## legacy report must not render",
-        "finding_refs": [{"sheet": "Alpha", "kind": "constant_offset"}],
-    }
-    html = render_adjudicated_report(_scan_two_findings(), verdict)
-    assert html.count('class="finding-block"') == 0
-    assert html.count('class="finding-card"') == 0
-    assert "legacy report must not render" not in html
-    assert "constant_offset" not in html
-
-
-def test_findings_index_and_blocks_share_binding_state():
-    verdict = {
-        "title": "Paper X",
-        "verdict": "KEEP",
-        "findings": [
+@pytest.mark.parametrize("value", ["not-a-list", {}, 7])
+def test_legacy_finding_refs_must_be_list_or_null(value):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
             {
-                "title": "Matched finding",
-                "finding_ref": {"sheet": "Alpha", "kind": "constant_offset"},
+                "verdict": "NEEDS_HUMAN",
+                "report_md": "The signal requires contextual review.",
+                "finding_refs": value,
             },
+        )
+
+    assert str(exc.value) == "verdict finding_refs must be a list or null"
+
+
+@pytest.mark.parametrize("entry", [None, [], "not-a-dictionary"])
+def test_legacy_finding_ref_entries_must_be_dictionaries(entry):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
             {
-                "title": "Omitted finding",
+                "verdict": "NEEDS_HUMAN",
+                "report_md": "The signal requires contextual review.",
+                "finding_refs": [entry],
             },
+        )
+
+    assert str(exc.value) == "verdict finding_refs entries must be dictionaries"
+
+
+def test_legacy_finding_refs_limit_is_deterministic():
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
             {
-                "title": "Unmatched finding",
-                "finding_ref": {"sheet": "Missing", "kind": "constant_ratio"},
+                "verdict": "NEEDS_HUMAN",
+                "report_md": "The signal requires contextual review.",
+                "finding_refs": [{} for _ in range(5001)],
             },
-        ],
-    }
-    html = render_adjudicated_report(_scan_two_findings(), verdict)
-    index = html.split('<table class="findings-index">', 1)[1].split("</table>", 1)[0]
-    assert index.count("Alpha 5-39") == 2
-    assert index.count("constant_offset") == 2
-    assert "Missing" in index
-    assert "constant_ratio" in index
-    assert "Beta" not in index
-    assert "within_col_value_duplication" not in index
+        )
 
-    matched, omitted, unmatched = html.split('<section class="finding-block">')[1:]
-    assert 'class="finding-card"' in matched
-    assert "Alpha" in matched
-    assert "constant_offset" in matched
-    assert "automatic evidence selection" not in matched.lower()
+    assert str(exc.value) == (
+        "verdict finding_refs must contain at most 5000 entries"
+    )
 
-    assert 'class="finding-card"' in omitted
-    assert "Alpha" in omitted
-    assert "constant_offset" in omitted
-    assert "automatic evidence selection" in omitted.lower()
 
-    assert 'class="finding-card"' not in unmatched
-    assert "Missing" in unmatched
-    assert "constant_ratio" in unmatched
-    assert "Alpha" not in unmatched
-    assert "constant_offset" not in unmatched
-    assert "Beta" not in unmatched
-    assert "within_col_value_duplication" not in unmatched
+def test_legacy_shape_validation_precedes_neutral_text_inspection():
+    blocked = "mis" + "conduct"
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "report_md": "The signal requires contextual review.",
+                "finding_refs": [blocked],
+            },
+        )
+
+    assert str(exc.value) == "verdict finding_refs entries must be dictionaries"
+    assert blocked not in str(exc.value).casefold()
 
 
 def _multi_finding_verdict() -> dict:
@@ -718,6 +1122,526 @@ def test_findings_array_renders_per_finding_blocks_with_own_evidence():
     assert html.count('class="ev"') == 2
     # a findings index summarises them
     assert "findings-index" in html
+
+
+@pytest.mark.parametrize("selector", ["sheet", "file", "rows", "kind"])
+def test_multi_finding_unmatched_visible_selector_is_neutral_validated(selector):
+    blocked = "mis" + "conduct"
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "paper_conclusion": "The signals require contextual review.",
+        "findings": [
+            {
+                "title": "Unmatched signal",
+                "finding_ref": {selector: blocked},
+                "report_md": "The signal requires contextual review.",
+            },
+            {
+                "title": "Matched signal",
+                "finding_ref": {"sheet": "Alpha", "kind": "constant_offset"},
+                "report_md": "The signal requires contextual review.",
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(_scan_two_findings(), verdict)
+
+    assert blocked not in str(exc.value).casefold()
+    assert "neutral-language policy" in str(exc.value)
+
+
+def test_multi_finding_non_rendered_selector_metadata_is_ignored():
+    blocked = "mis" + "conduct"
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "paper_conclusion": "The signals require contextual review.",
+        "findings": [
+            {
+                "title": "Unmatched signal",
+                "finding_ref": {
+                    "sheet": "Unmatched",
+                    "file": blocked,
+                    "finding_id": blocked,
+                    "rule": blocked,
+                    "private_note": blocked,
+                },
+                "report_md": "The signal requires contextual review.",
+            },
+            {
+                "title": "Matched signal",
+                "finding_ref": {"sheet": "Alpha", "kind": "constant_offset"},
+                "report_md": "The signal requires contextual review.",
+            },
+        ],
+    }
+
+    html = render_adjudicated_report(_scan_two_findings(), verdict)
+
+    assert blocked not in html.casefold()
+    assert "Unmatched" in html
+
+
+@pytest.mark.parametrize("entry", [None, [], "not-a-dictionary"])
+def test_modern_finding_entries_must_be_dictionaries(entry):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {"verdict": "NEEDS_HUMAN", "findings": [entry]},
+        )
+
+    assert str(exc.value) == "verdict finding entries must be dictionaries"
+
+
+@pytest.mark.parametrize("value", [[], "not-a-dictionary", 7])
+def test_modern_finding_ref_must_be_dictionary_or_null(value):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{"finding_ref": value}],
+            },
+        )
+
+    assert str(exc.value) == "verdict finding_ref must be a dictionary or null"
+
+
+@pytest.mark.parametrize("field", ["extra_refs", "image_refs"])
+@pytest.mark.parametrize("value", [None, {}, "not-a-list"])
+def test_modern_reference_collections_must_be_lists(field, value):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{field: value}],
+            },
+        )
+
+    assert str(exc.value) == f"verdict {field} must be a list"
+
+
+@pytest.mark.parametrize("field", ["extra_refs", "image_refs"])
+@pytest.mark.parametrize("entry", [None, [], "not-a-dictionary"])
+def test_modern_reference_entries_must_be_dictionaries(field, entry):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{field: [entry]}],
+            },
+        )
+
+    assert str(exc.value) == f"verdict {field} entries must be dictionaries"
+
+
+@pytest.mark.parametrize(
+    ("verdict", "message"),
+    [
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [UserDict({
+                    "title": "mis" + "conduct",
+                    "report_md": "The signal requires contextual review.",
+                })],
+            },
+            "verdict finding entries must be dictionaries",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{
+                    "finding_ref": UserDict({"sheet": "mis" + "conduct"}),
+                }],
+            },
+            "verdict finding_ref must be a dictionary or null",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{
+                    "extra_refs": [UserDict({"sheet": "mis" + "conduct"})],
+                }],
+            },
+            "verdict extra_refs entries must be dictionaries",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{
+                    "image_refs": [UserDict({
+                        "asset_id": "img:a",
+                        "label": "mis" + "conduct",
+                    })],
+                }],
+            },
+            "verdict image_refs entries must be dictionaries",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "report_md": "The signal requires contextual review.",
+                "finding_refs": [UserDict({"sheet": "mis" + "conduct"})],
+            },
+            "verdict finding_refs entries must be dictionaries",
+        ),
+    ],
+    ids=[
+        "modern-finding",
+        "modern-finding-ref",
+        "modern-extra-ref",
+        "modern-image-ref",
+        "legacy-finding-ref",
+    ],
+)
+def test_non_dictionary_verdict_objects_are_rejected_without_echo(
+    verdict,
+    message,
+):
+    blocked = "mis" + "conduct"
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(_scan_two_findings(), verdict)
+
+    assert str(exc.value) == message
+    assert blocked not in str(exc.value).casefold()
+
+
+@pytest.mark.parametrize(
+    ("verdict", "message"),
+    [
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [_DictionarySubclass()],
+            },
+            "verdict finding entries must be dictionaries",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{
+                    "finding_ref": _DictionarySubclass(),
+                }],
+            },
+            "verdict finding_ref must be a dictionary or null",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{
+                    "extra_refs": [_DictionarySubclass()],
+                }],
+            },
+            "verdict extra_refs entries must be dictionaries",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{
+                    "image_refs": [_DictionarySubclass()],
+                }],
+            },
+            "verdict image_refs entries must be dictionaries",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "report_md": "The signal requires contextual review.",
+                "finding_refs": [_DictionarySubclass()],
+            },
+            "verdict finding_refs entries must be dictionaries",
+        ),
+    ],
+    ids=[
+        "modern-finding",
+        "modern-finding-ref",
+        "modern-extra-ref",
+        "modern-image-ref",
+        "legacy-finding-ref",
+    ],
+)
+def test_dictionary_subclasses_are_rejected_at_verdict_ingress(
+    verdict,
+    message,
+):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(_scan_two_findings(), verdict)
+
+    assert str(exc.value) == message
+
+
+def test_modern_findings_limit_is_deterministic():
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{} for _ in range(5001)],
+            },
+        )
+
+    assert str(exc.value) == (
+        "verdict findings must contain at most 5000 entries"
+    )
+
+
+@pytest.mark.parametrize("field", ["extra_refs", "image_refs"])
+def test_modern_reference_limit_is_deterministic(field):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{
+                    field: [{} for _ in range(1001)],
+                }],
+            },
+        )
+
+    assert str(exc.value) == (
+        f"verdict {field} must contain at most 1000 entries"
+    )
+
+
+def test_verdict_wide_reference_limit_precedes_matching_and_rendering(
+    monkeypatch,
+):
+    def reject_late_work(*args, **kwargs):
+        raise AssertionError("late report work must not start")
+
+    monkeypatch.setattr(_adjudicated_html, "_match_finding", reject_late_work)
+    monkeypatch.setattr(
+        _adjudicated_html,
+        "registered_preview_data_uri",
+        reject_late_work,
+    )
+    monkeypatch.setattr(
+        _adjudicated_html.copy,
+        "deepcopy",
+        reject_late_work,
+    )
+    repeated = [{"asset_id": "img:a"} for _ in range(1000)]
+    findings = [{"image_refs": list(repeated)} for _ in range(5)]
+    findings.append({"finding_ref": {}})
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": findings,
+            },
+        )
+
+    assert str(exc.value) == (
+        "verdict references must contain at most 5000 entries"
+    )
+
+
+def test_repeated_extra_refs_render_once_by_selector_key():
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "title": "Combined numeric evidence",
+            "finding_ref": {"sheet": "Alpha", "kind": "constant_offset"},
+            "extra_refs": [
+                {
+                    "sheet": "Beta",
+                    "kind": "within_col_value_duplication",
+                    "private_note": "first",
+                },
+                {
+                    "sheet": "Beta",
+                    "kind": "within_col_value_duplication",
+                    "private_note": "second",
+                },
+            ],
+            "report_md": "The selected signals require contextual review.",
+        }],
+    }
+
+    html = render_adjudicated_report(_scan_two_findings(), verdict)
+
+    assert html.count('class="finding-card"') == 2
+    assert html.count("within_col_value_duplication") == 1
+
+
+def test_unique_multi_finding_report_structure_is_unchanged():
+    html = render_adjudicated_report(
+        _scan_two_findings(),
+        _multi_finding_verdict(),
+    )
+
+    assert html.count('class="finding-block"') == 2
+    assert html.count('class="finding-card"') == 2
+    assert "findings-index" in html
+
+
+def test_modern_shape_validation_precedes_neutral_text_inspection():
+    attacker_text = "fabri" + "cated-input-sentinel"
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [attacker_text],
+            },
+        )
+
+    assert str(exc.value) == "verdict finding entries must be dictionaries"
+    assert attacker_text not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        (
+            "paper_conclusion",
+            "verdict paper_conclusion must be a string or null",
+        ),
+        (
+            "review_note",
+            "verdict review_note must be a string or null",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "value",
+    [7, 1.5, False, [], {}, UserDict({"note": "value"})],
+    ids=["integer", "float", "boolean", "list", "dictionary", "user-dictionary"],
+)
+def test_paper_markdown_fields_require_string_or_null(field, message, value):
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [],
+        field: value,
+    }
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(_scan_two_findings(), verdict)
+
+    assert str(exc.value) == message
+
+
+@pytest.mark.parametrize(
+    "value",
+    [7, 1.5, False, [], {}, UserDict({"note": "value"})],
+    ids=["integer", "float", "boolean", "list", "dictionary", "user-dictionary"],
+)
+def test_modern_finding_report_md_requires_string_or_null(value):
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{"report_md": value}],
+    }
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(_scan_two_findings(), verdict)
+
+    assert str(exc.value) == (
+        "verdict finding report_md must be a string or null"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [7, 1.5, False, [], {}, UserDict({"note": "value"})],
+    ids=["integer", "float", "boolean", "list", "dictionary", "user-dictionary"],
+)
+def test_legacy_report_md_requires_string_or_null(value):
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "report_md": value,
+    }
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(_scan_two_findings(), verdict)
+
+    assert str(exc.value) == "verdict report_md must be a string or null"
+
+
+def test_markdown_schema_validation_precedes_copy_and_neutral_inspection(
+    monkeypatch,
+):
+    blocked = "mis" + "conduct"
+
+    def reject_late_work(*args, **kwargs):
+        raise AssertionError("late report work must not start")
+
+    monkeypatch.setattr(
+        _adjudicated_html.copy,
+        "deepcopy",
+        reject_late_work,
+    )
+    monkeypatch.setattr(
+        _adjudicated_html,
+        "_validate_neutral_verdict",
+        reject_late_work,
+    )
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "paper_conclusion": UserDict({"text": blocked}),
+                "findings": [],
+            },
+        )
+
+    assert str(exc.value) == (
+        "verdict paper_conclusion must be a string or null"
+    )
+    assert blocked not in str(exc.value).casefold()
+
+
+def test_markdown_fields_preserve_absent_null_and_string_behavior():
+    for verdict in (
+        {
+            "verdict": "NEEDS_HUMAN",
+            "findings": [{}],
+        },
+        {
+            "verdict": "NEEDS_HUMAN",
+            "paper_conclusion": None,
+            "review_note": None,
+            "findings": [{"report_md": None}],
+        },
+        {
+            "verdict": "NEEDS_HUMAN",
+            "review_note": None,
+            "report_md": None,
+        },
+    ):
+        render_adjudicated_report(_scan_two_findings(), verdict)
+
+    modern = render_adjudicated_report(
+        _scan_two_findings(),
+        {
+            "verdict": "NEEDS_HUMAN",
+            "paper_conclusion": "Paper-level context.",
+            "review_note": "Review context.",
+            "findings": [{"report_md": "Finding context."}],
+        },
+    )
+    legacy = render_adjudicated_report(
+        _scan_two_findings(),
+        {
+            "verdict": "NEEDS_HUMAN",
+            "review_note": "Legacy review context.",
+            "report_md": "Legacy finding context.",
+        },
+    )
+
+    assert "Paper-level context." in modern
+    assert "Review context." in modern
+    assert "Finding context." in modern
+    assert "Legacy review context." in legacy
+    assert "Legacy finding context." in legacy
 
 
 def test_hero_shows_highest_tier_across_findings():

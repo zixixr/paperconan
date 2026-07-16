@@ -10,13 +10,23 @@ worker, DOI claiming, or private batch assumptions live here.
 """
 from __future__ import annotations
 
+import copy
 import html
+from html.parser import HTMLParser
 import json
 import os
 import re
+import tempfile
 from typing import Any, Literal, NamedTuple
 
 from ._html import _all_findings, _esc, _render_cross_sheet_examples, _render_evidence_table
+from ._neutral_language import contains_blocked_language
+from .image._budget import report_image_evidence_bytes
+from .image._evidence import (
+    EvidenceBudget,
+    registered_native_crop_data_uri,
+    registered_preview_data_uri,
+)
 
 
 _SECTION_TITLES = (
@@ -29,6 +39,511 @@ _SECTION_TITLES = (
     "需要作者澄清",
     "证据",
 )
+
+_IMAGE_FINDING_STATUSES = {"needs_human", "explained", "different", "unresolved"}
+_IMAGE_REVIEW_STATUSES = {
+    "completed", "partial", "unavailable_no_multimodal", "not_requested",
+}
+_MAX_MODERN_FINDINGS = 5000
+_MAX_MODERN_REFERENCES = 1000
+# Raw selectors and image cards accepted across one verdict.
+_MAX_VERDICT_REFERENCES = 5000
+_VISIBLE_TEXT_SEPARATOR_TAGS = {
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "br",
+    "dd",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hr",
+    "li",
+    "main",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "tr",
+    "ul",
+}
+
+
+class _VisibleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._suppressed_depth = 0
+
+    def _separator(self) -> None:
+        if self.parts and self.parts[-1] != "\n":
+            self.parts.append("\n")
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in {"script", "style"}:
+            self._suppressed_depth += 1
+            return
+        if self._suppressed_depth:
+            return
+        if tag in _VISIBLE_TEXT_SEPARATOR_TAGS:
+            self._separator()
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        if self._suppressed_depth or tag in {"script", "style"}:
+            return
+        if tag in _VISIBLE_TEXT_SEPARATOR_TAGS:
+            self._separator()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style"}:
+            if self._suppressed_depth:
+                self._suppressed_depth -= 1
+            return
+        if self._suppressed_depth:
+            return
+        if tag in _VISIBLE_TEXT_SEPARATOR_TAGS:
+            self._separator()
+
+    def handle_data(self, data: str) -> None:
+        if not self._suppressed_depth:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        return "".join(self.parts)
+
+
+def _is_image_verdict_finding(finding: dict[str, Any]) -> bool:
+    return finding.get("finding_type") == "image" or bool(finding.get("image_refs"))
+
+
+def _validate_optional_markdown(value: object, message: str) -> None:
+    if value is not None and not isinstance(value, str):
+        raise ValueError(message)
+
+
+def _validate_top_level_verdict(verdict: object) -> None:
+    if type(verdict) is not dict:
+        raise ValueError("verdict must be a concrete JSON object")
+
+
+def _modern_findings(verdict: dict[str, Any]) -> list[Any] | None:
+    if "findings" not in verdict:
+        return None
+    findings = verdict["findings"]
+    if not isinstance(findings, list):
+        raise ValueError("verdict findings must be a list")
+    if len(findings) > _MAX_MODERN_FINDINGS:
+        raise ValueError(
+            "verdict findings must contain at most "
+            f"{_MAX_MODERN_FINDINGS} entries"
+        )
+    for finding in findings:
+        if type(finding) is not dict:
+            raise ValueError("verdict finding entries must be dictionaries")
+        finding_ref = finding.get("finding_ref")
+        if finding_ref is not None and type(finding_ref) is not dict:
+            raise ValueError(
+                "verdict finding_ref must be a dictionary or null"
+            )
+        for field in ("extra_refs", "image_refs"):
+            if field not in finding:
+                continue
+            references = finding[field]
+            if not isinstance(references, list):
+                raise ValueError(f"verdict {field} must be a list")
+            if len(references) > _MAX_MODERN_REFERENCES:
+                raise ValueError(
+                    f"verdict {field} must contain at most "
+                    f"{_MAX_MODERN_REFERENCES} entries"
+                )
+            if any(type(reference) is not dict for reference in references):
+                raise ValueError(
+                    f"verdict {field} entries must be dictionaries"
+                )
+            if field == "image_refs":
+                for reference in references:
+                    if "box" not in reference:
+                        continue
+                    box = reference["box"]
+                    if (
+                        not isinstance(box, list)
+                        or len(box) != 4
+                        or any(
+                            isinstance(value, bool) or not isinstance(value, int)
+                            for value in box
+                        )
+                    ):
+                        raise ValueError(
+                            "verdict image_refs box must contain exactly four "
+                            "non-boolean integers"
+                        )
+        _validate_optional_markdown(
+            finding.get("report_md"),
+            "verdict finding report_md must be a string or null",
+        )
+    return findings
+
+
+def _legacy_finding_refs(verdict: dict[str, Any]) -> list[dict[str, Any]]:
+    references = verdict.get("finding_refs")
+    if references is None:
+        return []
+    if not isinstance(references, list):
+        raise ValueError("verdict finding_refs must be a list or null")
+    if len(references) > _MAX_VERDICT_REFERENCES:
+        raise ValueError(
+            "verdict finding_refs must contain at most "
+            f"{_MAX_VERDICT_REFERENCES} entries"
+        )
+    if any(type(reference) is not dict for reference in references):
+        raise ValueError("verdict finding_refs entries must be dictionaries")
+    return references
+
+
+def _validate_verdict_reference_limit(
+    findings: list[Any] | None,
+    legacy_references: list[dict[str, Any]],
+) -> None:
+    count = len(legacy_references)
+    for finding in findings or []:
+        count += int(finding.get("finding_ref") is not None)
+        count += len(finding.get("extra_refs") or [])
+        count += len(finding.get("image_refs") or [])
+        if count > _MAX_VERDICT_REFERENCES:
+            raise ValueError(
+                "verdict references must contain at most "
+                f"{_MAX_VERDICT_REFERENCES} entries"
+            )
+
+
+_SELECTOR_REFERENCE_FIELDS = (
+    "file",
+    "sheet",
+    "rows",
+    "kind",
+    "rule",
+    "finding_id",
+)
+
+
+def _selector_reference_key(reference: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(
+        str(value) if (value := reference.get(field)) else None
+        for field in _SELECTOR_REFERENCE_FIELDS
+    )
+
+
+def _image_reference_key(
+    reference: dict[str, Any],
+    assets: dict[str, dict[str, Any]],
+) -> tuple[Any, ...]:
+    asset_id = str(reference.get("asset_id"))
+    asset = assets.get(asset_id)
+    label = reference.get("label") or (
+        asset.get("file") if asset is not None else None
+    )
+    boxed = "box" in reference
+    return (
+        asset_id,
+        boxed,
+        tuple(reference["box"]) if boxed else None,
+        str(label) if label not in (None, "") else None,
+    )
+
+
+def _deduplicate_references(
+    references: list[dict[str, Any]],
+    key,
+) -> list[dict[str, Any]]:
+    unique = []
+    seen = set()
+    for reference in references:
+        canonical = key(reference)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        unique.append(reference)
+    return unique
+
+
+def _deduplicate_modern_references(
+    findings: list[Any],
+    scan: dict[str, Any],
+) -> None:
+    assets = _image_asset_map(scan)
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        if "extra_refs" in finding:
+            finding["extra_refs"] = _deduplicate_references(
+                finding["extra_refs"],
+                _selector_reference_key,
+            )
+        if "image_refs" in finding:
+            finding["image_refs"] = _deduplicate_references(
+                finding["image_refs"],
+                lambda reference: _image_reference_key(reference, assets),
+            )
+
+
+def _normalize_image_review_status(value: object) -> str:
+    status = str(value or "").strip().lower()
+    return status if status in _IMAGE_FINDING_STATUSES else "unresolved"
+
+
+def _normalize_image_review(review: object, known_asset_ids: set[str]) -> dict[str, Any]:
+    source = review if isinstance(review, dict) else {}
+    status = str(source.get("status") or "").strip().lower()
+    if status not in _IMAGE_REVIEW_STATUSES:
+        status = "partial"
+    result = {"status": status}
+    keys = (
+        "reviewed_asset_ids",
+        "unresolved_asset_ids",
+        "unreadable_asset_ids",
+        "deferred_asset_ids",
+    )
+    category_ids = {}
+    for key in keys:
+        values = source.get(key) if isinstance(source.get(key), list) else []
+        category_ids[key] = {
+            str(x) for x in values
+            if str(x) in known_asset_ids
+        }
+    conflicts = {
+        asset_id
+        for asset_id in known_asset_ids
+        if sum(asset_id in category_ids[key] for key in keys) > 1
+    }
+    for key in keys:
+        result[key] = sorted(category_ids[key] - conflicts)
+    result["unresolved_asset_ids"] = sorted(
+        set(result["unresolved_asset_ids"]) | conflicts
+    )
+    assigned = {
+        asset_id
+        for key in keys
+        for asset_id in result[key]
+    }
+    missing = sorted(known_asset_ids - assigned)
+    if missing:
+        result["deferred_asset_ids"] = sorted(
+            set(result["deferred_asset_ids"] + missing)
+        )
+        if status == "completed":
+            result["status"] = "partial"
+    if conflicts:
+        result["status"] = "partial"
+    if source.get("note"):
+        result["note"] = str(source["note"])
+    return result
+
+
+def _visible_selector_reference(reference: dict[str, Any] | None) -> dict[str, str]:
+    if not isinstance(reference, dict):
+        return {}
+    visible = {}
+    if reference.get("sheet") not in (None, ""):
+        visible["sheet"] = str(reference["sheet"])
+    elif reference.get("file") not in (None, ""):
+        visible["file"] = str(reference["file"])
+    for key in ("rows", "kind"):
+        if reference.get(key) not in (None, ""):
+            visible[key] = str(reference[key])
+    return visible
+
+
+def _iter_verdict_text(
+    verdict: dict[str, Any],
+    scan_findings: list[dict[str, Any]] | None = None,
+):
+    def visible_values(
+        source: dict[str, Any],
+        keys: tuple[str, ...],
+        *,
+        markdown: bool,
+    ):
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, ""):
+                yield str(value), markdown
+
+    def visible_unmatched_selectors(finding: dict[str, Any]):
+        binding = _bind_finding_ref(scan_findings or [], finding)
+        if binding.state == "unmatched":
+            for value in _visible_selector_reference(binding.ref).values():
+                yield value, False
+        for reference in finding.get("extra_refs") or []:
+            binding = _bind_finding_ref(
+                scan_findings or [],
+                {"finding_ref": reference},
+            )
+            if binding.state == "unmatched":
+                for value in _visible_selector_reference(binding.ref).values():
+                    yield value, False
+
+    yield from visible_values(
+        verdict,
+        (
+            "verdict",
+            "title",
+            "overall_impact",
+        ),
+        markdown=False,
+    )
+    yield from visible_values(verdict, ("review_note",), markdown=True)
+    findings = _modern_findings(verdict)
+    if findings is not None:
+        yield from visible_values(verdict, ("paper_conclusion",), markdown=True)
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            yield from visible_values(
+                finding,
+                (
+                    "title",
+                    "suspicion_tier",
+                    "impact_scope",
+                    "review_status",
+                ),
+                markdown=False,
+            )
+            yield from visible_values(finding, ("report_md",), markdown=True)
+            for image_ref in finding.get("image_refs") or []:
+                if isinstance(image_ref, dict):
+                    yield from visible_values(
+                        image_ref,
+                        ("label",),
+                        markdown=False,
+                    )
+            if scan_findings is not None:
+                yield from visible_unmatched_selectors(finding)
+    else:
+        yield from visible_values(
+            verdict,
+            (
+                "suspicion_tier",
+                "impact_scope",
+                "review_status",
+                "tier_why",
+                "innocent_explanation",
+                "needs_author_data",
+            ),
+            markdown=False,
+        )
+        yield from visible_values(verdict, ("report_md",), markdown=True)
+        references = verdict.get("finding_refs") or []
+        if scan_findings is not None and references:
+            yield from visible_unmatched_selectors({
+                "finding_ref": references[0],
+                "extra_refs": references[1:],
+            })
+    image_review = verdict.get("image_review")
+    if isinstance(image_review, dict):
+        yield from visible_values(
+            image_review,
+            ("status", "note"),
+            markdown=False,
+        )
+
+
+def _rendered_visible_text(value: str) -> str:
+    parser = _VisibleTextParser()
+    parser.feed(_render_md(value))
+    parser.close()
+    return parser.text()
+
+
+def _validate_neutral_verdict(
+    verdict: dict[str, Any],
+    scan_findings: list[dict[str, Any]] | None = None,
+) -> None:
+    text = "\n".join(
+        _rendered_visible_text(value) if markdown else value
+        for value, markdown in _iter_verdict_text(verdict, scan_findings)
+    )
+    if contains_blocked_language(text):
+        raise ValueError(
+            "verdict text violates the neutral-language policy; rewrite it as a "
+            "statistical signal, data inconsistency, unresolved similarity, or "
+            "request for clarification; quoted or negated blocked language must "
+            "also be rewritten"
+        )
+
+
+def _normalized_verdict_copy(
+    scan: dict[str, Any],
+    verdict: dict[str, Any],
+    *,
+    scan_findings: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    source_findings = _modern_findings(verdict)
+    legacy_references = []
+    if source_findings is None:
+        legacy_references = _legacy_finding_refs(verdict)
+    _validate_verdict_reference_limit(source_findings, legacy_references)
+    _validate_optional_markdown(
+        verdict.get("paper_conclusion"),
+        "verdict paper_conclusion must be a string or null",
+    )
+    _validate_optional_markdown(
+        verdict.get("review_note"),
+        "verdict review_note must be a string or null",
+    )
+    if source_findings is None:
+        _validate_optional_markdown(
+            verdict.get("report_md"),
+            "verdict report_md must be a string or null",
+        )
+
+    normalized = copy.deepcopy(verdict)
+    findings = (
+        normalized["findings"]
+        if source_findings is not None
+        else None
+    )
+    if findings is not None:
+        _deduplicate_modern_references(findings, scan)
+    known = {
+        str(asset.get("asset_id"))
+        for asset in scan.get("image_assets", []) or []
+        if asset.get("asset_id")
+    }
+    for finding in findings or []:
+        if not isinstance(finding, dict):
+            continue
+        if _is_image_verdict_finding(finding):
+            finding["review_status"] = _normalize_image_review_status(
+                finding.get("review_status")
+            )
+    if known or "image_review" in normalized:
+        normalized["image_review"] = _normalize_image_review(
+            normalized.get("image_review"), known
+        )
+    if scan_findings is None:
+        scan_findings = _visible_scan_findings(scan)
+    _validate_neutral_verdict(normalized, scan_findings)
+    return normalized
 
 
 def _inline_md(text: str) -> str:
@@ -104,7 +619,15 @@ def _finding_score(item: dict[str, Any]) -> tuple[int, int]:
     return (sev_rank, scope_rank)
 
 
-_FINDING_REF_FIELDS = ("file", "sheet", "rows", "kind", "rule")
+def _visible_scan_findings(scan: dict[str, Any]) -> list[dict[str, Any]]:
+    visible = [
+        item for item in _all_findings(scan)
+        if str(item["finding"].get("profile_action") or "").lower() != "hidden"
+    ]
+    return sorted(visible, key=_finding_score)
+
+
+_FINDING_REF_FIELDS = ("file", "sheet", "rows", "kind", "rule", "finding_id")
 
 
 def _matches_non_location_constraints(
@@ -120,6 +643,9 @@ def _matches_non_location_constraints(
             return False
     if ref.get("rule"):
         if str(ref["rule"]) not in str(f.get("rule") or ""):
+            return False
+    if ref.get("finding_id"):
+        if str(ref["finding_id"]) != str(f.get("finding_id")):
             return False
     return True
 
@@ -298,6 +824,13 @@ footer { margin-top:20px; color:var(--muted); font-size:12px; }
 .fb-head { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;
   border-bottom:1px solid var(--line); padding-bottom:12px; margin-bottom:12px; }
 .fb-head h2 { font-size:17px; margin:0; }
+.image-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+  gap:12px; margin:12px 0; }
+.image-evidence { margin:0; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+.image-preview { display:block; width:100%; height:auto; max-height:420px; object-fit:contain;
+  background:#f8fafc; }
+.image-evidence figcaption { padding:8px 10px; color:var(--muted); font-size:12px; }
+.image-unavailable { padding:32px 12px; color:var(--muted); text-align:center; }
 @media (max-width: 900px) { .grid { grid-template-columns:1fr; } .page { padding:18px 12px 32px; } }
 """
 
@@ -329,7 +862,7 @@ def _page(title: str, badges_html: str, main_html: str) -> str:
     <div class="eyebrow">PaperConan adjudicated report</div>
     <h1>{_esc(title)}</h1>
     <div class="badges">{badges_html}</div>
-    <div class="notice">This page combines a human/AI review with deterministic PaperConan scan evidence. It surfaces statistical signals and data inconsistencies for clarification. Interpretation requires the original data, figure legends, Methods, author response, and journal or institution review.</div>
+    <div class="notice">This page combines a human/AI judgment with deterministic PaperConan scan evidence. PaperConan surfaces statistical signals and data inconsistencies. Statistical signal, not verdict: it does not establish author intent. Final assessment requires the original data, figure legends, Methods, author clarification, and journal or institution review.</div>
   </section>
   {main_html}
   <footer>Generated by paperconan. Keep original source tables and scan.json with this report so every claim remains reproducible.</footer>
@@ -390,15 +923,95 @@ def _bind_finding_ref(
     finding: dict[str, Any],
 ) -> _EvidenceBinding:
     if "finding_ref" not in finding or finding.get("finding_ref") is None:
-        item = scan_findings[0] if scan_findings else None
+        item = (
+            None
+            if _is_image_verdict_finding(finding)
+            else next(
+                (
+                    candidate
+                    for candidate in scan_findings
+                    if candidate.get("scope") != "image"
+                ),
+                None,
+            )
+        )
         return _EvidenceBinding("omitted", None, item)
     ref = finding.get("finding_ref")
     if not isinstance(ref, dict):
-        return _EvidenceBinding("unmatched", {"value": ref}, None)
+        return _EvidenceBinding("unmatched", None, None)
     item = _match_finding(scan_findings, ref)
     if item is None:
         return _EvidenceBinding("unmatched", ref, None)
     return _EvidenceBinding("matched", ref, item)
+
+
+def _image_asset_map(scan: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(asset["asset_id"]): asset
+        for asset in scan.get("image_assets", []) or []
+        if asset.get("asset_id")
+    }
+
+
+def _render_image_refs(
+    scan: dict[str, Any],
+    finding: dict[str, Any],
+    artifact_dir: str | None,
+    budget: EvidenceBudget,
+) -> str:
+    assets = _image_asset_map(scan)
+    cards = []
+    for ref in finding.get("image_refs", []) or []:
+        if not isinstance(ref, dict):
+            continue
+        asset = assets.get(str(ref.get("asset_id")))
+        if asset is None:
+            continue
+        boxed = "box" in ref
+        uri = (
+            registered_native_crop_data_uri(
+                asset,
+                ref.get("box"),
+                artifact_dir,
+                budget,
+            )
+            if boxed
+            else registered_preview_data_uri(asset, artifact_dir, budget)
+        )
+        unavailable = (
+            "requested native-pixel region unavailable"
+            if boxed
+            else "preview unavailable"
+        )
+        img = (
+            f'<img class="image-preview" src="{_esc(uri)}" alt="{_esc(asset.get("file"))}">'
+            if uri else f'<div class="image-unavailable">{unavailable}</div>'
+        )
+        region_label = ref.get("box") if boxed else "full image"
+        cards.append(
+            '<figure class="image-evidence">'
+            f'{img}<figcaption>{_esc(ref.get("label") or asset.get("file"))} '
+            f'· {_esc(region_label)}</figcaption></figure>'
+        )
+    if not cards:
+        return '<p class="no-evidence">图像证据引用未命中</p>'
+    return '<div class="image-grid">' + "".join(cards) + "</div>"
+
+
+def _render_image_review(review: dict[str, Any] | None) -> str:
+    if not review:
+        return ""
+    return (
+        '<section class="panel image-review">'
+        '<h2>图像语义复核覆盖</h2>'
+        f'<p><strong>{_esc(review.get("status"))}</strong></p>'
+        f'<p>{_esc(review.get("note"))}</p>'
+        f'<p>reviewed={len(review.get("reviewed_asset_ids") or [])} · '
+        f'unresolved={len(review.get("unresolved_asset_ids") or [])} · '
+        f'unreadable={len(review.get("unreadable_asset_ids") or [])} · '
+        f'deferred={len(review.get("deferred_asset_ids") or [])}</p>'
+        "</section>"
+    )
 
 
 def _render_findings_index(findings: list[dict[str, Any]], scan_findings: list[dict[str, Any]]) -> str:
@@ -425,7 +1038,31 @@ def _render_findings_index(findings: list[dict[str, Any]], scan_findings: list[d
     )
 
 
-def _render_finding_block(scan_findings: list[dict[str, Any]], finding: dict[str, Any], idx: int) -> str:
+def _render_unmatched_selector(
+    reference: dict[str, Any] | None,
+    *,
+    additional: bool = False,
+) -> str:
+    selector = json.dumps(
+        _visible_selector_reference(reference),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    label = "Explicit additional finding_ref" if additional else "Explicit finding_ref"
+    return (
+        f'<p class="no-evidence">无匹配证据。{label} unmatched: '
+        f'<code>{_esc(selector)}</code></p>'
+    )
+
+
+def _render_finding_block(
+    scan: dict[str, Any],
+    scan_findings: list[dict[str, Any]],
+    finding: dict[str, Any],
+    idx: int,
+    artifact_dir: str | None,
+    image_budget: EvidenceBudget,
+) -> str:
     binding = _bind_finding_ref(scan_findings, finding)
     tier = finding.get("suspicion_tier")
     status = finding.get("review_status") or "unreviewed"
@@ -438,28 +1075,35 @@ def _render_finding_block(scan_findings: list[dict[str, Any]], finding: dict[str
     badges.append(f'<span class="badge review">{_esc(status)}</span>')
     title = finding.get("title") or f"发现 {idx + 1}"
     body = _render_md(finding.get("report_md"))
-    if binding.state == "matched":
-        evidence = _render_key_finding(binding.item, idx)
-    elif binding.state == "omitted" and binding.item is not None:
-        evidence = (
-            '<p class="scope-note">Automatic evidence selection: '
-            "the strongest visible statistical signal is shown because no "
-            "finding_ref was supplied.</p>"
-            + _render_key_finding(binding.item, idx)
-        )
-    elif binding.state == "omitted":
-        evidence = '<p class="no-evidence">No scan evidence is available.</p>'
+    is_image = _is_image_verdict_finding(finding)
+    if is_image:
+        evidence = _render_image_refs(scan, finding, artifact_dir, image_budget)
+        if binding.state == "matched" and binding.item is not None:
+            evidence += _render_key_finding(binding.item, idx)
+        elif binding.state == "unmatched":
+            evidence += _render_unmatched_selector(binding.ref)
     else:
-        selector = json.dumps(binding.ref, ensure_ascii=False, sort_keys=True)
-        evidence = (
-            '<p class="no-evidence">Explicit finding_ref unmatched: '
-            f'<code>{_esc(selector)}</code></p>'
-        )
-    # Bind every additional legacy selector independently.
+        if binding.state == "matched" and binding.item is not None:
+            evidence = _render_key_finding(binding.item, idx)
+        elif binding.state == "omitted" and binding.item is not None:
+            evidence = (
+                '<p class="scope-note">Automatic evidence selection: '
+                "the strongest visible statistical signal is shown because no "
+                "finding_ref was supplied.</p>"
+                + _render_key_finding(binding.item, idx)
+            )
+        elif binding.state == "omitted":
+            evidence = '<p class="no-evidence">No scan evidence is available.</p>'
+        else:
+            evidence = _render_unmatched_selector(binding.ref)
+
     for j, xref in enumerate(finding.get("extra_refs") or []):
-        extra_binding = _bind_finding_ref(scan_findings, {"finding_ref": xref})
+        extra_binding = _bind_finding_ref(
+            scan_findings,
+            {"finding_ref": xref},
+        )
         extra_idx = (idx + 1) * 1000 + j
-        if extra_binding.state == "matched":
+        if extra_binding.state == "matched" and extra_binding.item is not None:
             evidence += _render_key_finding(extra_binding.item, extra_idx)
         elif extra_binding.state == "omitted" and extra_binding.item is not None:
             evidence += (
@@ -471,10 +1115,9 @@ def _render_finding_block(scan_findings: list[dict[str, Any]], finding: dict[str
         elif extra_binding.state == "omitted":
             evidence += '<p class="no-evidence">No scan evidence is available.</p>'
         else:
-            selector = json.dumps(extra_binding.ref, ensure_ascii=False, sort_keys=True)
-            evidence += (
-                '<p class="no-evidence">Explicit additional finding_ref unmatched: '
-                f'<code>{_esc(selector)}</code></p>'
+            evidence += _render_unmatched_selector(
+                extra_binding.ref,
+                additional=True,
             )
     return (
         '<section class="finding-block">'
@@ -493,11 +1136,12 @@ def _normalize_verdict(
     - legacy single shape (report_md + finding_refs): synthesize one finding and
       carry tier_why / innocent_explanation / needs_author_data as ``summary``.
     """
-    if "findings" in verdict and verdict.get("findings") is not None:
+    findings = _modern_findings(verdict)
+    if findings is not None:
         paper = {"paper_conclusion": verdict.get("paper_conclusion"),
                  "review_note": verdict.get("review_note")}
-        return paper, list(verdict["findings"]), {}
-    refs = verdict.get("finding_refs") or []
+        return paper, list(findings), {}
+    refs = _legacy_finding_refs(verdict)
     single = {
         "title": verdict.get("title") or "发现",
         "finding_ref": refs[0] if refs else None,
@@ -516,7 +1160,8 @@ def _normalize_verdict(
 
 def _render_unified(scan: dict[str, Any], verdict: dict[str, Any], title: str,
                     scan_findings: list[dict[str, Any]], findings: list[dict[str, Any]],
-                    paper: dict[str, Any], summary: dict[str, Any]) -> str:
+                    paper: dict[str, Any], summary: dict[str, Any],
+                    artifact_dir: str | None) -> str:
     """One high-fidelity layout for every verdict shape.
 
     Paper header + (optional) findings index + one self-contained block per
@@ -525,7 +1170,18 @@ def _render_unified(scan: dict[str, Any], verdict: dict[str, Any], title: str,
     needs_author_data) renders as a compact kv block under the conclusion.
     """
     conclusion = _render_md(paper.get("paper_conclusion")) or "<p>—</p>"
-    blocks = "".join(_render_finding_block(scan_findings, f, i) for i, f in enumerate(findings))
+    image_budget = EvidenceBudget(report_image_evidence_bytes())
+    blocks = "".join(
+        _render_finding_block(
+            scan,
+            scan_findings,
+            f,
+            i,
+            artifact_dir,
+            image_budget,
+        )
+        for i, f in enumerate(findings)
+    )
     note = _render_md(paper.get("review_note")) if paper.get("review_note") else ""
 
     summary_html = ""
@@ -553,12 +1209,14 @@ def _render_unified(scan: dict[str, Any], verdict: dict[str, Any], title: str,
         for k, v in kv.items()
         if v not in (None, "")
     )
+    coverage = _render_image_review(verdict.get("image_review"))
     main_html = f"""<section class="panel">
     <h2>论文主结论</h2>
     {conclusion}
     {summary_html}
     {index_html}
   </section>
+  {coverage}
   {blocks}
   <section class="panel" style="margin-top:18px">
     <h2>方法与背景</h2>
@@ -567,7 +1225,12 @@ def _render_unified(scan: dict[str, Any], verdict: dict[str, Any], title: str,
     return _page(title, _paper_badges(verdict, _top_tier(findings)), main_html)
 
 
-def render_adjudicated_report(scan: dict[str, Any], verdict: dict[str, Any]) -> str:
+def render_adjudicated_report(
+    scan: dict[str, Any],
+    verdict: dict[str, Any],
+    *,
+    artifact_dir: str | None = None,
+) -> str:
     """Return a self-contained HTML page for a judged PaperConan scan.
 
     Both verdict shapes render through one high-fidelity path: a ``findings``
@@ -575,20 +1238,58 @@ def render_adjudicated_report(scan: dict[str, Any], verdict: dict[str, Any]) -> 
     ``finding_refs``) are folded by :func:`_normalize_verdict` into one findings
     list, then rendered as a paper header + per-finding blocks with evidence.
     """
+    _validate_top_level_verdict(verdict)
+    scan_findings = _visible_scan_findings(scan)
+    verdict = _normalized_verdict_copy(
+        scan,
+        verdict,
+        scan_findings=scan_findings,
+    )
     title = _scan_title(scan, verdict)
-    # Mirror the deterministic report: findings the active profile suppressed as
-    # likely false positives must not resurface as key evidence here.
-    visible = [
-        item for item in _all_findings(scan)
-        if str(item["finding"].get("profile_action") or "").lower() != "hidden"
-    ]
-    scan_findings = sorted(visible, key=_finding_score)
     paper, findings, summary = _normalize_verdict(verdict)
-    return _render_unified(scan, verdict, title, scan_findings, findings, paper, summary)
+    return _render_unified(
+        scan,
+        verdict,
+        title,
+        scan_findings,
+        findings,
+        paper,
+        summary,
+        artifact_dir,
+    )
 
 
-def write_adjudicated_report(scan: dict[str, Any], verdict: dict[str, Any], out_path: str) -> None:
+def write_adjudicated_report(
+    scan: dict[str, Any],
+    verdict: dict[str, Any],
+    out_path: str,
+    *,
+    artifact_dir: str | None = None,
+) -> None:
     """Write an adjudicated PaperConan HTML report."""
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(render_adjudicated_report(scan, verdict))
+    _validate_top_level_verdict(verdict)
+    rendered = render_adjudicated_report(scan, verdict, artifact_dir=artifact_dir)
+    absolute_out = os.path.abspath(out_path)
+    destination_dir = os.path.dirname(absolute_out) or "."
+    os.makedirs(destination_dir, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=".paperconan-adjudicated-",
+        suffix=".html",
+        dir=destination_dir,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = -1
+            fh.write(rendered)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp_path, absolute_out)
+        temp_path = ""
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass

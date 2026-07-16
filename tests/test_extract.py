@@ -346,6 +346,95 @@ def test_pdf_adapter_extracts_one_table_at_a_time(monkeypatch):
     ]
 
 
+def test_pdf_adapter_rejects_declared_oversize_before_extract(
+    monkeypatch,
+):
+    class StubTable:
+        cells = [
+            (0, 0, 1, 1),
+            (0, 1, 1, 2),
+        ]
+
+        def extract(self):
+            raise AssertionError("oversized PDF table was extracted")
+
+    class StubPage:
+        def find_tables(self):
+            return [StubTable()]
+
+    class StubPdf:
+        pages = [StubPage()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    pdfplumber = __import__("pdfplumber")
+    monkeypatch.setattr(
+        pdfplumber, "open", lambda _path: StubPdf()
+    )
+
+    result = extract.load_pdf_tables(
+        "oversized.pdf",
+        max_cells=1,
+        with_metadata=True,
+    )
+
+    assert result.tables == {"oversized!p1_t1": None}
+    assert result.limitations[0].reason == "cell_limit"
+
+
+def test_pdf_adapter_preflights_against_cumulative_budget(
+    monkeypatch,
+):
+    events = []
+
+    class StubTable:
+        cells = [(0, 0, 1, 1)]
+
+        def __init__(self, index):
+            self.index = index
+
+        def extract(self):
+            events.append(f"extract:{self.index}")
+            if self.index == 2:
+                raise AssertionError(
+                    "second PDF table exceeded the remaining budget"
+                )
+            return [[str(self.index)]]
+
+    class StubPage:
+        def find_tables(self):
+            return [StubTable(1), StubTable(2)]
+
+    class StubPdf:
+        pages = [StubPage()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    pdfplumber = __import__("pdfplumber")
+    monkeypatch.setattr(
+        pdfplumber, "open", lambda _path: StubPdf()
+    )
+
+    result = extract.load_pdf_tables(
+        "cumulative.pdf",
+        max_cells=1,
+        with_metadata=True,
+    )
+
+    assert events == ["extract:1"]
+    assert result.tables["cumulative!p1_t1"] == [[1]]
+    assert result.tables["cumulative!p1_t2"] is None
+    assert result.limitations[0].reason == "cell_limit"
+
+
 @pytest.mark.parametrize(
     ("suffix", "loader_name", "sheet_name"),
     [

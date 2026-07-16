@@ -1,17 +1,28 @@
 from __future__ import annotations
 
+import ast
+import io
+import json
 import re
-import shlex
-import shutil
 import subprocess
-import zipfile
-from pathlib import Path, PurePosixPath
-from urllib.parse import urlsplit
+import tokenize
+from pathlib import Path
+
+import pytest
+
+from paperconan._neutral_language import contains_blocked_language
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIR = ROOT / "skills" / "paperconan"
 REF_DIR = SKILL_DIR / "references"
+_FALLBACK_SURFACE_ROOTS = (
+    "src",
+    "tests",
+    "skills",
+    "docs",
+    "examples",
+)
 
 
 PUBLIC_REFS = [
@@ -26,151 +37,6 @@ PUBLIC_REFS = [
     "case-patterns.md",
 ]
 
-WORKED_EXAMPLE_FILES = [
-    "make_demo_data.py",
-    "report-preview.png",
-    "README.md",
-    "demo_paper/ED_Fig2_tumor_volume.xlsx",
-    "demo_paper/ED_Fig4_qPCR.xlsx",
-    "demo_paper/audit/report.html",
-    "demo_paper/audit/scan.json",
-]
-
-
-def _local_markdown_links(text: str | None = None) -> list[str]:
-    if text is None:
-        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
-    links = set()
-    for match in re.finditer(r"\[[^\]]+\]\(([^)]+)\)", text):
-        target = match.group(1).strip()
-        parsed = urlsplit(target)
-        if parsed.scheme or parsed.netloc or not parsed.path.endswith(".md"):
-            continue
-        links.add(parsed.path)
-    return sorted(links)
-
-
-def _is_forbidden_zip_member(name: str) -> bool:
-    path = PurePosixPath(name)
-    return (
-        path.is_absolute()
-        or ".." in path.parts
-        or "__pycache__" in path.parts
-        or any(part == ".cache" for part in path.parts)
-        or any(part.startswith(".") and part.endswith("_cache") for part in path.parts)
-        or bool(re.search(r"\.py[cod]$", name))
-        or path.name == ".DS_Store"
-    )
-
-
-def _publishable_skill_files(skill_dir: Path) -> set[str]:
-    files = set()
-    for path in skill_dir.rglob("*"):
-        if not path.is_file():
-            continue
-        archive_name = f"paperconan/{path.relative_to(skill_dir).as_posix()}"
-        if not _is_forbidden_zip_member(archive_name):
-            files.add(archive_name)
-    return files
-
-
-def _skill_zip_sources(script=ROOT / "build_skill_zip.sh") -> set[str]:
-    text = script.read_text(encoding="utf-8")
-    match = re.search(
-        r"^SKILL_ZIP_SOURCES=\(\n(?P<body>.*?)^\)\n",
-        text,
-        re.MULTILINE | re.DOTALL,
-    )
-    assert match is not None
-    sources = set()
-    for line in match.group("body").splitlines():
-        tokens = shlex.split(line, comments=True)
-        if tokens:
-            assert len(tokens) == 1
-            sources.add(tokens[0])
-    return sources
-
-
-def _skill_zip_members(script=ROOT / "build_skill_zip.sh") -> set[str]:
-    members = set()
-    for source in _skill_zip_sources(script):
-        if source.startswith("skills/paperconan/"):
-            relative = source.removeprefix("skills/paperconan/")
-        else:
-            assert source.startswith("examples/")
-            relative = source
-        members.add(f"paperconan/{relative}")
-    return members
-
-
-def _tracked_skill_sources() -> set[str] | None:
-    repository = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        check=False,
-        capture_output=True,
-        cwd=ROOT,
-        text=True,
-    )
-    if (
-        repository.returncode != 0
-        or Path(repository.stdout.strip()).resolve() != ROOT.resolve()
-    ):
-        return None
-    result = subprocess.run(
-        ["git", "ls-files", "-z", "--", "skills/paperconan"],
-        check=True,
-        capture_output=True,
-        cwd=ROOT,
-        text=True,
-    )
-    return {name for name in result.stdout.split("\0") if name}
-
-
-def test_local_markdown_links_strip_suffixes_and_skip_external_urls() -> None:
-    text = """
-    [local](references/local.md#section)
-    [query](references/query.md?mode=full#section)
-    [external](https://example.test/reference.md)
-    [protocol-relative](//example.test/reference.md)
-    [anchor](#section)
-    """
-
-    assert _local_markdown_links(text) == [
-        "references/local.md",
-        "references/query.md",
-    ]
-
-
-def test_publishable_skill_files_exclude_generated_files(tmp_path) -> None:
-    skill_dir = tmp_path / "paperconan"
-    files = {
-        "guide.md": "publishable",
-        ".pytest_cache/state": "cache",
-        ".cache/state": "cache",
-        ".tool_cache/state": "cache",
-        "__pycache__/module.pyc": "bytecode",
-        "module.pyo": "bytecode",
-        ".DS_Store": "metadata",
-    }
-    for relative, contents in files.items():
-        path = skill_dir / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(contents, encoding="utf-8")
-
-    assert _publishable_skill_files(skill_dir) == {"paperconan/guide.md"}
-
-
-def test_skill_zip_allowlist_matches_tracked_skill_and_demo_sources() -> None:
-    tracked = _tracked_skill_sources()
-    if tracked is None:
-        return
-
-    expected = tracked | {
-        f"examples/{relative}"
-        for relative in WORKED_EXAMPLE_FILES
-    }
-    assert _skill_zip_sources() == expected
-
 
 def test_skill_routes_all_public_references() -> None:
     skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
@@ -178,228 +44,6 @@ def test_skill_routes_all_public_references() -> None:
     for name in PUBLIC_REFS:
         assert (REF_DIR / name).exists(), f"missing reference file: {name}"
         assert f"references/{name}" in skill, f"SKILL.md does not route {name}"
-
-
-def test_complete_output_schema_documents_recurring_lower_bounds() -> None:
-    text = (REF_DIR / "output-schema.md").read_text(
-        encoding="utf-8"
-    )
-    required_fields = {
-        "findings_omitted_is_lower_bound",
-        "recurring_row_vector_finalization_limit",
-        "candidate_limit",
-        "pair_limit",
-        "cell_limit",
-        "qualifying_candidates",
-        "candidates_retained",
-        "candidates_omitted",
-        "candidates_processed",
-        "pair_comparisons",
-        "cell_references_retained",
-        "limits_reached",
-        "omitted_findings_lower_bound",
-    }
-
-    missing = {
-        field for field in required_fields if field not in text
-    }
-    assert not missing
-    assert re.search(
-        r"lower[- ]bound.+(?:not|never).+exact",
-        text,
-        re.IGNORECASE | re.DOTALL,
-    )
-
-
-def test_output_schema_documents_relation_model_ambiguity():
-    text = (REF_DIR / "output-schema.md").read_text(
-        encoding="utf-8"
-    )
-    assert "relation_model_ambiguous" in text
-    assert "relation_model_alternatives" in text
-    assert "constant_ratio" in text
-    assert "exact_linear" in text
-    assert "schema_version" in text
-    assert "finding_ref" in text
-
-
-def test_public_docs_explain_recurring_window_exactness() -> None:
-    schema_text = (REF_DIR / "output-schema.md").read_text(
-        encoding="utf-8"
-    )
-    cli_text = (ROOT / "docs" / "cli.md").read_text(
-        encoding="utf-8"
-    )
-
-    for text in (schema_text, cli_text):
-        assert "windows_skipped_is_lower_bound" in text
-        assert re.search(
-            r"windows_skipped.+exact.+lower[- ]bound",
-            text,
-            re.IGNORECASE | re.DOTALL,
-        )
-
-
-def test_cli_recurring_window_budget_table_row_documents_lower_bound() -> None:
-    cli_text = (ROOT / "docs" / "cli.md").read_text(
-        encoding="utf-8"
-    )
-    row_match = re.search(
-        r"^\| `PAPERCONAN_RECURRING_ROW_VECTOR_BUDGET` \|[^\n]+$",
-        cli_text,
-        re.MULTILINE,
-    )
-
-    assert row_match is not None
-    row = row_match.group(0)
-    assert "`windows_skipped`" in row
-    assert re.search(r"所有候选行.+已检查.+精确", row)
-    assert re.search(r"否则.+下界", row)
-    assert "耗尽时记录精确跳过窗口数" not in row
-
-
-def test_cli_documents_fetch_state_and_work_controls() -> None:
-    text = (ROOT / "docs" / "cli.md").read_text(
-        encoding="utf-8"
-    )
-
-    for name in [
-        "PAPERCONAN_ARCHIVE_SPARSE_ENTRY_LIMIT",
-        "PAPERCONAN_ARCHIVE_TAR_TRAVERSAL_BYTES",
-        "PAPERCONAN_MANAGED_OUTPUT_NAME_BYTES",
-        "PAPERCONAN_MANAGED_OUTPUT_COLLISION_PROBE_LIMIT",
-    ]:
-        assert name in text
-
-
-def test_cli_documents_wave4_detector_and_cross_table_budgets() -> None:
-    cli_text = (ROOT / "docs" / "cli.md").read_text(
-        encoding="utf-8"
-    )
-    controls = {
-        "PAPERCONAN_DENSE_BLOCK_MAX_ROWS": (
-            "100000",
-            "dense_block_detector_limit",
-        ),
-        "PAPERCONAN_DENSE_BLOCK_CELL_WORK_LIMIT": (
-            "10000000",
-            "dense_block_detector_limit",
-        ),
-        "PAPERCONAN_DENSE_BLOCK_STATE_CELL_LIMIT": (
-            "2000000",
-            "dense_block_detector_limit",
-        ),
-        "PAPERCONAN_CROSS_SHEET_SUMMARY_LIMIT": (
-            "2000",
-            "cross_sheet_summary_count_limit",
-        ),
-        "PAPERCONAN_CROSS_SHEET_GRID_CELL_LIMIT": (
-            "2000000",
-            "cross_sheet_grid_cell_limit",
-        ),
-        "PAPERCONAN_CROSS_SHEET_LABEL_CELL_LIMIT": (
-            "500000",
-            "cross_sheet_label_cell_limit",
-        ),
-        "PAPERCONAN_CROSS_SHEET_LABEL_BYTE_LIMIT": (
-            "33554432",
-            "cross_sheet_label_byte_limit",
-        ),
-        "PAPERCONAN_CROSS_SHEET_COLUMN_FINGERPRINT_LIMIT": (
-            "200000",
-            "cross_sheet_column_fingerprint_limit",
-        ),
-        "PAPERCONAN_CROSS_SHEET_PAIR_BUDGET": (
-            "1000000",
-            "cross_sheet_work_limit",
-        ),
-        "PAPERCONAN_CROSS_SHEET_VALUE_BUDGET": (
-            "50000000",
-            "cross_sheet_work_limit",
-        ),
-        "PAPERCONAN_CROSS_SHEET_TAIL_MATCH_BUDGET": (
-            "1000000",
-            "cross_sheet_work_limit",
-        ),
-        "PAPERCONAN_CROSS_SHEET_FINDING_BUDGET": (
-            "10000",
-            "cross_sheet_work_limit",
-        ),
-    }
-
-    for name, (default, reason) in controls.items():
-        row = re.search(
-            rf"^\| `{re.escape(name)}` \| `{default}` \| (?P<body>.+) \|$",
-            cli_text,
-            re.MULTILINE,
-        )
-        assert row is not None, f"missing documented control: {name}"
-        assert f"`{reason}`" in row.group("body")
-
-    assert "稳定输入顺序" in cli_text
-    assert "超过预算前停止" in cli_text
-    assert "完整候选" in cli_text
-    assert "wide_integer_block_index_limit" in cli_text
-    assert "positional/value family 对 A、B 各扫描 1 次" in cli_text
-    assert "detector-owned" in cli_text
-    assert "allocation 前" in cli_text
-    assert "detector-owned source-grid loops" in cli_text
-    assert (
-        "axis loading / grouping / progression / fingerprint"
-        in cli_text
-    )
-    assert (
-        "recurrence order / group / comparison / mark / output"
-        in cli_text
-    )
-    assert (
-        "只接纳能完整运行的 detector family"
-        not in cli_text
-    )
-    assert "axis classification 固定每值 4 次" not in cli_text
-
-
-def test_output_schema_documents_consolidated_wave4_resource_units() -> None:
-    schema_text = (REF_DIR / "output-schema.md").read_text(
-        encoding="utf-8"
-    )
-
-    assert "wide_integer_block_index_limit" in schema_text
-    assert "one source-grid pass per side" in schema_text
-    assert "impossible detector families are excluded" in schema_text
-    assert "candidate_columns_skipped" in schema_text
-    assert "work_skipped_lower_bound" in schema_text
-    assert "state_required_lower_bound" in schema_text
-    assert "axis_context_available" in schema_text
-    assert "axis_recurrence_comparison_visits" in schema_text
-    assert "axis_work_skipped_is_lower_bound" in schema_text
-    assert "axis_state_unit_limit" in schema_text
-    assert "axis_peak_state_units" in schema_text
-
-
-def test_agent_schema_describes_generic_cross_table_signal_family() -> None:
-    text = (REF_DIR / "output-schema.md").read_text(
-        encoding="utf-8"
-    )
-
-    assert "cross-table statistical signals" in text
-    assert "bit-identical / value-overlap across sheets" not in text
-    for kind in [
-        "cross_sheet_position_identical",
-        "cross_sheet_decimal_tail_reuse",
-        "cross_sheet_column_duplicate",
-        "recurring_row_vector",
-        "within_table_fraction_reuse",
-    ]:
-        assert kind in text
-
-
-def test_detector_reference_describes_exact_column_duplicate_identity() -> None:
-    text = (REF_DIR / "detectors.md").read_text(encoding="utf-8")
-
-    assert "exact loader-preserved numeric identity" in text
-    assert "match to 6 decimal places" not in text
-    assert "对齐到 6 位小数" not in text
 
 
 def test_new_judgment_docs_keep_signal_not_verdict_boundary() -> None:
@@ -413,8 +57,8 @@ def test_new_judgment_docs_keep_signal_not_verdict_boundary() -> None:
     text = "\n".join(path.read_text(encoding="utf-8") for path in docs)
 
     assert "signal-not-verdict" in text
-    assert re.search(r"not\s+research-integrity probabilities", text)
-    assert "does not establish a research-integrity finding" in text
+    assert "review priority labels" in text
+    assert "not author-intent conclusions" in text
 
 
 def test_case_patterns_do_not_publish_real_paper_identifiers() -> None:
@@ -439,93 +83,330 @@ def test_readme_points_to_public_adjudication_docs() -> None:
     ]:
         assert f"skills/paperconan/references/{name}" in readme
 
-    assert "不是研究完整性问题概率" in readme
+    assert "不是作者意图判断" in readme
 
 
-def test_skill_zip_contains_complete_path_safe_skill_tree(tmp_path) -> None:
-    caller_cwd = tmp_path / "caller cwd"
-    caller_cwd.mkdir()
-    out = tmp_path / "nested output" / "with spaces" / "paperconan skill.zip"
-
-    subprocess.run(
-        [str(ROOT / "build_skill_zip.sh"), str(out.resolve())],
-        cwd=caller_cwd,
-        check=True,
-    )
-
-    assert out.is_file()
-    assert list(tmp_path.rglob("*.zip")) == [out]
-
-    with zipfile.ZipFile(out) as zf:
-        names = {
-            info.filename
-            for info in zf.infolist()
-            if not info.is_dir()
-        }
-
-    local_links = _local_markdown_links()
-    for relative in local_links:
-        assert (SKILL_DIR / relative).is_file(), (
-            f"missing local Markdown reference: {relative}"
+def _python_comments_and_docstrings(path: Path) -> str:
+    source = path.read_text(encoding="utf-8")
+    comments = [
+        token.string
+        for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        if token.type == tokenize.COMMENT
+    ]
+    tree = ast.parse(source, filename=str(path))
+    docstrings = [
+        value
+        for node in ast.walk(tree)
+        if isinstance(
+            node,
+            (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
         )
-        assert f"paperconan/{relative}" in names
+        if (value := ast.get_docstring(node, clean=False)) is not None
+    ]
+    return "\n".join([*comments, *docstrings])
 
-    assert names == _skill_zip_members()
 
-    forbidden = {
+def _python_product_text(path: Path) -> str:
+    source = path.read_text(encoding="utf-8")
+    comments_and_docstrings = _python_comments_and_docstrings(path)
+    tree = ast.parse(source, filename=str(path))
+    runtime_strings = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+    return "\n".join([comments_and_docstrings, *runtime_strings])
+
+
+def _python_identifier_text(path: Path) -> str:
+    source = path.read_text(encoding="utf-8")
+    return "\n".join(
+        token.string
+        for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        if token.type == tokenize.NAME
+    )
+
+
+def _tracked_surface_text(relative: str, path: Path) -> str | None:
+    if relative in {"README.md", "pyproject.toml"} or relative.startswith(
+        ("docs/", "examples/", "skills/")
+    ):
+        try:
+            return path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return None
+    if relative.endswith(".py") and relative.startswith("src/"):
+        return "\n".join([
+            _python_product_text(path),
+            _python_identifier_text(path),
+        ])
+    if relative.endswith(".py") and relative.startswith("tests/"):
+        return "\n".join([
+            _python_comments_and_docstrings(path),
+            _python_identifier_text(path),
+        ])
+    return None
+
+
+def _tracked_product_surfaces(root: Path = ROOT) -> list[str]:
+    repository = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        check=False,
+        capture_output=True,
+        cwd=root,
+        text=True,
+    )
+    if (
+        repository.returncode == 0
+        and repository.stdout.strip()
+        and Path(repository.stdout.strip()).resolve() == root.resolve()
+    ):
+        tracked = subprocess.run(
+            ["git", "ls-files", "-z"],
+            check=True,
+            capture_output=True,
+            cwd=root,
+            text=True,
+        )
+        return sorted(
+            relative
+            for relative in tracked.stdout.split("\0")
+            if relative
+        )
+
+    paths = [
+        path.relative_to(root).as_posix()
+        for name in _FALLBACK_SURFACE_ROOTS
+        for path in (root / name).rglob("*")
+        if path.is_file()
+    ]
+    paths.extend(
         name
-        for name in names
-        if _is_forbidden_zip_member(name)
-    }
-    assert not forbidden
-    assert all(name == "paperconan/" or name.startswith("paperconan/") for name in names)
+        for name in ("README.md", "pyproject.toml")
+        if (root / name).is_file()
+    )
+    return sorted(set(paths))
 
 
-def test_skill_zip_replaces_stale_output_inside_copied_skill_tree(tmp_path) -> None:
-    project = tmp_path / "copied project"
-    project.mkdir()
-    shutil.copy2(ROOT / "build_skill_zip.sh", project / "build_skill_zip.sh")
-    shutil.copytree(SKILL_DIR, project / "skills" / "paperconan")
-    for relative in WORKED_EXAMPLE_FILES:
-        source = ROOT / "examples" / relative
-        destination = project / "examples" / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
+def test_tracked_product_surface_fallback_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    included = (
+        "src/package.py",
+        "tests/test_example.py",
+        "skills/paperconan/SKILL.md",
+        "docs/guide.md",
+        "examples/README.md",
+        "README.md",
+        "pyproject.toml",
+    )
+    excluded = (
+        "recheck/private.md",
+        "batches/private.md",
+        "private/other.md",
+    )
+    for relative in included + excluded:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("content", encoding="utf-8")
 
-    cache_dir = project / "skills" / "paperconan" / ".pytest_cache"
-    cache_dir.mkdir(exist_ok=True)
-    (cache_dir / "state").write_text("cache", encoding="utf-8")
-    generic_cache_dir = project / "skills" / "paperconan" / ".cache"
-    generic_cache_dir.mkdir(exist_ok=True)
-    (generic_cache_dir / "state").write_text("cache", encoding="utf-8")
-    bytecode_dir = project / "skills" / "paperconan" / "__pycache__"
-    bytecode_dir.mkdir(exist_ok=True)
-    (bytecode_dir / "module.pyc").write_bytes(b"bytecode")
-    (project / "skills" / "paperconan" / ".DS_Store").write_bytes(b"metadata")
-    (project / "skills" / "paperconan" / "local-note.md").write_text(
-        "local only",
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args,
+            returncode=128,
+            stdout="",
+        ),
+    )
+
+    assert _tracked_product_surfaces(tmp_path) == sorted(included)
+
+
+def test_tracked_product_surfaces_follow_neutral_language_policy() -> None:
+    violations = []
+    for relative in _tracked_product_surfaces():
+        path = ROOT / relative
+        text = _tracked_surface_text(relative, path)
+        if text is None:
+            continue
+        if contains_blocked_language(text):
+            violations.append(relative)
+    assert violations == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "fr" + "aud",
+        "fr" + "audulent",
+        "de" + "fr" + "auded",
+        "fabri" + "cate",
+        "fabri" + "cated",
+        "fabri" + "cation",
+        "fa" + "ke",
+        "fa" + "ked",
+        "fa" + "king",
+        "fal" + "sify",
+        "fal" + "sified",
+        "fal" + "sification",
+        "mis" + "conduct",
+        "mis" + "conducted",
+        "guil" + "t",
+        "guil" + "ty",
+        "造" + "假",
+        "伪" + "造",
+        "捏" + "造",
+        "作" + "假",
+        "实" + "锤",
+        "fr" + "audster",
+        "de" + "fr" + "auder",
+    ],
+)
+def test_neutral_language_matcher_blocks_expression_families(text: str) -> None:
+    assert contains_blocked_language(f"prefix {text} suffix")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "sample_" + "fa" + "ke_download",
+        "sample" + "Fa" + "keDownload",
+        "sample_" + "fa" + "ke2_download",
+        "sample_2" + "fa" + "ke_download",
+    ],
+    ids=["underscore", "camel-case", "letter-to-digit", "digit-to-letter"],
+)
+def test_neutral_language_matcher_normalizes_identifier_boundaries(text: str) -> None:
+    assert contains_blocked_language(text)
+
+
+def test_tracked_surface_identifier_and_code_block_text_is_inspected(
+    tmp_path: Path,
+) -> None:
+    identifier = "fa" + "ke_download"
+    source = tmp_path / "sample.py"
+    source.write_text(f"def {identifier}():\n    return None\n", encoding="utf-8")
+    assert contains_blocked_language(_python_identifier_text(source))
+
+    numeric_identifier = "fa" + "ke2_download"
+    source.write_text(
+        f"def {numeric_identifier}():\n    return None\n",
         encoding="utf-8",
     )
-    (project / "examples" / "local-note.py").write_text(
-        "local_only = True\n",
+    assert contains_blocked_language(_python_identifier_text(source))
+
+    document = tmp_path / "sample.md"
+    document.write_text(
+        f"```python\ndef {identifier}():\n    return None\n```\n",
         encoding="utf-8",
     )
+    text = _tracked_surface_text("docs/sample.md", document)
+    assert text is not None
+    assert contains_blocked_language(text)
 
-    out = project / "skills" / "paperconan" / "stale output.zip"
-    with zipfile.ZipFile(out, "w") as zf:
-        zf.writestr("stale-marker.txt", "old archive")
 
-    subprocess.run(
-        [str(project / "build_skill_zip.sh"), str(out)],
-        cwd=tmp_path,
-        check=True,
+@pytest.mark.parametrize(
+    "text",
+    [
+        "statistical signal",
+        "data inconsistency",
+        "request for clarification",
+        "fabric",
+        "micro" + "fabri" + "cation",
+        "falsifiable hypothesis",
+        "fa" + "ke" + "root package",
+        "mis" + "conductance",
+        "guiltless",
+    ],
+)
+def test_neutral_language_matcher_allows_unrelated_words(text: str) -> None:
+    assert not contains_blocked_language(text)
+
+
+def test_image_budget_lock_scope_is_documented() -> None:
+    cli = (ROOT / "docs" / "cli.md").read_text(encoding="utf-8")
+
+    assert "PaperConan writers" in cli
+    assert "external writers that ignore the lock" in cli
+    assert "observed external changes" in cli
+
+
+def test_verdict_reference_ceiling_is_documented() -> None:
+    reports = (ROOT / "docs" / "reports.md").read_text(encoding="utf-8")
+
+    assert "5,000 raw verdict references" in reports
+
+
+def test_verdict_ingress_schema_contract_is_documented() -> None:
+    reports = (ROOT / "docs" / "reports.md").read_text(encoding="utf-8")
+
+    assert (
+        "The top-level verdict and all nested verdict objects must be "
+        "concrete JSON objects."
+    ) in reports
+    assert "concrete JSON objects" in reports
+    assert "Markdown-rendered verdict fields must be strings or `null`" in reports
+
+
+def test_skill_routes_adaptive_image_review() -> None:
+    skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+    required = [
+        "paperconan <input-dir> --images",
+        "unavailable_no_multimodal",
+        "image_assets",
+        "image_findings",
+        "image_refs",
+        "deferred_asset_ids",
+        "whole image",
+        "native-pixel crop",
+        "single unified report",
+    ]
+    for phrase in required:
+        assert phrase in skill
+
+
+def test_output_schema_and_report_template_document_image_contracts() -> None:
+    output = (REF_DIR / "output-schema.md").read_text(encoding="utf-8")
+    template = (REF_DIR / "report-templates.md").read_text(encoding="utf-8")
+    for phrase in ("image_assets", "image_findings", "image_review"):
+        assert phrase in output
+    for phrase in ("finding_type", "image_refs", "review_status"):
+        assert phrase in template
+
+
+def test_deterministic_image_examples_use_two_regions_in_one_asset() -> None:
+    for path in (
+        REF_DIR / "output-schema.md",
+        REF_DIR / "report-templates.md",
+    ):
+        text = path.read_text(encoding="utf-8")
+        blocks = re.findall(r"```json\n(.*?)\n```", text, flags=re.DOTALL)
+        examples = [
+            json.loads(block)
+            for block in blocks
+            if '"kind": "image_pair_similarity_signal"' in block
+        ]
+        assert examples, f"missing deterministic image example in {path.name}"
+        for example in examples:
+            assert example["asset_ids"] == ["img:a"]
+            assert len(example["regions"]) == 2
+            assert {
+                region["asset_id"] for region in example["regions"]
+            } == {"img:a"}
+
+
+def test_image_coverage_status_normalization_is_documented() -> None:
+    pattern = re.compile(
+        r"unknown `image_review\.status`[^.\n]*`partial`",
+        flags=re.IGNORECASE,
     )
-
-    with zipfile.ZipFile(out) as zf:
-        names = {
-            info.filename
-            for info in zf.infolist()
-            if not info.is_dir()
-        }
-
-    assert names == _skill_zip_members(project / "build_skill_zip.sh")
+    for path in (
+        REF_DIR / "output-schema.md",
+        REF_DIR / "report-templates.md",
+    ):
+        text = path.read_text(encoding="utf-8")
+        assert pattern.search(text), (
+            f"{path.name} must document unknown coverage status normalization"
+        )

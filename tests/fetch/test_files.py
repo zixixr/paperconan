@@ -85,3 +85,13 @@ def test_discover_supported_inputs_translates_enumeration_error(
 def test_make_fileref():
     ref = _files.make_fileref("t.csv", 1234, "https://x/t.csv")
     assert ref == {"name": "t.csv", "ext": "csv", "size": 1234, "download_url": "https://x/t.csv"}
+
+
+def test_image_and_document_classification_does_not_change_tabular_behavior():
+    assert _files.is_image("Fig1.PNG")
+    assert _files.is_image("panel.tiff")
+    assert _files.asset_type("panel.webp") == "image"
+    assert _files.asset_type("supplement.pdf") == "document"
+    assert _files.asset_type("table.csv") == "tabular"
+    assert _files.asset_type("movie.mp4") == "other"
+    assert not _files.is_tabular("Fig1.PNG")

@@ -21,9 +21,19 @@ paperconan path/to/dir/ --md                        # 额外生成 REPORT.md
 paperconan path/to/dir/ --no-html
 paperconan path/to/dir/ --profile forensic
 paperconan path/to/dir/ --doi "10.xxxx/..." --title "Paper title"
-paperconan path/to/dir/ --runtime-metadata        # 显式记录扫描时间与耗时
+paperconan path/to/dir/ --images
+paperconan path/to/dir/ --images --image-diagnostics
+paperconan path/to/dir/ --runtime-metadata          # 显式记录扫描时间与耗时
 python -m paperconan path/to/dir/                   # 等价 module 形式
 ```
+
+`--images` 把本地图像和 PDF 页面登记到 `scan.json image_assets[]`，并生成原始像素副本与有界预览。
+`--image-diagnostics` 额外运行可选、非门控的确定性图像提示，结果写入
+`image_findings[]`；它要求同时传 `--images`。`image_findings` 不是完整图像复核清单，
+为空也不能解读成所有图像问题都已解决。
+
+确定性提示只比较同一个登记资产内的两个区域，不做跨资产比较；跨资产比较属于外部多模态
+Agent 的语义复核。
 
 默认 `scan.json` 是确定性的：相同输入重复扫描会产生逐字节一致的 JSON。
 为保持 schema 兼容，`scanned_at` 以及 scan/file/sheet 层级的
@@ -37,10 +47,17 @@ paperconan fetch "10.xxxx/your.doi"
 paperconan fetch "10.xxxx/your.doi" --json
 paperconan fetch "10.xxxx/your.doi" --download zenodo:123456 --out data/
 paperconan fetch "10.xxxx/your.doi" --auto --out data/
+paperconan fetch "<DOI or title>" --auto --images --out data/
+paperconan data/ --images
 paperconan data/
 ```
 
 覆盖 Zenodo / Figshare（keyless 检索下载）、Europe PMC / NCBI PMC OA（自动抽 supplementary 里的表）、nature.com ESM、Dryad。`--auto` 仅在 DOI 命中或标题高度一致时下载，弱匹配会被拒绝（需 `--download ... --force` 显式确认）。`fetch --download` / `--auto` 会写 `paperconan_source.json`，随后扫描会把 DOI/标题/来源写进 `scan.json.paper` 做溯源。
+
+托管输出的覆盖与删除要求操作系统提供“目录项名称与已打开描述符身份原子绑定”的删除能力。
+FreeBSD 使用 `funlinkat`；缺少等价能力的平台允许首次发布，但凡后续清理或刷新需要删除
+既有目录项，就会保守停止并保留现有文件。此时请改用新的空输出目录继续拉取，不要把该停止
+解释为已有文件已被替换。
 
 ## PDF / Word 补充材料表格
 
@@ -57,6 +74,8 @@ scan = audit_dir(
     write_html=False,   # 不生成 HTML
     write_json=False,   # 只拿返回 dict，不落盘
     evidence=False,     # 跳过 evidence blob，适合批处理只要 metadata
+    images=True,        # 登记 image_assets
+    image_diagnostics=False,  # 可选确定性提示；不控制 Agent 是否复核
     include_runtime=True,  # 可选：记录时间戳和 scan/file/sheet 耗时
     # profile="forensic",
 )
@@ -84,6 +103,8 @@ write_adjudicated_report(scan, verdict, "adjudication.html")  # scan/verdict 均
 | `PAPERCONAN_MAX_CELLS` | `10000000` | 单 sheet / workbook 累计 cell 预算 |
 | `PAPERCONAN_MAX_SPARSE_CELLS` | `250000` | 单 sheet 保留的文本、日期/对象及超宽整数稀疏 cell 数上限；超限 sheet 会跳过并记录实际观测值 |
 | `PAPERCONAN_MAX_SPARSE_BYTES` | `67108864` | 单 sheet 稀疏 payload 字节预算；超限 sheet 会跳过并记录实际观测值 |
+| `PAPERCONAN_OOXML_FORMULA_METADATA_BYTES` | `8388608` | OOXML 公式缓存检查对 `workbook.xml` 与关系 XML 各自允许流式解压读取的最大字节数；超限时保留已加载 sheet，并记录 file-level coverage limitation |
+| `PAPERCONAN_OOXML_FORMULA_SHEET_LIMIT` | `10000` | OOXML 公式缓存检查最多保留的 accepted sheet / relationship 数；只保留已被主加载器接受的 sheet |
 | `PAPERCONAN_COLUMN_FINGERPRINT_MAX_COLUMNS` | `512` | 跨 sheet 列指纹按物理列顺序最多处理的列数；超出部分会记录精确覆盖限制 |
 | `PAPERCONAN_DENSE_BLOCK_MAX_ROWS` | `100000` | 单个 numeric block 的逻辑行数上限；由各 detector-owned family 在候选循环前检查，超限时该 family 不进入候选循环并记录 `dense_block_detector_limit` |
 | `PAPERCONAN_DENSE_BLOCK_CELL_WORK_LIMIT` | `10000000` | 单个 numeric block、每个 dense detector-owned family 的逻辑 numeric-cell visit 预算；候选整体不适配时不执行并记录 `dense_block_detector_limit` |
@@ -111,6 +132,13 @@ write_adjudicated_report(scan, verdict, "adjudication.html")  # scan/verdict 均
 | `PAPERCONAN_FRACTION_REUSE_PAIR_BUDGET` | `10000` | 同一 sheet 内 fraction-reuse detector 最多检查的 block pair 数 |
 | `PAPERCONAN_FRACTION_REUSE_CELL_BUDGET` | `1000000` | 同一 sheet 内 fraction-reuse detector 最多检查的位置 cell 数；与 pair 预算分别生效 |
 | `PAPERCONAN_MAX_PAPER_MB` | `1500` | `fetch` 下载/解压到一个 paper 目录的总量上限 |
+| `PAPERCONAN_MAX_IMAGE_MB` | `100` | 单个图像资产读取前的文件大小上限 |
+| `PAPERCONAN_MAX_IMAGE_PIXELS` | `100000000` | 单图或单个 PDF 渲染页的解码像素上限 |
+| `PAPERCONAN_MAX_IMAGE_ASSETS` | `1000` | 单次扫描最多登记的去重图像资产数 |
+| `PAPERCONAN_MAX_IMAGE_TOTAL_MB` | `1500` | 单次扫描的图像产物总预算，覆盖原图副本、预览、PDF 渲染暂存、诊断原始裁剪和拼图证据；重跑替换按已有最终文件体积抵扣 |
+| `PAPERCONAN_MAX_IMAGE_FINDINGS` | `200` | 可选确定性图像提示上限；超出部分写入 `scan_errors` |
+| `PAPERCONAN_MAX_IMAGE_COMPARISONS` | `100000` | 可选确定性图像提示在整次扫描中最多尝试的区域比较数；达到后停止并写入 `scan_errors` |
+| `PAPERCONAN_MAX_IMAGE_EVIDENCE_MB` | `20` | 一份 HTML 中登记预览的总内嵌预算；格式错误、非有限、负数或溢出值按 `0` 处理，只关闭图像内嵌，不影响数值报告 |
 | `PAPERCONAN_ARCHIVE_MEMBER_LIMIT` | `10000` | 单个 ZIP/TAR 最多检查的 member 元数据数（包括非表格 member）；超限记录遗漏下界 |
 | `PAPERCONAN_ARCHIVE_MEMBER_NAME_BYTES` | `8388608` | 单个 ZIP/TAR 已检查 member 名称的累计 UTF-8 字节预算 |
 | `PAPERCONAN_ARCHIVE_METADATA_BYTES` | `8388608` | 单个 TAR 的 PAX、GNU long-name / long-link 等扩展元数据累计字节预算；在读取或解码超限 payload 前停止 |
@@ -122,6 +150,15 @@ write_adjudicated_report(scan, verdict, "adjudication.html")  # scan/verdict 均
 | `PAPERCONAN_SOURCE_SIDECAR_NAME_BYTES` | `1048576` | provenance sidecar 保留的唯一 managed-name 累计 UTF-8 字节预算 |
 | `PAPERCONAN_MANAGED_OUTPUT_NAME_BYTES` | `4096` | 单个 requested/source/base/candidate 输出名称的 UTF-8 字节上限；在 hash、路径 probe 或候选名称分配前检查 |
 | `PAPERCONAN_MANAGED_OUTPUT_COLLISION_PROBE_LIMIT` | `128` | 单个 direct/archive 输出名称最多执行的 filesystem collision probe 数；包括 digest 与 numeric fallback |
+
+单图体积、像素和资产数设置在图像阶段按需解析。格式错误、非有限、负数或超出平台
+范围的值会写入 `scan_errors` 并停止相应图像工作，但已完成的数值结果和请求的报告仍会发布。
+
+图像产物发布使用输出根目录中的持久锁来协调 **PaperConan writers**。这个锁只能约束
+遵守同一协议的写入者；**external writers that ignore the lock** 无法被原子控制。
+临界区会重新统计已固定的 `images/` 树，只排除本次操作已验证身份的私有暂存项；
+**observed external changes** 会被保守计入预算并记录为产物预算错误，而不会假定它们
+属于当前写入者。
 
 Dense row/work/state checks 由各 detector-owned family 自己在候选循环和
 allocation 前执行，不再由 caller 预估整个 family 后统一接纳。Row gate 可在

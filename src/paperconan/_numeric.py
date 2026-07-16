@@ -166,6 +166,45 @@ def relation_close(actual, expected, *, rtol=1e-10, ulps=16):
     return exact | (representable & (residual <= tolerance))
 
 
+def constant_offset_close(
+    left,
+    right,
+    differences,
+    mean_difference,
+    *,
+    rtol=1e-10,
+    ulps=16,
+):
+    left = np.asarray(left, dtype=float)
+    right = np.asarray(right, dtype=float)
+    differences = np.asarray(differences, dtype=float)
+    mean_difference = float(mean_difference)
+    exact = differences == mean_difference
+    with np.errstate(
+        divide="ignore",
+        invalid="ignore",
+        over="ignore",
+        under="ignore",
+    ):
+        scale = _local_variation(differences)
+        tolerance = (
+            ulp_tolerance(
+                differences,
+                mean_difference,
+                ulps=ulps,
+            )
+            + ulp_tolerance(left, right, ulps=ulps)
+            + rtol * scale
+        )
+        residual = np.abs(differences - mean_difference)
+    representable = (
+        np.isfinite(scale)
+        & np.isfinite(tolerance)
+        & np.isfinite(residual)
+    )
+    return exact | (representable & (residual <= tolerance))
+
+
 def integer_shift_close(left, right, *, ulps=16):
     left = np.asarray(left, dtype=float)
     right = np.asarray(right, dtype=float)

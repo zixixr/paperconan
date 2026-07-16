@@ -106,6 +106,70 @@ Close with:
 以上是可复核的数据模式问题，不构成对作者意图或研究完整性问题的判断。
 ```
 
+## Adaptive Numeric And Image Report
+
+Use one `findings[]` for numeric and image entries and one `image_review`
+coverage object. PaperConan does not configure model APIs, keys, or provider
+SDKs.
+
+An optional deterministic `image_findings[]` hint has this shape:
+
+```json
+{
+  "finding_id": "image:pair:1",
+  "kind": "image_pair_similarity_signal",
+  "severity": "medium",
+  "rule": "two registered regions retain high structural similarity",
+  "asset_ids": ["img:a"],
+  "regions": [
+    {"asset_id": "img:a", "box": [0, 0, 800, 900]},
+    {"asset_id": "img:a", "box": [800, 0, 1600, 900]}
+  ],
+  "method": "panel_pair_similarity",
+  "score": 0.97,
+  "transform": "identity",
+  "profile_action": "kept"
+}
+```
+
+The deterministic helper compares two native-coordinate regions within one
+registered asset. It does not emit cross-asset comparisons. `image_findings`
+are optional hints, not the complete review set. Review every registered asset
+even when this list is empty. Start with the whole image, then use a
+native-pixel crop for small panels or unresolved detail.
+
+An Agent-created image entry uses registered `image_refs`:
+
+```json
+{
+  "finding_type": "image",
+  "title": "Registered image regions require contextual review",
+  "finding_ref": null,
+  "image_refs": [
+    {"asset_id": "img:a", "box": [0, 0, 800, 900], "label": "left region"},
+    {"asset_id": "img:a", "box": [800, 0, 1600, 900], "label": "right region"}
+  ],
+  "review_status": "needs_human",
+  "impact_scope": "supporting",
+  "report_md": "The registered regions require figure and Methods context."
+}
+```
+
+Every asset must appear in exactly one `image_review` coverage list:
+`reviewed_asset_ids`, `unresolved_asset_ids`, `unreadable_asset_ids`, or
+`deferred_asset_ids`. `image_review.status: "completed"` means coverage
+accounting completed, not that every image question was explained. Use
+`partial` when review is deferred, `unavailable_no_multimodal` when the Agent
+cannot open local images, and `not_requested` only when image review was not
+requested. Unknown `image_review.status` values normalize to `partial`, while
+unknown image finding `review_status` values normalize to `unresolved`.
+
+Render numeric and image entries as a single unified report:
+
+```bash
+paperconan report audit/scan.json --verdict verdict.json --out adjudication.html
+```
+
 ## Batch Verdict Record
 
 For batch work, one paper can be summarized as JSON. This schema is advisory;

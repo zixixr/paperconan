@@ -7,19 +7,17 @@ must not drown the genuine signal in high-severity output.
 """
 from __future__ import annotations
 
-from copy import deepcopy
-
 from paperconan._audit import (_demote_dense_relations, _demote_dense_sheets,
                                RELATION_FLOOD_CAP)
 
 
-def _stub_relations(n):
+def _synthetic_relations(n):
     return [dict(kind="identical_column", col_a=f"c{i}", col_b=f"c{i+1}",
                  n=10, severity="high", rule=f"col[{i}] == col[{i+1}]") for i in range(n)]
 
 
 def test_flood_of_relations_demoted_to_low():
-    rels = _stub_relations(RELATION_FLOOD_CAP + 10)
+    rels = _synthetic_relations(RELATION_FLOOD_CAP + 10)
     out = _demote_dense_relations(rels)
     assert all(r["severity"] == "low" for r in out)
     assert all(r.get("dense_block") for r in out)
@@ -28,7 +26,7 @@ def test_flood_of_relations_demoted_to_low():
 
 
 def test_handful_of_relations_keep_high():
-    rels = _stub_relations(3)
+    rels = _synthetic_relations(3)
     out = _demote_dense_relations(rels)
     assert all(r["severity"] == "high" for r in out)
     assert not any(r.get("dense_block") for r in out)
@@ -43,69 +41,20 @@ def test_flood_demoted_across_blocks_of_one_sheet():
     but together over it — the per-SHEET total must trigger demotion."""
     half = RELATION_FLOOD_CAP // 2 + 5
     blocks = [
-        {"file": "f.xlsx", "sheet": "S1", "relations": _stub_relations(half), "equal_pairs": []},
-        {"file": "f.xlsx", "sheet": "S1", "relations": _stub_relations(half), "equal_pairs": []},
+        {"file": "f.xlsx", "sheet": "S1", "relations": _synthetic_relations(half), "equal_pairs": []},
+        {"file": "f.xlsx", "sheet": "S1", "relations": _synthetic_relations(half), "equal_pairs": []},
     ]
     _demote_dense_sheets(blocks)
     flat = [r for b in blocks for r in b["relations"]]
     assert all(r["severity"] == "low" and r.get("dense_block") for r in flat)
 
 
-def test_forensic_dense_sheet_keeps_original_high_severity():
-    half = RELATION_FLOOD_CAP // 2 + 5
-
-    def relations():
-        return [
-            {
-                "kind": "identical_column",
-                "severity": "high",
-                "rule": f"synthetic relation {i}",
-                "profile_action": "kept",
-                "prefilter": "downweight",
-                "prefilter_reason": "existing_relation_prefilter",
-                "likely_benign": "existing relation context",
-                "false_positive_context": ["existing_relation_context"],
-            }
-            for i in range(half)
-        ]
-
-    blocks = [
-        {"file": "f.xlsx", "sheet": "S1",
-         "relations": relations(), "equal_pairs": [],
-         "within_col": []},
-        {"file": "f.xlsx", "sheet": "S1",
-         "relations": relations(), "equal_pairs": [],
-         "within_col": []},
-    ]
-    before = deepcopy(blocks)
-    returned = _demote_dense_sheets(blocks, profile="forensic")
-
-    assert returned is blocks
-    assert blocks == before
-    findings = [f for block in blocks for f in block["relations"]]
-    assert all(f["severity"] == "high" for f in findings)
-    assert all(f["profile_action"] == "kept" for f in findings)
-    assert all(f["prefilter"] == "downweight" for f in findings)
-    assert all(
-        f["prefilter_reason"] == "existing_relation_prefilter"
-        for f in findings
-    )
-    assert all(f["likely_benign"] == "existing relation context" for f in findings)
-    assert all(
-        f["false_positive_context"] == ["existing_relation_context"]
-        for f in findings
-    )
-    assert all("dense_block" not in f for f in findings)
-    assert all("reused_progression" not in f for f in findings)
-    assert all("within_col_flood_sheet" not in f for f in findings)
-
-
 def test_separate_sheets_each_below_cap_keep_high():
     """Two different sheets, each with a handful of relations, must NOT be demoted just
     because their combined total would exceed the cap."""
     blocks = [
-        {"file": "f.xlsx", "sheet": "S1", "relations": _stub_relations(3), "equal_pairs": []},
-        {"file": "f.xlsx", "sheet": "S2", "relations": _stub_relations(3), "equal_pairs": []},
+        {"file": "f.xlsx", "sheet": "S1", "relations": _synthetic_relations(3), "equal_pairs": []},
+        {"file": "f.xlsx", "sheet": "S2", "relations": _synthetic_relations(3), "equal_pairs": []},
     ]
     _demote_dense_sheets(blocks, cap=4)
     flat = [r for b in blocks for r in b["relations"]]

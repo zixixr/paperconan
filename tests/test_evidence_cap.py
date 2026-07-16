@@ -325,7 +325,9 @@ def test_deferred_spreadsheet_reload_attaches_evidence_and_cleans_keys(
     monkeypatch.setattr(
         audit,
         "load_table_result",
-        lambda _path: TableLoadResult({"Target": _evidence_sheet()}),
+        lambda _path, *, inspect_formulas=True: TableLoadResult(
+            {"Target": _evidence_sheet()}
+        ),
     )
     coverage = ScanCoverage(files_discovered=1)
 
@@ -360,7 +362,9 @@ def test_deferred_reload_attaches_evidence_to_every_retained_finding(
     monkeypatch.setattr(
         audit,
         "load_table_result",
-        lambda _path: TableLoadResult({"Target": _evidence_sheet()}),
+        lambda _path, *, inspect_formulas=True: TableLoadResult(
+            {"Target": _evidence_sheet()}
+        ),
     )
     coverage = ScanCoverage(files_discovered=1)
 
@@ -390,7 +394,7 @@ def test_deferred_reload_processes_every_retained_block_and_target(
     monkeypatch.setattr(
         audit,
         "load_table_result",
-        lambda _path: TableLoadResult({
+        lambda _path, *, inspect_formulas=True: TableLoadResult({
             "Alpha": _evidence_sheet(),
             "Beta": _evidence_sheet(),
         }),
@@ -436,7 +440,7 @@ def test_deferred_reload_records_missing_target(
         monkeypatch.setattr(
             audit,
             "load_table_result",
-            lambda _path: TableLoadResult({}),
+            lambda _path, *, inspect_formulas=True: TableLoadResult({}),
         )
     coverage = ScanCoverage(files_discovered=1)
 
@@ -466,7 +470,7 @@ def test_deferred_spreadsheet_reload_surfaces_loader_limitation(
     monkeypatch.setattr(
         audit,
         "load_table_result",
-        lambda _path: TableLoadResult(
+        lambda _path, *, inspect_formulas=True: TableLoadResult(
             {"Target": None}, [limitation]
         ),
     )
@@ -527,7 +531,7 @@ def test_deferred_reload_exception_isolated_per_source_and_bounded(
     good_block, good_finding = _deferred_block(good_path)
     secret = "/private/source.xlsx?credential=not-for-output"
 
-    def load(path):
+    def load(path, *, inspect_formulas=True):
         if path == str(failed_path):
             raise RuntimeError(secret)
         return TableLoadResult({"Target": _evidence_sheet()})
@@ -562,7 +566,7 @@ def test_deferred_loader_value_error_text_does_not_escape(
     path.write_bytes(b"placeholder")
     block, finding = _deferred_block(path)
 
-    def fail(_path):
+    def fail(_path, *, inspect_formulas=True):
         raise ValueError("details contains reserved key: ordinary reload")
 
     monkeypatch.setattr(audit, "load_table_result", fail)
@@ -614,7 +618,7 @@ def test_deferred_reload_records_missing_file_without_path_detail(
     path = tmp_path / "missing.xlsx"
     block, finding = _deferred_block(path)
 
-    def missing(_path):
+    def missing(_path, *, inspect_formulas=True):
         raise FileNotFoundError(str(path))
 
     monkeypatch.setattr(audit, "load_table_result", missing)
@@ -638,7 +642,7 @@ def test_deferred_inaccessible_source_is_reload_error(
     block, finding = _deferred_block(path)
     real_stat = audit.os.stat
 
-    def inaccessible(_path):
+    def inaccessible(_path, *, inspect_formulas=True):
         raise PermissionError("source load denied")
 
     def deny_stat(probed_path, *args, **kwargs):
@@ -668,7 +672,7 @@ def test_deferred_not_a_directory_source_is_missing_file(
     block, finding = _deferred_block(path)
     real_stat = audit.os.stat
 
-    def fail_load(_path):
+    def fail_load(_path, *, inspect_formulas=True):
         raise RuntimeError("source load failed")
 
     def fail_stat(probed_path, *args, **kwargs):
@@ -755,7 +759,9 @@ def test_deferred_attachment_missing_file_is_reload_error(
     monkeypatch.setattr(
         audit,
         "load_table_result",
-        lambda _path: TableLoadResult({"Target": _evidence_sheet()}),
+        lambda _path, *, inspect_formulas=True: TableLoadResult(
+            {"Target": _evidence_sheet()}
+        ),
     )
 
     def fail_attachment(*_args, **_kwargs):
@@ -822,7 +828,7 @@ def test_deferred_reload_propagates_base_exception_controls(
     block, _finding = _deferred_block(path)
     block["_evidence_sentinel"] = object()
 
-    def interrupt(_path):
+    def interrupt(_path, *, inspect_formulas=True):
         raise control()
 
     monkeypatch.setattr(audit, "load_table_result", interrupt)

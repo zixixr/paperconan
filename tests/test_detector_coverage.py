@@ -29,6 +29,7 @@ def _qualifying_row_pair_rows():
     [
         ("detect_relations", "relations"),
         ("detect_equal_pairs", "equal_pairs"),
+        ("detect_row_relations", "row_relations"),
         ("detect_arithmetic_progression", "progressions"),
         ("detect_within_column_patterns", "within_col"),
         ("detect_dispersed_repeats", "within_col"),
@@ -63,8 +64,9 @@ def test_wide_integer_block_skips_affected_detector_with_one_limitation(
 
     monkeypatch.setattr(audit, detector_name, fail_if_called)
     for name in (
-        "detect_relations",
-        "detect_arithmetic_progression",
+            "detect_relations",
+            "detect_row_relations",
+            "detect_arithmetic_progression",
         "detect_equal_pairs",
         "detect_within_column_patterns",
         "detect_dispersed_repeats",
@@ -113,10 +115,11 @@ def test_wide_integer_block_skips_affected_detector_with_one_limitation(
         "cols": "1-2",
         "affected_cells": 2,
         "detectors": [
-            "relations",
-            "equal_pairs",
-            "row_pairs",
-            "arithmetic_progression",
+                "relations",
+                "equal_pairs",
+                "row_pairs",
+                "row_relations",
+                "arithmetic_progression",
             "within_column",
             "dispersed_repeats",
             "identical_after_rounding",
@@ -209,6 +212,7 @@ def test_wide_integer_block_index_exhaustion_skips_before_state_grows(
 
     for name in (
         "detect_relations",
+        "detect_row_relations",
         "detect_arithmetic_progression",
         "detect_equal_pairs",
         "detect_within_column_patterns",
@@ -263,10 +267,11 @@ def test_wide_integer_block_index_exhaustion_skips_before_state_grows(
         "wide_integer_cells": 1,
         "affected_blocks_lower_bound": 0,
         "detectors": [
-            "relations",
-            "equal_pairs",
-            "row_pairs",
-            "arithmetic_progression",
+                "relations",
+                "equal_pairs",
+                "row_pairs",
+                "row_relations",
+                "arithmetic_progression",
             "within_column",
             "dispersed_repeats",
             "identical_after_rounding",

@@ -160,3 +160,28 @@ def test_fetch_empty_json_mode_stays_clean(monkeypatch, capsys):
     rc = _cli.fetch_main(["10.1038/x", "--json"])
     assert rc == 0
     assert json.loads(capsys.readouterr().out) == []
+
+
+def test_fetch_images_passes_additive_option(monkeypatch, tmp_path):
+    cands = [{
+        "cand_id": "source:1",
+        "source": "source",
+        "title": "T",
+        "all_files_count": 2,
+        "match_signals": {"doi_in_related": True},
+        "tabular_files": [{"name": "data.csv"}],
+        "image_files": [{"name": "Fig1.png"}],
+    }]
+    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: cands)
+    captured = {}
+
+    def stub_download(candidate, out_dir, **kwargs):
+        captured.update(kwargs)
+        return {"downloaded": [str(tmp_path / "Fig1.png")], "skipped": []}
+
+    monkeypatch.setattr(_cli, "download_candidate", stub_download)
+    rc = _cli.fetch_main([
+        "10.x/paper", "--auto", "--images", "--out", str(tmp_path),
+    ])
+    assert rc == 0
+    assert captured["include_images"] is True

@@ -1,8 +1,9 @@
 # paperconan adjudication tiers
 
 Use this reference when a user asks for ranking, batch review, a KEEP/DROP
-decision, or a formal report. These tiers are **review priority labels**, not
-research-integrity probabilities. They describe how hard it is to explain a numerical
+decision, or a formal report. These tiers are **review priority labels**. They
+are not research-integrity probabilities and are not author-intent conclusions.
+They describe how hard it is to explain a numerical
 signal innocently after checking the source table, labels, figure legend, and
 Methods.
 
@@ -56,8 +57,9 @@ Typical Tier 1 patterns:
 - Multiple independent anomalies in one paper point to separate data-integrity
   questions, not one obvious duplicated upload.
 
-Tier 1 still does not establish a research-integrity finding. It means the case is a high
-priority for author clarification or formal human review.
+Tier 1 does not establish a research-integrity finding and is still not an
+author-intent conclusion. It means the case is a high priority for author
+clarification or formal human review.
 
 ## Tier 2
 

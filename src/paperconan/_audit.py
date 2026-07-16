@@ -41,15 +41,18 @@ import openpyxl
 import numpy as np
 from scipy import stats
 
+from ._additional_detectors import _shared_frac_is_small_denominator
 from ._coverage import ScanCoverage
 from ._input import (
     InputLimitation,
+    OoxmlFormulaInspectionLimit,
     TableLoadResult,
     discover_supported_inputs,
     inspect_ooxml_formula_cache,
 )
 from ._numeric import (
     assess_relation_intercept,
+    constant_offset_close,
     integer_shift_close,
     max_ulp_tolerance,
     relation_close,
@@ -82,7 +85,7 @@ from .schema import PaperconanInputError
 # paperconan-watch severity counters / triage gate all iterate this set, so a
 # HIGH finding in ANY group (notably row_pairs) is counted and can reach review.
 BLOCK_FINDING_GROUPS = (
-    "relations", "equal_pairs", "progressions", "row_pairs",
+    "relations", "equal_pairs", "progressions", "row_pairs", "row_relations",
     "within_col", "identical_after_rounding", "grim",
 )
 
@@ -700,7 +703,7 @@ def _load_table_sheets(path, *, _limitations=None):
     return load_workbook_rows(path, _limitations=_limitations)
 
 
-def load_table_result(path) -> TableLoadResult:
+def load_table_result(path, *, inspect_formulas=True) -> TableLoadResult:
     ext = os.path.splitext(path)[1].lower()
     if ext in {".pdf", ".docx"}:
         if ext == ".pdf":
@@ -735,19 +738,39 @@ def load_table_result(path) -> TableLoadResult:
         sheets = _load_table_sheets(
             path, _limitations=limitations
         )
-    for sheet, gap in inspect_ooxml_formula_cache(path).items():
-        limitations.append(InputLimitation(
-            scope="sheet",
-            reason="formula_cache_missing",
-            sheet=sheet,
-            details={"count": gap["count"], "cells": gap["cells"]},
-        ))
+    accepted_sheets = {
+        name for name, value in sheets.items()
+        if value is not None
+    }
+    if inspect_formulas and accepted_sheets:
+        try:
+            formula_gaps = inspect_ooxml_formula_cache(
+                path,
+                accepted_sheets=accepted_sheets,
+            )
+        except OoxmlFormulaInspectionLimit as exc:
+            limitations.append(InputLimitation(
+                scope="file",
+                reason=exc.reason,
+                details=exc.details,
+            ))
+        else:
+            for sheet, gap in formula_gaps.items():
+                limitations.append(InputLimitation(
+                    scope="sheet",
+                    reason="formula_cache_missing",
+                    sheet=sheet,
+                    details={
+                        "count": gap["count"],
+                        "cells": gap["cells"],
+                    },
+                ))
     return TableLoadResult(sheets=sheets, limitations=limitations)
 
 
 def load_table(path) -> dict[str, Sheet | None]:
     """Dispatch by extension to a {sheet_name: Sheet|None} loader."""
-    return load_table_result(path).sheets
+    return load_table_result(path, inspect_formulas=False).sheets
 
 
 def _iter_extracted_sheets(path):
@@ -1091,6 +1114,28 @@ def _block_evidence(
     return out
 
 
+def _norm_label(value):
+    if not value:
+        return ""
+    normalized = " ".join(str(value).split()).strip().lower()
+    return (
+        ""
+        if re.fullmatch(r"row \d+", normalized)
+        else normalized
+    )
+
+
+def _is_round_power_of_ten(ratio):
+    value = abs(float(ratio))
+    if value <= 0 or value == 1.0:
+        return False
+    exponent = math.log10(value)
+    return (
+        abs(exponent - round(exponent)) < 1e-9
+        and round(exponent) != 0
+    )
+
+
 def benign_reason(f):
     """Return a common innocent explanation for a finding kind, or None.
 
@@ -1114,6 +1159,36 @@ def benign_reason(f):
     if kind == "identical_after_rounding":
         return ("cells share a rounded value but differ at full precision — usually "
                 "display rounding, not duplication")
+    if kind in (
+        "constant_ratio_row",
+        "scaled_row_reuse",
+        "identical_row_reuse",
+    ):
+        row_a = _norm_label(f.get("row_a"))
+        row_b = _norm_label(f.get("row_b"))
+        if (
+            f.get("same_figure")
+            and not f.get("same_sheet")
+            and row_a
+            and row_a == row_b
+        ):
+            return (
+                "the same-named row reused across two panels of one "
+                "figure is usually a shared control or baseline replot; "
+                "confirm that the legend discloses the reuse"
+            )
+        if kind != "identical_row_reuse":
+            ratio = f.get("ratio")
+            if (
+                ratio is not None
+                and _is_round_power_of_ten(ratio)
+            ):
+                return (
+                    "a whole power-of-ten ratio between two rows is "
+                    "usually a unit conversion or a percentage/fraction "
+                    "restatement of the same row"
+                )
+        return None
     if kind in ("cross_sheet_value_overlap", "cross_sheet_position_identical"):
         if f.get("same_figure"):
             return f.get("context")
@@ -1817,7 +1892,11 @@ def _compact_high_precision_fractions(frac_x, hp_rows):
     count = 0
     for index, selected in enumerate(hp_rows):
         value = frac_x[index]
-        if selected and _sig_frac_digits(value) >= 4:
+        if (
+            selected
+            and _sig_frac_digits(value) >= 4
+            and not _shared_frac_is_small_denominator(value)
+        ):
             frac_x[count] = round(float(value), 6)
             count += 1
     return count
@@ -2191,25 +2270,14 @@ def detect_relations(
                 )
                 offset_close = False
                 if mean_diff != 0:
-                    offset_representable = True
-                    for index, x_value in enumerate(x):
-                        offset_value = (
-                            float(x_value) + mean_diff
-                        )
-                        if not math.isfinite(offset_value):
-                            offset_representable = False
-                            break
-                        diff[index] = offset_value
-                    if offset_representable:
-                        offset_close = bool(
-                            relation_close(y, diff).all()
-                        )
-                    for index, (x_value, y_value) in enumerate(
-                        zip(x, y)
-                    ):
-                        diff[index] = (
-                            float(y_value) - float(x_value)
-                        )
+                    offset_close = bool(
+                        constant_offset_close(
+                            x,
+                            y,
+                            diff,
+                            mean_diff,
+                        ).all()
+                    )
                 candidate.release(relation_workspace)
                 if offset_close:
                     candidate.offer(
@@ -2757,6 +2825,34 @@ def detect_relations(
                     )
                     candidate.release(fractional_workspace)
                     n_real_frac = int(hp_rows.sum())
+                    round_shift_fraction_count = 0
+                    nonzero_integer_diff_count = 0
+                    round_ten_diff_count = 0
+                    round_shift_fractions = set()
+                    for index in range(n):
+                        if not bool(diff_is_int[index]):
+                            continue
+                        rounded_difference = round(
+                            float(diff[index])
+                        )
+                        if abs(rounded_difference) < 1:
+                            continue
+                        nonzero_integer_diff_count += 1
+                        is_round_ten = abs(
+                            rounded_difference
+                            - round(rounded_difference / 10.0) * 10.0
+                        ) < 0.5
+                        if not is_round_ten:
+                            continue
+                        round_ten_diff_count += 1
+                        fraction = float(frac_x[index])
+                        if abs(fraction) <= 1e-6:
+                            continue
+                        round_shift_fraction_count += 1
+                        if len(round_shift_fractions) < 3:
+                            round_shift_fractions.add(
+                                round(fraction, 6)
+                            )
                     high_precision_count = (
                         _compact_high_precision_fractions(
                             frac_x, hp_rows
@@ -2863,6 +2959,42 @@ def detect_relations(
                         candidate.release(diff_lease)
                         candidate.release(filtered_lease)
                         return
+                    if (
+                        round_shift_fraction_count
+                        >= max(5, int(round(0.7 * n)))
+                        and round_ten_diff_count
+                        == nonzero_integer_diff_count
+                        and len(round_shift_fractions) >= 3
+                    ):
+                        candidate.offer(
+                            "high",
+                            lambda ci=ci, cj=cj, n=n,
+                            n_shared=round_shift_fraction_count,
+                            x_sample=x_sample,
+                            y_sample=y_sample: dict(
+                                kind="round_shift_shared_fraction",
+                                col_a=header[ci - c0],
+                                col_b=header[cj - c0],
+                                col_a_idx=ci,
+                                col_b_idx=cj,
+                                n=n,
+                                n_shared_fraction=n_shared,
+                                severity="high",
+                                col_a_sample=list(x_sample),
+                                col_b_sample=list(y_sample),
+                                rule=(
+                                    f"col[{cj}] and col[{ci}] "
+                                    "share the same decimal fraction "
+                                    f"on {n_shared}/{n} rows and differ "
+                                    "only by non-zero integer multiples "
+                                    "of 10"
+                                ),
+                            ),
+                        )
+                        del diff, x, y
+                        candidate.release(diff_lease)
+                        candidate.release(filtered_lease)
+                        return
 
                 if n >= 8:
                     with np.errstate(
@@ -2961,6 +3093,18 @@ def detect_relations(
 _ROW_PAIR_MAX_ROWS = 80
 _ROW_PAIR_MAX_COLS = 200
 _ROW_PAIR_MAX_FINDINGS_PER_BLOCK = 25
+_ROW_REL_MAX_ROWS = int(
+    os.environ.get("PAPERCONAN_ROW_REL_MAX_ROWS", "60")
+)
+_ROW_REL_MIN_COLS = int(
+    os.environ.get("PAPERCONAN_ROW_REL_MIN_COLS", "12")
+)
+_ROW_REL_RTOL = float(
+    os.environ.get("PAPERCONAN_ROW_REL_RTOL", "1e-3")
+)
+_ROW_REL_BUDGET = int(
+    os.environ.get("PAPERCONAN_ROW_REL_BUDGET", "6000000")
+)
 
 
 def _row_label(sheet, r, c0):
@@ -2972,6 +3116,44 @@ def _row_label(sheet, r, c0):
             if s:
                 labels.append(s)
     return " | ".join(labels) if labels else f"row {r + 1}"
+
+
+def detect_row_relations(
+    sheet,
+    r0,
+    r1,
+    c0,
+    c1,
+    header,
+    *,
+    _finding_sink=None,
+):
+    del header
+    from ._additional_detectors import (
+        detect_row_relations as _detect_row_relations,
+    )
+
+    raw_findings = _detect_row_relations(
+        sheet,
+        r0,
+        r1,
+        c0,
+        c1,
+        max_rows=_ROW_REL_MAX_ROWS,
+        min_cols=_ROW_REL_MIN_COLS,
+        rtol=_ROW_REL_RTOL,
+        work_budget=_ROW_REL_BUDGET,
+    )
+    if _finding_sink is None:
+        return raw_findings
+    for finding in raw_findings:
+        payload = dict(finding)
+        _finding_sink.offer(
+            "row_relations",
+            str(payload.get("severity") or "low"),
+            lambda payload=payload: payload,
+        )
+    return []
 
 
 def _has_fractional_part(v):
@@ -4719,6 +4901,18 @@ def detect_repeated_decimals(values, label):
         return None
     flags = [(e, c) for e, c in counts.most_common(15) if c >= max(5, 5 * n / 100)]
     return dict(label=label, n=n, n_unique=len(counts), top=flags)
+
+
+def detect_decimal_tail_clustering(values, label, top_k=6):
+    from ._additional_detectors import (
+        detect_decimal_tail_clustering as _detect_decimal_tail_clustering,
+    )
+
+    return _detect_decimal_tail_clustering(
+        values,
+        label,
+        top_k=top_k,
+    )
 
 
 def benjamini_hochberg(pvals, alpha=0.05):
@@ -8554,6 +8748,80 @@ def detect_within_sheet_fraction_reuse(
     return findings
 
 
+def detect_scaled_row_reuse(
+    grid_sheets,
+    profile="review",
+    max_candidates=1500,
+    max_findings=40,
+):
+    from ._additional_detectors import (
+        detect_scaled_row_reuse as _detect_scaled_row_reuse,
+    )
+
+    return _detect_scaled_row_reuse(
+        grid_sheets,
+        profile=profile,
+        figure_key=figure_key,
+        row_relation_min_cols=_ROW_REL_MIN_COLS,
+        row_relation_max_rows=_ROW_REL_MAX_ROWS,
+        row_relation_rtol=_ROW_REL_RTOL,
+        max_candidates=max_candidates,
+        max_findings=max_findings,
+    )
+
+
+def detect_short_row_reuse(
+    grid_sheets,
+    profile="review",
+    max_findings=60,
+):
+    from ._additional_detectors import (
+        detect_short_row_reuse as _detect_short_row_reuse,
+    )
+
+    return _detect_short_row_reuse(
+        grid_sheets,
+        profile=profile,
+        figure_key=figure_key,
+        row_relation_min_cols=_ROW_REL_MIN_COLS,
+        max_findings=max_findings,
+    )
+
+
+def detect_within_row_shared_fraction(
+    grid_sheets,
+    profile="review",
+    max_findings=60,
+):
+    from ._additional_detectors import (
+        detect_within_row_shared_fraction as _detect_within_row_shared_fraction,
+    )
+
+    return _detect_within_row_shared_fraction(
+        grid_sheets,
+        profile=profile,
+        figure_key=figure_key,
+        max_findings=max_findings,
+    )
+
+
+def detect_row_pair_shared_fraction(
+    grid_sheets,
+    profile="review",
+    max_findings=60,
+):
+    from ._additional_detectors import (
+        detect_row_pair_shared_fraction as _detect_row_pair_shared_fraction,
+    )
+
+    return _detect_row_pair_shared_fraction(
+        grid_sheets,
+        profile=profile,
+        figure_key=figure_key,
+        max_findings=max_findings,
+    )
+
+
 def _load_provenance(in_dir, paper):
     """Resolve scan provenance: an explicit `paper` override wins; otherwise read a
     paperconan_source.json sidecar left by `fetch`; otherwise None."""
@@ -8788,6 +9056,7 @@ class FileScanResult:
     report_blocks: list[dict]
     digit_reports: list[dict]
     decimal_reports: list[dict]
+    tail_cluster_reports: list[dict]
     summaries: list[CrossSheetSummary]
     within_sheet_findings: list[dict]
     stats: dict
@@ -8799,6 +9068,7 @@ class _SheetScanResult:
     report_blocks: list[dict]
     digit_reports: list[dict]
     decimal_reports: list[dict]
+    tail_cluster_reports: list[dict]
     summaries: list[CrossSheetSummary]
     within_sheet_findings: list[dict]
     stats: dict
@@ -8809,6 +9079,7 @@ def _empty_file_scan_result(file_stat, errors):
         report_blocks=[],
         digit_reports=[],
         decimal_reports=[],
+        tail_cluster_reports=[],
         summaries=[],
         within_sheet_findings=[],
         stats={"files": [file_stat], "sheets": []},
@@ -9099,7 +9370,10 @@ def _attach_deferred_evidence(
             return
 
         try:
-            load_result = load_table_result(path)
+            load_result = load_table_result(
+                path,
+                inspect_formulas=False,
+            )
         except Exception as exc:
             if source_is_missing(path):
                 raise EvidenceReloadSourceMissing from exc
@@ -9182,6 +9456,7 @@ _WIDE_INTEGER_BLOCK_DETECTORS = [
     "relations",
     "equal_pairs",
     "row_pairs",
+    "row_relations",
     "arithmetic_progression",
     "within_column",
     "dispersed_repeats",
@@ -9617,6 +9892,19 @@ def _analyze_numeric_blocks(
                 omitted_findings=row_pair_omitted,
             )
             state.findings_omitted += row_pair_omitted
+        row_relations = (
+            detect_row_relations(
+                sheet,
+                r0,
+                r1,
+                c0,
+                c1,
+                header,
+                _finding_sink=collector,
+            )
+            if not wide_integer_limited
+            else []
+        )
         wc = (
             detect_within_column_patterns(
                 sheet,
@@ -9792,6 +10080,7 @@ def _analyze_numeric_blocks(
             "progressions": groups["progressions"],
             "equal_pairs": groups["equal_pairs"],
             "row_pairs": groups["row_pairs"],
+            "row_relations": groups["row_relations"],
             "within_col": groups["within_col"],
             "identical_after_rounding": groups[
                 "identical_after_rounding"
@@ -9830,6 +10119,31 @@ def _process_loaded_sheet(
         cell_budget=_FRACTION_REUSE_CELL_BUDGET,
         with_coverage=True,
     )
+    local_sheet = {(file_name, sheet_name): sheet}
+    within_sheet_findings.extend(
+        detect_scaled_row_reuse(
+            local_sheet,
+            profile=state.profile,
+        )
+    )
+    within_sheet_findings.extend(
+        detect_short_row_reuse(
+            local_sheet,
+            profile=state.profile,
+        )
+    )
+    within_sheet_findings.extend(
+        detect_within_row_shared_fraction(
+            local_sheet,
+            profile=state.profile,
+        )
+    )
+    within_sheet_findings.extend(
+        detect_row_pair_shared_fraction(
+            local_sheet,
+            profile=state.profile,
+        )
+    )
     for limitation in fraction_reuse_limitations:
         state.coverage.add_limitation(
             "sheet",
@@ -9856,6 +10170,12 @@ def _process_loaded_sheet(
     )
     if decimal_report:
         decimal_reports.append(decimal_report)
+    tail_cluster_reports = []
+    tail_cluster_report = detect_decimal_tail_clustering(
+        sheet.iter_numeric_values(), label=label
+    )
+    if tail_cluster_report:
+        tail_cluster_reports.append(tail_cluster_report)
 
     recurring_meta = state.recurring_index.add_sheet(
         file_name,
@@ -9933,6 +10253,7 @@ def _process_loaded_sheet(
         report_blocks=report_blocks,
         digit_reports=digit_reports,
         decimal_reports=decimal_reports,
+        tail_cluster_reports=tail_cluster_reports,
         summaries=[] if summary is None else [summary],
         within_sheet_findings=within_sheet_findings,
         stats=stats,
@@ -9948,6 +10269,7 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
     report_blocks = []
     digit_reports = []
     decimal_reports = []
+    tail_cluster_reports = []
     summaries = []
     within_sheet_findings = []
     errors = []
@@ -10088,6 +10410,9 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
         report_blocks.extend(sheet_result.report_blocks)
         digit_reports.extend(sheet_result.digit_reports)
         decimal_reports.extend(sheet_result.decimal_reports)
+        tail_cluster_reports.extend(
+            sheet_result.tail_cluster_reports
+        )
         summaries.extend(sheet_result.summaries)
         within_sheet_findings.extend(
             sheet_result.within_sheet_findings
@@ -10177,6 +10502,7 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
         report_blocks=report_blocks,
         digit_reports=digit_reports,
         decimal_reports=decimal_reports,
+        tail_cluster_reports=tail_cluster_reports,
         summaries=summaries,
         within_sheet_findings=within_sheet_findings,
         stats={"files": [file_stat], "sheets": sheet_stats},
@@ -10184,16 +10510,47 @@ def _process_file(path, *, input_dir, state) -> FileScanResult:
     )
 
 
+def _optional_image_error(prefix, exc):
+    detail = " ".join((str(exc) or exc.__class__.__name__).split())
+    if len(detail) > 500:
+        detail = detail[:497] + "..."
+    return {"error": f"{prefix}: {detail}"}
+
+
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
              profile="review", write_json=True, evidence=True,
-             diagnostic_on_empty=False, include_runtime=False):
+             diagnostic_on_empty=False, include_runtime=False, images=False,
+             image_diagnostics=False):
     profile = normalize_profile(profile)
     if write_html:
         evidence = True
     files = discover_supported_inputs(in_dir)
-    if not files and not diagnostic_on_empty:
+    from .fetch._files import is_image
+    local_images = sorted(
+        (
+            path for path in (
+                entry.path for entry in os.scandir(in_dir)
+            )
+            if os.path.isfile(path)
+            and is_image(os.path.basename(path))
+        ),
+        key=lambda path: (
+            os.path.basename(path).casefold(),
+            os.path.basename(path),
+        ),
+    )
+    if (
+        not files
+        and not (images and local_images)
+        and not diagnostic_on_empty
+    ):
+        supported = (
+            ".xlsx / .xls / .xlsm / .xlsb / .csv / .tsv / .pdf / .docx"
+        )
+        if images:
+            supported += " / .png / .jpg / .jpeg / .tif / .tiff / .webp"
         raise PaperconanInputError(
-            f"no .xlsx / .xls / .xlsm / .xlsb / .csv / .tsv / .pdf / .docx files in {in_dir}\n"
+            f"no {supported} files in {in_dir}\n"
             f"(paperconan reads .xlsx via openpyxl, legacy .xls / .xlsm / .xlsb via calamine, "
             f".csv / .tsv, and tables inside .pdf / .docx)"
         )
@@ -10237,6 +10594,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     report_blocks = []
     digit_reports = []
     decimal_reports = []
+    tail_cluster_reports = []
     summaries = []
     within_sheet_fraction_findings = []
     scan_errors = []
@@ -10249,6 +10607,9 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         report_blocks.extend(result.report_blocks)
         digit_reports.extend(result.digit_reports)
         decimal_reports.extend(result.decimal_reports)
+        tail_cluster_reports.extend(
+            result.tail_cluster_reports
+        )
         summaries.extend(result.summaries)
         within_sheet_fraction_findings.extend(
             result.within_sheet_findings
@@ -10302,6 +10663,11 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         profile=profile,
         budget=state.cross_sheet_work_budget,
     )
+    if (
+        state.cross_sheet_work_budget is not None
+        and state.cross_sheet_work_budget.pairs_examined > 0
+    ):
+        coverage.mark_non_block_analysis_completed()
     cross_sheet_findings += within_sheet_fraction_findings
     recurring_findings, recurring_meta = state.recurring_index.findings(
         profile=profile,
@@ -10393,6 +10759,72 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             d["p_adj"] = a
             d["fdr_significant"] = bool(s)
 
+    image_assets = []
+    image_findings = []
+    if images:
+        from .image import ImageDependencyError
+        from .image._assets import prepare_image_assets
+        from .image._budget import ImageArtifactBudget
+
+        try:
+            image_budget = ImageArtifactBudget.from_environment()
+        except ValueError as exc:
+            scan_errors.append({"error": str(exc)})
+        else:
+            inventory_ready = False
+            try:
+                from .image._dependencies import (
+                    preflight_image_dependencies,
+                )
+
+                preflight_image_dependencies(
+                    render_pdf=False,
+                    diagnostics=False,
+                )
+                image_assets, image_errors = prepare_image_assets(
+                    in_dir,
+                    out_dir,
+                    artifact_budget=image_budget,
+                )
+                scan_errors.extend(image_errors)
+                inventory_ready = True
+            except ImageDependencyError as exc:
+                scan_errors.append(_optional_image_error(
+                    "optional image inventory unavailable",
+                    exc,
+                ))
+            except Exception as exc:
+                scan_errors.append(_optional_image_error(
+                    "optional image inventory unavailable",
+                    exc,
+                ))
+            if image_diagnostics and inventory_ready:
+                try:
+                    preflight_image_dependencies(
+                        render_pdf=False,
+                        diagnostics=True,
+                    )
+                    from .image._diagnostics import diagnose_image_assets
+
+                    image_findings, diagnostic_errors = (
+                        diagnose_image_assets(
+                            image_assets,
+                            out_dir,
+                            artifact_budget=image_budget,
+                        )
+                    )
+                    scan_errors.extend(diagnostic_errors)
+                except ImageDependencyError as exc:
+                    scan_errors.append(_optional_image_error(
+                        "optional image diagnostics unavailable",
+                        exc,
+                    ))
+                except Exception as exc:
+                    scan_errors.append(_optional_image_error(
+                        "optional image diagnostics unavailable",
+                        exc,
+                    ))
+
     coverage_output = coverage.to_dict()
     if any(
         item.get("reason") == "recurring_row_vector_budget"
@@ -10416,6 +10848,8 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                input_dir=in_dir,
                paper=_load_provenance(in_dir, paper),
                n_files=len(files),
+               n_image_source_files=len(local_images),
+               n_image_assets=len(image_assets),
                n_blocks_with_findings=sum(
                    1
                    for block in report_blocks
@@ -10431,7 +10865,10 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                relations_blocks=report_blocks,
                digit_distribution=digit_reports,
                decimal_endings=decimal_reports,
-               cross_sheet_findings=cross_sheet_findings)
+               decimal_tail_clusters=tail_cluster_reports,
+               cross_sheet_findings=cross_sheet_findings,
+               image_assets=image_assets,
+               image_findings=image_findings)
     if state.findings_omitted_is_lower_bound:
         out["findings_omitted_is_lower_bound"] = True
     os.makedirs(out_dir, exist_ok=True)
@@ -10740,11 +11177,21 @@ def main():
         rp.add_argument("--verdict", required=True, help="Path to verdict JSON")
         rp.add_argument("--out", required=True, help="Output HTML path")
         rargs = rp.parse_args(sys.argv[2:])
-        with open(rargs.scan_json, encoding="utf-8") as fh:
-            scan = json.load(fh)
-        with open(rargs.verdict, encoding="utf-8") as fh:
-            verdict = json.load(fh)
-        write_adjudicated_report(scan, verdict, rargs.out)
+        try:
+            with open(rargs.scan_json, encoding="utf-8") as fh:
+                scan = json.load(fh)
+            with open(rargs.verdict, encoding="utf-8") as fh:
+                verdict = json.load(fh)
+            write_adjudicated_report(
+                scan,
+                verdict,
+                rargs.out,
+                artifact_dir=os.path.dirname(
+                    os.path.abspath(rargs.scan_json)
+                ),
+            )
+        except ValueError as exc:
+            sys.exit(str(exc))
         print(f"wrote {rargs.out}")
         return
     ap = argparse.ArgumentParser(
@@ -10767,12 +11214,30 @@ def main():
                     default="review",
                     help="False-positive handling profile: review (default), forensic, or triage")
     ap.add_argument(
+        "--images",
+        action="store_true",
+        help=(
+            "inventory local/fetched images and render PDF pages into "
+            "scan.json image_assets"
+        ),
+    )
+    ap.add_argument(
+        "--image-diagnostics",
+        action="store_true",
+        help=(
+            "also run optional non-gating deterministic image similarity "
+            "helpers"
+        ),
+    )
+    ap.add_argument(
         "--runtime-metadata",
         action="store_true",
         help="Record wall-clock timestamp and elapsed times",
     )
     ap.add_argument("--version", action="version", version=f"paperconan {_version()}")
     args = ap.parse_args()
+    if args.image_diagnostics and not args.images:
+        ap.error("--image-diagnostics requires --images")
     out_dir = args.out or os.path.join(args.in_dir, "audit")
     write_html = not args.no_html
     paper = None
@@ -10781,7 +11246,9 @@ def main():
     try:
         res = scan_dir(args.in_dir, out_dir, write_md=args.md, write_html=write_html,
                        paper=paper, profile=args.profile, diagnostic_on_empty=True,
-                       include_runtime=args.runtime_metadata)
+                       include_runtime=args.runtime_metadata,
+                       images=args.images,
+                       image_diagnostics=args.image_diagnostics)
     except PaperconanInputError as e:
         sys.exit(str(e))
     if res["scan_status"] == "failed":

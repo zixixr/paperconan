@@ -32,6 +32,30 @@
 
 `scan.json` 完整结构见 [`references/output-schema.md`](../skills/paperconan/references/output-schema.md)。
 
+## 图像语义复核
+
+图像语义复核属于外部多模态 Agent 工作流，PaperConan 不配置模型 API、密钥或 provider
+SDK，也不声称自主完成语义判断。标准顺序是：
+
+1. 运行 `paperconan <input-dir> --images`；只有需要确定性辅助提示时才增加
+   `--image-diagnostics`。
+2. Agent 先确认自己能否打开本地图像，再读取每个 `image_assets` 记录。
+3. 先看整图，理解面板标签、通道、处理步骤、共享对照、inset、图注和 Methods；小面板或
+   未解决细节再使用原始像素裁剪。
+4. 每个资产必须且只能记入 reviewed、unresolved、unreadable 或 deferred 中的一项。
+5. Agent 可以在 `image_findings` 为空时用 `image_refs` 写入图像 finding；这类
+   Agent-only finding 与数值 finding 放在同一个 `verdict.json findings[]`。
+
+确定性 `image_findings` 只比较一个登记资产内的区域；跨资产比较由外部多模态 Agent
+完成。其 `profile_action: "kept"` 只是信息字段，不经过数值 prefilter。若原始来源身份
+仍稳定但 evidence 预算或发布失败，finding 仍会以 `evidence: null` 保留，并在
+`scan_errors` 中记录限制；若来源在评分后改变，该 finding 会被抑制。数值 finding、
+确定性提示和 Agent-only 图像 finding 最终都保留在同一份统一报告中。
+
+没有本地图像能力时，Agent 应写
+`image_review.status: "unavailable_no_multimodal"`，说明图像语义复核未完成，并继续数值
+复核。`image_review.status: "completed"` 表示覆盖记账完成，不表示每个图像问题都已解释。
+
 ## 误报控制：profiles 和 prefilter
 
 检测器先产出原始 signal，`--profile` 再决定怎么处理常见误报。默认 `review`。
@@ -56,19 +80,35 @@
 paperconan report audit/scan.json --verdict verdict.json --out adjudication.html
 ```
 
-流程是一套：**Agent 写判断 → `paperconan report` 渲染**。渲染器**对任何 verdict 都输出同一种高保真版式**（论文头 + Tier/impact/review 徽章 + 每条 finding 的独立卡片 + 紧跟其后的 evidence 热力表）——README 顶部那份示例报告就是这条命令的直接产物，没有任何私有管线。
+流程是一套：**Agent 写判断 → `paperconan report` 渲染**。渲染器**对任何 verdict 都输出同一种高保真版式**（论文头 + Tier/impact/review 徽章 + 每条 finding 的独立卡片 + 紧跟其后的 evidence 热力表）——README 顶部那份示例报告就是这条命令的直接产物，没有任何私有管线。数值证据和图像证据出现在同一 finding 清单和同一 HTML 中，不另建图像报告。
 
-`verdict.json` 的**主形态**是带 `findings` 数组的论文级对象（每条 finding 各带 `finding_ref` / `suspicion_tier` / `impact_scope` / `review_status` / `report_md`，论文级另有 `paper_conclusion` / `overall_impact` / `review_note`）；**单条 finding 只是"列了一条"**，同样富渲染，不再是旧版朴素排版。完整 schema 与例子见 [`references/adjudication-tiers.md`](../skills/paperconan/references/adjudication-tiers.md) › "Multiple Findings In One Paper"。旧的扁平 `report_md` + `finding_refs` 形态向后兼容，现在也会渲染成同样的高保真版式。适合单篇论文复核或批量审计后的归档。
+`verdict.json` 的**主形态**是带 `findings` 数组的论文级对象（每条 finding 各带 `finding_ref` / `suspicion_tier` / `impact_scope` / `review_status` / `report_md`，图像 finding 还可带 `finding_type: "image"` 与 `image_refs`，论文级另有 `paper_conclusion` / `overall_impact` / `review_note` / `image_review`）；**单条 finding 只是"列了一条"**，同样富渲染，不再是旧版朴素排版。完整 schema 与例子见 [`references/adjudication-tiers.md`](../skills/paperconan/references/adjudication-tiers.md) › "Multiple Findings In One Paper" 和 [`references/report-templates.md`](../skills/paperconan/references/report-templates.md) › "Adaptive Numeric And Image Report"。旧的扁平 `report_md` + `finding_refs` 形态向后兼容，现在也会渲染成同样的高保真版式。适合单篇论文复核或批量审计后的归档。
+
+The top-level verdict and all nested verdict objects must be concrete JSON objects.
+在 Python 库入口中，这表示必须使用内建 `dict`，不接受 mapping wrapper 或 `dict` 子类；
+嵌套对象包括 `findings[]`、`finding_ref`、`extra_refs[]`、`image_refs[]`
+以及旧形态的 `finding_refs[]` 条目。Markdown-rendered verdict fields must be strings or `null`：包括 `paper_conclusion`、`review_note`、
+现代 finding 的 `report_md` 和旧形态顶层 `report_md`。
+
+为限制匹配、图像读取和 HTML 卡片构建，单个 verdict 最多接受 5,000 raw verdict references。
+计数在去重前完成，覆盖现代形态的 `finding_ref`、`extra_refs`、
+`image_refs` 以及旧形态的 `finding_refs`；各引用列表原有的单列表上限仍然有效。
 
 证据绑定有三种明确状态，两种 verdict JSON 形态遵循同一规则：
 
-- 省略 `finding_ref` 或将它设为 `null`：可以自动选择当前 profile 下最强的可见统计信号，页面会明确标注为 automatic evidence selection。
+- 省略 `finding_ref` 或将它设为 `null`：数值裁决可以自动选择当前 profile 下最强的可见数值统计信号，页面会明确标注为 automatic evidence selection；不会跨到图像 evidence 类型。
 - 显式 selector 唯一命中：优先使用精确的 file/sheet 身份；跨表 finding 会按同一
   `file_a`/`sheet_a` 或 `file_b`/`sheet_b` 端点绑定。仅在没有精确候选时保留旧版 file
   子串匹配，而且也必须唯一命中。
 - 显式 selector 未命中或存在多个候选（包括 `{}`）：展示未命中的 selector，不补入无关 evidence 表。
 
 旧形态的每个 `finding_refs` selector 都会按原顺序独立绑定，额外的未命中 selector 也会显示。主形态若显式提供 `"findings": []`，会保留为空，不会根据顶层 `report_md` / `finding_refs` 合成旧形态 finding。渲染器只读取 `scan.json` 中的 findings 作为 evidence，不会改写 `scan.json`；profile-hidden finding 仍不会进入判定后报告。
+
+图像 evidence 只会从 `scan.json image_assets[]` 登记且位于审计 artifact 根目录下的有界
+preview 读取并内嵌；`verdict.json` 不能提供任意本机路径。报告中的预览用于复核定位，
+Agent 的小区域判断仍应回到登记的原始像素资产。总内嵌预算由
+`PAPERCONAN_MAX_IMAGE_EVIDENCE_MB` 控制；格式错误、非有限、负数或溢出值会按 `0`
+处理，只关闭图像内嵌，不影响数值报告。
 
 扫描状态只改变确定性 `report.html` / `REPORT.md` 的覆盖说明；`paperconan report`
 的判定后报告布局和两种 verdict JSON 形态保持不变，旧 scan 也不需要补写新字段。

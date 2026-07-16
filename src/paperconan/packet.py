@@ -35,7 +35,7 @@ def _distill_cross_sheet(scan: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         n = int(f.get("same_position_count") or f.get("size_a") or 0)
         # Preserve the decimal-tail-reuse identity: a long fractional tail shared across
-        # sheets is a near-zero-chance statistical-signal pattern, distinct from a generic
+        # sheets is a near-zero-chance data inconsistency, distinct from a generic
         # value_tweaked partial overlap — it must not be relabeled away (or the judge sees
         # only "a small partial overlap" and dismisses it as benign).
         if f.get("kind") == "cross_sheet_decimal_tail_reuse":
@@ -166,14 +166,17 @@ def _distill_block_findings(scan: dict[str, Any]) -> list[dict[str, Any]]:
                 if _is_axis_finding(r):
                     continue
                 n = int(r.get("n") or 0)
-                sample = r.get("col_a_sample") or r.get("value_sample") or []
-                # grim/grimmer findings identify their column as mean_col (with n_col/sd_col),
-                # not col/col_a — carry it so the distilled entry has a usable location.
-                col_a = r.get("col") or r.get("col_a") or r.get("mean_col")
+                # grim/grimmer identify their column as mean_col; the row-oriented
+                # detectors (constant_ratio_row/identical_row) locate by row_a/row_b and
+                # sample as row_a_sample — carry those so the distilled entry keeps a
+                # usable location and value peek instead of dropping them.
+                sample = (r.get("col_a_sample") or r.get("value_sample")
+                          or r.get("row_a_sample") or [])
+                col_a = r.get("col") or r.get("col_a") or r.get("mean_col") or r.get("row_a")
                 findings.append({
                     "kind": r.get("kind"),
                     "col_a": col_a,
-                    "col_b": r.get("col_b") or r.get("sd_col"),
+                    "col_b": r.get("col_b") or r.get("sd_col") or r.get("row_b"),
                     "n": n,
                     "rule": r.get("rule"),
                     "top5_a": list(sample)[:5],
@@ -188,6 +191,38 @@ def _distill_block_findings(scan: dict[str, Any]) -> list[dict[str, Any]]:
                     "figure_label": block.get("figure_label"),
                 })
     return findings
+
+
+def _distill_tail_clusters(scan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Distill high-severity `decimal_tail_clusters` (a top-level per-sheet field, not a
+    per-block group) so the signal reaches the review packet instead of being visible
+    only in the HTML report."""
+    out = []
+    for d in scan.get("decimal_tail_clusters", []) or []:
+        if str(d.get("severity")).lower() != "high":
+            continue
+        label = d.get("label") or ""
+        file, _, sheet = label.partition("::")
+        n = int(d.get("n") or 0)
+        top = d.get("top") or []
+        out.append({
+            "kind": "decimal_tail_clustering",
+            "col_a": sheet or label,
+            "col_b": None,
+            "n": n,
+            "rule": d.get("rule"),
+            "top5_a": [t for t, _ in top[:5]],
+            "top5_b": [],
+            "high_precision": True,
+            "mass": bool(n >= 200),
+            "evidence_confidence": evidence_confidence(n, 1.0, True),
+            "prefilter": "keep",
+            "prefilter_reason": None,
+            "sheet": sheet or None,
+            "file": file or None,
+            "figure_label": None,
+        })
+    return out
 
 
 def distill_findings_for_review(scan: dict[str, Any], *,
@@ -207,6 +242,7 @@ def distill_findings_for_review(scan: dict[str, Any], *,
     findings.extend(_distill_relations(scan))
     findings.extend(_distill_within_col(scan, within_col_drop_budget))
     findings.extend(_distill_block_findings(scan))
+    findings.extend(_distill_tail_clusters(scan))
     return findings
 
 

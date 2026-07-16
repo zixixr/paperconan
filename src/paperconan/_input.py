@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 import posixpath
 from typing import TYPE_CHECKING, Any
@@ -93,24 +94,148 @@ _MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 _CELL_TAG = f"{{{_MAIN_NS}}}c"
+_SHEET_TAG = f"{{{_MAIN_NS}}}sheet"
+_RELATIONSHIP_TAG = f"{{{_PKG_REL_NS}}}Relationship"
+_OOXML_FORMULA_METADATA_BYTES = int(os.environ.get(
+    "PAPERCONAN_OOXML_FORMULA_METADATA_BYTES",
+    str(8 * 1024 * 1024),
+))
+_OOXML_FORMULA_SHEET_LIMIT = int(os.environ.get(
+    "PAPERCONAN_OOXML_FORMULA_SHEET_LIMIT",
+    "10000",
+))
 
 
-def _worksheet_paths(zf) -> list[tuple[str, str]]:
-    workbook = ET.fromstring(zf.read("xl/workbook.xml"))
-    relationships = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
-    targets = {}
-    for relationship in relationships.findall(
-        f"{{{_PKG_REL_NS}}}Relationship"
-    ):
-        targets[relationship.attrib["Id"]] = (
-            relationship.attrib["Target"],
-            relationship.attrib.get("TargetMode"),
+class OoxmlFormulaInspectionLimit(ValueError):
+    def __init__(self, reason, **details):
+        self.reason = reason
+        self.details = details
+        super().__init__(reason)
+
+
+class _BoundedXmlReader:
+    def __init__(self, stream, *, member, byte_limit):
+        self._stream = stream
+        self._member = member
+        self._limit = max(0, int(byte_limit))
+        self._read = 0
+
+    def read(self, size=-1):
+        requested = (
+            64 * 1024
+            if size is None or size < 0
+            else max(0, int(size))
         )
+        allowed = min(requested, self._limit - self._read + 1)
+        data = self._stream.read(max(0, allowed))
+        self._read += len(data)
+        if self._read > self._limit:
+            raise OoxmlFormulaInspectionLimit(
+                "formula_metadata_byte_limit",
+                limit=self._limit,
+                member=self._member,
+            )
+        return data
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _bounded_accepted_sheets(values, *, max_sheets):
+    if values is None:
+        return None
+    limit = max(0, int(max_sheets))
+    accepted = set()
+    for value in values:
+        name = str(value)
+        if name in accepted:
+            continue
+        if len(accepted) >= limit:
+            raise OoxmlFormulaInspectionLimit(
+                "formula_metadata_sheet_limit",
+                limit=limit,
+                selected_sheets=len(accepted) + 1,
+            )
+        accepted.add(name)
+    return frozenset(accepted)
+
+
+def _worksheet_paths(
+    zf,
+    *,
+    accepted_sheets=None,
+    max_sheets=None,
+    metadata_byte_limit=None,
+) -> list[tuple[str, str]]:
+    sheet_limit = (
+        _OOXML_FORMULA_SHEET_LIMIT
+        if max_sheets is None
+        else max_sheets
+    )
+    byte_limit = (
+        _OOXML_FORMULA_METADATA_BYTES
+        if metadata_byte_limit is None
+        else metadata_byte_limit
+    )
+    accepted = _bounded_accepted_sheets(
+        accepted_sheets,
+        max_sheets=sheet_limit,
+    )
+    if accepted == frozenset():
+        return []
+
+    workbook_sheets = []
+    with zf.open("xl/workbook.xml") as stream:
+        bounded = _BoundedXmlReader(
+            stream,
+            member="xl/workbook.xml",
+            byte_limit=byte_limit,
+        )
+        for _event, sheet in ET.iterparse(bounded, events=("end",)):
+            if sheet.tag == _SHEET_TAG:
+                sheet_name = sheet.attrib["name"]
+                if accepted is None or sheet_name in accepted:
+                    if len(workbook_sheets) >= max(
+                        0, int(sheet_limit)
+                    ):
+                        raise OoxmlFormulaInspectionLimit(
+                            "formula_metadata_sheet_limit",
+                            limit=max(0, int(sheet_limit)),
+                            selected_sheets=(
+                                len(workbook_sheets) + 1
+                            ),
+                        )
+                    workbook_sheets.append((
+                        sheet_name,
+                        sheet.attrib[f"{{{_REL_NS}}}id"],
+                    ))
+            sheet.clear()
+    if not workbook_sheets:
+        return []
+
+    needed_ids = {rel_id for _name, rel_id in workbook_sheets}
+    targets = {}
+    with zf.open("xl/_rels/workbook.xml.rels") as stream:
+        bounded = _BoundedXmlReader(
+            stream,
+            member="xl/_rels/workbook.xml.rels",
+            byte_limit=byte_limit,
+        )
+        for _event, relationship in ET.iterparse(
+            bounded, events=("end",)
+        ):
+            if (
+                relationship.tag == _RELATIONSHIP_TAG
+                and relationship.attrib["Id"] in needed_ids
+            ):
+                targets[relationship.attrib["Id"]] = (
+                    relationship.attrib["Target"],
+                    relationship.attrib.get("TargetMode"),
+                )
+            relationship.clear()
 
     out = []
-    sheets = workbook.find(f"{{{_MAIN_NS}}}sheets")
-    for sheet in list(sheets) if sheets is not None else []:
-        rel_id = sheet.attrib[f"{{{_REL_NS}}}id"]
+    for sheet_name, rel_id in workbook_sheets:
         target, target_mode = targets[rel_id]
         if target_mode == "External":
             raise ValueError(f"worksheet target is external: {target!r}")
@@ -121,12 +246,12 @@ def _worksheet_paths(zf) -> list[tuple[str, str]]:
             member = posixpath.normpath(posixpath.join("xl", target))
         if member in {"", ".", ".."} or member.startswith("../"):
             raise ValueError(f"worksheet target leaves package: {target!r}")
-        out.append((sheet.attrib["name"], member))
+        out.append((sheet_name, member))
     return out
 
 
 def inspect_ooxml_formula_cache(
-    path, *, max_examples=20
+    path, *, max_examples=20, accepted_sheets=None
 ) -> dict[str, dict[str, object]]:
     if not str(path).lower().endswith((".xlsx", ".xlsm")):
         return {}
@@ -134,7 +259,10 @@ def inspect_ooxml_formula_cache(
     example_limit = max(0, int(max_examples))
     gaps = {}
     with zipfile.ZipFile(path) as zf:
-        for sheet_name, member in _worksheet_paths(zf):
+        for sheet_name, member in _worksheet_paths(
+            zf,
+            accepted_sheets=accepted_sheets,
+        ):
             count = 0
             cells = []
             with zf.open(member) as stream:

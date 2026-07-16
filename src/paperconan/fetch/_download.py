@@ -4,13 +4,26 @@ from __future__ import annotations
 from bisect import bisect_right
 import codecs
 from collections import Counter
+from contextlib import contextmanager, nullcontext
+import ctypes
+from dataclasses import dataclass
+from enum import Enum
+import errno
+import gzip
 import hashlib
+import io
 import json
 import os
+import re
+import secrets
+import stat
 import struct
+import sys
 import tarfile
 import tempfile
+import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,11 +34,26 @@ from paperconan._input import is_supported_input
 from paperconan._source_sidecar import (
     SidecarLimitError,
     encode_sidecar,
+    parse_sidecar_bytes,
     read_sidecar,
 )
+from . import _http
+from ._files import asset_type
 
 # Provenance sidecar written next to downloads; read back by scan_dir to stamp scan.json.
 SOURCE_SIDECAR = "paperconan_source.json"
+_RESERVED_SOURCE_SIDECAR_REASON = "reserved provenance sidecar basename"
+_ZIP_MEMBER_READ_EXCEPTIONS = (
+    zipfile.BadZipFile,
+    zlib.error,
+    RuntimeError,
+    NotImplementedError,
+)
+_TAR_STREAM_READ_EXCEPTIONS = (
+    gzip.BadGzipFile,
+    EOFError,
+    zlib.error,
+)
 
 _UA = "paperconan-fetch/0.6 (+https://github.com/zixixr/paperconan)"
 _DEFAULT_MAX = 50 * 1024 * 1024     # 50 MB — per individual file / per extracted table
@@ -74,6 +102,7 @@ _SOURCE_SIDECAR_MAX_BYTES = int(
         str(2 * 1024 * 1024),
     )
 )
+_MAX_SOURCE_SIDECAR_BYTES = _SOURCE_SIDECAR_MAX_BYTES
 _SOURCE_SIDECAR_ENTRY_LIMIT = int(
     os.environ.get(
         "PAPERCONAN_SOURCE_SIDECAR_ENTRY_LIMIT",
@@ -99,13 +128,1117 @@ _MANAGED_OUTPUT_COLLISION_PROBE_LIMIT = int(
     )
 )
 _TRANSIENT_CLEANUP_ATTEMPTS = 2
+_INTERNAL_STATE_ENTRY_LIMIT = 4096
+_INTERNAL_STATE_NAME_BYTES = 1024 * 1024
+_INTERNAL_STATE_METADATA_LIMIT = 4096
+_MAX_PUBLISHED_FILES_PER_CANDIDATE = 1000
+_MAX_ARCHIVE_MEMBERS_PER_CANDIDATE = 1000
+_MAX_RAW_ZIP_ENTRIES_PER_ARCHIVE = 4096
+_MAX_RAW_TAR_MEMBERS_PER_ARCHIVE = 4096
+_MAX_UNCOMPRESSED_TAR_BYTES_PER_ARCHIVE = 2 * _ARCHIVE_MAX
+_FILE_COPY_CHUNK_BYTES = 64 * 1024
+_URL_IN_ERROR = re.compile(r"https?://[^\s]+")
+_URL_POLICY_SKIP_REASON = "download URL rejected by HTTP(S) policy"
 _ZIP_UTF8_FILENAME_FLAG = 1 << 11
 _ZIP64_EXTRA_FIELD = 0x0001
 _ZIP_UNICODE_PATH_EXTRA_FIELD = 0x7075
+_ZIP_EOCD = struct.Struct("<4s4H2IH")
+_ZIP64_LOCATOR = struct.Struct("<4sIQI")
+_ZIP64_EOCD = struct.Struct("<4sQ2H2I4Q")
+_ZIP_CENTRAL_FILE_HEADER = struct.Struct("<4s6H3I5H2I")
+_ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
+_ZIP64_LOCATOR_SIGNATURE = b"PK\x06\x07"
+_ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
+_ZIP_CENTRAL_DIRECTORY_SIGNATURE = b"PK\x01\x02"
+_ZIP_MAX_COMMENT_BYTES = 0xFFFF
+_ZIP16_SENTINEL = 0xFFFF
+_ZIP32_SENTINEL = 0xFFFFFFFF
+_ROLLBACK_NAME_HASH = hashlib.sha256
 
 
 class _SizeLimitExceeded(ValueError):
     pass
+
+
+class _UnstableRegularFileError(OSError):
+    pass
+
+
+class _IdentityBoundMutationUnavailableError(OSError):
+    pass
+
+
+class _ManagedOutputRecoveryRequiredError(_UnstableRegularFileError):
+    def __init__(self, message, *, recovery_paths=()):
+        self.recovery_paths = tuple(recovery_paths)
+        super().__init__(message)
+
+
+class _ManagedOutputPrepareError(_UnstableRegularFileError):
+    pass
+
+
+class _SourceSidecarLimitError(ValueError):
+    pass
+
+
+class _SourceSidecarPublicationError(ValueError):
+    pass
+
+
+class _SourceSidecarRecoveryRequiredError(
+    _SourceSidecarPublicationError
+):
+    def __init__(
+        self,
+        message,
+        *,
+        recovery_paths,
+        operation_error,
+        rollback_error=None,
+    ):
+        self.recovery_paths = tuple(recovery_paths)
+        self.operation_error = operation_error
+        self.rollback_error = rollback_error
+        details = ", ".join(self.recovery_paths)
+        if details:
+            message = (
+                f"{message}; retained sidecar recovery path: {details}"
+            )
+        super().__init__(message)
+
+
+class _ManagedOutputJournalState(Enum):
+    OPEN = "OPEN"
+    COMMIT_CLEANUP = "COMMIT_CLEANUP"
+    COMMITTED = "COMMITTED"
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+
+
+class _PaperDataLimitError(ValueError):
+    pass
+
+
+class _ArchiveReadError(Exception):
+    pass
+
+
+class _PublicationRecoveryError(OSError):
+    pass
+
+
+@dataclass(frozen=True)
+class _PublishedOutputFile:
+    filename: str
+    size: int
+    identity: tuple[int, int]
+    sha256: str
+    created: bool
+    cleanup_warning: str | None = None
+
+    def display_path(self, output):
+        return os.path.join(output.path, self.filename)
+
+
+@dataclass
+class _SourceSidecarWriteResult:
+    pending_cleanup: tuple[object, ...] = ()
+    cleanup_warning: str | None = None
+
+
+class _ArchiveExtractionPaths(list):
+    def __init__(self, paths=(), *, skipped=()):
+        super().__init__(paths)
+        self.skipped = list(skipped)
+
+
+@dataclass
+class _CandidateCardinality:
+    max_published_files: int
+    max_archive_members: int
+    published_files: int = 0
+    archive_members: int = 0
+
+    def can_publish(self):
+        return self.published_files < self.max_published_files
+
+    def record_publication(self):
+        self.published_files += 1
+
+    def claim_archive_member(self):
+        if self.archive_members >= self.max_archive_members:
+            return False
+        self.archive_members += 1
+        return True
+
+
+@dataclass(frozen=True)
+class _ManagedFileState:
+    name: str
+    size: int
+    sha256: str
+    identity: tuple[int, int]
+    created: bool = False
+    mtime_ns: int | None = None
+    ctime_ns: int | None = None
+    cleanup_warning: str | None = None
+
+
+_PENDING_CLEANUP_WITHOUT_PATH = object()
+# FreeBSD funlinkat atomically requires the name and descriptor to match.
+_FREEBSD_AT_REMOVEDIR = 0x0800
+_IDENTITY_BOUND_UNSUPPORTED_ERRNOS = frozenset({
+    errno.ENOSYS,
+    errno.ENOTSUP,
+    errno.EOPNOTSUPP,
+})
+_IN_ROOT_TRANSACTION_PREFIXES = (
+    ".paperconan-download-",
+    ".paperconan-member-",
+    ".paperconan-archive-",
+    ".paperconan-zip-snapshot-",
+    ".paperconan-publish-",
+    f".{SOURCE_SIDECAR}.",
+)
+_SIBLING_ROLLBACK_PREFIXES = (
+    ".paperconan-output-rollback-",
+    ".paperconan-sidecar-rollback-",
+)
+
+
+def _load_funlinkat():
+    if not sys.platform.startswith("freebsd"):
+        return None
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        funlinkat = libc.funlinkat
+        funlinkat.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_int,
+        )
+        funlinkat.restype = ctypes.c_int
+    except (AttributeError, OSError, TypeError):
+        return None
+
+    def remove(
+        directory_fd,
+        name,
+        descriptor,
+        *,
+        is_directory,
+    ):
+        flags = _FREEBSD_AT_REMOVEDIR if is_directory else 0
+        encoded_name = os.fsencode(name)
+        ctypes.set_errno(0)
+        if funlinkat(
+            directory_fd,
+            encoded_name,
+            descriptor,
+            flags,
+        ) == 0:
+            return
+        error_number = ctypes.get_errno() or errno.EIO
+        if error_number in _IDENTITY_BOUND_UNSUPPORTED_ERRNOS:
+            raise _IdentityBoundMutationUnavailableError(
+                error_number,
+                "identity-bound cleanup is unavailable",
+                os.fsdecode(encoded_name),
+            )
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            os.fsdecode(encoded_name),
+        )
+
+    return remove
+
+
+_FUNLINKAT_RUNTIME_UNAVAILABLE_PENDING = object()
+_FUNLINKAT_RUNTIME_UNAVAILABLE = object()
+_FUNLINKAT_STATE_LOCK = threading.RLock()
+_FUNLINKAT_CANDIDATE_STATE = threading.local()
+_FUNLINKAT = _load_funlinkat()
+
+
+def _candidate_transaction_active():
+    return (
+        getattr(_FUNLINKAT_CANDIDATE_STATE, "depth", 0) > 0
+    )
+
+
+@contextmanager
+def _candidate_transaction_admission():
+    global _FUNLINKAT
+    with _FUNLINKAT_STATE_LOCK:
+        if (
+            _FUNLINKAT
+            is _FUNLINKAT_RUNTIME_UNAVAILABLE_PENDING
+            or _FUNLINKAT is _FUNLINKAT_RUNTIME_UNAVAILABLE
+        ):
+            yield False
+            return
+        previous_depth = getattr(
+            _FUNLINKAT_CANDIDATE_STATE,
+            "depth",
+            0,
+        )
+        _FUNLINKAT_CANDIDATE_STATE.depth = previous_depth + 1
+        try:
+            yield True
+        finally:
+            if previous_depth:
+                _FUNLINKAT_CANDIDATE_STATE.depth = previous_depth
+            else:
+                try:
+                    del _FUNLINKAT_CANDIDATE_STATE.depth
+                except AttributeError:
+                    pass
+                if (
+                    _FUNLINKAT
+                    is _FUNLINKAT_RUNTIME_UNAVAILABLE_PENDING
+                ):
+                    _FUNLINKAT = _FUNLINKAT_RUNTIME_UNAVAILABLE
+
+
+@contextmanager
+def _transaction_state_allocation():
+    with _FUNLINKAT_STATE_LOCK:
+        if (
+            _FUNLINKAT is _FUNLINKAT_RUNTIME_UNAVAILABLE
+            or (
+                _FUNLINKAT
+                is _FUNLINKAT_RUNTIME_UNAVAILABLE_PENDING
+                and not _candidate_transaction_active()
+            )
+        ):
+            raise _IdentityBoundMutationUnavailableError(
+                "identity-bound cleanup is unavailable"
+            )
+        yield
+
+
+def _identity_bound_mutation_available():
+    with _FUNLINKAT_STATE_LOCK:
+        return (
+            _FUNLINKAT is not None
+            and _FUNLINKAT
+            is not _FUNLINKAT_RUNTIME_UNAVAILABLE_PENDING
+            and _FUNLINKAT is not _FUNLINKAT_RUNTIME_UNAVAILABLE
+        )
+
+
+def _require_identity_bound_mutation():
+    if not _identity_bound_mutation_available():
+        raise _IdentityBoundMutationUnavailableError(
+            "identity-bound cleanup is unavailable"
+        )
+
+
+def _identity_bound_remove(
+    directory_fd,
+    name,
+    descriptor,
+    *,
+    is_directory,
+):
+    global _FUNLINKAT
+    with _FUNLINKAT_STATE_LOCK:
+        if (
+            _FUNLINKAT is None
+            or _FUNLINKAT
+            is _FUNLINKAT_RUNTIME_UNAVAILABLE_PENDING
+            or _FUNLINKAT is _FUNLINKAT_RUNTIME_UNAVAILABLE
+        ):
+            raise _IdentityBoundMutationUnavailableError(
+                "identity-bound cleanup is unavailable"
+            )
+        remove = _FUNLINKAT
+        try:
+            remove(
+                directory_fd,
+                name,
+                descriptor,
+                is_directory=is_directory,
+            )
+        except OSError as error:
+            if error.errno in _IDENTITY_BOUND_UNSUPPORTED_ERRNOS:
+                if _candidate_transaction_active():
+                    _FUNLINKAT = (
+                        _FUNLINKAT_RUNTIME_UNAVAILABLE_PENDING
+                    )
+                else:
+                    _FUNLINKAT = _FUNLINKAT_RUNTIME_UNAVAILABLE
+            raise
+
+
+def _rollback_directory_name(output, prefix):
+    opened_output = os.fstat(output.fd)
+    identity_seed = (
+        f"{opened_output.st_dev}:{opened_output.st_ino}:{prefix}"
+    ).encode("ascii")
+    return (
+        f"{prefix}"
+        f"{_ROLLBACK_NAME_HASH(identity_seed).hexdigest()[:16]}"
+    )
+
+
+class _PinnedOutputDirectory:
+    def __init__(self, path, fd):
+        self.path = os.path.abspath(os.fspath(path))
+        self.fd = fd
+        self._opened = os.fstat(fd)
+
+    def __fspath__(self):
+        return self.path
+
+    def verify(self):
+        try:
+            current = os.stat(self.path, follow_symlinks=False)
+        except (OSError, TypeError, NotImplementedError) as error:
+            raise ValueError(
+                "fetch output directory changed during publication"
+            ) from error
+        if (
+            not stat.S_ISDIR(self._opened.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or self._opened.st_dev != current.st_dev
+            or self._opened.st_ino != current.st_ino
+        ):
+            raise ValueError(
+                "fetch output directory changed during publication"
+            )
+
+
+class _DownloadStagingFile:
+    def __init__(self, output, name, fd, logical_name=None):
+        self.output = output
+        self.name = name
+        self.fd = fd
+        self.logical_name = logical_name
+        self._cleanup_attempted = False
+        self._cleanup_result = None
+
+    @property
+    def display_path(self):
+        return os.path.join(self.output.path, self.name)
+
+    def __fspath__(self):
+        if self.logical_name is not None:
+            return os.path.join(self.output.path, self.logical_name)
+        if os.path.isdir("/dev/fd"):
+            return f"/dev/fd/{self.fd}"
+        return f"/proc/self/fd/{self.fd}"
+
+
+class _PrivateZipSnapshot:
+    def __init__(self, stream, staging):
+        self._stream = stream
+        self.staging = staging
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _output_path(output):
+    if isinstance(output, _PinnedOutputDirectory):
+        return output.path
+    return os.fspath(output)
+
+
+@contextmanager
+def _pinned_output_directory(path):
+    absolute = os.path.abspath(os.fspath(path))
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise ValueError("secure fetch output publication is unavailable")
+    try:
+        existing = os.stat(absolute, follow_symlinks=False)
+    except FileNotFoundError:
+        os.makedirs(absolute, exist_ok=False)
+    except (OSError, TypeError, NotImplementedError) as error:
+        raise ValueError(
+            "fetch output directory is not a stable no-follow directory"
+        ) from error
+    else:
+        if not stat.S_ISDIR(existing.st_mode):
+            raise ValueError(
+                "fetch output directory is not a stable no-follow directory"
+            )
+    try:
+        fd = os.open(
+            absolute,
+            os.O_RDONLY | directory | nofollow,
+        )
+    except (OSError, TypeError, NotImplementedError) as error:
+        raise ValueError(
+            "fetch output directory is not a stable no-follow directory"
+        ) from error
+    try:
+        output = _PinnedOutputDirectory(absolute, fd)
+        output.verify()
+        yield output
+    finally:
+        os.close(fd)
+
+
+def _verify_staging_file(staging):
+    opened = os.fstat(staging.fd)
+    try:
+        current = os.stat(
+            staging.name,
+            dir_fd=staging.output.fd,
+            follow_symlinks=False,
+        )
+    except (OSError, TypeError, NotImplementedError) as error:
+        raise _UnstableRegularFileError(
+            "download staging entry is unavailable"
+        ) from error
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+        or (opened.st_dev, opened.st_ino)
+        != (current.st_dev, current.st_ino)
+    ):
+        raise _UnstableRegularFileError(
+            "download staging entry is not a stable regular file"
+        )
+
+
+def _unlink_owned_regular_entry(
+    directory_fd,
+    name,
+    descriptor,
+    *,
+    expected=None,
+):
+    try:
+        opened = os.fstat(descriptor)
+        current = os.stat(
+            name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return False
+    except (
+        OSError,
+        TypeError,
+        NotImplementedError,
+        ValueError,
+    ) as error:
+        raise _UnstableRegularFileError(
+            "owned entry cleanup verification is unavailable"
+        ) from error
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+        or (current.st_dev, current.st_ino)
+        != (opened.st_dev, opened.st_ino)
+        or current.st_size != opened.st_size
+        or current.st_mtime_ns != opened.st_mtime_ns
+        or current.st_ctime_ns != opened.st_ctime_ns
+        or (
+            expected is not None
+            and (
+                (opened.st_dev, opened.st_ino) != expected.identity
+                or opened.st_size != expected.size
+                or (
+                    expected.mtime_ns is not None
+                    and opened.st_mtime_ns != expected.mtime_ns
+                )
+                or (
+                    expected.ctime_ns is not None
+                    and opened.st_ctime_ns != expected.ctime_ns
+                )
+            )
+        )
+    ):
+        raise _UnstableRegularFileError(
+            "owned entry changed before cleanup"
+        )
+    _identity_bound_remove(
+        directory_fd,
+        name,
+        descriptor,
+        is_directory=False,
+    )
+    return True
+
+
+def _open_owned_regular_entry(
+    directory_fd,
+    name,
+    *,
+    expected=None,
+    error_message="owned entry changed",
+):
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise _UnstableRegularFileError(error_message)
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | nofollow,
+            dir_fd=directory_fd,
+        )
+    except FileNotFoundError:
+        raise
+    except (
+        OSError,
+        TypeError,
+        NotImplementedError,
+        ValueError,
+    ) as error:
+        raise _UnstableRegularFileError(error_message) from error
+    try:
+        opened = os.fstat(descriptor)
+        current = os.stat(
+            name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or (opened.st_dev, opened.st_ino)
+            != (current.st_dev, current.st_ino)
+            or opened.st_size != current.st_size
+            or opened.st_mtime_ns != current.st_mtime_ns
+            or opened.st_ctime_ns != current.st_ctime_ns
+            or (
+                expected is not None
+                and (
+                    (opened.st_dev, opened.st_ino) != expected.identity
+                    or opened.st_size != expected.size
+                    or (
+                        expected.mtime_ns is not None
+                        and opened.st_mtime_ns != expected.mtime_ns
+                    )
+                    or (
+                        expected.ctime_ns is not None
+                        and opened.st_ctime_ns != expected.ctime_ns
+                    )
+                )
+            )
+        ):
+            raise _UnstableRegularFileError(error_message)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _download_staging_file(
+    output,
+    *,
+    prefix,
+    suffix,
+    logical_name=None,
+):
+    output.verify()
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise _UnstableRegularFileError(
+            "no-follow file creation is unavailable"
+        )
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow
+    for _attempt in range(128):
+        name = f"{prefix}{secrets.token_hex(8)}{suffix}"
+        try:
+            with _transaction_state_allocation():
+                fd = os.open(
+                    name,
+                    flags,
+                    0o600,
+                    dir_fd=output.fd,
+                )
+        except FileExistsError:
+            continue
+        staging = _DownloadStagingFile(
+            output,
+            name,
+            fd,
+            logical_name=logical_name,
+        )
+        try:
+            _verify_staging_file(staging)
+            output.verify()
+            return staging
+        except BaseException as operation_error:
+            cleanup_error = None
+            try:
+                _unlink_owned_regular_entry(
+                    output.fd,
+                    name,
+                    fd,
+                )
+            except (
+                OSError,
+                TypeError,
+                NotImplementedError,
+                ValueError,
+            ) as error:
+                cleanup_error = _UnstableRegularFileError(
+                    "download staging cleanup incomplete"
+                )
+                cleanup_error.__cause__ = error
+                cleanup_error.__suppress_context__ = True
+            try:
+                os.close(fd)
+            except OSError as error:
+                if cleanup_error is None:
+                    cleanup_error = _UnstableRegularFileError(
+                        "download staging cleanup incomplete"
+                    )
+                    cleanup_error.__cause__ = error
+                    cleanup_error.__suppress_context__ = True
+            if cleanup_error is not None:
+                _raise_transient_cleanup_error(
+                    "<download staging>",
+                    cleanup_error,
+                    operation_error,
+                )
+            raise
+    raise FileExistsError("could not allocate fetch download staging file")
+
+
+def _cleanup_download_staging(staging):
+    if staging is None:
+        return None
+    if staging._cleanup_attempted:
+        return staging._cleanup_result
+    staging._cleanup_attempted = True
+    failures = []
+    descriptor = staging.fd
+    staging.fd = -1
+    try:
+        _unlink_owned_regular_entry(
+            staging.output.fd,
+            staging.name,
+            descriptor,
+        )
+    except (
+        OSError,
+        TypeError,
+        NotImplementedError,
+        ValueError,
+    ):
+        failures.append("deletion failed")
+    try:
+        os.close(descriptor)
+    except OSError:
+        failures.append("descriptor close failed")
+    if failures:
+        staging._cleanup_result = (
+            "download staging cleanup incomplete: "
+            + ", ".join(failures)
+        )
+    return staging._cleanup_result
+
+
+@contextmanager
+def _open_download_staging(staging):
+    try:
+        staging.output.verify()
+        _verify_staging_file(staging)
+    except ValueError as error:
+        raise _UnstableRegularFileError(str(error)) from error
+    with os.fdopen(os.dup(staging.fd), "rb") as stream:
+        stream.seek(0)
+        yield stream
+        _verify_staging_file(staging)
+        try:
+            staging.output.verify()
+        except ValueError as error:
+            raise _UnstableRegularFileError(str(error)) from error
+
+
+def _hash_exact_fd(fd, size):
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    remaining = size
+    while remaining:
+        chunk = os.read(fd, min(_FILE_COPY_CHUNK_BYTES, remaining))
+        if not chunk:
+            raise _UnstableRegularFileError(
+                "regular file changed during bounded read"
+            )
+        digest.update(chunk)
+        remaining -= len(chunk)
+    if os.read(fd, 1):
+        raise _UnstableRegularFileError(
+            "regular file changed during bounded read"
+        )
+    return digest.hexdigest()
+
+
+def _read_verified_download_staging(staging, *, max_bytes):
+    try:
+        staging.output.verify()
+        _verify_staging_file(staging)
+    except ValueError as error:
+        raise _UnstableRegularFileError(str(error)) from error
+    initial = os.fstat(staging.fd)
+    if not stat.S_ISREG(initial.st_mode):
+        raise _UnstableRegularFileError(
+            "download staging entry is not a stable regular file"
+        )
+    if initial.st_size > max_bytes:
+        raise ValueError(
+            "downloaded file exceeds max_bytes after staging verification "
+            f"({max_bytes})"
+        )
+    with _open_download_staging(staging) as source:
+        data = source.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError(
+            "downloaded file exceeds max_bytes after staging verification "
+            f"({max_bytes})"
+        )
+    if len(data) != initial.st_size:
+        raise _UnstableRegularFileError(
+            "downloaded file size changed during bounded staging read"
+        )
+    expected_sha256 = hashlib.sha256(data).hexdigest()
+    final = os.fstat(staging.fd)
+    if (
+        not stat.S_ISREG(final.st_mode)
+        or final.st_size != initial.st_size
+        or (final.st_dev, final.st_ino)
+        != (initial.st_dev, initial.st_ino)
+        or final.st_mtime_ns != initial.st_mtime_ns
+        or final.st_ctime_ns != initial.st_ctime_ns
+        or _hash_exact_fd(staging.fd, initial.st_size)
+        != expected_sha256
+    ):
+        raise _UnstableRegularFileError(
+            "downloaded file content changed during bounded staging read"
+        )
+    _verify_staging_file(staging)
+    try:
+        staging.output.verify()
+    except ValueError as error:
+        raise _UnstableRegularFileError(str(error)) from error
+    return data
+
+
+class _BoundedUncompressedReader:
+    def __init__(
+        self,
+        source,
+        *,
+        max_bytes,
+        max_members,
+    ):
+        self._source = source
+        self._max_bytes = max(0, int(max_bytes))
+        self._max_members = max(0, int(max_members))
+        self._used_bytes = 0
+        self._raw_members = 0
+        self._scan_buffer = bytearray()
+        self._payload_padding_remaining = 0
+        self._archive_ended = False
+
+    def readable(self):
+        return True
+
+    def read(self, size=-1):
+        if size == 0:
+            return b""
+        remaining = self._max_bytes - self._used_bytes
+        requested = remaining + 1 if size is None or size < 0 else size
+        requested = min(max(1, requested), remaining + 1)
+        if not self._archive_ended:
+            parser_boundary = (
+                self._payload_padding_remaining
+                or tarfile.BLOCKSIZE - len(self._scan_buffer)
+            )
+            requested = min(requested, max(1, parser_boundary))
+        data = self._source.read(requested)
+        self._used_bytes += len(data)
+        if self._used_bytes > self._max_bytes:
+            raise ValueError(
+                "decompressed TAR byte ceiling exceeded "
+                f"({self._max_bytes})"
+            )
+        self._scan_raw_tar(data)
+        return data
+
+    def readinto(self, buffer):
+        data = self.read(len(buffer))
+        buffer[:len(data)] = data
+        return len(data)
+
+    def _scan_raw_tar(self, data):
+        if self._archive_ended or not data:
+            return
+        self._scan_buffer.extend(data)
+        block_size = tarfile.BLOCKSIZE
+        while True:
+            if self._payload_padding_remaining:
+                consumed = min(
+                    len(self._scan_buffer),
+                    self._payload_padding_remaining,
+                )
+                del self._scan_buffer[:consumed]
+                self._payload_padding_remaining -= consumed
+                if (
+                    self._payload_padding_remaining
+                    or not self._scan_buffer
+                ):
+                    return
+            if len(self._scan_buffer) < block_size:
+                return
+            header = bytes(self._scan_buffer[:block_size])
+            del self._scan_buffer[:block_size]
+            if header == tarfile.NUL * block_size:
+                self._archive_ended = True
+                self._scan_buffer.clear()
+                return
+            self._raw_members += 1
+            if self._raw_members > self._max_members:
+                raise ValueError(
+                    "raw TAR member count exceeds traversal ceiling "
+                    f"({self._max_members})"
+                )
+            raw_info = tarfile.TarInfo.frombuf(
+                header,
+                tarfile.ENCODING,
+                "surrogateescape",
+            )
+            self._payload_padding_remaining = (
+                (raw_info.size + block_size - 1) // block_size
+            ) * block_size
+
+
+@contextmanager
+def _private_zip_snapshot(
+    source,
+    *,
+    max_bytes,
+    output,
+    cleanup_warnings,
+):
+    if not isinstance(output, _PinnedOutputDirectory):
+        raise _UnstableRegularFileError(
+            "private ZIP snapshot requires a pinned output directory"
+        )
+    staging = None
+    snapshot_stream = None
+    try:
+        try:
+            staging = _download_staging_file(
+                output,
+                prefix=".paperconan-zip-snapshot-",
+                suffix=".zip",
+            )
+            source.seek(0, os.SEEK_SET)
+            total = 0
+            while True:
+                chunk = source.read(_FILE_COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(
+                        "private ZIP snapshot exceeds archive limit "
+                        f"({max_bytes})"
+                    )
+                pending = memoryview(chunk)
+                while pending:
+                    written = os.write(staging.fd, pending)
+                    if written <= 0:
+                        raise OSError(
+                            "private ZIP snapshot write failed"
+                        )
+                    pending = pending[written:]
+            os.fsync(staging.fd)
+            written_state = os.fstat(staging.fd)
+            if (
+                not stat.S_ISREG(written_state.st_mode)
+                or written_state.st_size != total
+            ):
+                raise _UnstableRegularFileError(
+                    "private ZIP snapshot is not a stable regular file"
+                )
+            stable = _stable_staging_state(staging)
+            reader_fd = _open_owned_regular_entry(
+                output.fd,
+                staging.name,
+                expected=stable,
+                error_message=(
+                    "private ZIP snapshot changed before read-only reopen"
+                ),
+            )
+            writer_fd = staging.fd
+            staging.fd = reader_fd
+            os.close(writer_fd)
+            snapshot_stream = os.fdopen(
+                os.dup(staging.fd),
+                "rb",
+            )
+        except (OSError, ValueError) as error:
+            detail = str(error)
+            if staging is not None:
+                detail = detail.replace(
+                    staging.display_path,
+                    "<private ZIP snapshot>",
+                ).replace(
+                    staging.name,
+                    "<private ZIP snapshot>",
+                )
+                cleanup_warning = _cleanup_download_staging(
+                    staging
+                )
+                if cleanup_warning is not None:
+                    detail = (
+                        f"{detail}; private ZIP snapshot cleanup pending"
+                    )
+            raise _UnstableRegularFileError(
+                f"private ZIP snapshot unavailable: {detail}"
+            ) from error
+        with snapshot_stream:
+            yield _PrivateZipSnapshot(snapshot_stream, staging)
+    finally:
+        if staging is not None:
+            cleanup_warning = _cleanup_download_staging(staging)
+            if (
+                cleanup_warning is not None
+                and "private ZIP snapshot cleanup pending"
+                not in cleanup_warnings
+            ):
+                cleanup_warnings.append(
+                    "private ZIP snapshot cleanup pending"
+                )
+
+
+def _stable_managed_file(output, name, expected=None):
+    output.verify()
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise _UnstableRegularFileError(
+            "no-follow file opening is unavailable"
+        )
+    try:
+        fd = os.open(
+            name,
+            os.O_RDONLY | nofollow,
+            dir_fd=output.fd,
+        )
+    except (OSError, TypeError, NotImplementedError) as error:
+        raise _UnstableRegularFileError(
+            "managed output entry is unavailable"
+        ) from error
+    try:
+        opened = os.fstat(fd)
+        try:
+            current = os.stat(
+                name,
+                dir_fd=output.fd,
+                follow_symlinks=False,
+            )
+        except (OSError, TypeError, NotImplementedError) as error:
+            raise _UnstableRegularFileError(
+                "managed output entry is unavailable"
+            ) from error
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or (opened.st_dev, opened.st_ino)
+            != (current.st_dev, current.st_ino)
+        ):
+            raise _UnstableRegularFileError(
+                "managed output entry is not a stable regular file"
+            )
+        if expected is not None and opened.st_size != expected["size"]:
+            raise _UnstableRegularFileError(
+                "managed output fingerprint does not match"
+            )
+        digest = _hash_exact_fd(fd, opened.st_size)
+        final_opened = os.fstat(fd)
+        try:
+            final_current = os.stat(
+                name,
+                dir_fd=output.fd,
+                follow_symlinks=False,
+            )
+        except (OSError, TypeError, NotImplementedError) as error:
+            raise _UnstableRegularFileError(
+                "managed output entry is unavailable"
+            ) from error
+        if (
+            not stat.S_ISREG(final_opened.st_mode)
+            or not stat.S_ISREG(final_current.st_mode)
+            or final_opened.st_size != opened.st_size
+            or final_opened.st_mtime_ns != opened.st_mtime_ns
+            or final_opened.st_ctime_ns != opened.st_ctime_ns
+            or (final_opened.st_dev, final_opened.st_ino)
+            != (opened.st_dev, opened.st_ino)
+            or (final_current.st_dev, final_current.st_ino)
+            != (opened.st_dev, opened.st_ino)
+            or final_current.st_size != opened.st_size
+            or final_current.st_mtime_ns != opened.st_mtime_ns
+            or final_current.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise _UnstableRegularFileError(
+                "managed output entry changed during verification"
+            )
+        if expected is not None and digest != expected["sha256"]:
+            raise _UnstableRegularFileError(
+                "managed output fingerprint does not match"
+            )
+        output.verify()
+        return _ManagedFileState(
+            name=name,
+            size=opened.st_size,
+            sha256=digest,
+            identity=(opened.st_dev, opened.st_ino),
+            mtime_ns=opened.st_mtime_ns,
+            ctime_ns=opened.st_ctime_ns,
+        )
+    finally:
+        os.close(fd)
+
+
+def _stable_staging_state(staging):
+    staging.output.verify()
+    _verify_staging_file(staging)
+    opened = os.fstat(staging.fd)
+    if not stat.S_ISREG(opened.st_mode):
+        raise _UnstableRegularFileError(
+            "download staging entry is not a regular file"
+        )
+    digest = _hash_exact_fd(staging.fd, opened.st_size)
+    final = os.fstat(staging.fd)
+    current = os.stat(
+        staging.name,
+        dir_fd=staging.output.fd,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(final.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+        or final.st_size != opened.st_size
+        or final.st_mtime_ns != opened.st_mtime_ns
+        or final.st_ctime_ns != opened.st_ctime_ns
+        or (final.st_dev, final.st_ino)
+        != (opened.st_dev, opened.st_ino)
+        or (current.st_dev, current.st_ino)
+        != (opened.st_dev, opened.st_ino)
+    ):
+        raise _UnstableRegularFileError(
+            "download staging entry changed during verification"
+        )
+    staging.output.verify()
+    return _ManagedFileState(
+        name=staging.name,
+        size=opened.st_size,
+        sha256=digest,
+        identity=(opened.st_dev, opened.st_ino),
+    )
 
 
 class _TransientCleanupError(RuntimeError):
@@ -122,7 +1255,190 @@ class _TransientCleanupError(RuntimeError):
         super().__init__("transient file cleanup failed")
 
 
+def _dir_size_fd(directory_fd, excluded_names):
+    total = 0
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    for name in os.listdir(directory_fd):
+        if name in excluded_names:
+            continue
+        try:
+            current = os.stat(
+                name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if stat.S_ISREG(current.st_mode):
+                total += current.st_size
+            elif stat.S_ISDIR(current.st_mode):
+                child_fd = os.open(
+                    name,
+                    flags,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    total += _dir_size_fd(child_fd, set())
+                finally:
+                    os.close(child_fd)
+        except (OSError, TypeError, NotImplementedError):
+            pass
+    return total
+
+
+def _excluded_entry_matches(current, identity):
+    if len(identity) == 2:
+        return identity == (current.st_dev, current.st_ino)
+    return identity == (
+        current.st_dev,
+        current.st_ino,
+        current.st_size,
+        current.st_mtime_ns,
+        current.st_ctime_ns,
+    )
+
+
+def _dir_size_fd_excluding_root_entries(
+    directory_fd,
+    excluded_entries,
+):
+    total = 0
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    for name in os.listdir(directory_fd):
+        current = os.stat(
+            name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if stat.S_ISREG(current.st_mode):
+            identity = excluded_entries.get(name)
+            if (
+                identity is not None
+                and _excluded_entry_matches(current, identity)
+            ):
+                continue
+            total += current.st_size
+        elif stat.S_ISDIR(current.st_mode):
+            child_fd = os.open(
+                name,
+                flags,
+                dir_fd=directory_fd,
+            )
+            try:
+                total += _dir_size_fd_excluding_root_entries(
+                    child_fd, {}
+                )
+            finally:
+                os.close(child_fd)
+    return total
+
+
+def _verified_source_sidecar_identity(output):
+    fd = -1
+    try:
+        output.verify()
+        current = os.stat(
+            SOURCE_SIDECAR,
+            dir_fd=output.fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISREG(current.st_mode):
+            return None
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            return None
+        fd = os.open(
+            SOURCE_SIDECAR,
+            os.O_RDONLY | nofollow,
+            dir_fd=output.fd,
+        )
+        opened = os.fstat(fd)
+        final_current = os.stat(
+            SOURCE_SIDECAR,
+            dir_fd=output.fd,
+            follow_symlinks=False,
+        )
+        final_opened = os.fstat(fd)
+        output.verify()
+    except (
+        FileNotFoundError,
+        OSError,
+        TypeError,
+        NotImplementedError,
+        ValueError,
+    ):
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(final_opened.st_mode)
+        or not stat.S_ISREG(final_current.st_mode)
+        or (opened.st_dev, opened.st_ino)
+        != (current.st_dev, current.st_ino)
+        or (final_opened.st_dev, final_opened.st_ino)
+        != (current.st_dev, current.st_ino)
+        or (final_current.st_dev, final_current.st_ino)
+        != (current.st_dev, current.st_ino)
+        or final_opened.st_size != opened.st_size
+        or final_opened.st_mtime_ns != opened.st_mtime_ns
+        or final_opened.st_ctime_ns != opened.st_ctime_ns
+        or final_current.st_size != opened.st_size
+        or final_current.st_mtime_ns != opened.st_mtime_ns
+        or final_current.st_ctime_ns != opened.st_ctime_ns
+    ):
+        return None
+    return (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_size,
+        opened.st_mtime_ns,
+        opened.st_ctime_ns,
+    )
+
+
+def _paper_data_size(output, transient_files=()):
+    excluded_entries = {}
+    sidecar_identity = _verified_source_sidecar_identity(output)
+    if sidecar_identity is not None:
+        excluded_entries[SOURCE_SIDECAR] = sidecar_identity
+    for staging in transient_files:
+        if not isinstance(staging, _DownloadStagingFile):
+            continue
+        if staging.output.fd != output.fd:
+            raise _UnstableRegularFileError(
+                "download staging belongs to a different output directory"
+            )
+        _verify_staging_file(staging)
+        current = os.fstat(staging.fd)
+        excluded_entries[staging.name] = (
+            current.st_dev,
+            current.st_ino,
+        )
+    return _dir_size_fd_excluding_root_entries(
+        output.fd,
+        excluded_entries,
+    )
+
+
 def _dir_size(path, exclude_paths=()):
+    if isinstance(path, _PinnedOutputDirectory):
+        excluded_names = {
+            item.name
+            for item in exclude_paths
+            if (
+                isinstance(item, _DownloadStagingFile)
+                and item.output.fd == path.fd
+            )
+        }
+        return _dir_size_fd(path.fd, excluded_names)
     excluded = {
         os.path.abspath(os.fspath(excluded_path))
         for excluded_path in exclude_paths
@@ -181,6 +1497,27 @@ def _raise_transient_cleanup_error(
 
 
 def _atomic_stream_write(src, dest_path, max_bytes):
+    if isinstance(dest_path, _DownloadStagingFile):
+        staging = dest_path
+        staging.output.verify()
+        _verify_staging_file(staging)
+        os.ftruncate(staging.fd, 0)
+        os.lseek(staging.fd, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(staging.fd), "wb") as dest:
+            size = _copy_limited(src, dest, max_bytes)
+            dest.flush()
+            os.fsync(dest.fileno())
+        _verify_staging_file(staging)
+        current = os.fstat(staging.fd)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_size != size
+        ):
+            raise _UnstableRegularFileError(
+                "download staging entry changed during write"
+            )
+        staging.output.verify()
+        return size
     directory = os.path.dirname(os.path.abspath(dest_path)) or "."
     os.makedirs(directory, exist_ok=True)
     fd, temp_path = tempfile.mkstemp(
@@ -253,10 +1590,16 @@ class _ManagedOutputRollbackError(RuntimeError):
             )
         if cleanup_failure is not None:
             backup_dir, error = cleanup_failure
-            messages.append(
-                "could not remove managed-output rollback directory "
-                f"{backup_dir}: {type(error).__name__}: {error}"
-            )
+            if backup_dir is _PENDING_CLEANUP_WITHOUT_PATH:
+                messages.append(
+                    "managed-output cleanup remains pending: "
+                    f"{type(error).__name__}: {error}"
+                )
+            else:
+                messages.append(
+                    "could not remove managed-output rollback directory "
+                    f"{backup_dir}: {type(error).__name__}: {error}"
+                )
         super().__init__("; ".join(messages))
 
 
@@ -312,89 +1655,1808 @@ def _raise_operation_with_rollback_errors(
 
 
 class _ManagedOutputJournal:
-    def __init__(self, out_dir):
-        self._parent = os.path.dirname(os.path.abspath(out_dir))
-        self._backup_dir = None
-        self._entries = {}
-        self._committed = False
-
-    def prepare(self, dest_path):
-        if self._committed:
-            raise RuntimeError("managed-output journal is committed")
-        dest_path = os.path.abspath(dest_path)
-        if dest_path in self._entries:
-            return
-        backup_path = None
-        if os.path.lexists(dest_path):
-            if self._backup_dir is None:
-                self._backup_dir = tempfile.mkdtemp(
-                    prefix=".paperconan-output-rollback-",
-                    dir=self._parent,
-                )
-            backup_path = os.path.join(
-                self._backup_dir, str(len(self._entries))
+    def __init__(
+        self,
+        out_dir,
+        *,
+        internal_names=(),
+        backup_prefix=".paperconan-output-rollback-",
+        backup_entry_prefix="",
+    ):
+        if not isinstance(out_dir, _PinnedOutputDirectory):
+            raise _UnstableRegularFileError(
+                "managed-output journal requires a pinned output directory"
             )
-            os.replace(dest_path, backup_path)
-        self._entries[dest_path] = backup_path
+        self._output = out_dir
+        self._out_dir = os.path.abspath(_output_path(out_dir))
+        self._parent = os.path.dirname(self._out_dir)
+        self._backup_dir = None
+        self._backup_parent_fd = -1
+        self._backup_fd = -1
+        self._backup_parent_identity = None
+        self._backup_identity = None
+        self._backup_name = None
+        self._entries = {}
+        self._detached_backup_paths = {}
+        self._state = _ManagedOutputJournalState.OPEN
+        self._recovery_error = None
+        self._rollback_error = None
+        self._verify_empty_root_on_commit = False
+        self._commit_cleanup_descriptor = -1
+        self._commit_cleanup_expected = None
+        self._move_descriptor = -1
+        self._move_expected = None
+        self._internal_names = frozenset(internal_names)
+        self._backup_prefix = str(backup_prefix)
+        self._backup_entry_prefix = str(backup_entry_prefix)
 
-    def stage_removal(self, dest_path):
-        if self._committed:
-            raise RuntimeError("managed-output journal is committed")
+    def _require_open(self):
+        if self._state is not _ManagedOutputJournalState.OPEN:
+            raise RuntimeError(
+                "managed-output journal is not open "
+                f"({self._state.value})"
+            )
+
+    def recovery_paths(self):
+        paths = []
+        if self._output is None:
+            return ()
+        for entry in self._entries.values():
+            backup_state = entry["backup_state"]
+            if backup_state is None:
+                continue
+            if entry.get("restored"):
+                try:
+                    canonical = _stable_managed_file(
+                        self._output,
+                        entry["name"],
+                        expected={
+                            "size": backup_state.size,
+                            "sha256": backup_state.sha256,
+                        },
+                    )
+                except (
+                    OSError,
+                    TypeError,
+                    NotImplementedError,
+                    ValueError,
+                ):
+                    pass
+                else:
+                    if (
+                        canonical.identity == backup_state.identity
+                        and self._output_lexical_path_matches()
+                    ):
+                        paths.append(os.path.abspath(
+                            os.path.join(
+                                self._out_dir,
+                                entry["name"],
+                            )
+                        ))
+                        continue
+            backup_name = entry["backup"]
+            if backup_name is not None and self._backup_copy_matches(
+                backup_name,
+                backup_state,
+            ) and self._backup_lexical_path_matches():
+                paths.append(os.path.abspath(
+                    self._backup_path(backup_name)
+                ))
+        for backup_path, backup_state in (
+            self._detached_backup_paths.items()
+        ):
+            if (
+                backup_state is not None
+                and self._detached_backup_copy_matches(
+                    backup_path,
+                    backup_state,
+                )
+                and self._backup_lexical_path_matches()
+            ):
+                paths.append(backup_path)
+        return tuple(dict.fromkeys(paths))
+
+    def _output_lexical_path_matches(self):
+        try:
+            self._output.verify()
+        except (
+            OSError,
+            TypeError,
+            NotImplementedError,
+            ValueError,
+        ):
+            return False
+        return True
+
+    def _backup_copy_matches(self, backup_name, expected):
+        try:
+            actual = self._stable_backup_entry(
+                backup_name,
+                identity=expected.identity,
+                size=expected.size,
+                verify_output=False,
+            )
+        except (
+            OSError,
+            TypeError,
+            NotImplementedError,
+            ValueError,
+        ):
+            return False
+        return actual.sha256 == expected.sha256
+
+    def _detached_backup_copy_matches(
+        self,
+        backup_path,
+        expected,
+    ):
+        return (
+            self._detached_backup_copy_status(
+                backup_path,
+                expected,
+            )
+            == "owned"
+        )
+
+    def _detached_backup_copy_status(
+        self,
+        backup_path,
+        expected,
+    ):
+        if (
+            self._backup_dir is None
+            or os.path.dirname(backup_path) != self._backup_dir
+        ):
+            return "unavailable"
+        backup_name = os.path.basename(backup_path)
+        try:
+            self._verify_backup_storage()
+            current = os.stat(
+                backup_name,
+                dir_fd=self._backup_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return "missing"
+        except (
+            OSError,
+            TypeError,
+            NotImplementedError,
+            ValueError,
+        ):
+            return "unavailable"
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != expected.identity
+            or current.st_size != expected.size
+        ):
+            return "replaced"
+        try:
+            actual = self._stable_backup_entry(
+                backup_name,
+                identity=expected.identity,
+                size=expected.size,
+                verify_output=False,
+            )
+        except FileNotFoundError:
+            return "missing"
+        except (
+            OSError,
+            TypeError,
+            NotImplementedError,
+            ValueError,
+        ):
+            return "unavailable"
+        if actual.sha256 == expected.sha256:
+            return "owned"
+        return "replaced"
+
+    def _detached_backup_copy_is_absent(self, backup_path):
+        expected = self._detached_backup_paths.get(backup_path)
+        if expected is None:
+            return False
+        return (
+            self._detached_backup_copy_status(
+                backup_path,
+                expected,
+            )
+            == "missing"
+        )
+
+    def _backup_directory_matches(self):
+        try:
+            self._verify_backup_storage()
+        except (
+            OSError,
+            TypeError,
+            NotImplementedError,
+            ValueError,
+        ):
+            return False
+        return self._backup_lexical_path_matches()
+
+    def _enter_recovery_required(self, error):
+        if not isinstance(
+            error,
+            _ManagedOutputRecoveryRequiredError,
+        ):
+            raise TypeError(
+                "managed-output recovery state requires a recovery error"
+            )
+        if not error.recovery_paths:
+            error.recovery_paths = self.recovery_paths()
+        if self._state is not _ManagedOutputJournalState.RECOVERY_REQUIRED:
+            self._recovery_error = error
+            self._rollback_error = None
+        self._state = _ManagedOutputJournalState.RECOVERY_REQUIRED
+        return self._recovery_error
+
+    def _raise_recovery_required(self, message, cause=None):
+        error = _ManagedOutputRecoveryRequiredError(
+            message,
+            recovery_paths=self.recovery_paths(),
+        )
+        error = self._enter_recovery_required(error)
+        if cause is None:
+            raise error
+        raise error from cause
+
+    def _raise_pathless_recovery_required(
+        self,
+        message,
+        cause=None,
+    ):
+        error = _ManagedOutputRecoveryRequiredError(
+            message,
+            recovery_paths=(),
+        )
+        if self._state is not _ManagedOutputJournalState.RECOVERY_REQUIRED:
+            self._recovery_error = error
+            self._rollback_error = None
+        self._state = _ManagedOutputJournalState.RECOVERY_REQUIRED
+        if cause is None:
+            raise self._recovery_error
+        raise self._recovery_error from cause
+
+    def _recovery_rollback_failure(self):
+        if self._rollback_error is None:
+            recovery_error = self._recovery_error
+            if recovery_error is None:
+                recovery_error = _ManagedOutputRecoveryRequiredError(
+                    "managed-output recovery is required",
+                    recovery_paths=self.recovery_paths(),
+                )
+                self._recovery_error = recovery_error
+            failures = [
+                (dest_path, recovery_error)
+                for dest_path in self._entries
+            ]
+            if not failures:
+                failures = [(self._out_dir, recovery_error)]
+            self._rollback_error = _ManagedOutputRollbackError(
+                failures
+            )
+        return self._rollback_error
+
+    def _pinned_name(self, dest_path):
+        dest_path = os.path.abspath(os.fspath(dest_path))
+        try:
+            relative = os.path.relpath(dest_path, self._out_dir)
+        except ValueError:
+            return None
+        if (
+            relative not in self._internal_names
+            and _safe_managed_name(relative) is None
+        ):
+            return None
+        return relative
+
+    def _ensure_backup_dir(self):
+        if self._backup_dir is not None:
+            self._verify_backup_dir()
+            return self._backup_dir
+        _require_identity_bound_mutation()
+        self._output.verify()
+        directory = getattr(os, "O_DIRECTORY", None)
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if directory is None or nofollow is None:
+            raise _UnstableRegularFileError(
+                "secure managed-output rollback is unavailable"
+            )
+        flags = os.O_RDONLY | directory | nofollow
+        parent_fd = os.open("..", flags, dir_fd=self._output.fd)
+        backup_fd = -1
+        backup_name = None
+        try:
+            parent = os.fstat(parent_fd)
+            if not stat.S_ISDIR(parent.st_mode):
+                raise _UnstableRegularFileError(
+                    "managed-output rollback parent is not a directory"
+                )
+            backup_name = _rollback_directory_name(
+                self._output,
+                self._backup_prefix,
+            )
+            try:
+                with _transaction_state_allocation():
+                    os.mkdir(
+                        backup_name,
+                        0o700,
+                        dir_fd=parent_fd,
+                    )
+            except FileExistsError as error:
+                raise _UnstableRegularFileError(
+                    "managed-output recovery state is already pending"
+                ) from error
+            backup_fd = os.open(
+                backup_name,
+                flags,
+                dir_fd=parent_fd,
+            )
+            opened = os.fstat(backup_fd)
+            visible = os.stat(
+                backup_name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(visible.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (visible.st_dev, visible.st_ino)
+            ):
+                raise _UnstableRegularFileError(
+                    "managed-output rollback directory is unstable"
+                )
+            self._backup_parent_fd = parent_fd
+            self._backup_fd = backup_fd
+            self._backup_parent_identity = (
+                parent.st_dev,
+                parent.st_ino,
+            )
+            self._backup_identity = (
+                opened.st_dev,
+                opened.st_ino,
+            )
+            self._backup_name = backup_name
+            self._backup_dir = os.path.join(
+                self._parent,
+                backup_name,
+            )
+            parent_fd = -1
+            backup_fd = -1
+        except BaseException:
+            if backup_fd >= 0:
+                try:
+                    _identity_bound_remove(
+                        parent_fd,
+                        backup_name,
+                        backup_fd,
+                        is_directory=True,
+                    )
+                except OSError:
+                    pass
+                os.close(backup_fd)
+            if parent_fd >= 0:
+                os.close(parent_fd)
+            raise
+        return self._backup_dir
+
+    def _verify_backup_dir(self):
+        try:
+            self._output.verify()
+            self._verify_backup_storage()
+            self._output.verify()
+        except (
+            OSError,
+            TypeError,
+            NotImplementedError,
+            ValueError,
+        ) as error:
+            raise _UnstableRegularFileError(
+                "managed-output rollback directory changed"
+            ) from error
+
+    def _verify_backup_storage(self):
+        if (
+            self._backup_dir is None
+            or self._backup_parent_fd < 0
+            or self._backup_fd < 0
+            or self._backup_name is None
+        ):
+            raise _UnstableRegularFileError(
+                "managed-output rollback directory is unavailable"
+            )
+        try:
+            parent = os.fstat(self._backup_parent_fd)
+            opened = os.fstat(self._backup_fd)
+            visible = os.stat(
+                self._backup_name,
+                dir_fd=self._backup_parent_fd,
+                follow_symlinks=False,
+            )
+        except (
+            OSError,
+            TypeError,
+            NotImplementedError,
+            ValueError,
+        ) as error:
+            raise _UnstableRegularFileError(
+                "managed-output rollback directory changed"
+            ) from error
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(visible.st_mode)
+            or (parent.st_dev, parent.st_ino)
+            != self._backup_parent_identity
+            or (opened.st_dev, opened.st_ino)
+            != self._backup_identity
+            or (visible.st_dev, visible.st_ino)
+            != self._backup_identity
+        ):
+            raise _UnstableRegularFileError(
+                "managed-output rollback directory changed"
+            )
+
+    def _backup_lexical_path_matches(self):
+        if self._backup_dir is None or self._backup_fd < 0:
+            return False
+        try:
+            opened = os.fstat(self._backup_fd)
+            visible = os.stat(
+                self._backup_dir,
+                follow_symlinks=False,
+            )
+        except (
+            OSError,
+            TypeError,
+            NotImplementedError,
+            ValueError,
+        ):
+            return False
+        return (
+            stat.S_ISDIR(opened.st_mode)
+            and stat.S_ISDIR(visible.st_mode)
+            and (opened.st_dev, opened.st_ino)
+            == self._backup_identity
+            and (visible.st_dev, visible.st_ino)
+            == self._backup_identity
+        )
+
+    def _backup_path(self, backup_name):
+        if backup_name is None:
+            return None
+        return os.path.join(self._backup_dir, backup_name)
+
+    def _pending_backup_cleanup(self, path):
+        path = os.path.abspath(os.fspath(path))
+        if self._backup_lexical_path_matches():
+            return path
+        return _PENDING_CLEANUP_WITHOUT_PATH
+
+    def _move_to_backup(self, output_name, backup_name):
+        self._verify_backup_dir()
+        descriptor = self._move_descriptor
+        expected = self._move_expected
+        if descriptor < 0 or expected is None:
+            raise RuntimeError("managed-output move descriptor is unavailable")
+        linked = False
+        try:
+            with _transaction_state_allocation():
+                os.link(
+                    output_name,
+                    backup_name,
+                    src_dir_fd=self._output.fd,
+                    dst_dir_fd=self._backup_fd,
+                    follow_symlinks=False,
+                )
+            linked = True
+            self._verify_backup_entry(backup_name, expected)
+        except BaseException as operation_error:
+            if linked:
+                try:
+                    self._remove_backup_entry(backup_name)
+                except BaseException as cleanup_error:
+                    backup_path = os.path.abspath(
+                        self._backup_path(backup_name)
+                    )
+                    self._detached_backup_paths[backup_path] = None
+                    self._raise_pathless_recovery_required(
+                        "managed-output cleanup remains pending",
+                        cleanup_error,
+                    )
+            raise operation_error
+        operation_error = None
+        for _attempt in range(2):
+            try:
+                _identity_bound_remove(
+                    self._output.fd,
+                    output_name,
+                    descriptor,
+                    is_directory=False,
+                )
+                operation_error = None
+                break
+            except _IdentityBoundMutationUnavailableError:
+                raise
+            except OSError as error:
+                operation_error = error
+        if operation_error is not None:
+            try:
+                self._remove_backup_entry(backup_name, expected)
+            except BaseException as cleanup_error:
+                backup_path = os.path.abspath(
+                    self._backup_path(backup_name)
+                )
+                self._detached_backup_paths[backup_path] = expected
+                self._raise_pathless_recovery_required(
+                    "managed-output cleanup remains pending",
+                    cleanup_error,
+                )
+            raise _UnstableRegularFileError(
+                "managed output changed before backup move"
+            ) from operation_error
+
+    def _stable_backup_entry(
+        self,
+        backup_name,
+        *,
+        identity=None,
+        size=None,
+        max_size=None,
+        verify_output=True,
+    ):
+        if verify_output:
+            self._verify_backup_dir()
+        else:
+            self._verify_backup_storage()
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise _UnstableRegularFileError(
+                "no-follow rollback entry opening is unavailable"
+            )
+        fd = os.open(
+            backup_name,
+            os.O_RDONLY | nofollow,
+            dir_fd=self._backup_fd,
+        )
+        try:
+            opened = os.fstat(fd)
+            visible = os.stat(
+                backup_name,
+                dir_fd=self._backup_fd,
+                follow_symlinks=False,
+            )
+            opened_identity = (opened.st_dev, opened.st_ino)
+            visible_identity = (visible.st_dev, visible.st_ino)
+            actual_size = opened.st_size
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(visible.st_mode)
+                or opened_identity != visible_identity
+                or (
+                    identity is not None
+                    and opened_identity != tuple(identity)
+                )
+                or (
+                    size is not None
+                    and actual_size != size
+                )
+                or visible.st_size != actual_size
+                or (
+                    max_size is not None
+                    and actual_size > max_size
+                )
+            ):
+                raise _UnstableRegularFileError(
+                    "managed-output rollback entry changed"
+                )
+            digest = _hash_exact_fd(fd, actual_size)
+            final_opened = os.fstat(fd)
+            final_visible = os.stat(
+                backup_name,
+                dir_fd=self._backup_fd,
+                follow_symlinks=False,
+            )
+            final_opened_identity = (
+                final_opened.st_dev,
+                final_opened.st_ino,
+            )
+            final_visible_identity = (
+                final_visible.st_dev,
+                final_visible.st_ino,
+            )
+            if (
+                not stat.S_ISREG(final_opened.st_mode)
+                or not stat.S_ISREG(final_visible.st_mode)
+                or final_opened_identity != opened_identity
+                or final_visible_identity != opened_identity
+                or final_opened.st_size != actual_size
+                or final_visible.st_size != actual_size
+                or final_opened.st_mtime_ns != opened.st_mtime_ns
+                or final_opened.st_ctime_ns != opened.st_ctime_ns
+                or final_visible.st_mtime_ns != opened.st_mtime_ns
+                or final_visible.st_ctime_ns != opened.st_ctime_ns
+            ):
+                raise _UnstableRegularFileError(
+                    "managed-output rollback entry changed"
+                )
+            if verify_output:
+                self._verify_backup_dir()
+            else:
+                self._verify_backup_storage()
+            return _ManagedFileState(
+                name=backup_name,
+                size=actual_size,
+                sha256=digest,
+                identity=opened_identity,
+            )
+        finally:
+            os.close(fd)
+
+    def _verify_backup_entry(
+        self,
+        backup_name,
+        expected,
+        *,
+        verify_output=True,
+    ):
+        try:
+            actual = self._stable_backup_entry(
+                backup_name,
+                identity=expected.identity,
+                size=expected.size,
+                verify_output=verify_output,
+            )
+        except _UnstableRegularFileError:
+            raise
+        except (
+            OSError,
+            TypeError,
+            NotImplementedError,
+            ValueError,
+        ) as error:
+            raise _UnstableRegularFileError(
+                "managed-output rollback entry changed"
+            ) from error
+        if actual.sha256 != expected.sha256:
+            raise _UnstableRegularFileError(
+                "managed-output rollback entry changed"
+            )
+
+    def _open_verified_backup_entry(self, backup_name, expected):
+        self._verify_backup_dir()
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise _UnstableRegularFileError(
+                "no-follow rollback entry opening is unavailable"
+            )
+        try:
+            fd = os.open(
+                backup_name,
+                os.O_RDONLY | nofollow,
+                dir_fd=self._backup_fd,
+            )
+        except (
+            OSError,
+            TypeError,
+            NotImplementedError,
+            ValueError,
+        ) as error:
+            raise _UnstableRegularFileError(
+                "managed-output rollback entry changed"
+            ) from error
+        try:
+            opened = os.fstat(fd)
+            visible = os.stat(
+                backup_name,
+                dir_fd=self._backup_fd,
+                follow_symlinks=False,
+            )
+            identity = (opened.st_dev, opened.st_ino)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(visible.st_mode)
+                or (visible.st_dev, visible.st_ino) != identity
+                or visible.st_size != opened.st_size
+                or visible.st_mtime_ns != opened.st_mtime_ns
+                or visible.st_ctime_ns != opened.st_ctime_ns
+                or (
+                    expected is not None
+                    and (
+                        identity != expected.identity
+                        or opened.st_size != expected.size
+                    )
+                )
+            ):
+                raise _UnstableRegularFileError(
+                    "managed-output rollback entry changed"
+                )
+            digest = _hash_exact_fd(fd, opened.st_size)
+            final_opened = os.fstat(fd)
+            final_visible = os.stat(
+                backup_name,
+                dir_fd=self._backup_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(final_opened.st_mode)
+                or not stat.S_ISREG(final_visible.st_mode)
+                or (final_opened.st_dev, final_opened.st_ino) != identity
+                or (final_visible.st_dev, final_visible.st_ino) != identity
+                or final_opened.st_size != opened.st_size
+                or final_visible.st_size != opened.st_size
+                or final_opened.st_mtime_ns != opened.st_mtime_ns
+                or final_opened.st_ctime_ns != opened.st_ctime_ns
+                or final_visible.st_mtime_ns != opened.st_mtime_ns
+                or final_visible.st_ctime_ns != opened.st_ctime_ns
+                or (
+                    expected is not None
+                    and digest != expected.sha256
+                )
+            ):
+                raise _UnstableRegularFileError(
+                    "managed-output rollback entry changed"
+                )
+            self._verify_backup_dir()
+            return fd, _ManagedFileState(
+                name=backup_name,
+                size=final_opened.st_size,
+                sha256=digest,
+                identity=identity,
+                mtime_ns=final_opened.st_mtime_ns,
+                ctime_ns=final_opened.st_ctime_ns,
+            )
+        except _UnstableRegularFileError:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        except (
+            OSError,
+            TypeError,
+            NotImplementedError,
+            ValueError,
+        ) as error:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise _UnstableRegularFileError(
+                "managed-output rollback entry changed"
+            ) from error
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+
+    def _restore_from_backup(self, backup_name, output_name):
+        with _transaction_state_allocation():
+            os.link(
+                backup_name,
+                output_name,
+                src_dir_fd=self._backup_fd,
+                dst_dir_fd=self._output.fd,
+                follow_symlinks=False,
+            )
+
+    def _unlink_created_after_final_canonical_check(
+        self,
+        output_name,
+        expected,
+    ):
+        descriptor = _open_owned_regular_entry(
+            self._output.fd,
+            output_name,
+            expected=expected,
+            error_message="managed output changed before rollback",
+        )
+        try:
+            _unlink_owned_regular_entry(
+                self._output.fd,
+                output_name,
+                descriptor,
+                expected=expected,
+            )
+        finally:
+            os.close(descriptor)
+
+    def _restore_backup_over_published_after_final_check(
+        self,
+        backup_name,
+        output_name,
+        expected,
+    ):
+        self._unlink_created_after_final_canonical_check(
+            output_name,
+            expected,
+        )
+        self._restore_from_backup(backup_name, output_name)
+
+    def _restore_backup_into_absent_path_after_final_check(
+        self,
+        backup_name,
+        output_name,
+    ):
+        try:
+            self._restore_from_backup(backup_name, output_name)
+        except FileExistsError as error:
+            raise _UnstableRegularFileError(
+                "managed output changed before rollback"
+            ) from error
+
+    def _restore_anchor_name(self, backup_name):
+        return f".restore-{backup_name}"
+
+    def _ensure_restore_anchor(self, backup_name, expected):
+        anchor_name = self._restore_anchor_name(backup_name)
+        self._verify_backup_dir()
+        created = False
+        try:
+            with _transaction_state_allocation():
+                os.link(
+                    backup_name,
+                    anchor_name,
+                    src_dir_fd=self._backup_fd,
+                    dst_dir_fd=self._backup_fd,
+                    follow_symlinks=False,
+                )
+            created = True
+        except FileExistsError:
+            pass
+        try:
+            self._verify_backup_entry(anchor_name, expected)
+        except BaseException:
+            if created:
+                try:
+                    self._remove_backup_entry(anchor_name)
+                except BaseException as cleanup_error:
+                    anchor_path = os.path.abspath(
+                        self._backup_path(anchor_name)
+                    )
+                    self._detached_backup_paths[anchor_path] = None
+                    self._raise_pathless_recovery_required(
+                        "managed-output cleanup remains pending",
+                        cleanup_error,
+                    )
+            raise
+        return anchor_name
+
+    def _cleanup_restore_anchor(self, anchor_name, expected):
+        anchor_path = os.path.abspath(
+            self._backup_path(anchor_name)
+        )
+        try:
+            self._remove_backup_entry(anchor_name, expected)
+        except _IdentityBoundMutationUnavailableError as error:
+            raise _ManagedOutputDirectoryCleanupError(
+                _PENDING_CLEANUP_WITHOUT_PATH,
+                error,
+            ) from error
+        except _UnstableRegularFileError as error:
+            try:
+                os.stat(
+                    anchor_name,
+                    dir_fd=self._backup_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                self._detached_backup_paths.pop(anchor_path, None)
+                return
+            raise _ManagedOutputDirectoryCleanupError(
+                anchor_path,
+                error,
+            ) from error
+        except OSError as error:
+            raise _ManagedOutputDirectoryCleanupError(
+                anchor_path,
+                error,
+            ) from error
+        self._detached_backup_paths.pop(anchor_path, None)
+
+    def _remove_backup_entry(
+        self,
+        backup_name,
+        expected=None,
+        *,
+        commit_entry=None,
+    ):
+        if expected is not None:
+            self._verify_backup_entry(backup_name, expected)
+        descriptor, verified = self._open_verified_backup_entry(
+            backup_name,
+            expected,
+        )
+        try:
+            if commit_entry is None:
+                _identity_bound_remove(
+                    self._backup_fd,
+                    backup_name,
+                    descriptor,
+                    is_directory=False,
+                )
+            else:
+                self._commit_cleanup_descriptor = descriptor
+                self._commit_cleanup_expected = verified
+                try:
+                    self._unlink_backup_after_visible_commit_check(
+                        backup_name,
+                        commit_entry,
+                    )
+                finally:
+                    self._commit_cleanup_descriptor = -1
+                    self._commit_cleanup_expected = None
+        finally:
+            os.close(descriptor)
+
+    def _unlink_backup_after_visible_commit_check(
+        self,
+        backup_name,
+        entry,
+    ):
+        descriptor = self._commit_cleanup_descriptor
+        expected = self._commit_cleanup_expected
+        if descriptor < 0 or expected is None:
+            raise RuntimeError(
+                "commit cleanup descriptor is unavailable"
+            )
+        name = entry["name"]
+        identity = entry["published_identity"]
+        try:
+            self._output.verify()
+        except (
+            OSError,
+            TypeError,
+            NotImplementedError,
+            ValueError,
+        ) as error:
+            raise _UnstableRegularFileError(
+                "published managed output changed"
+            ) from error
+        if identity is None:
+            try:
+                os.stat(
+                    name,
+                    dir_fd=self._output.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            except (
+                OSError,
+                TypeError,
+                NotImplementedError,
+                ValueError,
+            ) as error:
+                raise _UnstableRegularFileError(
+                    "staged managed-output removal could not be verified"
+                ) from error
+            else:
+                raise _UnstableRegularFileError(
+                    "staged managed-output removal reappeared"
+                )
+        else:
+            try:
+                current = os.stat(
+                    name,
+                    dir_fd=self._output.fd,
+                    follow_symlinks=False,
+                )
+            except (
+                OSError,
+                TypeError,
+                NotImplementedError,
+                ValueError,
+            ) as error:
+                raise _UnstableRegularFileError(
+                    "published managed output changed"
+                ) from error
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or (current.st_dev, current.st_ino) != identity
+                or current.st_size != entry["published_size"]
+                or current.st_mtime_ns != entry["commit_mtime_ns"]
+                or current.st_ctime_ns != entry["commit_ctime_ns"]
+            ):
+                raise _UnstableRegularFileError(
+                    "published managed output changed"
+                )
+        _identity_bound_remove(
+            self._backup_fd,
+            backup_name,
+            descriptor,
+            is_directory=False,
+        )
+
+    def _close_backup_handles(self):
+        backup_fd = self._backup_fd
+        backup_parent_fd = self._backup_parent_fd
+        self._backup_parent_fd = -1
+        self._backup_fd = -1
+        self._backup_parent_identity = None
+        self._backup_identity = None
+        self._backup_name = None
+        for fd in (backup_fd, backup_parent_fd):
+            if fd < 0:
+                continue
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def close(self):
+        self._close_backup_handles()
+
+    def _remove_pinned_backup_dir(self):
+        self._verify_backup_dir()
+        backup_name = self._backup_name
+        try:
+            parent = os.fstat(self._backup_parent_fd)
+            opened = os.fstat(self._backup_fd)
+            visible = os.stat(
+                backup_name,
+                dir_fd=self._backup_parent_fd,
+                follow_symlinks=False,
+            )
+        except (
+            OSError,
+            TypeError,
+            NotImplementedError,
+            ValueError,
+        ) as error:
+            raise _UnstableRegularFileError(
+                "managed-output rollback directory changed"
+            ) from error
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(visible.st_mode)
+            or (parent.st_dev, parent.st_ino)
+            != self._backup_parent_identity
+            or (opened.st_dev, opened.st_ino)
+            != self._backup_identity
+            or (visible.st_dev, visible.st_ino)
+            != self._backup_identity
+        ):
+            raise _UnstableRegularFileError(
+                "managed-output rollback directory changed"
+            )
+        _identity_bound_remove(
+            self._backup_parent_fd,
+            backup_name,
+            self._backup_fd,
+            is_directory=True,
+        )
+        self._account_removed_backup_dir()
+
+    def _account_removed_backup_dir(self):
+        self._backup_dir = None
+        self._close_backup_handles()
+
+    def prepare(
+        self,
+        dest_path,
+        expected=None,
+        *,
+        recovery_max_bytes=None,
+    ):
+        self._require_open()
         dest_path = os.path.abspath(dest_path)
         if dest_path in self._entries:
             return True
-        if self._backup_dir is None:
-            self._backup_dir = tempfile.mkdtemp(
-                prefix=".paperconan-output-rollback-",
-                dir=self._parent,
+        if self._output is not None:
+            name = self._pinned_name(dest_path)
+            if name is None:
+                return False
+            self._output.verify()
+            if expected is None:
+                try:
+                    os.stat(
+                        name,
+                        dir_fd=self._output.fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    self._entries[dest_path] = {
+                        "name": name,
+                        "backup": None,
+                        "backup_state": None,
+                        "published_identity": None,
+                        "published_size": None,
+                        "published_sha256": None,
+                    }
+                    return True
+                except (OSError, TypeError, NotImplementedError):
+                    return False
+                return False
+            try:
+                initial = _stable_managed_file(
+                    self._output,
+                    name,
+                    expected=expected,
+                )
+            except (OSError, ValueError):
+                return False
+            expected_identity = (
+                expected.get("identity")
+                if type(expected) is dict
+                else None
             )
-        backup_path = os.path.join(
-            self._backup_dir, str(len(self._entries))
+            if (
+                expected_identity is not None
+                and initial.identity != tuple(expected_identity)
+            ):
+                return False
+            self._ensure_backup_dir()
+            self._output.verify()
+            moved = False
+            move_verified = False
+            try:
+                stable = _stable_managed_file(
+                    self._output,
+                    name,
+                    expected=expected,
+                )
+                if (
+                    expected_identity is not None
+                    and stable.identity != tuple(expected_identity)
+                ):
+                    return False
+                backup_name = (
+                    f"{self._backup_entry_prefix}"
+                    f"{len(self._entries)}"
+                )
+                self._verify_backup_dir()
+                move_descriptor = _open_owned_regular_entry(
+                    self._output.fd,
+                    name,
+                    expected=stable,
+                    error_message=(
+                        "managed output changed before backup move"
+                    ),
+                )
+                self._move_descriptor = move_descriptor
+                self._move_expected = stable
+                try:
+                    self._move_to_backup(
+                        name,
+                        backup_name,
+                    )
+                finally:
+                    self._move_descriptor = -1
+                    self._move_expected = None
+                    os.close(move_descriptor)
+                moved = True
+                self._verify_backup_dir()
+                move_verified = True
+                self._verify_backup_entry(
+                    backup_name,
+                    stable,
+                )
+            except _ManagedOutputRecoveryRequiredError:
+                raise
+            except (
+                OSError,
+                TypeError,
+                NotImplementedError,
+                ValueError,
+            ) as error:
+                if moved:
+                    try:
+                        recovery_state = self._stable_backup_entry(
+                            backup_name,
+                            max_size=(
+                                stable.size
+                                if recovery_max_bytes is None
+                                else recovery_max_bytes
+                            ),
+                        )
+                    except (
+                        OSError,
+                        TypeError,
+                        NotImplementedError,
+                        ValueError,
+                    ) as recovery_error:
+                        self._entries[dest_path] = {
+                            "name": name,
+                            "backup": backup_name,
+                            "backup_state": stable,
+                            "published_identity": None,
+                            "published_size": None,
+                            "published_sha256": None,
+                        }
+                        _append_explicit_cause(
+                            recovery_error,
+                            error,
+                        )
+                        self._raise_recovery_required(
+                            "managed-output rollback entry could not be "
+                            "verified after prepare conflict",
+                            recovery_error,
+                        )
+                    self._entries[dest_path] = {
+                        "name": name,
+                        "backup": backup_name,
+                        "backup_state": recovery_state,
+                        "published_identity": None,
+                        "published_size": None,
+                        "published_sha256": None,
+                    }
+                    try:
+                        self.restore(dest_path)
+                    except _ManagedOutputRecoveryRequiredError as recovery_error:
+                        _append_explicit_cause(
+                            recovery_error,
+                            error,
+                        )
+                        raise
+                    except (
+                        OSError,
+                        TypeError,
+                        NotImplementedError,
+                        ValueError,
+                    ) as restore_error:
+                        _append_explicit_cause(
+                            restore_error,
+                            error,
+                        )
+                        self._raise_recovery_required(
+                            "managed-output rollback entry could not be "
+                            "verified and restored after prepare conflict",
+                            restore_error,
+                        )
+                    if not move_verified:
+                        raise _ManagedOutputPrepareError(
+                            "managed-output move could not be verified "
+                            f"after prepare: {error}"
+                        ) from error
+                    return False
+                return False
+            self._entries[dest_path] = {
+                "name": name,
+                "backup": backup_name,
+                "backup_state": stable,
+                "published_identity": None,
+                "published_size": None,
+                "published_sha256": None,
+            }
+            return True
+        raise RuntimeError("managed-output journal lost its pinned directory")
+
+    def stage_removal(self, dest_path, expected=None):
+        self._require_open()
+        dest_path = os.path.abspath(dest_path)
+        if dest_path in self._entries:
+            return True
+        if self._output is not None:
+            if expected is None:
+                return False
+            return self.prepare(dest_path, expected=expected)
+        raise RuntimeError("managed-output journal lost its pinned directory")
+
+    def bind_published(
+        self,
+        dest_path,
+        identity,
+        size,
+        sha256,
+    ):
+        self._require_open()
+        dest_path = os.path.abspath(dest_path)
+        if self._output is None:
+            return
+        entry = self._entries.get(dest_path)
+        if entry is None:
+            raise RuntimeError(
+                "managed output was not prepared before publication"
+            )
+        published = _stable_managed_file(
+            self._output,
+            entry["name"],
+            expected={"size": size, "sha256": sha256},
         )
-        try:
-            os.replace(dest_path, backup_path)
-        except FileNotFoundError:
-            return False
-        self._entries[dest_path] = backup_path
-        return True
+        if published.identity != tuple(identity):
+            raise _UnstableRegularFileError(
+                "published output changed before journal binding"
+            )
+        entry["published_identity"] = tuple(identity)
+        entry["published_size"] = int(size)
+        entry["published_sha256"] = str(sha256)
+
+    def record_created(
+        self,
+        dest_path,
+        identity,
+        size,
+        sha256,
+    ):
+        self._require_open()
+        if self._output is None:
+            raise RuntimeError(
+                "created output recording requires a pinned directory"
+            )
+        dest_path = os.path.abspath(dest_path)
+        name = self._pinned_name(dest_path)
+        if name is None or dest_path in self._entries:
+            raise RuntimeError("managed output could not be recorded")
+        published = _stable_managed_file(
+            self._output,
+            name,
+            expected={"size": size, "sha256": sha256},
+        )
+        if published.identity != tuple(identity):
+            raise _UnstableRegularFileError(
+                "published output changed before journal recording"
+            )
+        self._entries[dest_path] = {
+            "name": name,
+            "backup": None,
+            "backup_state": None,
+            "published_identity": tuple(identity),
+            "published_size": int(size),
+            "published_sha256": str(sha256),
+        }
+
+    def abandon(self, dest_path):
+        self._require_open()
+        dest_path = os.path.abspath(dest_path)
+        entry = self._entries.get(dest_path)
+        if entry is None:
+            return None
+        if self._output is None:
+            backup_path = entry
+        else:
+            backup_name = entry["backup"]
+            backup_path = self._backup_path(backup_name)
+            if backup_name is not None:
+                backup_state = entry["backup_state"]
+                if backup_state is None:
+                    self._raise_recovery_required(
+                        "managed-output rollback entry changed "
+                        "before abandon"
+                    )
+                try:
+                    self._verify_backup_entry(
+                        backup_name,
+                        backup_state,
+                    )
+                except _UnstableRegularFileError as error:
+                    self._raise_recovery_required(
+                        "managed-output rollback entry changed "
+                        "before abandon",
+                        error,
+                    )
+        self._entries.pop(dest_path)
+        if backup_path is not None:
+            backup_path = os.path.abspath(backup_path)
+            if backup_path not in self._detached_backup_paths:
+                self._detached_backup_paths[backup_path] = (
+                    backup_state if self._output is not None else None
+                )
+        if backup_path is None:
+            self._cleanup_backup_dir()
+        return backup_path
 
     def restore(self, dest_path, *, cleanup=True):
+        self._require_open()
         dest_path = os.path.abspath(dest_path)
         if dest_path not in self._entries:
             return
-        backup_path = self._entries[dest_path]
-        if backup_path is None:
+        if self._output is not None:
+            entry = self._entries[dest_path]
+            name = entry["name"]
+            backup_path = entry["backup"]
+            backup_state = entry["backup_state"]
+            identity = entry["published_identity"]
+            published_size = entry["published_size"]
+            published_sha256 = entry["published_sha256"]
+            if entry.get("restored"):
+                if backup_path is None or backup_state is None:
+                    self._raise_recovery_required(
+                        "managed-output restore anchor is unavailable"
+                    )
+                try:
+                    restored = _stable_managed_file(
+                        self._output,
+                        name,
+                        expected={
+                            "size": backup_state.size,
+                            "sha256": backup_state.sha256,
+                        },
+                    )
+                except (
+                    OSError,
+                    TypeError,
+                    NotImplementedError,
+                    ValueError,
+                ) as error:
+                    self._raise_recovery_required(
+                        "managed-output rollback entry changed "
+                        "during rollback",
+                        error,
+                    )
+                if restored.identity != backup_state.identity:
+                    self._raise_recovery_required(
+                        "managed-output rollback entry changed "
+                        "during rollback"
+                    )
+                self._cleanup_restore_anchor(
+                    backup_path,
+                    backup_state,
+                )
+                self._entries.pop(dest_path)
+                if cleanup:
+                    self._cleanup_backup_dir()
+                return
             try:
-                os.remove(dest_path)
-            except FileNotFoundError:
-                pass
-        else:
-            os.replace(backup_path, dest_path)
-        self._entries.pop(dest_path)
-        if cleanup:
-            self._cleanup_backup_dir()
+                self._output.verify()
+            except (
+                OSError,
+                TypeError,
+                NotImplementedError,
+                ValueError,
+            ) as error:
+                self._raise_recovery_required(
+                    "managed output changed before rollback",
+                    error,
+                )
+            if identity is not None:
+                try:
+                    current = os.stat(
+                        name,
+                        dir_fd=self._output.fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    current = None
+                except (
+                    OSError,
+                    TypeError,
+                    NotImplementedError,
+                    ValueError,
+                ) as error:
+                    self._raise_recovery_required(
+                        "managed output changed before rollback",
+                        error,
+                    )
+                if current is not None:
+                    try:
+                        published = _stable_managed_file(
+                            self._output,
+                            name,
+                            expected={
+                                "size": published_size,
+                                "sha256": published_sha256,
+                            },
+                        )
+                    except (
+                        OSError,
+                        TypeError,
+                        NotImplementedError,
+                        ValueError,
+                    ) as error:
+                        self._raise_recovery_required(
+                            "managed output changed before rollback",
+                            error,
+                        )
+                    if published.identity != identity:
+                        self._raise_recovery_required(
+                            "managed output changed before rollback"
+                        )
+            if backup_path is None:
+                if identity is not None and current is not None:
+                    try:
+                        self._unlink_created_after_final_canonical_check(
+                            name,
+                            published,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    except _IdentityBoundMutationUnavailableError as error:
+                        self._raise_pathless_recovery_required(
+                            "managed-output cleanup remains pending",
+                            error,
+                        )
+                    except _UnstableRegularFileError as error:
+                        self._raise_recovery_required(
+                            "managed output changed before rollback",
+                            error,
+                        )
+                self._entries.pop(dest_path)
+                if cleanup:
+                    self._cleanup_backup_dir()
+                return
+            else:
+                if backup_state is None:
+                    self._raise_recovery_required(
+                        "managed-output rollback entry changed "
+                        "before rollback"
+                    )
+                try:
+                    self._verify_backup_entry(
+                        backup_path,
+                        backup_state,
+                    )
+                except (
+                    OSError,
+                    TypeError,
+                    NotImplementedError,
+                    ValueError,
+                ) as error:
+                    self._raise_recovery_required(
+                        "managed-output rollback entry changed "
+                        "before rollback",
+                        error,
+                    )
+                if identity is None:
+                    try:
+                        os.stat(
+                            name,
+                            dir_fd=self._output.fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    except (
+                        OSError,
+                        TypeError,
+                        NotImplementedError,
+                        ValueError,
+                    ) as error:
+                        self._raise_recovery_required(
+                            "managed output changed before rollback",
+                            error,
+                        )
+                    else:
+                        self._raise_recovery_required(
+                            "managed output changed before rollback"
+                        )
+                try:
+                    _require_identity_bound_mutation()
+                except _IdentityBoundMutationUnavailableError as error:
+                    self._raise_pathless_recovery_required(
+                        "managed-output cleanup remains pending",
+                        error,
+                    )
+                try:
+                    anchor_name = self._ensure_restore_anchor(
+                        backup_path,
+                        backup_state,
+                    )
+                except (
+                    OSError,
+                    TypeError,
+                    NotImplementedError,
+                    ValueError,
+                ) as error:
+                    self._raise_recovery_required(
+                        "managed-output restore anchor could not be verified",
+                        error,
+                    )
+                restore_accounted = False
+                try:
+                    self._verify_backup_dir()
+                    if identity is not None and current is not None:
+                        self._restore_backup_over_published_after_final_check(
+                            backup_path,
+                            name,
+                            published,
+                        )
+                    else:
+                        self._restore_backup_into_absent_path_after_final_check(
+                            backup_path,
+                            name,
+                        )
+                    try:
+                        restored = _stable_managed_file(
+                            self._output,
+                            name,
+                            expected={
+                                "size": backup_state.size,
+                                "sha256": backup_state.sha256,
+                            },
+                        )
+                    except (
+                        OSError,
+                        TypeError,
+                        NotImplementedError,
+                        ValueError,
+                    ) as error:
+                        try:
+                            descriptor = _open_owned_regular_entry(
+                                self._output.fd,
+                                name,
+                                expected=backup_state,
+                                error_message=(
+                                    "managed output changed before rollback"
+                                ),
+                            )
+                            try:
+                                _unlink_owned_regular_entry(
+                                    self._output.fd,
+                                    name,
+                                    descriptor,
+                                    expected=backup_state,
+                                )
+                            finally:
+                                os.close(descriptor)
+                        except BaseException as cleanup_error:
+                            _append_explicit_cause(
+                                error,
+                                cleanup_error,
+                            )
+                        self._raise_recovery_required(
+                            "managed-output rollback entry changed "
+                            "during rollback",
+                            error,
+                        )
+                    if restored.identity != backup_state.identity:
+                        self._raise_recovery_required(
+                            "managed-output rollback entry changed "
+                            "during rollback"
+                        )
+                    entry["backup"] = anchor_name
+                    entry["backup_state"] = backup_state
+                    entry["restored"] = True
+                    entry.pop("recovery_path", None)
+                    restore_accounted = True
+                    original_backup_path = os.path.abspath(
+                        self._backup_path(backup_path)
+                    )
+                    self._detached_backup_paths[
+                        original_backup_path
+                    ] = backup_state
+                    try:
+                        self._remove_backup_entry(
+                            backup_path,
+                            backup_state,
+                        )
+                    except _IdentityBoundMutationUnavailableError as error:
+                        self._raise_pathless_recovery_required(
+                            "managed-output cleanup remains pending",
+                            error,
+                        )
+                    except _UnstableRegularFileError as error:
+                        self._raise_recovery_required(
+                            "managed-output rollback entry changed "
+                            "during rollback",
+                            error,
+                        )
+                    self._detached_backup_paths.pop(
+                        original_backup_path,
+                        None,
+                    )
+                except BaseException:
+                    if restore_accounted:
+                        raise
+                    try:
+                        self._cleanup_restore_anchor(
+                            anchor_name,
+                            backup_state,
+                        )
+                    except _ManagedOutputDirectoryCleanupError:
+                        anchor_path = os.path.abspath(
+                            self._backup_path(anchor_name)
+                        )
+                        if (
+                            anchor_path
+                            not in self._detached_backup_paths
+                        ):
+                            self._detached_backup_paths[anchor_path] = (
+                                backup_state
+                            )
+                    raise
+                post_move_error = None
+                try:
+                    self._verify_backup_dir()
+                except (
+                    OSError,
+                    TypeError,
+                    NotImplementedError,
+                    ValueError,
+                ) as error:
+                    post_move_error = error
+                try:
+                    restored = _stable_managed_file(
+                        self._output,
+                        name,
+                        expected={
+                            "size": backup_state.size,
+                            "sha256": backup_state.sha256,
+                        },
+                    )
+                except (
+                    OSError,
+                    TypeError,
+                    NotImplementedError,
+                    ValueError,
+                ) as error:
+                    if post_move_error is not None:
+                        _append_explicit_cause(
+                            error,
+                            post_move_error,
+                        )
+                    self._raise_recovery_required(
+                        "managed-output rollback entry changed "
+                        "during rollback",
+                        error,
+                    )
+                if restored.identity != backup_state.identity:
+                    self._raise_recovery_required(
+                        "managed-output rollback entry changed "
+                        "during rollback"
+                    )
+                self._cleanup_restore_anchor(
+                    anchor_name,
+                    backup_state,
+                )
+                self._entries.pop(dest_path)
+                if cleanup:
+                    self._cleanup_backup_dir()
+                return
+        raise RuntimeError("managed-output journal lost its pinned directory")
 
     def discard(self, dest_path):
+        self._require_open()
         dest_path = os.path.abspath(dest_path)
         if dest_path not in self._entries:
             return
-        backup_path = self._entries.pop(dest_path)
-        if backup_path is not None:
-            try:
-                os.remove(backup_path)
-            except FileNotFoundError:
-                pass
-        self._cleanup_backup_dir()
+        if self._output is not None:
+            entry = self._entries[dest_path]
+            backup_path = entry["backup"]
+            if backup_path is not None:
+                backup_state = entry["backup_state"]
+                if backup_state is None:
+                    self._raise_recovery_required(
+                        "managed-output rollback entry changed "
+                        "before discard"
+                    )
+                try:
+                    self._remove_backup_entry(
+                        backup_path,
+                        backup_state,
+                    )
+                except _IdentityBoundMutationUnavailableError as error:
+                    self._raise_pathless_recovery_required(
+                        "managed-output cleanup remains pending",
+                        error,
+                    )
+                except _UnstableRegularFileError as error:
+                    self._raise_recovery_required(
+                        "managed-output rollback entry changed "
+                        "before discard",
+                        error,
+                    )
+                self._entries.pop(dest_path)
+            else:
+                self._entries.pop(dest_path)
+            self._cleanup_backup_dir()
+            return
+        raise RuntimeError("managed-output journal lost its pinned directory")
 
     def rollback(self):
-        if self._committed:
-            self.commit()
+        if self._state in {
+            _ManagedOutputJournalState.COMMIT_CLEANUP,
+            _ManagedOutputJournalState.COMMITTED,
+        }:
             return set()
+        if self._state is _ManagedOutputJournalState.RECOVERY_REQUIRED:
+            rollback_error = self._recovery_rollback_failure()
+            raise rollback_error from self._recovery_error
         paths = set(self._entries)
         failures = []
+        recovery_failure = None
         for dest_path in reversed(tuple(self._entries)):
             try:
                 self.restore(dest_path, cleanup=False)
+            except _ManagedOutputRecoveryRequiredError as error:
+                failures.append((dest_path, error))
+                recovery_failure = error
+                break
             except OSError as error:
                 failures.append((dest_path, error))
         cleanup_failure = None
@@ -404,70 +3466,284 @@ class _ManagedOutputJournal:
             except _ManagedOutputDirectoryCleanupError as error:
                 cleanup_failure = (error.backup_dir, error.error)
         if failures or cleanup_failure is not None:
-            raise _ManagedOutputRollbackError(
+            rollback_error = _ManagedOutputRollbackError(
                 failures,
                 cleanup_failure=cleanup_failure,
             )
+            if recovery_failure is not None:
+                self._rollback_error = rollback_error
+                raise rollback_error from recovery_failure
+            raise rollback_error
         return paths
 
-    def commit(self):
-        self._committed = True
-        for dest_path, backup_path in tuple(self._entries.items()):
-            if backup_path is None:
-                self._entries.pop(dest_path, None)
-                continue
-            removed = False
-            for _attempt in range(2):
-                try:
-                    os.remove(backup_path)
-                    removed = True
-                    break
-                except FileNotFoundError:
-                    removed = True
-                    break
-                except OSError:
-                    continue
-            if removed:
-                self._entries.pop(dest_path, None)
-
-        pending = [
-            backup_path
-            for backup_path in self._entries.values()
-            if backup_path is not None
-        ]
-        if not self._entries and self._backup_dir is not None:
-            backup_dir = self._backup_dir
-            removed = False
-            for _attempt in range(2):
-                try:
-                    os.rmdir(backup_dir)
-                    removed = True
-                    break
-                except FileNotFoundError:
-                    removed = True
-                    break
-                except OSError:
-                    continue
-            if removed:
-                self._backup_dir = None
+    def _verify_visible_commit_entry(self, entry):
+        name = entry["name"]
+        identity = entry["published_identity"]
+        self._output.verify()
+        if identity is None:
+            try:
+                os.stat(
+                    name,
+                    dir_fd=self._output.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
             else:
-                pending.append(backup_dir)
-        return pending
+                raise _UnstableRegularFileError(
+                    "staged managed-output removal reappeared"
+                )
+        else:
+            published = _stable_managed_file(
+                self._output,
+                name,
+                expected={
+                    "size": entry["published_size"],
+                    "sha256": entry["published_sha256"],
+                },
+            )
+            if published.identity != identity:
+                raise _UnstableRegularFileError(
+                    "published managed output identity changed"
+                )
+            entry["commit_mtime_ns"] = published.mtime_ns
+            entry["commit_ctime_ns"] = published.ctime_ns
+        self._output.verify()
+
+    def _verify_commit_entry(self, entry):
+        backup_path = entry["backup"]
+        backup_state = entry["backup_state"]
+        try:
+            self._verify_visible_commit_entry(entry)
+            if (backup_path is None) != (backup_state is None):
+                raise _UnstableRegularFileError(
+                    "managed-output rollback entry is unavailable"
+                )
+            if backup_path is not None:
+                self._verify_backup_entry(
+                    backup_path,
+                    backup_state,
+                )
+        except (
+            OSError,
+            TypeError,
+            NotImplementedError,
+            ValueError,
+        ) as error:
+            raise _ManagedOutputRecoveryRequiredError(
+                "managed output changed before journal commit"
+            ) from error
+
+    def _raise_commit_recovery(self, error):
+        if isinstance(
+            error,
+            _ManagedOutputRecoveryRequiredError,
+        ):
+            recovery_error = error
+        else:
+            recovery_error = _ManagedOutputRecoveryRequiredError(
+                "managed output changed before journal commit",
+                recovery_paths=self.recovery_paths(),
+            )
+        recovery_error = self._enter_recovery_required(
+            recovery_error
+        )
+        if recovery_error is error:
+            raise recovery_error
+        raise recovery_error from error
+
+    def commit(self):
+        if self._state is _ManagedOutputJournalState.RECOVERY_REQUIRED:
+            raise self._recovery_error
+        if self._state is _ManagedOutputJournalState.COMMITTED:
+            return []
+        if self._state is _ManagedOutputJournalState.OPEN:
+            if self._output is not None:
+                if self._entries:
+                    for entry in tuple(self._entries.values()):
+                        try:
+                            self._verify_commit_entry(entry)
+                        except _ManagedOutputRecoveryRequiredError as error:
+                            self._raise_commit_recovery(error)
+                elif self._verify_empty_root_on_commit:
+                    self._output.verify()
+            self._state = _ManagedOutputJournalState.COMMIT_CLEANUP
+        elif self._state is not _ManagedOutputJournalState.COMMIT_CLEANUP:
+            raise RuntimeError(
+                "managed-output journal cannot commit from "
+                f"{self._state.value}"
+            )
+        if self._output is not None:
+            pending = []
+            for backup_path, backup_state in tuple(
+                self._detached_backup_paths.items()
+            ):
+                status = (
+                    self._detached_backup_copy_status(
+                        backup_path,
+                        backup_state,
+                    )
+                    if backup_state is not None
+                    else "unavailable"
+                )
+                if status == "owned":
+                    pending.append(
+                        self._pending_backup_cleanup(backup_path)
+                    )
+                elif status == "unavailable":
+                    pending.append(_PENDING_CLEANUP_WITHOUT_PATH)
+                elif status in {"missing", "replaced"}:
+                    self._detached_backup_paths.pop(
+                        backup_path,
+                        None,
+                    )
+            for dest_path, entry in tuple(self._entries.items()):
+                backup_path = entry["backup"]
+                if backup_path is None:
+                    self._entries.pop(dest_path, None)
+                    continue
+                removed = False
+                cleanup_unavailable = False
+                for _attempt in range(2):
+                    try:
+                        self._remove_backup_entry(
+                            backup_path,
+                            entry["backup_state"],
+                            commit_entry=entry,
+                        )
+                        self._entries.pop(dest_path, None)
+                        removed = True
+                        break
+                    except _ManagedOutputRecoveryRequiredError as error:
+                        self._raise_commit_recovery(error)
+                    except _IdentityBoundMutationUnavailableError:
+                        cleanup_unavailable = True
+                        break
+                    except _UnstableRegularFileError as error:
+                        self._raise_commit_recovery(error)
+                    except OSError:
+                        continue
+                if not removed:
+                    if cleanup_unavailable:
+                        pending.append(_PENDING_CLEANUP_WITHOUT_PATH)
+                    elif self._backup_copy_matches(
+                        backup_path,
+                        entry["backup_state"],
+                    ):
+                        pending.append(
+                            self._pending_backup_cleanup(
+                                self._backup_path(backup_path)
+                            )
+                        )
+                    else:
+                        pending.append(_PENDING_CLEANUP_WITHOUT_PATH)
+            if (
+                not self._entries
+                and not self._detached_backup_paths
+                and self._backup_dir is not None
+            ):
+                backup_dir = self._backup_dir
+                removed = False
+                cleanup_unavailable = False
+                for _attempt in range(2):
+                    try:
+                        self._remove_pinned_backup_dir()
+                        removed = True
+                        break
+                    except _IdentityBoundMutationUnavailableError:
+                        cleanup_unavailable = True
+                        break
+                    except OSError:
+                        continue
+                if not removed:
+                    if cleanup_unavailable:
+                        pending.append(
+                            _PENDING_CLEANUP_WITHOUT_PATH
+                        )
+                    elif self._backup_directory_matches():
+                        pending.append(backup_dir)
+                    else:
+                        pending.append(
+                            _PENDING_CLEANUP_WITHOUT_PATH
+                        )
+            if (
+                not self._entries
+                and not self._detached_backup_paths
+                and self._backup_dir is None
+            ):
+                self._state = _ManagedOutputJournalState.COMMITTED
+            return list(dict.fromkeys(pending))
+        raise RuntimeError("managed-output journal lost its pinned directory")
+
+    def commit_after_sidecar(self):
+        self._verify_empty_root_on_commit = True
+        try:
+            return self.commit()
+        finally:
+            self._verify_empty_root_on_commit = False
 
     def _cleanup_backup_dir(self):
-        if self._entries or self._backup_dir is None:
+        if (
+            self._entries
+            or self._detached_backup_paths
+            or self._backup_dir is None
+        ):
             return
         backup_dir = self._backup_dir
         try:
-            os.rmdir(backup_dir)
+            self._remove_pinned_backup_dir()
+        except _IdentityBoundMutationUnavailableError as error:
+            raise _ManagedOutputDirectoryCleanupError(
+                _PENDING_CLEANUP_WITHOUT_PATH,
+                error,
+            ) from error
         except FileNotFoundError:
-            pass
+            raise _ManagedOutputDirectoryCleanupError(
+                backup_dir,
+                _UnstableRegularFileError(
+                    "managed-output rollback directory changed"
+                ),
+            )
         except OSError as error:
             raise _ManagedOutputDirectoryCleanupError(
                 backup_dir,
                 error,
             ) from error
-        self._backup_dir = None
+
+
+def _append_post_commit_cleanup_records(records, paths):
+    seen = {
+        os.path.abspath(os.fspath(record["path"]))
+        for record in records
+        if (
+            record.get("reason") == "post-commit cleanup pending"
+            and record.get("path") is not None
+        )
+    }
+    generic_seen = any(
+        record.get("reason") == "post-commit cleanup pending"
+        and record.get("path") is None
+        for record in records
+    )
+    for path in paths:
+        if path is _PENDING_CLEANUP_WITHOUT_PATH:
+            if generic_seen:
+                continue
+            records.append({
+                "name": "managed-output cleanup",
+                "reason": "post-commit cleanup pending",
+            })
+            generic_seen = True
+            continue
+        path = os.path.abspath(os.fspath(path))
+        if path in seen:
+            continue
+        records.append({
+            "name": os.path.basename(path),
+            "reason": "post-commit cleanup pending",
+            "path": path,
+        })
+        seen.add(path)
 
 
 def _restore_managed_output(
@@ -508,46 +3784,1165 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
     """Download to disk with redirects, size cap, HTML sniffing, and retry/backoff.
     Streams the body in chunks (no whole-file buffering). Retries on timeout and
     HTTP 5xx; auth errors (401/403) and size/HTML rejections are terminal."""
-    if not url.lower().startswith(("https://", "http://")):
-        return {"ok": False, "path": dest_path,
-                "skipped_reason": f"unsupported URL scheme: {url!r}"}
+    staging = (
+        dest_path
+        if isinstance(dest_path, _DownloadStagingFile)
+        else None
+    )
+    result_path = (
+        staging.display_path if staging is not None else dest_path
+    )
+    if not _http.is_valid_http_url(url):
+        try:
+            scheme = urllib.parse.urlsplit(url).scheme.lower()
+        except (AttributeError, TypeError, ValueError):
+            scheme = (
+                url.split(":", 1)[0].lower()
+                if isinstance(url, str) and ":" in url
+                else ""
+            )
+        if scheme in {"http", "https"}:
+            return {
+                "ok": False,
+                "path": result_path,
+                "skipped_reason": "invalid download URL",
+            }
+        return {
+            "ok": False,
+            "path": result_path,
+            "skipped_reason": f"unsupported URL scheme: {url!r}",
+        }
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
     last_reason = "unknown error"
     for attempt in range(retries):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _http.open_http(req, timeout=timeout) as resp:
+                final_url = _http.validated_response_url(resp)
                 ctype = (resp.info().get("Content-Type") or "").lower()
                 if "text/html" in ctype:
-                    return {"ok": False, "path": dest_path,
+                    return {"ok": False, "path": result_path,
                             "skipped_reason": f"server returned HTML ({ctype}), not a data file"}
                 clen = resp.info().get("Content-Length")
                 if clen and clen.isdigit() and int(clen) > max_bytes:
-                    return {"ok": False, "path": dest_path,
+                    return {"ok": False, "path": result_path,
                             "skipped_reason": f"file exceeds max_bytes ({max_bytes})"}
                 try:
                     size = _atomic_stream_write(resp, dest_path, max_bytes)
                 except _SizeLimitExceeded as e:
-                    return {"ok": False, "path": dest_path,
+                    return {"ok": False, "path": result_path,
                             "skipped_reason": str(e)}
-                return {"ok": True, "path": dest_path, "size": size}
+                result = {
+                    "ok": True,
+                    "path": result_path,
+                    "size": size,
+                    "content_type": ctype.split(";", 1)[0].strip(),
+                    "source_url": final_url,
+                }
+                return result
         except _TransientCleanupError:
             raise
+        except _http.URLPolicyError:
+            return {
+                "ok": False,
+                "path": result_path,
+                "skipped_reason": _URL_POLICY_SKIP_REASON,
+            }
         except urllib.error.HTTPError as e:
-            try:
-                if e.code in (401, 403):
-                    return {"ok": False, "path": dest_path,
-                            "skipped_reason": (f"requires authentication (HTTP {e.code}); "
-                                               "download this file manually from the dataset page")}
-                last_reason = f"HTTP {e.code}: {e.reason}"
-                if not (500 <= e.code < 600):
-                    return {"ok": False, "path": dest_path, "skipped_reason": last_reason}
-            finally:
-                e.close()
+            _http._close_http_response(e)
+            if e.code in (401, 403):
+                return {"ok": False, "path": result_path,
+                        "skipped_reason": (f"requires authentication (HTTP {e.code}); "
+                                           "download this file manually from the dataset page")}
+            last_reason = f"HTTP {e.code}: {e.reason}"
+            if not (500 <= e.code < 600):
+                return {"ok": False, "path": result_path, "skipped_reason": last_reason}
         except Exception as e:
             last_reason = f"download error: {e}"
         if attempt < retries - 1:
             time.sleep(backoff * (2 ** attempt))
-    return {"ok": False, "path": dest_path, "skipped_reason": last_reason}
+    return {
+        "ok": False,
+        "path": result_path,
+        "skipped_reason": last_reason,
+    }
+
+
+def _write_collision_safe(
+    out_dir,
+    name,
+    data,
+    *,
+    _return_entry=False,
+    max_total_bytes=None,
+    transient_files=(),
+):
+    if not isinstance(out_dir, _PinnedOutputDirectory):
+        with _pinned_output_directory(out_dir) as output:
+            return _write_collision_safe(
+                output,
+                name,
+                data,
+                _return_entry=_return_entry,
+                max_total_bytes=max_total_bytes,
+                transient_files=transient_files,
+            )
+
+    def regular_file_matches(filename):
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            return None
+        try:
+            fd = os.open(
+                filename,
+                os.O_RDONLY | nofollow,
+                dir_fd=out_dir.fd,
+            )
+        except OSError:
+            return None
+        try:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_size != len(data)
+            ):
+                return None
+            offset = 0
+            with os.fdopen(os.dup(fd), "rb") as fh:
+                while offset < len(data):
+                    chunk = fh.read(
+                        min(1024 * 1024, len(data) - offset)
+                    )
+                    if (
+                        not chunk
+                        or chunk != data[offset:offset + len(chunk)]
+                    ):
+                        return None
+                    offset += len(chunk)
+            final_opened = os.fstat(fd)
+            try:
+                current = os.stat(
+                    filename,
+                    dir_fd=out_dir.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return None
+            if (
+                stat.S_ISREG(current.st_mode)
+                and stat.S_ISREG(final_opened.st_mode)
+                and current.st_size == len(data)
+                and final_opened.st_size == len(data)
+                and current.st_dev == opened.st_dev
+                and current.st_ino == opened.st_ino
+                and final_opened.st_dev == opened.st_dev
+                and final_opened.st_ino == opened.st_ino
+            ):
+                return current
+            return None
+        finally:
+            os.close(fd)
+
+    def publication(
+        filename,
+        *,
+        size,
+        identity,
+        created,
+    ):
+        return _PublishedOutputFile(
+            filename=filename,
+            size=size,
+            identity=identity,
+            sha256=content_sha256,
+            created=created,
+        )
+
+    def result(entry):
+        if _return_entry:
+            return entry
+        return entry.display_path(out_dir)
+
+    def require_projected_size(
+        *,
+        private_name,
+        private_state,
+        additional_size,
+    ):
+        if max_total_bytes is None:
+            return
+        excluded_entries = {
+            private_name: (
+                private_state.st_dev,
+                private_state.st_ino,
+            ),
+        }
+        sidecar_identity = _verified_source_sidecar_identity(out_dir)
+        if sidecar_identity is not None:
+            excluded_entries[SOURCE_SIDECAR] = sidecar_identity
+        for staging in transient_files:
+            if staging.output.fd != out_dir.fd:
+                raise _UnstableRegularFileError(
+                    "download staging belongs to a different output directory"
+                )
+            _verify_staging_file(staging)
+            current = os.fstat(staging.fd)
+            excluded_entries[staging.name] = (
+                current.st_dev,
+                current.st_ino,
+            )
+        out_dir.verify()
+        projected = (
+            _dir_size_fd_excluding_root_entries(
+                out_dir.fd,
+                excluded_entries,
+            )
+            + additional_size
+        )
+        if projected > max_total_bytes:
+            raise _PaperDataLimitError(
+                "publication skipped because projected paper data exceeds "
+                "per-paper cap"
+            )
+
+    out_dir.verify()
+    stem, suffix = os.path.splitext(os.path.basename(name))
+    content_sha256 = hashlib.sha256(data).hexdigest()
+    digest = content_sha256[:10]
+    temp_name = None
+    temp_fd = -1
+    private_entry = None
+    published_entry = None
+    operation_error = None
+    cleanup_warning = None
+    try:
+        for _attempt in range(128):
+            temp_name = f".paperconan-publish-{secrets.token_hex(8)}"
+            try:
+                with _transaction_state_allocation():
+                    temp_fd = os.open(
+                        temp_name,
+                        (
+                            os.O_RDWR
+                            | os.O_CREAT
+                            | os.O_EXCL
+                            | os.O_NOFOLLOW
+                        ),
+                        0o600,
+                        dir_fd=out_dir.fd,
+                    )
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise FileExistsError(
+                "could not allocate fetch publication staging file"
+            )
+        with os.fdopen(os.dup(temp_fd), "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        private = os.fstat(temp_fd)
+        if (
+            not stat.S_ISREG(private.st_mode)
+            or private.st_size != len(data)
+            or _hash_exact_fd(temp_fd, private.st_size)
+            != content_sha256
+        ):
+            raise _UnstableRegularFileError(
+                "publication staging is not a stable regular file"
+            )
+        collision_index = 0
+        while True:
+            if collision_index == 0:
+                filename = stem + suffix
+            elif collision_index == 1:
+                filename = f"{stem}-{digest}{suffix}"
+            else:
+                filename = (
+                    f"{stem}-{digest}-{collision_index}{suffix}"
+                )
+            private_entry = publication(
+                filename,
+                size=private.st_size,
+                identity=(private.st_dev, private.st_ino),
+                created=True,
+            )
+            matched = regular_file_matches(filename)
+            if matched is not None:
+                require_projected_size(
+                    private_name=temp_name,
+                    private_state=private,
+                    additional_size=0,
+                )
+                out_dir.verify()
+                published_entry = publication(
+                    filename,
+                    size=matched.st_size,
+                    identity=(matched.st_dev, matched.st_ino),
+                    created=False,
+                )
+                break
+            require_projected_size(
+                private_name=temp_name,
+                private_state=private,
+                additional_size=private.st_size,
+            )
+            try:
+                with _transaction_state_allocation():
+                    os.link(
+                        temp_name,
+                        filename,
+                        src_dir_fd=out_dir.fd,
+                        dst_dir_fd=out_dir.fd,
+                        follow_symlinks=False,
+                    )
+            except FileExistsError:
+                matched = regular_file_matches(filename)
+                if matched is not None:
+                    require_projected_size(
+                        private_name=temp_name,
+                        private_state=private,
+                        additional_size=0,
+                    )
+                    out_dir.verify()
+                    published_entry = publication(
+                        filename,
+                        size=matched.st_size,
+                        identity=(
+                            matched.st_dev,
+                            matched.st_ino,
+                        ),
+                        created=False,
+                    )
+                    break
+                collision_index += 1
+                continue
+            visible_fd = -1
+            try:
+                visible_fd = os.open(
+                    filename,
+                    os.O_RDONLY | os.O_NOFOLLOW,
+                    dir_fd=out_dir.fd,
+                )
+                opened = os.fstat(visible_fd)
+                current = os.stat(
+                    filename,
+                    dir_fd=out_dir.fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or not stat.S_ISREG(opened.st_mode)
+                    or current.st_size != private_entry.size
+                    or opened.st_size != private_entry.size
+                    or (current.st_dev, current.st_ino)
+                    != private_entry.identity
+                    or (opened.st_dev, opened.st_ino)
+                    != private_entry.identity
+                ):
+                    raise _UnstableRegularFileError(
+                        "published output entry is not a stable regular file"
+                    )
+                out_dir.verify()
+            except Exception as exc:
+                raise _PublicationRecoveryError(
+                    f"{exc}; retained visible output for recovery: "
+                    f"{filename}"
+                ) from exc
+            finally:
+                if visible_fd >= 0:
+                    os.close(visible_fd)
+            published_entry = private_entry
+            break
+    except BaseException as error:
+        operation_error = error
+        raise
+    finally:
+        cleanup_error = None
+        if temp_fd >= 0:
+            try:
+                _unlink_owned_regular_entry(
+                    out_dir.fd,
+                    temp_name,
+                    temp_fd,
+                )
+            except (
+                OSError,
+                TypeError,
+                NotImplementedError,
+                ValueError,
+            ) as error:
+                cleanup_error = error
+            try:
+                os.close(temp_fd)
+            except OSError as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if cleanup_error is not None:
+            if operation_error is not None:
+                _append_explicit_cause(
+                    cleanup_error,
+                    operation_error,
+                )
+                raise _PublicationRecoveryError(
+                    "publication staging cleanup incomplete"
+                ) from cleanup_error
+            cleanup_warning = "publication staging cleanup incomplete"
+    if cleanup_warning is not None:
+        published_entry = _PublishedOutputFile(
+            filename=published_entry.filename,
+            size=published_entry.size,
+            identity=published_entry.identity,
+            sha256=published_entry.sha256,
+            created=published_entry.created,
+            cleanup_warning=cleanup_warning,
+        )
+    return result(published_entry)
+
+
+def _publish_download_staging(
+    output,
+    staging,
+    *,
+    output_name,
+    base,
+    source_name,
+    expected_old,
+    output_journal,
+):
+    staged = _stable_staging_state(staging)
+    if expected_old is None:
+        data = _read_verified_download_staging(
+            staging,
+            max_bytes=staged.size,
+        )
+        published = _write_collision_safe(
+            output,
+            output_name,
+            data,
+            _return_entry=True,
+        )
+        dest = os.path.join(output.path, published.filename)
+        if published.created:
+            output_journal.record_created(
+                dest,
+                published.identity,
+                published.size,
+                published.sha256,
+            )
+        output.verify()
+        return _ManagedFileState(
+            name=published.filename,
+            size=published.size,
+            sha256=published.sha256,
+            identity=published.identity,
+            created=published.created,
+            cleanup_warning=published.cleanup_warning,
+        )
+    candidate = output_name
+    expected = expected_old
+    while True:
+        dest = os.path.join(output.path, candidate)
+        if not output_journal.prepare(dest, expected=expected):
+            candidate = _managed_output_name(
+                output,
+                base,
+                source_name,
+                (),
+            )
+            expected = None
+            continue
+        try:
+            output.verify()
+            with _transaction_state_allocation():
+                os.link(
+                    staging.name,
+                    candidate,
+                    src_dir_fd=output.fd,
+                    dst_dir_fd=output.fd,
+                    follow_symlinks=False,
+                )
+            output_journal.bind_published(
+                dest,
+                staged.identity,
+                staged.size,
+                staged.sha256,
+            )
+            published = _stable_managed_file(output, candidate)
+            if (
+                published.size != staged.size
+                or published.sha256 != staged.sha256
+                or published.identity != staged.identity
+            ):
+                raise _UnstableRegularFileError(
+                    "published output does not match download staging"
+                )
+            output.verify()
+            return published
+        except FileExistsError:
+            _restore_managed_output(output_journal, dest)
+            candidate = _managed_output_name(
+                output,
+                base,
+                source_name,
+                (),
+            )
+            expected = None
+        except BaseException as error:
+            _restore_managed_output(
+                output_journal,
+                dest,
+                operation_error=error,
+            )
+            raise
+
+
+def _archive_staging_file(out_dir, suffix):
+    return _download_staging_file(
+        out_dir,
+        prefix=".paperconan-archive-",
+        suffix=suffix,
+    )
+
+
+def _published_file_limit_reason(cardinality):
+    return (
+        "published file cardinality ceiling reached "
+        f"({cardinality.max_published_files}); remaining files were skipped"
+    )
+
+
+def _archive_member_limit_reason(cardinality):
+    return (
+        "archive member cardinality ceiling reached "
+        f"({cardinality.max_archive_members}); "
+        "remaining eligible members were skipped"
+    )
+
+
+def _append_limit_reason(reasons, reason):
+    if reasons is not None and reason not in reasons:
+        reasons.append(reason)
+
+
+def _is_reserved_source_sidecar(name):
+    try:
+        basename = os.path.basename(os.fsdecode(name))
+    except (TypeError, ValueError):
+        return False
+    return basename.casefold() == SOURCE_SIDECAR.casefold()
+
+
+def _archive_blocking_reason(cardinality):
+    if cardinality is None:
+        return None
+    if not cardinality.can_publish():
+        return _published_file_limit_reason(cardinality)
+    if cardinality.archive_members >= cardinality.max_archive_members:
+        return _archive_member_limit_reason(cardinality)
+    return None
+
+
+def _read_exact_zip_range(source, offset, size, label):
+    if offset < 0 or size < 0:
+        raise ValueError(f"ZIP {label} position is invalid")
+    source.seek(offset, os.SEEK_SET)
+    data = source.read(size)
+    if len(data) != size:
+        raise ValueError(f"ZIP {label} is truncated")
+    return data
+
+
+def _validate_zip_central_directory(
+    source,
+    *,
+    entry_count,
+    directory_size,
+    directory_offset,
+    record_position,
+    max_entries,
+    prefix_adjustment=None,
+):
+    if directory_size > record_position:
+        raise ValueError("ZIP central directory position is invalid")
+    actual_offset = record_position - directory_size
+    if actual_offset < directory_offset or actual_offset < 0:
+        raise ValueError("ZIP central directory position is invalid")
+    if (
+        prefix_adjustment is not None
+        and actual_offset - directory_offset != prefix_adjustment
+    ):
+        raise ValueError(
+            "ZIP central directory position is inconsistent"
+        )
+    observed = 0
+    position = actual_offset
+    while position < record_position:
+        remaining = record_position - position
+        if remaining < _ZIP_CENTRAL_FILE_HEADER.size:
+            raise ValueError(
+                "ZIP central directory fixed header is truncated"
+            )
+        fixed = _read_exact_zip_range(
+            source,
+            position,
+            _ZIP_CENTRAL_FILE_HEADER.size,
+            "central directory fixed header",
+        )
+        fields = _ZIP_CENTRAL_FILE_HEADER.unpack(fixed)
+        if fields[0] != _ZIP_CENTRAL_DIRECTORY_SIGNATURE:
+            raise ValueError(
+                "ZIP central directory signature is invalid"
+            )
+        filename_size, extra_size, comment_size = fields[10:13]
+        disk_number = fields[13]
+        if disk_number != 0:
+            raise ValueError(
+                "multi-disk ZIP archives are unavailable"
+            )
+        variable_size = filename_size + extra_size + comment_size
+        record_size = (
+            _ZIP_CENTRAL_FILE_HEADER.size + variable_size
+        )
+        record_end = position + record_size
+        if (
+            record_size < _ZIP_CENTRAL_FILE_HEADER.size
+            or record_end <= position
+            or record_end > record_position
+        ):
+            raise ValueError(
+                "ZIP central directory record is truncated"
+            )
+        observed += 1
+        if observed > max_entries:
+            raise ValueError(
+                f"observed ZIP entry count {observed} exceeds "
+                f"preflight ceiling {max_entries}"
+            )
+        position = record_end
+        source.seek(position, os.SEEK_SET)
+    if position != record_position:
+        raise ValueError(
+            "ZIP central directory end is inconsistent"
+        )
+    if observed != entry_count:
+        raise ValueError("ZIP entry counts are inconsistent")
+    return observed
+
+
+def _preflight_zip_entry_count(source, *, max_entries):
+    if not isinstance(max_entries, int) or max_entries < 0:
+        raise ValueError("ZIP entry ceiling is invalid")
+    try:
+        source.seek(0, os.SEEK_END)
+        file_size = source.tell()
+    except (AttributeError, OSError, ValueError) as error:
+        raise ValueError("ZIP source is not seekable") from error
+    if file_size < _ZIP_EOCD.size:
+        raise ValueError(
+            "ZIP EOCD record is missing or truncated"
+        )
+
+    tail_size = min(
+        file_size,
+        _ZIP_EOCD.size + _ZIP_MAX_COMMENT_BYTES,
+    )
+    tail_offset = file_size - tail_size
+    tail = _read_exact_zip_range(
+        source,
+        tail_offset,
+        tail_size,
+        "EOCD tail",
+    )
+    candidates = []
+    for relative_offset in range(
+        tail_size - _ZIP_EOCD.size,
+        -1,
+        -1,
+    ):
+        fields = _ZIP_EOCD.unpack_from(tail, relative_offset)
+        if fields[0] != _ZIP_EOCD_SIGNATURE:
+            continue
+        comment_size = fields[-1]
+        record_position = tail_offset + relative_offset
+        if (
+            record_position
+            + _ZIP_EOCD.size
+            + comment_size
+            == file_size
+        ):
+            candidates.append((record_position, fields))
+    if not candidates:
+        raise ValueError(
+            "ZIP EOCD record is missing or truncated"
+        )
+    if len(candidates) != 1:
+        raise ValueError("ZIP EOCD metadata is ambiguous")
+
+    record_position, fields = candidates[0]
+    (
+        _,
+        disk_number,
+        central_directory_disk,
+        entries_on_disk,
+        total_entries,
+        directory_size,
+        directory_offset,
+        _,
+    ) = fields
+    needs_zip64 = (
+        disk_number == _ZIP16_SENTINEL
+        or central_directory_disk == _ZIP16_SENTINEL
+        or entries_on_disk == _ZIP16_SENTINEL
+        or total_entries == _ZIP16_SENTINEL
+        or directory_size == _ZIP32_SENTINEL
+        or directory_offset == _ZIP32_SENTINEL
+    )
+
+    if not needs_zip64:
+        if disk_number != 0 or central_directory_disk != 0:
+            raise ValueError(
+                "multi-disk ZIP archives are unavailable"
+            )
+        if entries_on_disk != total_entries:
+            raise ValueError(
+                "ZIP entry counts are inconsistent"
+            )
+        if total_entries > max_entries:
+            raise ValueError(
+                f"raw ZIP entry count {total_entries} exceeds "
+                f"preflight ceiling {max_entries}"
+            )
+        return _validate_zip_central_directory(
+            source,
+            entry_count=total_entries,
+            directory_size=directory_size,
+            directory_offset=directory_offset,
+            record_position=record_position,
+            max_entries=max_entries,
+        )
+
+    locator_position = (
+        record_position - _ZIP64_LOCATOR.size
+    )
+    locator_data = _read_exact_zip_range(
+        source,
+        locator_position,
+        _ZIP64_LOCATOR.size,
+        "ZIP64 locator",
+    )
+    (
+        locator_signature,
+        zip64_disk,
+        declared_zip64_offset,
+        disk_count,
+    ) = _ZIP64_LOCATOR.unpack(locator_data)
+    if locator_signature != _ZIP64_LOCATOR_SIGNATURE:
+        raise ValueError(
+            "ZIP64 locator signature is invalid"
+        )
+    if zip64_disk != 0 or disk_count != 1:
+        raise ValueError(
+            "multi-disk ZIP64 archives are unavailable"
+        )
+
+    candidate_positions = [declared_zip64_offset]
+    inferred_position = (
+        locator_position - _ZIP64_EOCD.size
+    )
+    if inferred_position != declared_zip64_offset:
+        candidate_positions.append(inferred_position)
+    zip64_records = []
+    for candidate_position in candidate_positions:
+        if (
+            candidate_position < 0
+            or candidate_position + _ZIP64_EOCD.size
+            > locator_position
+        ):
+            continue
+        data = _read_exact_zip_range(
+            source,
+            candidate_position,
+            _ZIP64_EOCD.size,
+            "ZIP64 EOCD record",
+        )
+        values = _ZIP64_EOCD.unpack(data)
+        if values[0] != _ZIP64_EOCD_SIGNATURE:
+            continue
+        record_size = values[1]
+        if (
+            record_size < _ZIP64_EOCD.size - 12
+            or candidate_position + 12 + record_size
+            != locator_position
+        ):
+            continue
+        zip64_records.append(
+            (candidate_position, values)
+        )
+    if len(zip64_records) != 1:
+        raise ValueError(
+            "ZIP64 EOCD record position or length is invalid"
+        )
+
+    zip64_position, values = zip64_records[0]
+    (
+        _,
+        _,
+        _,
+        _,
+        zip64_disk_number,
+        zip64_directory_disk,
+        zip64_entries_on_disk,
+        zip64_total_entries,
+        zip64_directory_size,
+        zip64_directory_offset,
+    ) = values
+    if (
+        zip64_disk_number != 0
+        or zip64_directory_disk != 0
+    ):
+        raise ValueError(
+            "multi-disk ZIP64 archives are unavailable"
+        )
+    if zip64_entries_on_disk != zip64_total_entries:
+        raise ValueError(
+            "ZIP64 entry counts are inconsistent"
+        )
+
+    classic_pairs = (
+        (
+            disk_number,
+            _ZIP16_SENTINEL,
+            zip64_disk_number,
+        ),
+        (
+            central_directory_disk,
+            _ZIP16_SENTINEL,
+            zip64_directory_disk,
+        ),
+        (
+            entries_on_disk,
+            _ZIP16_SENTINEL,
+            zip64_entries_on_disk,
+        ),
+        (
+            total_entries,
+            _ZIP16_SENTINEL,
+            zip64_total_entries,
+        ),
+        (
+            directory_size,
+            _ZIP32_SENTINEL,
+            zip64_directory_size,
+        ),
+        (
+            directory_offset,
+            _ZIP32_SENTINEL,
+            zip64_directory_offset,
+        ),
+    )
+    if any(
+        classic_value != sentinel
+        and classic_value != zip64_value
+        for classic_value, sentinel, zip64_value
+        in classic_pairs
+    ):
+        raise ValueError(
+            "classic and ZIP64 metadata are inconsistent"
+        )
+    if zip64_total_entries > max_entries:
+        raise ValueError(
+            f"raw ZIP entry count {zip64_total_entries} exceeds "
+            f"preflight ceiling {max_entries}"
+        )
+    prefix_adjustment = (
+        zip64_position - declared_zip64_offset
+    )
+    if prefix_adjustment < 0:
+        raise ValueError(
+            "ZIP64 EOCD position is invalid"
+        )
+    return _validate_zip_central_directory(
+        source,
+        entry_count=zip64_total_entries,
+        directory_size=zip64_directory_size,
+        directory_offset=zip64_directory_offset,
+        record_position=zip64_position,
+        max_entries=max_entries,
+        prefix_adjustment=prefix_adjustment,
+    )
+
+
+def _extract_selected_zip(
+    zip_source,
+    out_dir,
+    *,
+    include_images=False,
+    max_member_bytes=_DEFAULT_MAX,
+    return_entries=False,
+    cardinality=None,
+    limit_reasons=None,
+    published_entries=None,
+    pending_entries=None,
+    transient_files=(),
+):
+    extracted = (
+        published_entries
+        if published_entries is not None
+        else []
+    )
+    pending = (
+        pending_entries
+        if pending_entries is not None
+        else []
+    )
+    allowed = {"tabular"}
+    if include_images:
+        allowed.update({"image", "document"})
+    if isinstance(
+        zip_source,
+        (bytes, bytearray, memoryview),
+    ):
+        source = io.BytesIO(bytes(zip_source))
+    elif all(
+        hasattr(zip_source, name)
+        for name in ("read", "seek", "tell")
+    ):
+        source = zip_source
+    else:
+        raise ValueError("ZIP source is not seekable")
+    _preflight_zip_entry_count(
+        source,
+        max_entries=_MAX_RAW_ZIP_ENTRIES_PER_ARCHIVE,
+    )
+    source.seek(0, os.SEEK_SET)
+    with zipfile.ZipFile(source) as archive:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            name = os.path.basename(info.filename)
+            if _is_reserved_source_sidecar(name):
+                _append_limit_reason(
+                    limit_reasons,
+                    _RESERVED_SOURCE_SIDECAR_REASON,
+                )
+                continue
+            publication_name = name
+            if _is_reserved_managed_name(publication_name):
+                publication_name = _managed_output_name(
+                    out_dir,
+                    publication_name,
+                    info.filename,
+                    (),
+                )
+            if (
+                not name
+                or asset_type(name) not in allowed
+                or info.file_size > max_member_bytes
+            ):
+                continue
+            if cardinality is not None:
+                if not cardinality.can_publish():
+                    _append_limit_reason(
+                        limit_reasons,
+                        _published_file_limit_reason(
+                            cardinality
+                        ),
+                    )
+                    break
+                if not cardinality.claim_archive_member():
+                    _append_limit_reason(
+                        limit_reasons,
+                        _archive_member_limit_reason(
+                            cardinality
+                        ),
+                    )
+                    break
+            try:
+                with archive.open(info) as source_member:
+                    data = source_member.read(
+                        max_member_bytes + 1
+                    )
+            except _ZIP_MEMBER_READ_EXCEPTIONS as error:
+                raise _ArchiveReadError(str(error)) from error
+            if len(data) > max_member_bytes:
+                continue
+            try:
+                destination = _write_collision_safe(
+                    out_dir,
+                    publication_name,
+                    data,
+                    _return_entry=return_entries,
+                    max_total_bytes=_MAX_PAPER_BYTES,
+                    transient_files=transient_files,
+                )
+            except _PaperDataLimitError as error:
+                _append_limit_reason(
+                    limit_reasons,
+                    str(error),
+                )
+                continue
+            if return_entries:
+                pending.append(destination)
+            if cardinality is not None:
+                cardinality.record_publication()
+            if return_entries:
+                _verify_published_output_file(
+                    out_dir,
+                    destination,
+                )
+                out_dir.verify()
+                pending.remove(destination)
+            extracted.append(destination)
+    return extracted
+
+
+def _extract_selected_tar(
+    tar_source,
+    out_dir,
+    *,
+    include_images=False,
+    max_member_bytes=_DEFAULT_MAX,
+    return_entries=False,
+    cardinality=None,
+    limit_reasons=None,
+    published_entries=None,
+    pending_entries=None,
+    transient_files=(),
+):
+    extracted = (
+        published_entries
+        if published_entries is not None
+        else []
+    )
+    pending = (
+        pending_entries
+        if pending_entries is not None
+        else []
+    )
+    allowed = {"tabular"}
+    if include_images:
+        allowed.update({"image", "document"})
+    compressed = (
+        nullcontext(tar_source)
+        if hasattr(tar_source, "read")
+        else open(tar_source, "rb")
+    )
+    with compressed as compressed_source:
+        with gzip.GzipFile(
+            fileobj=compressed_source,
+            mode="rb",
+        ) as uncompressed:
+            bounded = _BoundedUncompressedReader(
+                uncompressed,
+                max_bytes=(
+                    _MAX_UNCOMPRESSED_TAR_BYTES_PER_ARCHIVE
+                ),
+                max_members=_MAX_RAW_TAR_MEMBERS_PER_ARCHIVE,
+            )
+            try:
+                archive = tarfile.open(
+                    fileobj=bounded,
+                    mode="r|",
+                )
+            except _TAR_STREAM_READ_EXCEPTIONS as error:
+                raise _ArchiveReadError(str(error)) from error
+            with archive:
+                members = iter(archive)
+                while True:
+                    try:
+                        member = next(members)
+                    except StopIteration:
+                        break
+                    except _TAR_STREAM_READ_EXCEPTIONS as error:
+                        raise _ArchiveReadError(
+                            str(error)
+                        ) from error
+                    if not member.isfile():
+                        continue
+                    name = os.path.basename(member.name)
+                    if _is_reserved_source_sidecar(name):
+                        _append_limit_reason(
+                            limit_reasons,
+                            _RESERVED_SOURCE_SIDECAR_REASON,
+                        )
+                        continue
+                    publication_name = name
+                    if _is_reserved_managed_name(
+                        publication_name
+                    ):
+                        publication_name = _managed_output_name(
+                            out_dir,
+                            publication_name,
+                            member.name,
+                            (),
+                        )
+                    if (
+                        not name
+                        or asset_type(name) not in allowed
+                        or member.size > max_member_bytes
+                    ):
+                        continue
+                    if cardinality is not None:
+                        if not cardinality.can_publish():
+                            _append_limit_reason(
+                                limit_reasons,
+                                _published_file_limit_reason(
+                                    cardinality
+                                ),
+                            )
+                            break
+                        if not cardinality.claim_archive_member():
+                            _append_limit_reason(
+                                limit_reasons,
+                                _archive_member_limit_reason(
+                                    cardinality
+                                ),
+                            )
+                            break
+                    try:
+                        source_member = archive.extractfile(
+                            member
+                        )
+                        if source_member is None:
+                            continue
+                        data = source_member.read(
+                            max_member_bytes + 1
+                        )
+                    except _TAR_STREAM_READ_EXCEPTIONS as error:
+                        raise _ArchiveReadError(
+                            str(error)
+                        ) from error
+                    if len(data) > max_member_bytes:
+                        continue
+                    try:
+                        destination = _write_collision_safe(
+                            out_dir,
+                            publication_name,
+                            data,
+                            _return_entry=return_entries,
+                            max_total_bytes=_MAX_PAPER_BYTES,
+                            transient_files=transient_files,
+                        )
+                    except _PaperDataLimitError as error:
+                        _append_limit_reason(
+                            limit_reasons,
+                            str(error),
+                        )
+                        continue
+                    if return_entries:
+                        pending.append(destination)
+                    if cardinality is not None:
+                        cardinality.record_publication()
+                    if return_entries:
+                        _verify_published_output_file(
+                            out_dir,
+                            destination,
+                        )
+                        out_dir.verify()
+                        pending.remove(destination)
+                    extracted.append(destination)
+    return extracted
 
 
 def _is_reserved_managed_name(name):
@@ -611,6 +5006,26 @@ def _safe_managed_path(out_dir, relative):
     return lexical_path
 
 
+def _safe_managed_name(relative):
+    if (
+        not isinstance(relative, str)
+        or not relative
+        or _is_reserved_managed_name(relative)
+        or relative in (".", "..")
+        or os.path.basename(relative) != relative
+        or "\x00" in relative
+    ):
+        return None
+    try:
+        if os.path.isabs(relative):
+            return None
+    except (OSError, TypeError, ValueError):
+        return None
+    if os.altsep and os.altsep in relative:
+        return None
+    return relative
+
+
 def _safe_managed_names(
     out_dir,
     managed_files,
@@ -632,11 +5047,11 @@ def _safe_managed_names(
         known_entry_count = (
             len(managed_files)
             if type(managed_files)
-            in (list, tuple, set, frozenset)
+            in (dict, list, tuple, set, frozenset)
             else None
         )
 
-    lexical_root = os.path.abspath(out_dir)
+    lexical_root = os.path.abspath(_output_path(out_dir))
     safe = set()
     entries_inspected = 0
     retained_name_bytes = 0
@@ -706,6 +5121,156 @@ def _safe_managed_names(
         safe.add(normalized)
         retained_name_bytes += name_bytes
     return sorted(safe)
+
+
+def _canonical_fingerprint(value):
+    if (
+        type(value) is not dict
+        or set(value) != {"size", "sha256"}
+        or type(value.get("size")) is not int
+        or value["size"] < 0
+        or type(value.get("sha256")) is not str
+        or len(value["sha256"]) != 64
+        or any(
+            char not in "0123456789abcdef"
+            for char in value["sha256"]
+        )
+    ):
+        return None
+    return {
+        "size": value["size"],
+        "sha256": value["sha256"],
+    }
+
+
+def _path_fingerprint(out_dir, relative):
+    relative = _safe_managed_name(relative)
+    if relative is None:
+        return None
+    if isinstance(out_dir, _PinnedOutputDirectory):
+        try:
+            state = _stable_managed_file(out_dir, relative)
+        except (OSError, ValueError):
+            return None
+        return {"size": state.size, "sha256": state.sha256}
+    path = os.path.join(_output_path(out_dir), relative)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | nofollow)
+    except OSError:
+        return None
+    try:
+        opened = os.fstat(fd)
+        current = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or (opened.st_dev, opened.st_ino)
+            != (current.st_dev, current.st_ino)
+        ):
+            return None
+        digest = _hash_exact_fd(fd, opened.st_size)
+        final = os.fstat(fd)
+        final_current = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or not stat.S_ISREG(final_current.st_mode)
+            or final.st_size != opened.st_size
+            or final.st_mtime_ns != opened.st_mtime_ns
+            or final.st_ctime_ns != opened.st_ctime_ns
+            or (final.st_dev, final.st_ino)
+            != (opened.st_dev, opened.st_ino)
+            or (final_current.st_dev, final_current.st_ino)
+            != (opened.st_dev, opened.st_ino)
+        ):
+            return None
+        return {"size": opened.st_size, "sha256": digest}
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _safe_managed_fingerprints(
+    out_dir,
+    managed_files,
+    *,
+    entry_limit,
+    name_byte_limit,
+):
+    if type(managed_files) is dict:
+        entries = iter(managed_files.items())
+        known_entry_count = len(managed_files)
+    else:
+        names = _safe_managed_names(
+            out_dir,
+            managed_files,
+            entry_limit=entry_limit,
+            name_byte_limit=None,
+        )
+        entries = ((name, None) for name in names)
+        known_entry_count = len(names)
+    safe = {}
+    entries_inspected = 0
+    retained_name_bytes = 0
+    while True:
+        if entries_inspected >= entry_limit:
+            if entries_inspected >= known_entry_count:
+                break
+            raise _SourceSidecarLimit(
+                _source_sidecar_limit_record(
+                    "source sidecar managed entry limit",
+                    limit=entry_limit,
+                    omitted_entries_lower_bound=(
+                        known_entry_count - entries_inspected
+                    ),
+                    managed_entries_inspected=entries_inspected,
+                    managed_entries_retained=len(safe),
+                    managed_name_bytes_retained=retained_name_bytes,
+                )
+            )
+        try:
+            relative, supplied = next(entries)
+        except StopIteration:
+            break
+        entries_inspected += 1
+        normalized = _safe_managed_name(relative)
+        if normalized is None or normalized in safe:
+            continue
+        fingerprint = (
+            _canonical_fingerprint(supplied)
+            if supplied is not None
+            else _path_fingerprint(out_dir, normalized)
+        )
+        if fingerprint is None:
+            continue
+        requested_name_bytes = (
+            len(
+                normalized.encode(
+                    "utf-8", errors="surrogatepass"
+                )
+            )
+            + 64
+        )
+        if (
+            retained_name_bytes + requested_name_bytes
+            > name_byte_limit
+        ):
+            raise _SourceSidecarLimit(
+                _source_sidecar_limit_record(
+                    "source sidecar managed name byte limit",
+                    limit=name_byte_limit,
+                    managed_entries_inspected=entries_inspected,
+                    managed_entries_retained=len(safe),
+                    managed_name_bytes_retained=retained_name_bytes,
+                    requested_name_bytes=requested_name_bytes,
+                )
+            )
+        safe[normalized] = fingerprint
+        retained_name_bytes += requested_name_bytes
+    return {name: safe[name] for name in sorted(safe)}
 
 
 class _SourceSidecarLimit(ValueError):
@@ -822,28 +5387,90 @@ def _source_sidecar_limit_record(
 
 
 def _read_source_sidecar(out_dir):
-    path = os.path.join(out_dir, SOURCE_SIDECAR)
+    path = os.path.join(_output_path(out_dir), SOURCE_SIDECAR)
     byte_limit = max(0, int(_SOURCE_SIDECAR_MAX_BYTES))
     entry_limit = max(0, int(_SOURCE_SIDECAR_ENTRY_LIMIT))
     name_byte_limit = max(
         0, int(_SOURCE_SIDECAR_NAME_BYTES)
     )
-    lexical_root = os.path.abspath(out_dir)
-
     def normalize_name(relative):
-        path = _safe_managed_path(out_dir, relative)
-        if path is None:
-            return None
-        return os.path.relpath(path, lexical_root)
+        return _safe_managed_name(relative)
 
     try:
-        data = read_sidecar(
-            path,
-            byte_limit=byte_limit,
-            entry_limit=entry_limit,
-            name_byte_limit=name_byte_limit,
-            normalize_name=normalize_name,
-        )
+        if isinstance(out_dir, _PinnedOutputDirectory):
+            out_dir.verify()
+            nofollow = getattr(os, "O_NOFOLLOW", None)
+            if nofollow is None:
+                raise _UnstableRegularFileError(
+                    "no-follow sidecar opening is unavailable"
+                )
+            try:
+                fd = os.open(
+                    SOURCE_SIDECAR,
+                    os.O_RDONLY | nofollow,
+                    dir_fd=out_dir.fd,
+                )
+            except FileNotFoundError:
+                return {}
+            except (OSError, TypeError, NotImplementedError):
+                return {}
+            try:
+                opened = os.fstat(fd)
+                if not stat.S_ISREG(opened.st_mode):
+                    return {}
+                payload = bytearray()
+                while len(payload) <= byte_limit:
+                    chunk = os.read(
+                        fd,
+                        min(
+                            65536,
+                            byte_limit + 1 - len(payload),
+                        ),
+                    )
+                    if not chunk:
+                        break
+                    payload.extend(chunk)
+                if len(payload) > byte_limit:
+                    raise SidecarLimitError(
+                        "source sidecar byte limit",
+                        observed_bytes=len(payload),
+                        observed_bytes_is_lower_bound=True,
+                    )
+                final = os.fstat(fd)
+                current = os.stat(
+                    SOURCE_SIDECAR,
+                    dir_fd=out_dir.fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(final.st_mode)
+                    or not stat.S_ISREG(current.st_mode)
+                    or final.st_size != opened.st_size
+                    or final.st_mtime_ns != opened.st_mtime_ns
+                    or final.st_ctime_ns != opened.st_ctime_ns
+                    or (final.st_dev, final.st_ino)
+                    != (opened.st_dev, opened.st_ino)
+                    or (current.st_dev, current.st_ino)
+                    != (opened.st_dev, opened.st_ino)
+                ):
+                    return {}
+                out_dir.verify()
+            finally:
+                os.close(fd)
+            data = parse_sidecar_bytes(
+                bytes(payload),
+                entry_limit=entry_limit,
+                name_byte_limit=name_byte_limit,
+                normalize_name=normalize_name,
+            )
+        else:
+            data = read_sidecar(
+                path,
+                byte_limit=byte_limit,
+                entry_limit=entry_limit,
+                name_byte_limit=name_byte_limit,
+                normalize_name=normalize_name,
+            )
         return data if isinstance(data, dict) else {}
     except SidecarLimitError as error:
         limit = (
@@ -865,20 +5492,67 @@ def _read_source_sidecar(out_dir):
 
 
 def _remove_managed_files(out_dir, managed_files):
+    if type(managed_files) is not dict:
+        return []
+    if not isinstance(out_dir, _PinnedOutputDirectory):
+        try:
+            with _pinned_output_directory(out_dir) as output:
+                return _remove_managed_files(
+                    output,
+                    managed_files,
+                )
+        except ValueError:
+            return sorted(managed_files)
     failed = []
-    for relative in _safe_managed_names(out_dir, managed_files):
+    for relative, expected in sorted(managed_files.items()):
+        expected = _canonical_fingerprint(expected)
+        if expected is None:
+            continue
         path = _safe_managed_path(out_dir, relative)
         if path is None:
             continue
-        if os.path.isdir(path) and not os.path.islink(path):
-            failed.append(relative)
+        if isinstance(out_dir, _PinnedOutputDirectory):
+            descriptor = -1
+            try:
+                authorized = _stable_managed_file(
+                    out_dir,
+                    relative,
+                    expected=expected,
+                )
+                out_dir.verify()
+                nofollow = getattr(os, "O_NOFOLLOW", None)
+                if nofollow is None:
+                    raise _UnstableRegularFileError(
+                        "no-follow managed output cleanup is unavailable"
+                    )
+                descriptor = os.open(
+                    relative,
+                    os.O_RDONLY | nofollow,
+                    dir_fd=out_dir.fd,
+                )
+                out_dir.verify()
+                _unlink_owned_regular_entry(
+                    out_dir.fd,
+                    relative,
+                    descriptor,
+                    expected=authorized,
+                )
+            except FileNotFoundError:
+                pass
+            except (
+                OSError,
+                TypeError,
+                NotImplementedError,
+                ValueError,
+            ):
+                failed.append(relative)
+            finally:
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
             continue
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            failed.append(relative)
     return failed
 
 
@@ -887,9 +5561,37 @@ def _stage_managed_file_cleanup(
 ):
     failed = []
     absent = []
-    for relative in _safe_managed_names(out_dir, managed_files):
+    if type(managed_files) is not dict:
+        return failed, absent
+    for relative, expected in sorted(managed_files.items()):
+        expected = _canonical_fingerprint(expected)
+        if expected is None:
+            continue
         path = _safe_managed_path(out_dir, relative)
         if path is None:
+            continue
+        if isinstance(out_dir, _PinnedOutputDirectory):
+            try:
+                _stable_managed_file(
+                    out_dir,
+                    relative,
+                    expected=expected,
+                )
+            except (OSError, ValueError):
+                absent.append(relative)
+                continue
+            try:
+                staged = cleanup_journal.stage_removal(
+                    path,
+                    expected=expected,
+                )
+            except _ManagedOutputRecoveryRequiredError:
+                raise
+            except OSError:
+                failed.append(relative)
+                continue
+            if not staged:
+                failed.append(relative)
             continue
         if os.path.isdir(path) and not os.path.islink(path):
             failed.append(relative)
@@ -980,8 +5682,21 @@ def _managed_output_name(out_dir, base, source_name, reusable_names):
         if probes >= probe_limit:
             collision_limit()
         probes += 1
-        return (
-            not os.path.lexists(os.path.join(out_dir, name))
+        if isinstance(out_dir, _PinnedOutputDirectory):
+            out_dir.verify()
+            try:
+                os.stat(
+                    name,
+                    dir_fd=out_dir.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return True
+            except (OSError, TypeError, NotImplementedError):
+                return False
+            return False
+        return not os.path.lexists(
+            os.path.join(_output_path(out_dir), name)
         )
 
     if available(base):
@@ -2167,6 +6882,7 @@ class _BoundedTarFile(tarfile.TarFile):
         mode="r",
         fileobj=None,
         *args,
+        include_images=False,
         **kwargs,
     ):
         self._paperconan_budget_state = {
@@ -2194,6 +6910,7 @@ class _BoundedTarFile(tarfile.TarFile):
             "decompressed_bytes_traversed": 0,
             "global_pax_headers": {},
             "suppress_global_pax": 0,
+            "include_images": bool(include_images),
         }
         if mode == "r" and fileobj is not None:
             fileobj = _TarTraversalFile(
@@ -2241,7 +6958,10 @@ class _BoundedTarFile(tarfile.TarFile):
         state["retained_name_bytes"] += name_bytes
         if (
             member.isfile()
-            and is_supported_input(member.name)
+            and _is_selected_archive_member(
+                member.name,
+                include_images=state["include_images"],
+            )
         ):
             state["eligible_members_retained"] += 1
         return member
@@ -2250,8 +6970,15 @@ class _BoundedTarFile(tarfile.TarFile):
 class _BoundedZipFile(zipfile.ZipFile):
     """Read only budgeted central-directory metadata into ZipFile state."""
 
-    def __init__(self, file, *, archive_name):
+    def __init__(
+        self,
+        file,
+        *,
+        archive_name,
+        include_images=False,
+    ):
         self.archive_name = archive_name
+        self.include_images = bool(include_images)
         self.selection_skipped = []
         self._member_limit = max(0, int(_ARCHIVE_MEMBER_LIMIT))
         self._name_byte_limit = max(
@@ -2427,7 +7154,10 @@ class _BoundedZipFile(zipfile.ZipFile):
             total += entry_size
             if (
                 not info.is_dir()
-                and is_supported_input(info.filename)
+                and _is_selected_archive_member(
+                    info.filename,
+                    include_images=self.include_images,
+                )
             ):
                 eligible_members_retained += 1
                 self.filelist.append(info)
@@ -2447,7 +7177,25 @@ class _BoundedZipFile(zipfile.ZipFile):
             )
 
 
-def _collect_bounded_tar_members(archive, archive_name):
+def _is_tabular_archive_member(name):
+    return is_supported_input(name)
+
+
+def _is_selected_archive_member(name, *, include_images):
+    if _is_tabular_archive_member(name):
+        return True
+    return (
+        include_images
+        and asset_type(name) in {"image", "document"}
+    )
+
+
+def _collect_bounded_tar_members(
+    archive,
+    archive_name,
+    *,
+    include_images=False,
+):
     selected = []
     skipped = []
     while True:
@@ -2461,7 +7209,10 @@ def _collect_bounded_tar_members(archive, archive_name):
         archive.members.clear()
         if (
             member.isfile()
-            and is_supported_input(member.name)
+            and _is_selected_archive_member(
+                member.name,
+                include_images=include_images,
+            )
         ):
             selected.append(member)
     return selected, skipped
@@ -2484,11 +7235,47 @@ def _extract_archive_members(
     archive_name=None,
     initial_skipped=(),
 ):
+    if not isinstance(out_dir, _PinnedOutputDirectory):
+        with _pinned_output_directory(out_dir) as output:
+            owns_journal = output_journal is None
+            journal = output_journal or _ManagedOutputJournal(output)
+            try:
+                try:
+                    result = _extract_archive_members(
+                        output,
+                        members,
+                        max_member_bytes,
+                        reusable_names=reusable_names,
+                        member_name=member_name,
+                        member_size=member_size,
+                        open_member=open_member,
+                        member_errors=member_errors,
+                        transient_paths=transient_paths,
+                        managed_name_accounting=managed_name_accounting,
+                        cap_state=cap_state,
+                        output_journal=journal,
+                        archive_name=archive_name,
+                        initial_skipped=initial_skipped,
+                    )
+                except BaseException:
+                    if owns_journal:
+                        journal.rollback()
+                    raise
+                if owns_journal:
+                    pending_cleanup = journal.commit()
+                    _append_post_commit_cleanup_records(
+                        result[2],
+                        pending_cleanup,
+                    )
+                return result
+            finally:
+                if owns_journal:
+                    journal.close()
     extracted = []
     preserved = set()
     skipped = list(initial_skipped)
     coverage_limited = bool(skipped)
-    written = _dir_size(out_dir, transient_paths)
+    written = _paper_data_size(out_dir, transient_paths)
     max_member_bytes = max(0, int(max_member_bytes))
     output_file_limit = max(0, int(_ARCHIVE_OUTPUT_FILE_LIMIT))
     try:
@@ -2501,7 +7288,22 @@ def _extract_archive_members(
             cap_state["exceeded"] = True
             cap_state["ownership_blocked"] = True
         return extracted, preserved, skipped
-    reusable = set(_safe_managed_names(out_dir, reusable_names))
+    if type(reusable_names) is dict:
+        reusable_files = {
+            name: fingerprint
+            for name, fingerprint in reusable_names.items()
+            if (
+                _safe_managed_name(name) is not None
+                and _canonical_fingerprint(fingerprint) is not None
+            )
+        }
+    else:
+        reusable_files = {}
+        for name in _safe_managed_names(out_dir, reusable_names):
+            fingerprint = _path_fingerprint(out_dir, name)
+            if fingerprint is not None:
+                reusable_files[name] = fingerprint
+    reusable = set(reusable_files)
     for index, (member, preferred) in enumerate(
         zip(members, preferred_names)
     ):
@@ -2537,6 +7339,7 @@ def _extract_archive_members(
                 cap_state["ownership_blocked"] = True
             break
         reuses_old = name in reusable
+        expected_old = reusable_files.get(name)
         if managed_name_accounting is not None:
             sidecar_limitation = (
                 managed_name_accounting.limitation_for(name)
@@ -2547,25 +7350,18 @@ def _extract_archive_members(
                 skipped.append(sidecar_limitation)
                 if cap_state is not None:
                     cap_state["exceeded"] = True
-                if reuses_old and os.path.lexists(
-                    os.path.join(out_dir, name)
-                ):
+                if reuses_old:
                     preserved.add(name)
                 continue
         reusable.discard(name)
-        dest = os.path.join(out_dir, name)
-        sidecar_delta = (
-            managed_name_accounting.replacement_delta_with(name)
-            if managed_name_accounting is not None
-            else 0
+        dest = os.path.join(out_dir.path, name)
+        replacement_credit = (
+            expected_old["size"] if reuses_old else 0
         )
-        remaining, replacement_credit = (
-            _remaining_final_size_allowance(
-                written,
-                dest,
-                reuses_old,
-                sidecar_delta,
-            )
+        remaining = (
+            _MAX_PAPER_BYTES
+            - written
+            + replacement_credit
         )
         write_limit = min(max_member_bytes, remaining)
         declared_size = member_size(member)
@@ -2576,7 +7372,7 @@ def _extract_archive_members(
                 "limit": max_member_bytes,
                 "declared_size": declared_size,
             })
-            if reuses_old and os.path.lexists(dest):
+            if reuses_old:
                 preserved.add(name)
             continue
         if remaining <= 0 or declared_size > remaining:
@@ -2589,27 +7385,113 @@ def _extract_archive_members(
             })
             if cap_state is not None:
                 cap_state["exceeded"] = True
-            if reuses_old and os.path.lexists(dest):
+            if reuses_old:
                 preserved.add(name)
             continue
-        if output_journal is not None:
-            output_journal.prepare(dest)
+        staging = _download_staging_file(
+            out_dir,
+            prefix=".paperconan-member-",
+            suffix=os.path.splitext(name)[1],
+            logical_name=name,
+        )
         committed = False
+        published = None
+        fingerprint = None
         try:
             src = open_member(member)
             if src is None:
                 raise OSError("could not open archive member")
             with src:
                 size = _atomic_stream_write(
-                    src, dest, write_limit
+                    src, staging, write_limit
                 )
+                staged = _stable_staging_state(staging)
+                fingerprint = {
+                    "size": staged.size,
+                    "sha256": staged.sha256,
+                }
+                if managed_name_accounting is not None:
+                    sidecar_limitation = (
+                        managed_name_accounting.limitation_for(
+                            name,
+                            fingerprint,
+                        )
+                    )
+                    if sidecar_limitation is not None:
+                        sidecar_limitation["name"] = source_name
+                        skipped.append(sidecar_limitation)
+                        if cap_state is not None:
+                            cap_state["exceeded"] = True
+                        if reuses_old:
+                            preserved.add(name)
+                        continue
+                published = _publish_download_staging(
+                    out_dir,
+                    staging,
+                    output_name=name,
+                    base=preferred,
+                    source_name=source_name,
+                    expected_old=expected_old,
+                    output_journal=output_journal,
+                )
+                if published.cleanup_warning is not None:
+                    skipped.append({
+                        "name": source_name,
+                        "reason": published.cleanup_warning,
+                    })
+                fingerprint = {
+                    "size": published.size,
+                    "sha256": published.sha256,
+                }
+                projected = _paper_data_size(
+                    out_dir,
+                    tuple(transient_paths) + (staging,),
+                )
+                if managed_name_accounting is not None:
+                    sidecar_limitation = (
+                        managed_name_accounting.limitation_for(
+                            published.name,
+                            fingerprint,
+                        )
+                    )
+                else:
+                    sidecar_limitation = None
+                if (
+                    sidecar_limitation is not None
+                    or projected > _MAX_PAPER_BYTES
+                ):
+                    _restore_managed_output(
+                        output_journal,
+                        os.path.join(
+                            out_dir.path, published.name
+                        ),
+                    )
+                    published = None
+                    if sidecar_limitation is not None:
+                        sidecar_limitation["name"] = source_name
+                        skipped.append(sidecar_limitation)
+                    else:
+                        skipped.append({
+                            "name": source_name,
+                            "reason": (
+                                "archive member exceeds per-paper cap"
+                            ),
+                            "limit": _MAX_PAPER_BYTES,
+                            "remaining_bytes": max(0, remaining),
+                            "declared_size": declared_size,
+                        })
+                    if cap_state is not None:
+                        cap_state["exceeded"] = True
+                    if reuses_old:
+                        preserved.add(name)
+                    continue
                 committed = True
         except _TransientCleanupError:
             raise
+        except _ManagedOutputRecoveryRequiredError:
+            raise
         except _TarArchiveLimit as error:
-            if output_journal is not None:
-                _restore_managed_output(output_journal, dest)
-            if reuses_old and os.path.lexists(dest):
+            if reuses_old:
                 preserved.add(name)
             record = error.record(archive_name)
             if (
@@ -2623,9 +7505,7 @@ def _extract_archive_members(
                 cap_state["exceeded"] = True
             break
         except _SizeLimitExceeded:
-            if output_journal is not None:
-                _restore_managed_output(output_journal, dest)
-            if reuses_old and os.path.lexists(dest):
+            if reuses_old:
                 preserved.add(name)
             if remaining < max_member_bytes:
                 skipped.append({
@@ -2651,10 +7531,19 @@ def _extract_archive_members(
             continue
         except member_errors as e:
             if committed:
-                written = written - replacement_credit + size
-                extracted.append(dest)
+                written = _paper_data_size(
+                    out_dir,
+                    tuple(transient_paths) + (staging,),
+                )
+                final_path = os.path.join(
+                    out_dir.path, published.name
+                )
+                extracted.append(final_path)
                 if managed_name_accounting is not None:
-                    managed_name_accounting.add(name)
+                    managed_name_accounting.add(
+                        published.name,
+                        fingerprint,
+                    )
                 skipped.append({
                     "name": source_name,
                     "reason": (
@@ -2663,26 +7552,44 @@ def _extract_archive_members(
                     ),
                 })
                 continue
-            if output_journal is not None:
-                _restore_managed_output(
-                    output_journal,
-                    dest,
-                    operation_error=e,
-                )
-            if reuses_old and os.path.lexists(dest):
+            if reuses_old:
                 preserved.add(name)
             skipped.append({
                 "name": source_name,
                 "reason": f"archive member failed: {e}",
             })
             continue
-        written = written - replacement_credit + size
-        extracted.append(dest)
-        if managed_name_accounting is not None:
-            managed_name_accounting.add(name)
+        finally:
+            cleanup_context = _cleanup_download_staging(staging)
+            if cleanup_context is not None:
+                skipped.append({
+                    "name": source_name,
+                    "reason": cleanup_context,
+                })
+        if committed:
+            written = _paper_data_size(
+                out_dir,
+                transient_paths,
+            )
+            extracted.append(
+                os.path.join(out_dir.path, published.name)
+            )
+            if managed_name_accounting is not None:
+                managed_name_accounting.add(
+                    published.name,
+                    fingerprint,
+                )
     if coverage_limited:
         for name in reusable:
-            if os.path.lexists(os.path.join(out_dir, name)):
+            try:
+                _stable_managed_file(
+                    out_dir,
+                    name,
+                    expected=reusable_files[name],
+                )
+            except (OSError, ValueError):
+                continue
+            else:
                 preserved.add(name)
     return extracted, preserved, skipped
 
@@ -2693,17 +7600,22 @@ def _extract_tabular_zip(
     max_member_bytes=_DEFAULT_MAX,
     *,
     reusable_names=(),
+    include_images=False,
 ):
     """Extract scanner-supported inputs from a supplementary zip into
     out_dir, flattening internal paths to the basename (no path traversal) and
     capping per-member size. Returns the list of extracted file paths."""
-    extracted, _, _ = _extract_tabular_zip_managed(
+    extracted, _, skipped = _extract_tabular_zip_managed(
         zip_path,
         out_dir,
         max_member_bytes,
         reusable_names=reusable_names,
+        include_images=include_images,
     )
-    return extracted
+    return _ArchiveExtractionPaths(
+        extracted,
+        skipped=skipped,
+    )
 
 
 def _extract_tabular_zip_managed(
@@ -2716,36 +7628,40 @@ def _extract_tabular_zip_managed(
     cap_state=None,
     output_journal=None,
     archive_name=None,
+    include_images=False,
 ):
     stable_archive_name = archive_name or os.path.basename(zip_path)
-    with _BoundedZipFile(
-        zip_path, archive_name=stable_archive_name
-    ) as zf:
-        infos = zf.filelist
-        selection_skipped = zf.selection_skipped
-        if selection_skipped and cap_state is not None:
-            cap_state["exceeded"] = True
-        return _extract_archive_members(
-            out_dir,
-            infos,
-            max_member_bytes,
-            reusable_names=reusable_names,
-            member_name=lambda info: info.filename,
-            member_size=lambda info: info.file_size,
-            open_member=zf.open,
-            member_errors=(
-                OSError,
-                EOFError,
-                RuntimeError,
-                zipfile.BadZipFile,
-            ),
-            transient_paths=(zip_path,),
-            managed_name_accounting=managed_name_accounting,
-            cap_state=cap_state,
-            output_journal=output_journal,
+    with _open_archive_source(zip_path) as source:
+        with _BoundedZipFile(
+            source,
             archive_name=stable_archive_name,
-            initial_skipped=selection_skipped,
-        )
+            include_images=include_images,
+        ) as zf:
+            infos = zf.filelist
+            selection_skipped = zf.selection_skipped
+            if selection_skipped and cap_state is not None:
+                cap_state["exceeded"] = True
+            return _extract_archive_members(
+                out_dir,
+                infos,
+                max_member_bytes,
+                reusable_names=reusable_names,
+                member_name=lambda info: info.filename,
+                member_size=lambda info: info.file_size,
+                open_member=zf.open,
+                member_errors=(
+                    OSError,
+                    EOFError,
+                    RuntimeError,
+                    zipfile.BadZipFile,
+                ),
+                transient_paths=(zip_path,),
+                managed_name_accounting=managed_name_accounting,
+                cap_state=cap_state,
+                output_journal=output_journal,
+                archive_name=stable_archive_name,
+                initial_skipped=selection_skipped,
+            )
 
 
 def _extract_tabular_tar(
@@ -2754,17 +7670,22 @@ def _extract_tabular_tar(
     max_member_bytes=_DEFAULT_MAX,
     *,
     reusable_names=(),
+    include_images=False,
 ):
     """Extract scanner-supported inputs from a .tar.gz into out_dir,
     flattening internal paths to the basename and capping per-member size.
     Returns the list of extracted file paths."""
-    extracted, _, _ = _extract_tabular_tar_managed(
+    extracted, _, skipped = _extract_tabular_tar_managed(
         tar_path,
         out_dir,
         max_member_bytes,
         reusable_names=reusable_names,
+        include_images=include_images,
     )
-    return extracted
+    return _ArchiveExtractionPaths(
+        extracted,
+        skipped=skipped,
+    )
 
 
 def _extract_tabular_tar_managed(
@@ -2777,71 +7698,133 @@ def _extract_tabular_tar_managed(
     cap_state=None,
     output_journal=None,
     archive_name=None,
+    include_images=False,
 ):
     stable_archive_name = (
         archive_name or os.path.basename(tar_path)
     )
-    try:
-        tf = _BoundedTarFile.open(
-            tar_path,
-            "r:gz",
-            tarinfo=_BoundedTarInfo,
-        )
-    except _TarArchiveLimit as error:
-        selection_skipped = [error.record(stable_archive_name)]
-        if selection_skipped and cap_state is not None:
-            cap_state["exceeded"] = True
-        return _extract_archive_members(
-            out_dir,
-            [],
-            max_member_bytes,
-            reusable_names=reusable_names,
-            member_name=lambda member: member.name,
-            member_size=lambda member: member.size,
-            open_member=lambda member: None,
-            member_errors=(
-                OSError,
-                EOFError,
-                tarfile.TarError,
-            ),
-            transient_paths=(tar_path,),
-            managed_name_accounting=managed_name_accounting,
-            cap_state=cap_state,
-            output_journal=output_journal,
-            archive_name=stable_archive_name,
-            initial_skipped=selection_skipped,
-        )
-    with tf:
-        members, selection_skipped = (
-            _collect_bounded_tar_members(
-                tf, stable_archive_name
+    with _open_archive_source(tar_path) as source:
+        try:
+            if isinstance(source, str):
+                tf = _BoundedTarFile.open(
+                    source,
+                    "r:gz",
+                    tarinfo=_BoundedTarInfo,
+                    include_images=include_images,
+                )
+            else:
+                tf = _BoundedTarFile.open(
+                    fileobj=source,
+                    mode="r:gz",
+                    tarinfo=_BoundedTarInfo,
+                    include_images=include_images,
+                )
+        except _TarArchiveLimit as error:
+            selection_skipped = [error.record(stable_archive_name)]
+            if selection_skipped and cap_state is not None:
+                cap_state["exceeded"] = True
+            return _extract_archive_members(
+                out_dir,
+                [],
+                max_member_bytes,
+                reusable_names=reusable_names,
+                member_name=lambda member: member.name,
+                member_size=lambda member: member.size,
+                open_member=lambda member: None,
+                member_errors=(
+                    OSError,
+                    EOFError,
+                    tarfile.TarError,
+                ),
+                transient_paths=(tar_path,),
+                managed_name_accounting=managed_name_accounting,
+                cap_state=cap_state,
+                output_journal=output_journal,
+                archive_name=stable_archive_name,
+                initial_skipped=selection_skipped,
             )
+        with tf:
+            members, selection_skipped = (
+                _collect_bounded_tar_members(
+                    tf,
+                    stable_archive_name,
+                    include_images=include_images,
+                )
+            )
+            if selection_skipped and cap_state is not None:
+                cap_state["exceeded"] = True
+            return _extract_archive_members(
+                out_dir,
+                members,
+                max_member_bytes,
+                reusable_names=reusable_names,
+                member_name=lambda member: member.name,
+                member_size=lambda member: member.size,
+                open_member=tf.extractfile,
+                member_errors=(
+                    OSError,
+                    EOFError,
+                    tarfile.TarError,
+                ),
+                transient_paths=(tar_path,),
+                managed_name_accounting=managed_name_accounting,
+                cap_state=cap_state,
+                output_journal=output_journal,
+                archive_name=stable_archive_name,
+                initial_skipped=selection_skipped,
+            )
+
+
+@contextmanager
+def _open_archive_source(path):
+    if not isinstance(path, _DownloadStagingFile):
+        yield os.fspath(path)
+        return
+    before = _stable_staging_state(path)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise _UnstableRegularFileError(
+            "no-follow archive opening is unavailable"
         )
-        if selection_skipped and cap_state is not None:
-            cap_state["exceeded"] = True
-        return _extract_archive_members(
-            out_dir,
-            members,
-            max_member_bytes,
-            reusable_names=reusable_names,
-            member_name=lambda member: member.name,
-            member_size=lambda member: member.size,
-            open_member=tf.extractfile,
-            member_errors=(
-                OSError,
-                EOFError,
-                tarfile.TarError,
-            ),
-            transient_paths=(tar_path,),
-            managed_name_accounting=managed_name_accounting,
-            cap_state=cap_state,
-            output_journal=output_journal,
-            archive_name=stable_archive_name,
-            initial_skipped=selection_skipped,
-        )
+    fd = os.open(
+        path.name,
+        os.O_RDONLY | nofollow,
+        dir_fd=path.output.fd,
+    )
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != before.identity
+            or opened.st_size != before.size
+        ):
+            raise _UnstableRegularFileError(
+                "downloaded archive is not a stable regular file"
+            )
+        with os.fdopen(fd, "rb") as source:
+            fd = -1
+            yield source
+        after = _stable_staging_state(path)
+        if (
+            after.identity != before.identity
+            or after.size != before.size
+            or after.sha256 != before.sha256
+        ):
+            raise _UnstableRegularFileError(
+                "downloaded archive changed during extraction"
+            )
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def _temporary_archive_path(out_dir, suffix):
+    if isinstance(out_dir, _PinnedOutputDirectory):
+        return _download_staging_file(
+            out_dir,
+            prefix=".paperconan-archive-",
+            suffix=suffix,
+        )
     fd, path = tempfile.mkstemp(
         prefix=".paperconan-archive-",
         suffix=suffix,
@@ -2857,12 +7840,27 @@ def _cleanup_transient_archive(
     skipped,
     operation_error,
 ):
+    if path is None:
+        return
     try:
-        _remove_transient_file(path)
+        if isinstance(path, _DownloadStagingFile):
+            cleanup_context = _cleanup_download_staging(path)
+            if cleanup_context is not None:
+                skipped.append({
+                    "name": archive_name,
+                    "reason": cleanup_context,
+                })
+                return
+        else:
+            _remove_transient_file(path)
     except OSError as cleanup_error:
         if operation_error is not None:
             _raise_transient_cleanup_error(
-                path,
+                (
+                    path.display_path
+                    if isinstance(path, _DownloadStagingFile)
+                    else path
+                ),
                 cleanup_error,
                 operation_error,
             )
@@ -2870,6 +7868,74 @@ def _cleanup_transient_archive(
             "name": archive_name,
             "reason": "transient archive cleanup pending",
         })
+
+
+def _accept_archive_publications(
+    out_dir,
+    entries,
+    downloaded,
+    skipped,
+    *,
+    archive_name,
+    managed_name_accounting,
+    cap_state,
+    output_journal,
+    published_outputs,
+):
+    accepted = []
+    for entry in entries:
+        if entry.cleanup_warning is not None:
+            skipped.append({
+                "name": archive_name,
+                "reason": entry.cleanup_warning,
+            })
+        fingerprint = {
+            "size": entry.size,
+            "sha256": entry.sha256,
+        }
+        limitation = (
+            managed_name_accounting.limitation_for(
+                entry.filename,
+                fingerprint,
+            )
+            if managed_name_accounting is not None
+            else None
+        )
+        path = entry.display_path(out_dir)
+        if limitation is not None:
+            limitation["name"] = archive_name
+            skipped.append(limitation)
+            if cap_state is not None:
+                cap_state["exceeded"] = True
+            if entry.created and output_journal is not None:
+                output_journal.record_created(
+                    path,
+                    entry.identity,
+                    entry.size,
+                    entry.sha256,
+                )
+                _restore_managed_output(
+                    output_journal,
+                    path,
+                )
+            continue
+        if entry.created and output_journal is not None:
+            output_journal.record_created(
+                path,
+                entry.identity,
+                entry.size,
+                entry.sha256,
+            )
+        if managed_name_accounting is not None:
+            managed_name_accounting.add(
+                entry.filename,
+                fingerprint,
+            )
+        downloaded.append(path)
+        accepted.append(entry)
+        if published_outputs is not None:
+            published_outputs.append(entry)
+    return accepted
 
 
 def _download_oa_package(
@@ -2884,8 +7950,127 @@ def _download_oa_package(
     managed_name_accounting=None,
     cap_state=None,
     output_journal=None,
+    include_images=False,
+    cardinality=None,
+    published_outputs=None,
 ):
     """Download the static PMC OA tar.gz, extract its tabular members, drop the tarball."""
+    if not reusable_names:
+        blocking_reason = _archive_blocking_reason(cardinality)
+        if blocking_reason is not None:
+            skipped.append({
+                "name": pkg.get("name"),
+                "reason": blocking_reason,
+            })
+            return False, set()
+        tmp = None
+        operation_error = None
+        try:
+            tmp = _archive_staging_file(out_dir, ".tar.gz")
+            res = download_file(
+                pkg["url"],
+                tmp,
+                max_bytes=archive_max,
+            )
+            if not res.get("ok"):
+                skipped.append({
+                    "name": pkg.get("name"),
+                    "reason": res.get("skipped_reason"),
+                })
+                return False, set()
+            limit_reasons = []
+            extracted = []
+            pending = []
+            processing_error = None
+            staging_error = None
+            try:
+                with _open_download_staging(tmp) as archive_fh:
+                    try:
+                        _extract_selected_tar(
+                            archive_fh,
+                            out_dir,
+                            include_images=include_images,
+                            max_member_bytes=max_bytes,
+                            return_entries=True,
+                            cardinality=cardinality,
+                            limit_reasons=limit_reasons,
+                            published_entries=extracted,
+                            pending_entries=pending,
+                            transient_files=(tmp,),
+                        )
+                    except (
+                        tarfile.TarError,
+                        OSError,
+                        ValueError,
+                        _ArchiveReadError,
+                    ) as error:
+                        processing_error = error
+            except _UnstableRegularFileError as error:
+                staging_error = error
+            reconciled, outcomes, reconciliation_error = (
+                _reconcile_archive_publications(
+                    out_dir,
+                    extracted,
+                    pending,
+                )
+            )
+            failure = (
+                staging_error
+                or processing_error
+                or reconciliation_error
+            )
+            if failure is not None:
+                if staging_error is not None:
+                    reason = (
+                        "downloaded archive is not a stable regular "
+                        f"file: {staging_error}"
+                    )
+                else:
+                    reason = (
+                        f"archive publication unavailable: {failure}"
+                        if isinstance(failure, OSError)
+                        else (
+                            "archive processing unavailable: "
+                            f"{failure}"
+                        )
+                    )
+                if outcomes:
+                    reason += "; " + "; ".join(outcomes)
+                skipped.append({
+                    "name": pkg.get("name"),
+                    "reason": reason,
+                })
+            skipped.extend(
+                {
+                    "name": pkg.get("name"),
+                    "reason": reason,
+                }
+                for reason in limit_reasons
+            )
+            accepted = _accept_archive_publications(
+                out_dir,
+                reconciled,
+                downloaded,
+                skipped,
+                archive_name=(
+                    pkg.get("name") or "PMC OA package"
+                ),
+                managed_name_accounting=managed_name_accounting,
+                cap_state=cap_state,
+                output_journal=output_journal,
+                published_outputs=published_outputs,
+            )
+            return failure is None, set()
+        except BaseException as error:
+            operation_error = error
+            raise
+        finally:
+            _cleanup_transient_archive(
+                tmp,
+                pkg.get("name") or "PMC OA package",
+                skipped,
+                operation_error,
+            )
     tmp = _temporary_archive_path(out_dir, ".tar.gz")
     archive_name = pkg.get("name") or "PMC OA package"
     operation_error = None
@@ -2913,10 +8098,13 @@ def _download_oa_package(
                         pkg.get("name")
                         or os.path.basename(tmp)
                     ),
+                    include_images=include_images,
                 )
             )
             skipped.extend(member_skipped)
             downloaded.extend(extracted)
+        except _ManagedOutputRecoveryRequiredError:
+            raise
         except (tarfile.TarError, OSError) as e:
             skipped.append({
                 "name": pkg.get("name"),
@@ -2941,11 +8129,154 @@ def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_byte
                                     reusable_names=(),
                                     managed_name_accounting=None,
                                     cap_state=None,
-                                    output_journal=None):
+                                    output_journal=None,
+                                    include_images=False,
+                                    cardinality=None,
+                                    published_outputs=None):
     """Fetch a supplementary zip (Europe PMC), extract its tabular members, drop the zip.
 
     The archive downloads with the larger ``archive_max`` cap; each extracted table is
     still capped at the per-file ``max_bytes``."""
+    if not reusable_names:
+        blocking_reason = _archive_blocking_reason(cardinality)
+        if blocking_reason is not None:
+            skipped.append({
+                "name": arch.get("name"),
+                "reason": blocking_reason,
+            })
+            return False, set()
+        tmp_zip = None
+        operation_error = None
+        try:
+            tmp_zip = _archive_staging_file(out_dir, ".zip")
+            res = download_file(
+                arch["url"],
+                tmp_zip,
+                max_bytes=archive_max,
+            )
+            if not res.get("ok"):
+                skipped.append({
+                    "name": arch.get("name"),
+                    "reason": res.get("skipped_reason"),
+                })
+                return False, set()
+            limit_reasons = []
+            extracted = []
+            pending = []
+            processing_error = None
+            staging_error = None
+            snapshot_cleanup_warnings = []
+            try:
+                with _open_download_staging(tmp_zip) as archive_fh:
+                    try:
+                        with _private_zip_snapshot(
+                            archive_fh,
+                            max_bytes=archive_max,
+                            output=out_dir,
+                            cleanup_warnings=(
+                                snapshot_cleanup_warnings
+                            ),
+                        ) as snapshot:
+                            _extract_selected_zip(
+                                snapshot,
+                                out_dir,
+                                include_images=include_images,
+                                max_member_bytes=max_bytes,
+                                return_entries=True,
+                                cardinality=cardinality,
+                                limit_reasons=limit_reasons,
+                                published_entries=extracted,
+                                pending_entries=pending,
+                                transient_files=(
+                                    tmp_zip,
+                                    snapshot.staging,
+                                ),
+                            )
+                    except (
+                        zipfile.BadZipFile,
+                        zipfile.LargeZipFile,
+                        OSError,
+                        ValueError,
+                        _ArchiveReadError,
+                    ) as error:
+                        processing_error = error
+            except _UnstableRegularFileError as error:
+                staging_error = error
+            for warning in snapshot_cleanup_warnings:
+                skipped.append({
+                    "name": arch.get("name"),
+                    "reason": warning,
+                })
+            reconciled, outcomes, reconciliation_error = (
+                _reconcile_archive_publications(
+                    out_dir,
+                    extracted,
+                    pending,
+                )
+            )
+            failure = (
+                staging_error
+                or processing_error
+                or reconciliation_error
+            )
+            if failure is not None:
+                if staging_error is not None:
+                    reason = (
+                        "downloaded archive is not a stable regular "
+                        f"file: {staging_error}"
+                    )
+                elif isinstance(failure, zipfile.BadZipFile):
+                    reason = "not a valid zip archive"
+                else:
+                    reason = (
+                        f"archive publication unavailable: {failure}"
+                        if isinstance(failure, OSError)
+                        else (
+                            "archive processing unavailable: "
+                            f"{failure}"
+                        )
+                    )
+                if outcomes:
+                    reason += "; " + "; ".join(outcomes)
+                skipped.append({
+                    "name": arch.get("name"),
+                    "reason": reason,
+                })
+            skipped.extend(
+                {
+                    "name": arch.get("name"),
+                    "reason": reason,
+                }
+                for reason in limit_reasons
+            )
+            _accept_archive_publications(
+                out_dir,
+                reconciled,
+                downloaded,
+                skipped,
+                archive_name=(
+                    arch.get("name")
+                    or "supplementary archive"
+                ),
+                managed_name_accounting=managed_name_accounting,
+                cap_state=cap_state,
+                output_journal=output_journal,
+                published_outputs=published_outputs,
+            )
+            return failure is None, set()
+        except BaseException as error:
+            operation_error = error
+            raise
+        finally:
+            _cleanup_transient_archive(
+                tmp_zip,
+                (
+                    arch.get("name")
+                    or "supplementary archive"
+                ),
+                skipped,
+                operation_error,
+            )
     tmp_zip = _temporary_archive_path(out_dir, ".zip")
     archive_name = (
         arch.get("name") or "supplementary archive"
@@ -2975,10 +8306,13 @@ def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_byte
                         arch.get("name")
                         or os.path.basename(tmp_zip)
                     ),
+                    include_images=include_images,
                 )
             )
             skipped.extend(member_skipped)
             downloaded.extend(extracted)
+        except _ManagedOutputRecoveryRequiredError:
+            raise
         except (zipfile.BadZipFile, OSError):
             skipped.append({
                 "name": arch.get("name"),
@@ -3002,7 +8336,7 @@ def _source_sidecar_provenance(cand, managed_files):
     related_dois = cand.get("related_dois")
     if related_dois is None:
         related_dois = []
-    return {
+    provenance = {
         "doi": cand.get("doi"),
         "title": cand.get("title"),
         "source": cand.get("source"),
@@ -3010,6 +8344,18 @@ def _source_sidecar_provenance(cand, managed_files):
         "related_dois": related_dois,
         "managed_files": managed_files,
     }
+    if "_paperconan_downloads" in cand:
+        downloads = {}
+        for entry in cand.get("_paperconan_downloads") or ():
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("file")
+            if isinstance(name, str) and name:
+                downloads.setdefault(name, entry)
+        provenance["downloads"] = [
+            downloads[name] for name in sorted(downloads)
+        ]
+    return provenance
 
 
 def _encode_source_sidecar(provenance):
@@ -3030,7 +8376,7 @@ def _encode_source_sidecar(provenance):
 
 
 def _source_sidecar_bytes(cand, out_dir, managed_files):
-    safe_names = _safe_managed_names(
+    safe_files = _safe_managed_fingerprints(
         out_dir,
         managed_files,
         entry_limit=max(0, int(_SOURCE_SIDECAR_ENTRY_LIMIT)),
@@ -3039,7 +8385,7 @@ def _source_sidecar_bytes(cand, out_dir, managed_files):
         ),
     )
     return _encode_source_sidecar(
-        _source_sidecar_provenance(cand, safe_names)
+        _source_sidecar_provenance(cand, safe_files)
     )
 
 
@@ -3080,7 +8426,7 @@ def _prepare_sidecar_candidate(cand):
     prepared = dict(cand)
     prepared["related_dois"] = CapturingIterable()
     _encode_source_sidecar(
-        _source_sidecar_provenance(prepared, [])
+        _source_sidecar_provenance(prepared, {})
     )
     prepared["related_dois"] = retained
     return prepared
@@ -3096,16 +8442,35 @@ def _managed_name_list_extra_bytes(count, encoded_name_bytes):
     return encoded_name_bytes + 8 + 6 * (count - 1)
 
 
+def _managed_fingerprint_value_bytes(fingerprint):
+    return 106 + len(str(fingerprint["size"]))
+
+
+def _managed_fingerprint_map_extra_bytes(
+    count,
+    encoded_name_bytes,
+    fingerprint_value_bytes,
+):
+    if count <= 0:
+        return 0
+    return (
+        encoded_name_bytes
+        + fingerprint_value_bytes
+        + 10
+        + 8 * (count - 1)
+    )
+
+
 class _ManagedNameAccounting:
     def __init__(
         self,
         cand,
         out_dir,
-        old_names,
-        new_names,
+        old_files,
+        new_files,
     ):
-        self._old_names = old_names
-        self._new_names = new_names
+        self._old_files = old_files
+        self._new_files = new_files
         self._entry_limit = max(
             0, int(_SOURCE_SIDECAR_ENTRY_LIMIT)
         )
@@ -3117,22 +8482,38 @@ class _ManagedNameAccounting:
         )
         self._previous_size = 0
         try:
-            self._previous_size = os.path.getsize(
-                os.path.join(out_dir, SOURCE_SIDECAR)
-            )
+            if isinstance(out_dir, _PinnedOutputDirectory):
+                previous = os.stat(
+                    SOURCE_SIDECAR,
+                    dir_fd=out_dir.fd,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISREG(previous.st_mode):
+                    self._previous_size = previous.st_size
+            else:
+                self._previous_size = os.path.getsize(
+                    os.path.join(
+                        _output_path(out_dir), SOURCE_SIDECAR
+                    )
+                )
         except OSError:
             pass
-        self._entry_count = len(old_names)
+        self._entry_count = len(old_files)
         self._name_bytes = sum(
             len(name.encode("utf-8", errors="surrogatepass"))
-            for name in old_names
+            + 64
+            for name in old_files
         )
         self._encoded_name_bytes = sum(
             _encoded_json_name_bytes(name)
-            for name in old_names
+            for name in old_files
+        )
+        self._fingerprint_value_bytes = sum(
+            _managed_fingerprint_value_bytes(fingerprint)
+            for fingerprint in old_files.values()
         )
         self._base_size = len(_encode_source_sidecar(
-            _source_sidecar_provenance(cand, [])
+            _source_sidecar_provenance(cand, {})
         ))
         current_size = self._payload_size()
         if current_size > self._sidecar_byte_limit:
@@ -3146,22 +8527,39 @@ class _ManagedNameAccounting:
             )
 
     def _contains(self, name):
-        return name in self._old_names or name in self._new_names
+        return name in self._old_files or name in self._new_files
 
-    def _prospective_counts(self, name):
+    def _current_fingerprint(self, name):
+        if name in self._new_files:
+            return self._new_files[name]
+        return self._old_files.get(name)
+
+    def _prospective_counts(self, name, fingerprint=None):
+        candidate = (
+            fingerprint
+            if fingerprint is not None
+            else self._current_fingerprint(name)
+            or {"size": 0, "sha256": "0" * 64}
+        )
         if self._contains(name):
+            current = self._current_fingerprint(name)
             return (
                 self._entry_count,
                 self._name_bytes,
                 self._encoded_name_bytes,
+                self._fingerprint_value_bytes
+                - _managed_fingerprint_value_bytes(current)
+                + _managed_fingerprint_value_bytes(candidate),
             )
         return (
             self._entry_count + 1,
             self._name_bytes + len(
                 name.encode("utf-8", errors="surrogatepass")
-            ),
+            ) + 64,
             self._encoded_name_bytes
             + _encoded_json_name_bytes(name),
+            self._fingerprint_value_bytes
+            + _managed_fingerprint_value_bytes(candidate),
         )
 
     def _payload_size(
@@ -3169,6 +8567,7 @@ class _ManagedNameAccounting:
         *,
         entry_count=None,
         encoded_name_bytes=None,
+        fingerprint_value_bytes=None,
     ):
         count = (
             self._entry_count
@@ -3180,15 +8579,27 @@ class _ManagedNameAccounting:
             if encoded_name_bytes is None
             else encoded_name_bytes
         )
+        fingerprints = (
+            self._fingerprint_value_bytes
+            if fingerprint_value_bytes is None
+            else fingerprint_value_bytes
+        )
         return (
             self._base_size
-            + _managed_name_list_extra_bytes(count, encoded)
+            + _managed_fingerprint_map_extra_bytes(
+                count,
+                encoded,
+                fingerprints,
+            )
         )
 
-    def limitation_for(self, name):
-        entry_count, name_bytes, encoded_name_bytes = (
-            self._prospective_counts(name)
-        )
+    def limitation_for(self, name, fingerprint=None):
+        (
+            entry_count,
+            name_bytes,
+            encoded_name_bytes,
+            fingerprint_value_bytes,
+        ) = self._prospective_counts(name, fingerprint)
         if entry_count > self._entry_limit:
             return _source_sidecar_limit_record(
                 "source sidecar managed entry limit",
@@ -3212,6 +8623,7 @@ class _ManagedNameAccounting:
         payload_size = self._payload_size(
             entry_count=entry_count,
             encoded_name_bytes=encoded_name_bytes,
+            fingerprint_value_bytes=fingerprint_value_bytes,
         )
         if payload_size > self._sidecar_byte_limit:
             return _source_sidecar_limit_record(
@@ -3221,39 +8633,69 @@ class _ManagedNameAccounting:
             )
         return None
 
-    def replacement_delta_with(self, name):
-        entry_count, _name_bytes, encoded_name_bytes = (
-            self._prospective_counts(name)
-        )
+    def replacement_delta_with(self, name, fingerprint=None):
+        (
+            entry_count,
+            _name_bytes,
+            encoded_name_bytes,
+            fingerprint_value_bytes,
+        ) = self._prospective_counts(name, fingerprint)
         return (
             self._payload_size(
                 entry_count=entry_count,
                 encoded_name_bytes=encoded_name_bytes,
+                fingerprint_value_bytes=fingerprint_value_bytes,
             )
             - self._previous_size
         )
 
-    def add(self, name):
-        if name in self._new_names:
+    def add(self, name, fingerprint):
+        fingerprint = _canonical_fingerprint(fingerprint)
+        if fingerprint is None:
+            raise ValueError("invalid managed output fingerprint")
+        previous = self._current_fingerprint(name)
+        if name in self._new_files and previous == fingerprint:
             return
-        already_accounted = name in self._old_names
-        self._new_names.add(name)
+        already_accounted = name in self._old_files
+        self._new_files[name] = fingerprint
         if already_accounted:
+            self._fingerprint_value_bytes += (
+                _managed_fingerprint_value_bytes(fingerprint)
+                - _managed_fingerprint_value_bytes(previous)
+            )
             return
         self._entry_count += 1
         self._name_bytes += len(
             name.encode("utf-8", errors="surrogatepass")
-        )
+        ) + 64
         self._encoded_name_bytes += _encoded_json_name_bytes(name)
+        self._fingerprint_value_bytes += (
+            _managed_fingerprint_value_bytes(fingerprint)
+        )
 
     def replacement_delta(self):
         return self._payload_size() - self._previous_size
 
 
 def _source_sidecar_replacement_delta(cand, out_dir, managed_files):
-    path = os.path.join(out_dir, SOURCE_SIDECAR)
     try:
-        previous_size = os.path.getsize(path)
+        if isinstance(out_dir, _PinnedOutputDirectory):
+            previous = os.stat(
+                SOURCE_SIDECAR,
+                dir_fd=out_dir.fd,
+                follow_symlinks=False,
+            )
+            previous_size = (
+                previous.st_size
+                if stat.S_ISREG(previous.st_mode)
+                else 0
+            )
+        else:
+            previous_size = os.path.getsize(
+                os.path.join(
+                    _output_path(out_dir), SOURCE_SIDECAR
+                )
+            )
     except OSError:
         previous_size = 0
     return (
@@ -3262,36 +8704,532 @@ def _source_sidecar_replacement_delta(cand, out_dir, managed_files):
     )
 
 
-def _write_source_sidecar(cand, out_dir, managed_files):
-    """Record which paper/dataset these downloads came from, for scan.json provenance."""
-    payload = _source_sidecar_bytes(cand, out_dir, managed_files)
-    fd = None
-    temp_path = None
+def _authoritative_sidecar_payload(payload):
+    class _DuplicateKey(ValueError):
+        pass
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise _DuplicateKey
+            result[key] = value
+        return result
+
     try:
-        fd, temp_path = tempfile.mkstemp(
-            prefix=f".{SOURCE_SIDECAR}.",
-            suffix=".part",
-            dir=out_dir,
+        decoded = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=unique_object,
         )
-        stream = os.fdopen(fd, "wb")
-        fd = None
-        with stream as fh:
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+    if type(decoded) is not dict:
+        return False
+    managed = decoded.get("managed_files")
+    if type(managed) is not dict:
+        return False
+    return all(
+        _safe_managed_name(name) is not None
+        and _canonical_fingerprint(fingerprint) is not None
+        for name, fingerprint in managed.items()
+    )
+
+
+def _raise_source_sidecar_recovery_required(
+    journal,
+    operation_error,
+    rollback_error=None,
+):
+    recovery_paths = journal.recovery_paths()
+    error = _SourceSidecarRecoveryRequiredError(
+        "source sidecar recovery required after "
+        f"{operation_error}",
+        recovery_paths=recovery_paths,
+        operation_error=operation_error,
+        rollback_error=rollback_error,
+    )
+    if rollback_error is not None:
+        _append_explicit_cause(
+            rollback_error,
+            operation_error,
+        )
+        raise error from rollback_error
+    raise error from operation_error
+
+
+def _verify_published_source_sidecar(
+    output,
+    staged_fd,
+    expected_size,
+    expected_sha256,
+):
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise _SourceSidecarPublicationError(
+            "retained provenance sidecar because it changed "
+            "during publication"
+        )
+    canonical_fd = -1
+    try:
+        output.verify()
+        canonical_fd = os.open(
+            SOURCE_SIDECAR,
+            os.O_RDONLY | nofollow,
+            dir_fd=output.fd,
+        )
+        staged = os.fstat(staged_fd)
+        opened = os.fstat(canonical_fd)
+        current = os.stat(
+            SOURCE_SIDECAR,
+            dir_fd=output.fd,
+            follow_symlinks=False,
+        )
+        identity = (staged.st_dev, staged.st_ino)
+        if (
+            not stat.S_ISREG(staged.st_mode)
+            or not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or (opened.st_dev, opened.st_ino) != identity
+            or (current.st_dev, current.st_ino) != identity
+            or staged.st_size != expected_size
+            or opened.st_size != expected_size
+            or current.st_size != expected_size
+            or opened.st_mtime_ns != staged.st_mtime_ns
+            or opened.st_ctime_ns != staged.st_ctime_ns
+            or current.st_mtime_ns != staged.st_mtime_ns
+            or current.st_ctime_ns != staged.st_ctime_ns
+        ):
+            raise _SourceSidecarPublicationError(
+                "retained provenance sidecar because it changed "
+                "during publication"
+            )
+        digest = _hash_exact_fd(canonical_fd, expected_size)
+        output.verify()
+        final_staged = os.fstat(staged_fd)
+        final_opened = os.fstat(canonical_fd)
+        final_current = os.stat(
+            SOURCE_SIDECAR,
+            dir_fd=output.fd,
+            follow_symlinks=False,
+        )
+        if (
+            digest != expected_sha256
+            or not stat.S_ISREG(final_staged.st_mode)
+            or not stat.S_ISREG(final_opened.st_mode)
+            or not stat.S_ISREG(final_current.st_mode)
+            or (final_staged.st_dev, final_staged.st_ino) != identity
+            or (final_opened.st_dev, final_opened.st_ino) != identity
+            or (final_current.st_dev, final_current.st_ino) != identity
+            or final_staged.st_size != expected_size
+            or final_opened.st_size != expected_size
+            or final_current.st_size != expected_size
+            or final_staged.st_mtime_ns != staged.st_mtime_ns
+            or final_staged.st_ctime_ns != staged.st_ctime_ns
+            or final_opened.st_mtime_ns != staged.st_mtime_ns
+            or final_opened.st_ctime_ns != staged.st_ctime_ns
+            or final_current.st_mtime_ns != staged.st_mtime_ns
+            or final_current.st_ctime_ns != staged.st_ctime_ns
+        ):
+            raise _SourceSidecarPublicationError(
+                "retained provenance sidecar because it changed "
+                "during publication"
+            )
+        _verify_final_published_sidecar_root(output)
+    except _SourceSidecarPublicationError:
+        raise
+    except (
+        OSError,
+        TypeError,
+        NotImplementedError,
+        ValueError,
+    ) as error:
+        raise _SourceSidecarPublicationError(
+            "retained provenance sidecar because it changed "
+            "during publication"
+        ) from error
+    finally:
+        if canonical_fd >= 0:
+            os.close(canonical_fd)
+
+
+def _verify_final_published_sidecar_root(output):
+    output.verify()
+
+
+def _write_source_sidecar(
+    cand,
+    out_dir,
+    managed_files=None,
+    *,
+    downloads=None,
+):
+    """Record which paper/dataset these downloads came from, for scan.json provenance."""
+    if managed_files is None:
+        managed_files = cand.get(
+            "_paperconan_managed_files", {}
+        )
+    if downloads is not None:
+        cand = dict(cand)
+        cand["_paperconan_downloads"] = downloads
+    if not isinstance(out_dir, _PinnedOutputDirectory):
+        with _pinned_output_directory(out_dir) as output:
+            return _write_source_sidecar(
+                cand,
+                output,
+                managed_files,
+                downloads=downloads,
+            )
+    payload = _source_sidecar_bytes(cand, out_dir, managed_files)
+    pending_cleanup = ()
+    max_sidecar_bytes = max(
+        0, int(_MAX_SOURCE_SIDECAR_BYTES)
+    )
+    if len(payload) > max_sidecar_bytes:
+        raise _SourceSidecarLimitError(
+            "new provenance sidecar exceeds "
+            f"{max_sidecar_bytes}-byte limit"
+        )
+    out_dir.verify()
+    try:
+        previous = os.stat(
+            SOURCE_SIDECAR,
+            dir_fd=out_dir.fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        previous = None
+    if previous is not None and not stat.S_ISREG(previous.st_mode):
+        raise _SourceSidecarPublicationError(
+            "retained existing provenance sidecar because it is not "
+            "a regular file"
+        )
+    if (
+        previous is not None
+        and previous.st_size > max_sidecar_bytes
+    ):
+        raise _SourceSidecarLimitError(
+            "existing provenance sidecar exceeds "
+            f"{max_sidecar_bytes}-byte limit"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError("no-follow sidecar publication is unavailable")
+    fd = -1
+    temp_name = None
+    sidecar_operation_error = None
+    sidecar_result = None
+    try:
+        for _attempt in range(128):
+            temp_name = (
+                f".{SOURCE_SIDECAR}."
+                f"{secrets.token_hex(8)}.part"
+            )
+            try:
+                with _transaction_state_allocation():
+                    fd = os.open(
+                        temp_name,
+                        (
+                            os.O_RDWR
+                            | os.O_CREAT
+                            | os.O_EXCL
+                            | nofollow
+                        ),
+                        0o600,
+                        dir_fd=out_dir.fd,
+                    )
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise FileExistsError(
+                "could not allocate source sidecar staging file"
+            )
+        with os.fdopen(os.dup(fd), "wb") as fh:
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(temp_path, os.path.join(out_dir, SOURCE_SIDECAR))
-        return True
+        opened = os.fstat(fd)
+        visible = os.stat(
+            temp_name,
+            dir_fd=out_dir.fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(visible.st_mode)
+            or opened.st_size != len(payload)
+            or visible.st_size != len(payload)
+            or (opened.st_dev, opened.st_ino)
+            != (visible.st_dev, visible.st_ino)
+            or _hash_exact_fd(fd, opened.st_size)
+            != hashlib.sha256(payload).hexdigest()
+        ):
+            raise _UnstableRegularFileError(
+                "source sidecar staging is not a stable regular file"
+            )
+        out_dir.verify()
+        if previous is None:
+            try:
+                with _transaction_state_allocation():
+                    os.link(
+                        temp_name,
+                        SOURCE_SIDECAR,
+                        src_dir_fd=out_dir.fd,
+                        dst_dir_fd=out_dir.fd,
+                        follow_symlinks=False,
+                    )
+            except FileExistsError as error:
+                raise _SourceSidecarPublicationError(
+                    "retained existing provenance sidecar created "
+                    "during publication"
+                ) from error
+            _verify_published_source_sidecar(
+                out_dir,
+                fd,
+                len(payload),
+                hashlib.sha256(payload).hexdigest(),
+            )
+        else:
+            existing_fd = -1
+            try:
+                existing_fd = os.open(
+                    SOURCE_SIDECAR,
+                    os.O_RDONLY | nofollow,
+                    dir_fd=out_dir.fd,
+                )
+                opened_previous = os.fstat(existing_fd)
+                if (
+                    not stat.S_ISREG(opened_previous.st_mode)
+                    or (
+                        opened_previous.st_dev,
+                        opened_previous.st_ino,
+                    )
+                    != (previous.st_dev, previous.st_ino)
+                ):
+                    raise _SourceSidecarPublicationError(
+                        "retained existing provenance sidecar because "
+                        "it changed during verification"
+                    )
+                if opened_previous.st_size > max_sidecar_bytes:
+                    raise _SourceSidecarLimitError(
+                        "existing provenance sidecar exceeds "
+                        f"{max_sidecar_bytes}-byte limit"
+                    )
+                existing_payload = bytearray()
+                remaining = opened_previous.st_size
+                os.lseek(existing_fd, 0, os.SEEK_SET)
+                while remaining:
+                    chunk = os.read(
+                        existing_fd,
+                        min(_FILE_COPY_CHUNK_BYTES, remaining),
+                    )
+                    if not chunk:
+                        raise _SourceSidecarPublicationError(
+                            "retained existing provenance sidecar "
+                            "because it changed during verification"
+                        )
+                    existing_payload.extend(chunk)
+                    remaining -= len(chunk)
+                if len(existing_payload) != opened_previous.st_size:
+                    raise _SourceSidecarPublicationError(
+                        "retained existing provenance sidecar because "
+                        "it changed during verification"
+                    )
+                trailing = os.read(existing_fd, 1)
+                if trailing:
+                    existing_payload.extend(trailing)
+                    if len(existing_payload) > max_sidecar_bytes:
+                        raise _SourceSidecarLimitError(
+                            "existing provenance sidecar exceeds "
+                            f"{max_sidecar_bytes}-byte limit"
+                        )
+                    raise _SourceSidecarPublicationError(
+                        "retained existing provenance sidecar because "
+                        "it changed during verification"
+                    )
+                final_opened = os.fstat(existing_fd)
+                current = os.stat(
+                    SOURCE_SIDECAR,
+                    dir_fd=out_dir.fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(final_opened.st_mode)
+                    or not stat.S_ISREG(current.st_mode)
+                    or final_opened.st_size
+                    != opened_previous.st_size
+                    or final_opened.st_mtime_ns
+                    != opened_previous.st_mtime_ns
+                    or final_opened.st_ctime_ns
+                    != opened_previous.st_ctime_ns
+                    or (
+                        final_opened.st_dev,
+                        final_opened.st_ino,
+                    )
+                    != (previous.st_dev, previous.st_ino)
+                    or (current.st_dev, current.st_ino)
+                    != (previous.st_dev, previous.st_ino)
+                    or current.st_size != previous.st_size
+                    or current.st_mtime_ns
+                    != previous.st_mtime_ns
+                    or current.st_ctime_ns
+                    != previous.st_ctime_ns
+                ):
+                    raise _SourceSidecarPublicationError(
+                        "retained existing provenance sidecar because "
+                        "it changed during verification"
+                    )
+                existing_payload = bytes(existing_payload)
+                if existing_payload == payload:
+                    sidecar_result = _SourceSidecarWriteResult()
+                    return sidecar_result
+                if not _authoritative_sidecar_payload(
+                    existing_payload
+                ):
+                    raise _SourceSidecarPublicationError(
+                        "retained existing provenance sidecar because "
+                        "it differs from prepared provenance"
+                    )
+                sidecar_path = os.path.join(
+                    out_dir.path,
+                    SOURCE_SIDECAR,
+                )
+                journal = _ManagedOutputJournal(
+                    out_dir,
+                    internal_names=(SOURCE_SIDECAR,),
+                    backup_prefix=(
+                        ".paperconan-sidecar-rollback-"
+                    ),
+                    backup_entry_prefix="previous-",
+                )
+                try:
+                    try:
+                        prepared = journal.prepare(
+                            sidecar_path,
+                            expected={
+                                "size": opened_previous.st_size,
+                                "sha256": hashlib.sha256(
+                                    existing_payload
+                                ).hexdigest(),
+                                "identity": (
+                                    opened_previous.st_dev,
+                                    opened_previous.st_ino,
+                                ),
+                            },
+                            recovery_max_bytes=max_sidecar_bytes,
+                        )
+                    except _ManagedOutputRecoveryRequiredError as error:
+                        raise _SourceSidecarPublicationError(
+                            "retained provenance sidecar because it "
+                            "changed during publication"
+                        ) from error
+                    if not prepared:
+                        raise _SourceSidecarPublicationError(
+                            "retained provenance sidecar because it "
+                            "changed during publication"
+                        )
+                    try:
+                        with _transaction_state_allocation():
+                            os.link(
+                                temp_name,
+                                SOURCE_SIDECAR,
+                                src_dir_fd=out_dir.fd,
+                                dst_dir_fd=out_dir.fd,
+                                follow_symlinks=False,
+                            )
+                    except FileExistsError as error:
+                        raise _SourceSidecarPublicationError(
+                            "retained existing provenance sidecar "
+                            "created during publication"
+                        ) from error
+                    staged = os.fstat(fd)
+                    journal.bind_published(
+                        sidecar_path,
+                        (staged.st_dev, staged.st_ino),
+                        len(payload),
+                        hashlib.sha256(payload).hexdigest(),
+                    )
+                    pending_cleanup = tuple(journal.commit())
+                except BaseException as operation_error:
+                    rollback_error = None
+                    try:
+                        journal.rollback()
+                    except _ManagedOutputRollbackError as error:
+                        rollback_error = error
+                    if (
+                        isinstance(
+                            operation_error,
+                            _ManagedOutputRecoveryRequiredError,
+                        )
+                        or (
+                            rollback_error is not None
+                            and journal.recovery_paths()
+                        )
+                    ):
+                        _raise_source_sidecar_recovery_required(
+                            journal,
+                            operation_error,
+                            rollback_error,
+                        )
+                    if rollback_error is not None:
+                        _raise_operation_with_rollback_errors(
+                            operation_error,
+                            [rollback_error],
+                        )
+                    raise
+                finally:
+                    journal.close()
+            finally:
+                if existing_fd >= 0:
+                    os.close(existing_fd)
+        sidecar_result = _SourceSidecarWriteResult(
+            pending_cleanup=tuple(dict.fromkeys(
+                pending_cleanup
+            )),
+        )
+        return sidecar_result
+    except BaseException as error:
+        sidecar_operation_error = error
+        raise
     finally:
-        if fd is not None:
+        cleanup_error = None
+        if fd >= 0:
+            try:
+                _unlink_owned_regular_entry(
+                    out_dir.fd,
+                    temp_name,
+                    fd,
+                )
+            except (
+                OSError,
+                TypeError,
+                NotImplementedError,
+                ValueError,
+            ) as error:
+                cleanup_error = error
             try:
                 os.close(fd)
-            except OSError:
-                pass
-        if temp_path is not None:
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+            except OSError as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if cleanup_error is not None:
+            if sidecar_operation_error is not None:
+                _append_explicit_cause(
+                    cleanup_error,
+                    sidecar_operation_error,
+                )
+                raise _SourceSidecarPublicationError(
+                    "source sidecar staging cleanup incomplete"
+                ) from cleanup_error
+            sidecar_result.cleanup_warning = (
+                "source sidecar staging cleanup incomplete"
+            )
 
 
 def _sidecar_write_failure_record(error, *, operation):
@@ -3305,43 +9243,534 @@ def _sidecar_write_failure_record(error, *, operation):
     }
 
 
+def _safe_source_url(url):
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if (
+        scheme not in {"http", "https"}
+        or not hostname
+        or any(
+            character.isspace() or ord(character) < 32
+            for character in hostname
+        )
+    ):
+        return None
+    authority_host = (
+        f"[{hostname}]" if ":" in hostname else hostname
+    )
+    authority = (
+        f"{authority_host}:{port}"
+        if port is not None
+        else authority_host
+    )
+    return urllib.parse.urlunsplit(
+        (scheme, authority, parsed.path, "", "")
+    )
+
+
+def _provenance_entry(
+    path,
+    source_url,
+    content_type=None,
+    size=None,
+):
+    return {
+        "file": os.path.basename(path),
+        "source_url": _safe_source_url(source_url),
+        "content_type": content_type,
+        "asset_type": asset_type(os.path.basename(path)),
+        "size": size,
+    }
+
+
+def _archive_provenance_entries(
+    output,
+    paths,
+    source_url,
+    published_outputs,
+):
+    by_name = {
+        entry.filename: entry
+        for entry in published_outputs
+    }
+    provenance = []
+    for path in paths:
+        name = os.path.basename(path)
+        entry = by_name.get(name)
+        if entry is None:
+            try:
+                state = _stable_managed_file(output, name)
+            except (OSError, ValueError):
+                continue
+            entry = _PublishedOutputFile(
+                filename=state.name,
+                size=state.size,
+                identity=state.identity,
+                sha256=state.sha256,
+                created=True,
+            )
+            published_outputs.append(entry)
+            by_name[name] = entry
+        provenance.append(_provenance_entry(
+            entry.display_path(output),
+            source_url,
+            size=entry.size,
+        ))
+    return provenance
+
+
+def _selected_candidate_files(
+    cand,
+    *,
+    tabular_only,
+    include_images,
+):
+    if tabular_only:
+        selected = list(cand.get("tabular_files") or ())
+    else:
+        selected = list(
+            cand.get("all_files")
+            or cand.get("tabular_files")
+            or ()
+        )
+    if include_images:
+        selected.extend(cand.get("image_files") or ())
+        selected.extend(
+            file_ref
+            for file_ref in cand.get("all_files") or ()
+            if asset_type(file_ref.get("name") or "")
+            == "document"
+        )
+    unique = []
+    seen = set()
+    for file_ref in selected:
+        if not isinstance(file_ref, dict):
+            continue
+        key = (
+            file_ref.get("name"),
+            file_ref.get("download_url"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(file_ref)
+    return unique
+
+
+def _verified_managed_files(output, managed_files):
+    if type(managed_files) is not dict:
+        return {}
+    candidates = []
+    normalized_names = {}
+    for name, supplied in sorted(managed_files.items()):
+        expected = _canonical_fingerprint(supplied)
+        safe_name = _safe_managed_name(name)
+        if expected is None or safe_name is None:
+            continue
+        try:
+            normalized = unicodedata.normalize(
+                "NFC",
+                safe_name,
+            ).casefold()
+        except (TypeError, ValueError):
+            return {}
+        previous_name = normalized_names.get(normalized)
+        if previous_name is not None and previous_name != safe_name:
+            return {}
+        normalized_names[normalized] = safe_name
+        candidates.append((safe_name, expected))
+
+    verified = {}
+    verified_identities = {}
+    for name, expected in candidates:
+        try:
+            current = _stable_managed_file(
+                output,
+                name,
+                expected=expected,
+            )
+        except (OSError, ValueError):
+            continue
+        previous_name = verified_identities.get(current.identity)
+        if previous_name is not None and previous_name != name:
+            return {}
+        verified_identities[current.identity] = name
+        verified[name] = expected
+    return verified
+
+
+def _bounded_in_root_transaction_state_pending(output):
+    entries_seen = 0
+    name_bytes = 0
+    metadata_reads = 0
+    try:
+        entries = os.scandir(output.fd)
+    except (OSError, TypeError, NotImplementedError, ValueError):
+        return True
+    try:
+        with entries:
+            for entry in entries:
+                entries_seen += 1
+                if entries_seen > _INTERNAL_STATE_ENTRY_LIMIT:
+                    return True
+                try:
+                    encoded_name = os.fsencode(entry.name)
+                except (OSError, TypeError, ValueError):
+                    return True
+                name_bytes += len(encoded_name)
+                if name_bytes > _INTERNAL_STATE_NAME_BYTES:
+                    return True
+                metadata_reads += 1
+                if metadata_reads > _INTERNAL_STATE_METADATA_LIMIT:
+                    return True
+                try:
+                    entry.stat(follow_symlinks=False)
+                except (
+                    OSError,
+                    TypeError,
+                    NotImplementedError,
+                    ValueError,
+                ):
+                    return True
+                if entry.name.startswith(
+                    _IN_ROOT_TRANSACTION_PREFIXES
+                ):
+                    return True
+    except (OSError, TypeError, NotImplementedError, ValueError):
+        return True
+    return False
+
+
+def _sibling_rollback_state_pending(output):
+    directory = getattr(os, "O_DIRECTORY", None)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if directory is None or nofollow is None:
+        return True
+    parent_fd = -1
+    try:
+        output.verify()
+        parent_fd = os.open(
+            "..",
+            os.O_RDONLY | directory | nofollow,
+            dir_fd=output.fd,
+        )
+        parent = os.fstat(parent_fd)
+        if not stat.S_ISDIR(parent.st_mode):
+            return True
+        name_bytes = 0
+        metadata_reads = 0
+        for prefix in _SIBLING_ROLLBACK_PREFIXES:
+            name = _rollback_directory_name(output, prefix)
+            name_bytes += len(os.fsencode(name))
+            if name_bytes > _INTERNAL_STATE_NAME_BYTES:
+                return True
+            metadata_reads += 1
+            if metadata_reads > _INTERNAL_STATE_METADATA_LIMIT:
+                return True
+            try:
+                os.stat(
+                    name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            except (
+                OSError,
+                TypeError,
+                NotImplementedError,
+                ValueError,
+            ):
+                return True
+            return True
+        output.verify()
+        return False
+    except (
+        OSError,
+        TypeError,
+        NotImplementedError,
+        ValueError,
+    ):
+        return True
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def _managed_internal_cleanup_pending(output):
+    try:
+        output.verify()
+    except (OSError, TypeError, NotImplementedError, ValueError):
+        return True
+    if _bounded_in_root_transaction_state_pending(output):
+        return True
+    if _sibling_rollback_state_pending(output):
+        return True
+    try:
+        output.verify()
+    except (OSError, TypeError, NotImplementedError, ValueError):
+        return True
+    return False
+
+
+def _managed_cleanup_pending_result(cand, out_dir):
+    return {
+        "cand_id": cand.get("cand_id"),
+        "out_dir": _output_path(out_dir),
+        "downloaded": [],
+        "skipped": [{
+            "name": "managed-output cleanup",
+            "reason": "managed-output cleanup remains pending",
+        }],
+    }
+
+
+def _verify_published_output_file(output, entry):
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise _UnstableRegularFileError(
+            "published output verification is unavailable"
+        )
+    try:
+        output.verify()
+        fd = os.open(
+            entry.filename,
+            os.O_RDONLY | nofollow,
+            dir_fd=output.fd,
+        )
+    except (OSError, TypeError, NotImplementedError) as error:
+        raise _UnstableRegularFileError(
+            "published output entry is unavailable"
+        ) from error
+    try:
+        opened = os.fstat(fd)
+        try:
+            current = os.stat(
+                entry.filename,
+                dir_fd=output.fd,
+                follow_symlinks=False,
+            )
+        except (OSError, TypeError, NotImplementedError) as error:
+            raise _UnstableRegularFileError(
+                "published output entry is unavailable"
+            ) from error
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or opened.st_size != entry.size
+            or current.st_size != entry.size
+            or (opened.st_dev, opened.st_ino) != entry.identity
+            or (current.st_dev, current.st_ino) != entry.identity
+            or current.st_mtime_ns != opened.st_mtime_ns
+            or current.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise _UnstableRegularFileError(
+                "published output entry is not a stable regular file"
+            )
+        digest = _hash_exact_fd(fd, entry.size)
+        output.verify()
+        try:
+            final_opened = os.fstat(fd)
+            final_current = os.stat(
+                entry.filename,
+                dir_fd=output.fd,
+                follow_symlinks=False,
+            )
+        except (OSError, TypeError, NotImplementedError) as error:
+            raise _UnstableRegularFileError(
+                "published output entry is unavailable"
+            ) from error
+        if (
+            not stat.S_ISREG(final_opened.st_mode)
+            or not stat.S_ISREG(final_current.st_mode)
+            or final_opened.st_size != entry.size
+            or final_current.st_size != entry.size
+            or (final_opened.st_dev, final_opened.st_ino)
+            != entry.identity
+            or (final_current.st_dev, final_current.st_ino)
+            != entry.identity
+            or final_opened.st_mtime_ns != opened.st_mtime_ns
+            or final_opened.st_ctime_ns != opened.st_ctime_ns
+            or final_current.st_mtime_ns != opened.st_mtime_ns
+            or final_current.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise _UnstableRegularFileError(
+                "published output entry is not a stable regular file"
+            )
+        if digest != entry.sha256:
+            raise _UnstableRegularFileError(
+                "published output entry content changed during publication"
+            )
+    finally:
+        os.close(fd)
+
+
+def _reconcile_publications(
+    output,
+    entries,
+    *,
+    attempts,
+    report_verified=False,
+):
+    reconciled = []
+    outcomes = []
+    first_error = None
+    seen = set()
+    attempt_count = max(1, attempts)
+    if not entries:
+        for _attempt in range(attempt_count):
+            try:
+                output.verify()
+            except (OSError, ValueError) as error:
+                if first_error is None:
+                    first_error = error
+                continue
+            break
+        return reconciled, outcomes, first_error
+    for entry in entries:
+        key = (entry.filename, entry.identity)
+        if key in seen:
+            continue
+        seen.add(key)
+        entry_error = None
+        for _attempt in range(attempt_count):
+            attempt_error = None
+            try:
+                _verify_published_output_file(output, entry)
+            except (OSError, ValueError) as error:
+                attempt_error = error
+            try:
+                output.verify()
+            except (OSError, ValueError) as error:
+                if attempt_error is None:
+                    attempt_error = error
+            if attempt_error is not None:
+                entry_error = attempt_error
+                if first_error is None:
+                    first_error = attempt_error
+                continue
+            reconciled.append(entry)
+            if entry_error is not None:
+                outcomes.append(
+                    "recovered stable output after bounded verification "
+                    f"retry: {entry.filename}"
+                )
+            elif report_verified:
+                outcomes.append(
+                    f"retained verified output: {entry.filename}"
+                )
+            break
+        else:
+            if not entry.created:
+                outcomes.append(
+                    "retained collision-reused output without reporting it: "
+                    f"{entry.filename}"
+                )
+            else:
+                outcomes.append(
+                    "retained visible output for recovery without reporting "
+                    f"it: {entry.filename}"
+                )
+    return reconciled, outcomes, first_error
+
+
+def _reconcile_archive_publications(
+    output,
+    accepted,
+    pending,
+):
+    reconciled, outcomes, first_error = _reconcile_publications(
+        output,
+        [*accepted, *pending],
+        attempts=2,
+        report_verified=True,
+    )
+    accepted[:] = reconciled
+    pending.clear()
+    return reconciled, outcomes, first_error
+
+
 def _download_candidate(
     cand,
     out_dir,
     *,
     tabular_only,
+    include_images,
     max_bytes,
     archive_max,
     output_journal,
 ):
     downloaded, skipped = [], []
+    published_outputs = []
+    cardinality = _CandidateCardinality(
+        max_published_files=_MAX_PUBLISHED_FILES_PER_CANDIDATE,
+        max_archive_members=_MAX_ARCHIVE_MEMBERS_PER_CANDIDATE,
+    )
+    display_out_dir = _output_path(out_dir)
+    if _managed_internal_cleanup_pending(out_dir):
+        return _managed_cleanup_pending_result(cand, out_dir)
     try:
         cand = _prepare_sidecar_candidate(cand)
     except _SourceSidecarLimit as error:
         error.record["ownership_preserved"] = True
         return {
             "cand_id": cand.get("cand_id"),
-            "out_dir": out_dir,
+            "out_dir": display_out_dir,
             "downloaded": downloaded,
             "skipped": [error.record],
         }
-    if tabular_only:
-        files = cand.get("tabular_files", [])
-    else:
-        files = cand.get("all_files") or cand.get("tabular_files", [])
+    cand = dict(cand)
+    provenance_downloads = []
+    cand["_paperconan_downloads"] = provenance_downloads
+    files = _selected_candidate_files(
+        cand,
+        tabular_only=tabular_only,
+        include_images=include_images,
+    )
     try:
         previous = _read_source_sidecar(out_dir)
     except _SourceSidecarLimit as error:
         return {
             "cand_id": cand.get("cand_id"),
-            "out_dir": out_dir,
+            "out_dir": display_out_dir,
             "downloaded": downloaded,
             "skipped": [error.record],
         }
-    old_managed = set(previous.get("managed_files") or ())
+    has_prior_managed_descriptor = "managed_files" in previous
+    old_managed = _verified_managed_files(
+        out_dir,
+        previous.get("managed_files"),
+    )
+    prior_sidecar = (
+        has_prior_managed_descriptor
+        or _verified_source_sidecar_identity(out_dir) is not None
+    )
+    if (
+        not _identity_bound_mutation_available()
+        and prior_sidecar
+    ):
+        return {
+            "cand_id": cand.get("cand_id"),
+            "out_dir": display_out_dir,
+            "downloaded": downloaded,
+            "skipped": [{
+                "name": "managed-output cleanup",
+                "reason": (
+                    "managed-output refresh unavailable: "
+                    "identity-bound mutation is unavailable"
+                ),
+            }],
+        }
     reusable_names = set(old_managed)
-    new_managed = set()
-    preserved_managed = set()
+    new_managed = {}
+    preserved_managed = {}
     try:
         managed_name_accounting = _ManagedNameAccounting(
             cand,
@@ -3353,13 +9782,14 @@ def _download_candidate(
         error.record["ownership_preserved"] = True
         return {
             "cand_id": cand.get("cand_id"),
-            "out_dir": out_dir,
+            "out_dir": display_out_dir,
             "downloaded": downloaded,
             "skipped": [error.record],
         }
     cap_state = {
         "exceeded": False,
         "ownership_blocked": False,
+        "output_root_unavailable": False,
     }
     for file_ref in files:
         try:
@@ -3386,9 +9816,33 @@ def _download_candidate(
             )
             if base in (".", ".."):
                 base = "download"
-            output_name = _managed_output_name(
-                out_dir, base, source_name, reusable_names
-            )
+            if _is_reserved_source_sidecar(base):
+                skipped.append({
+                    "name": requested_name or base,
+                    "reason": _RESERVED_SOURCE_SIDECAR_REASON,
+                })
+                continue
+            if not cardinality.can_publish():
+                skipped.append({
+                    "name": requested_name or base,
+                    "reason": _published_file_limit_reason(
+                        cardinality
+                    ),
+                })
+                break
+            if (
+                has_prior_managed_descriptor
+                or _safe_managed_name(base) is None
+                or _is_reserved_managed_name(base)
+            ):
+                output_name = _managed_output_name(
+                    out_dir,
+                    base,
+                    source_name,
+                    reusable_names,
+                )
+            else:
+                output_name = _managed_output_candidate((base,))
         except _ManagedOutputNameLimit as error:
             skipped.append(
                 error.record(ownership_preserved=True)
@@ -3398,31 +9852,26 @@ def _download_candidate(
             preserved_managed.update(old_managed)
             break
         reuses_old = output_name in reusable_names
-        sidecar_limitation = (
-            managed_name_accounting.limitation_for(output_name)
-        )
-        if sidecar_limitation is not None:
-            sidecar_limitation["name"] = (
-                requested_name or output_name
-            )
-            skipped.append(sidecar_limitation)
-            cap_state["exceeded"] = True
-            preserved_managed.update(old_managed)
-            continue
         reusable_names.discard(output_name)
-        dest = os.path.join(out_dir, output_name)
-        sidecar_delta = (
-            managed_name_accounting.replacement_delta_with(
-                output_name
+        dest = os.path.join(out_dir.path, output_name)
+        replacement_credit = (
+            old_managed[output_name]["size"]
+            if reuses_old
+            else 0
+        )
+        remaining = (
+            _MAX_PAPER_BYTES
+            - _paper_data_size(out_dir)
+            + replacement_credit
+        )
+        download_limit = (
+            max_bytes
+            if (
+                not reuses_old
+                and not has_prior_managed_descriptor
             )
+            else min(max_bytes, remaining)
         )
-        remaining, _ = _remaining_final_size_allowance(
-            _dir_size(out_dir),
-            dest,
-            reuses_old,
-            sidecar_delta,
-        )
-        download_limit = min(max_bytes, remaining)
         if download_limit <= 0:
             cap_state["exceeded"] = True
             skipped.append({
@@ -3430,45 +9879,197 @@ def _download_candidate(
                 "reason": "paper data exceeds per-paper cap",
             })
             if reuses_old:
-                preserved_managed.add(output_name)
+                preserved_managed[output_name] = old_managed[
+                    output_name
+                ]
             continue
-        output_journal.prepare(dest)
+        suffix = os.path.splitext(output_name)[1]
+        staging = _download_staging_file(
+            out_dir,
+            prefix=".paperconan-download-",
+            suffix=suffix,
+        )
+        operation_error = None
         try:
             res = download_file(
                 source_url,
-                dest,
+                staging,
                 max_bytes=download_limit,
             )
         except BaseException as error:
-            _restore_managed_output(
-                output_journal,
-                dest,
-                operation_error=error,
-            )
+            operation_error = error
+            _cleanup_download_staging(staging)
             raise
-        if res.get("ok"):
-            downloaded.append(res["path"])
-            managed_name_accounting.add(output_name)
-        else:
-            _restore_managed_output(output_journal, dest)
+        abort_direct_files = False
+        try:
+            if res.get("ok"):
+                staged = _stable_staging_state(staging)
+                fingerprint = {
+                    "size": staged.size,
+                    "sha256": staged.sha256,
+                }
+                sidecar_limitation = (
+                    managed_name_accounting.limitation_for(
+                        output_name,
+                        fingerprint,
+                    )
+                )
+                if sidecar_limitation is not None:
+                    sidecar_limitation["name"] = (
+                        requested_name or output_name
+                    )
+                    skipped.append(sidecar_limitation)
+                    cap_state["exceeded"] = True
+                    if reuses_old:
+                        preserved_managed[output_name] = (
+                            old_managed[output_name]
+                        )
+                    continue
+                published = _publish_download_staging(
+                    out_dir,
+                    staging,
+                    output_name=output_name,
+                    base=base,
+                    source_name=source_name,
+                    expected_old=(
+                        old_managed.get(output_name)
+                        if reuses_old
+                        else None
+                    ),
+                    output_journal=output_journal,
+                )
+                if published.cleanup_warning is not None:
+                    skipped.append({
+                        "name": requested_name or published.name,
+                        "reason": published.cleanup_warning,
+                    })
+                fingerprint = {
+                    "size": published.size,
+                    "sha256": published.sha256,
+                }
+                sidecar_limitation = (
+                    managed_name_accounting.limitation_for(
+                        published.name,
+                        fingerprint,
+                    )
+                )
+                projected_size = _paper_data_size(
+                    out_dir,
+                    (staging,),
+                )
+                if (
+                    sidecar_limitation is not None
+                    or projected_size > _MAX_PAPER_BYTES
+                ):
+                    _restore_managed_output(
+                        output_journal,
+                        os.path.join(
+                            out_dir.path, published.name
+                        ),
+                    )
+                    if sidecar_limitation is not None:
+                        sidecar_limitation["name"] = (
+                            requested_name or published.name
+                        )
+                        skipped.append(sidecar_limitation)
+                    else:
+                        skipped.append({
+                            "name": requested_name,
+                            "reason": (
+                                "publication skipped because projected "
+                                "paper data exceeds per-paper cap"
+                            ),
+                        })
+                    cap_state["exceeded"] = True
+                    if reuses_old:
+                        preserved_managed[output_name] = (
+                            old_managed[output_name]
+                        )
+                    continue
+                managed_name_accounting.add(
+                    published.name,
+                    fingerprint,
+                )
+                published_path = os.path.join(
+                    out_dir.path, published.name
+                )
+                downloaded.append(published_path)
+                published_outputs.append(_PublishedOutputFile(
+                    filename=published.name,
+                    size=published.size,
+                    identity=published.identity,
+                    sha256=published.sha256,
+                    created=published.created,
+                    cleanup_warning=published.cleanup_warning,
+                ))
+                cardinality.record_publication()
+                provenance_downloads.append(_provenance_entry(
+                    published_path,
+                    res.get("source_url") or source_url,
+                    content_type=res.get("content_type"),
+                    size=published.size,
+                ))
+            else:
+                if (
+                    remaining < max_bytes
+                    and "exceeds max_bytes"
+                    in str(res.get("skipped_reason") or "")
+                ):
+                    cap_state["exceeded"] = True
+                skipped.append({
+                    "name": requested_name,
+                    "reason": res.get("skipped_reason"),
+                })
+                if reuses_old:
+                    preserved_managed[output_name] = (
+                        old_managed[output_name]
+                    )
+        except _ManagedOutputRecoveryRequiredError:
+            raise
+        except (_UnstableRegularFileError, ValueError) as error:
             if (
-                remaining < max_bytes
-                and "exceeds max_bytes"
-                in str(res.get("skipped_reason") or "")
+                reuses_old
+                and isinstance(error, _ManagedOutputPrepareError)
             ):
-                cap_state["exceeded"] = True
+                preserved_managed[output_name] = old_managed[
+                    output_name
+                ]
             skipped.append({
-                "name": requested_name,
-                "reason": res.get("skipped_reason"),
+                "name": requested_name or output_name,
+                "reason": (
+                    "secure publication unavailable: "
+                    f"{error}"
+                ),
             })
-            if reuses_old:
-                preserved_managed.add(output_name)
+            output_root_changed = (
+                "output directory changed" in str(error)
+            )
+            if output_root_changed:
+                cap_state["ownership_blocked"] = True
+                cap_state["output_root_unavailable"] = True
+                preserved_managed.update(old_managed)
+                abort_direct_files = True
+        finally:
+            cleanup_context = _cleanup_download_staging(staging)
+            if cleanup_context is not None:
+                skipped.append({
+                    "name": requested_name or output_name,
+                    "reason": cleanup_context,
+                })
+        if abort_direct_files:
+            break
     pkg = cand.get("oa_package")
+    reusable_files = {
+        name: old_managed[name]
+        for name in reusable_names
+        if name in old_managed
+    }
     if (
         not cap_state["ownership_blocked"]
         and pkg
         and pkg.get("url")
     ):
+        archive_start = len(downloaded)
         archive_ok, archive_preserved = _download_oa_package(
             pkg,
             out_dir,
@@ -3476,21 +10077,35 @@ def _download_candidate(
             skipped,
             max_bytes,
             archive_max=archive_max,
-            reusable_names=reusable_names,
+            reusable_names=reusable_files,
             managed_name_accounting=managed_name_accounting,
             cap_state=cap_state,
             output_journal=output_journal,
+            include_images=include_images,
+            cardinality=cardinality,
+            published_outputs=published_outputs,
         )
-        preserved_managed.update(archive_preserved)
+        provenance_downloads.extend(_archive_provenance_entries(
+            out_dir,
+            downloaded[archive_start:],
+            pkg.get("url"),
+            published_outputs,
+        ))
+        preserved_managed.update({
+            name: old_managed[name]
+            for name in archive_preserved
+            if name in old_managed
+        })
         if not archive_ok:
             preserved_managed.update(old_managed)
     arch = cand.get("supplementary_archive")
     if (
         not cap_state["ownership_blocked"]
-        and not downloaded
+        and (not downloaded or include_images)
         and arch
         and arch.get("url")
     ):
+        archive_start = len(downloaded)
         archive_ok, archive_preserved = _download_supplementary_archive(
             arch,
             out_dir,
@@ -3498,92 +10113,252 @@ def _download_candidate(
             skipped,
             max_bytes,
             archive_max=archive_max,
-            reusable_names=reusable_names,
+            reusable_names=reusable_files,
             managed_name_accounting=managed_name_accounting,
             cap_state=cap_state,
             output_journal=output_journal,
+            include_images=include_images,
+            cardinality=cardinality,
+            published_outputs=published_outputs,
         )
-        preserved_managed.update(archive_preserved)
+        provenance_downloads.extend(_archive_provenance_entries(
+            out_dir,
+            downloaded[archive_start:],
+            arch.get("url"),
+            published_outputs,
+        ))
+        preserved_managed.update({
+            name: old_managed[name]
+            for name in archive_preserved
+            if name in old_managed
+        })
         if not archive_ok:
             preserved_managed.update(old_managed)
-    managed_files = new_managed | preserved_managed
-    stale_managed = old_managed - managed_files
-    committed_managed = managed_files | stale_managed
+
+    boundary_error_seen = set()
+    for boundary in ("initial", "final"):
+        (
+            published_outputs,
+            outcomes,
+            boundary_error,
+        ) = _reconcile_publications(
+            out_dir,
+            published_outputs,
+            attempts=2,
+        )
+        if boundary_error is not None:
+            if "output directory changed" in str(boundary_error):
+                cap_state["ownership_blocked"] = True
+                cap_state["output_root_unavailable"] = True
+            error_text = str(boundary_error)
+            key = (boundary, error_text)
+            already_reported = any(
+                error_text in str(item.get("reason") or "")
+                for item in skipped
+            )
+            if (
+                key not in boundary_error_seen
+                and not already_reported
+            ):
+                boundary_error_seen.add(key)
+                reason = (
+                    "published output verification required "
+                    f"reconciliation at the {boundary} "
+                    "reconciliation boundary before provenance "
+                    f"publication: {boundary_error}"
+                )
+                if outcomes:
+                    reason += "; " + "; ".join(outcomes)
+                skipped.append({
+                    "name": cand.get("cand_id"),
+                    "reason": reason,
+                })
+    reconciled_names = {
+        entry.filename for entry in published_outputs
+    }
+    for path in tuple(downloaded):
+        name = os.path.basename(path)
+        if name in reconciled_names:
+            continue
+        new_managed.pop(name, None)
+        detached_backup = output_journal.abandon(path)
+        if detached_backup is not None:
+            _append_post_commit_cleanup_records(
+                skipped,
+                (detached_backup,),
+            )
+    downloaded[:] = [
+        entry.display_path(out_dir)
+        for entry in published_outputs
+    ]
+    provenance_downloads[:] = [
+        entry
+        for entry in provenance_downloads
+        if entry.get("file") in reconciled_names
+    ]
+
+    managed_files = dict(preserved_managed)
+    managed_files.update(new_managed)
+    stale_managed = {
+        name: fingerprint
+        for name, fingerprint in old_managed.items()
+        if name not in managed_files
+    }
+    committed_managed = dict(managed_files)
+    committed_managed.update(stale_managed)
     preserve_previous_refresh = (
         cap_state["exceeded"]
         and bool(old_managed)
         and not new_managed
     )
-    sidecar_delta = managed_name_accounting.replacement_delta()
-    sidecar_fits = (
-        _dir_size(out_dir) + sidecar_delta <= _MAX_PAPER_BYTES
-    )
+    sidecar_fits = True
     sidecar_committed = False
+    outputs_finalized_without_sidecar = False
     if (
         not cap_state["ownership_blocked"]
         and not preserve_previous_refresh
         and sidecar_fits
     ):
         try:
-            _write_source_sidecar(
-                cand, out_dir, committed_managed
+            cand["_paperconan_managed_files"] = committed_managed
+            sidecar_result = _write_source_sidecar(
+                cand,
+                out_dir,
+                downloads=provenance_downloads,
             )
+        except (
+            _SourceSidecarRecoveryRequiredError,
+            _ManagedOutputRecoveryRequiredError,
+        ):
+            raise
+        except (
+            _SourceSidecarLimitError,
+            _SourceSidecarPublicationError,
+        ) as error:
+            skipped.append({
+                "name": SOURCE_SIDECAR,
+                "reason": str(error),
+            })
+            outputs_finalized_without_sidecar = not old_managed
         except OSError as error:
             skipped.append(_sidecar_write_failure_record(
                 error, operation="initial"
             ))
         else:
-            sidecar_committed = True
-    if sidecar_committed:
-        pending_cleanup = output_journal.commit()
-        for path in pending_cleanup:
-            skipped.append({
-                "name": os.path.basename(path),
-                "reason": "post-commit cleanup pending",
-                "path": path,
-            })
-        cleanup_journal = _ManagedOutputJournal(out_dir)
-        failed_removals, absent_removals = (
-            _stage_managed_file_cleanup(
-                out_dir, stale_managed, cleanup_journal
-            )
-        )
-        failed_removals = set(failed_removals)
-        absent_removals = set(absent_removals)
-        for relative in sorted(failed_removals):
-            skipped.append({
-                "name": relative,
-                "reason": "could not remove managed file",
-            })
-        final_managed = managed_files | failed_removals
-        if final_managed != committed_managed:
-            try:
-                _write_source_sidecar(
-                    cand, out_dir, final_managed
+            if sidecar_result is None:
+                skipped.append({
+                    "name": SOURCE_SIDECAR,
+                    "reason": (
+                        "provenance sidecar publication unavailable"
+                    ),
+                })
+                outputs_finalized_without_sidecar = not old_managed
+            else:
+                if sidecar_result.cleanup_warning is not None:
+                    skipped.append({
+                        "name": SOURCE_SIDECAR,
+                        "reason": sidecar_result.cleanup_warning,
+                    })
+                _append_post_commit_cleanup_records(
+                    skipped,
+                    getattr(
+                        sidecar_result,
+                        "pending_cleanup",
+                        (),
+                    ),
                 )
-            except OSError as error:
-                cleanup_journal.rollback()
-                if absent_removals:
+                sidecar_committed = True
+    if sidecar_committed:
+        pending_cleanup = output_journal.commit_after_sidecar()
+        _append_post_commit_cleanup_records(
+            skipped,
+            pending_cleanup,
+        )
+        cleanup_journal = _ManagedOutputJournal(out_dir)
+        try:
+            failed_removals, absent_removals = (
+                _stage_managed_file_cleanup(
+                    out_dir, stale_managed, cleanup_journal
+                )
+            )
+            failed_removals = set(failed_removals)
+            absent_removals = set(absent_removals)
+            for relative in sorted(failed_removals):
+                skipped.append({
+                    "name": relative,
+                    "reason": "could not remove managed file",
+                })
+            final_managed = dict(managed_files)
+            final_managed.update({
+                relative: stale_managed[relative]
+                for relative in failed_removals
+                if relative in stale_managed
+            })
+            if final_managed != committed_managed:
+                try:
+                    cand["_paperconan_managed_files"] = final_managed
+                    sidecar_result = _write_source_sidecar(
+                        cand,
+                        out_dir,
+                        downloads=provenance_downloads,
+                    )
+                except (
+                    _SourceSidecarRecoveryRequiredError,
+                    _ManagedOutputRecoveryRequiredError,
+                ):
                     raise
-                skipped.append(_sidecar_write_failure_record(
-                    error, operation="cleanup_narrowing"
-                ))
+                except OSError as error:
+                    cleanup_journal.rollback()
+                    if absent_removals:
+                        raise
+                    skipped.append(_sidecar_write_failure_record(
+                        error, operation="cleanup_narrowing"
+                    ))
+                else:
+                    if sidecar_result.cleanup_warning is not None:
+                        skipped.append({
+                            "name": SOURCE_SIDECAR,
+                            "reason": sidecar_result.cleanup_warning,
+                        })
+                    _append_post_commit_cleanup_records(
+                        skipped,
+                        getattr(
+                            sidecar_result,
+                            "pending_cleanup",
+                            (),
+                        ),
+                    )
+                    pending_cleanup = cleanup_journal.commit()
+                    _append_post_commit_cleanup_records(
+                        skipped,
+                        pending_cleanup,
+                    )
             else:
                 pending_cleanup = cleanup_journal.commit()
-                for path in pending_cleanup:
-                    skipped.append({
-                        "name": os.path.basename(path),
-                        "reason": "post-commit cleanup pending",
-                        "path": path,
-                    })
-        else:
-            pending_cleanup = cleanup_journal.commit()
-            for path in pending_cleanup:
-                skipped.append({
-                    "name": os.path.basename(path),
-                    "reason": "post-commit cleanup pending",
-                    "path": path,
-                })
+                _append_post_commit_cleanup_records(
+                    skipped,
+                    pending_cleanup,
+                )
+        except BaseException as operation_error:
+            try:
+                cleanup_journal.rollback()
+            except _ManagedOutputRollbackError as rollback_error:
+                _raise_operation_with_rollback_errors(
+                    operation_error,
+                    [rollback_error],
+                )
+            raise
+        finally:
+            cleanup_journal.close()
+    elif (
+        outputs_finalized_without_sidecar
+        or cap_state["output_root_unavailable"]
+    ):
+        pending_cleanup = output_journal.commit()
+        _append_post_commit_cleanup_records(
+            skipped,
+            pending_cleanup,
+        )
     else:
         rolled_back = output_journal.rollback()
         if rolled_back:
@@ -3591,45 +10366,60 @@ def _download_candidate(
                 path for path in downloaded
                 if os.path.abspath(path) not in rolled_back
             ]
-    return {"cand_id": cand.get("cand_id"), "out_dir": out_dir,
+    if cap_state["output_root_unavailable"]:
+        skipped.append({
+            "name": SOURCE_SIDECAR,
+            "reason": "provenance sidecar publication unavailable",
+        })
+    return {"cand_id": cand.get("cand_id"), "out_dir": display_out_dir,
             "downloaded": downloaded, "skipped": skipped}
 
 
 def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
-                       archive_max=_ARCHIVE_MAX):
-    os.makedirs(out_dir, exist_ok=True)
-    output_journal = _ManagedOutputJournal(out_dir)
-    try:
-        return _download_candidate(
-            cand,
-            out_dir,
-            tabular_only=tabular_only,
-            max_bytes=max_bytes,
-            archive_max=archive_max,
-            output_journal=output_journal,
-        )
-    except _ManagedOutputRestoreFailure as failure:
-        rollback_errors = [failure.rollback_error]
-        try:
-            output_journal.rollback()
-        except _ManagedOutputRollbackError as rollback_error:
-            rollback_errors.append(rollback_error)
-        _raise_operation_with_rollback_errors(
-            failure.operation_error,
-            rollback_errors,
-        )
-    except _ManagedOutputRollbackError as primary_error:
-        try:
-            output_journal.rollback()
-        except _ManagedOutputRollbackError as rollback_error:
-            raise primary_error from rollback_error
-        raise
-    except BaseException as operation_error:
-        try:
-            output_journal.rollback()
-        except _ManagedOutputRollbackError as rollback_error:
-            _raise_operation_with_rollback_errors(
-                operation_error,
-                [rollback_error],
+                       archive_max=_ARCHIVE_MAX, include_images=False):
+    with _candidate_transaction_admission() as admitted:
+        if not admitted:
+            return _managed_cleanup_pending_result(
+                cand,
+                os.path.abspath(os.fspath(out_dir)),
             )
-        raise
+        with _pinned_output_directory(out_dir) as output:
+            output_journal = _ManagedOutputJournal(output)
+            try:
+                try:
+                    return _download_candidate(
+                        cand,
+                        output,
+                        tabular_only=tabular_only,
+                        include_images=include_images,
+                        max_bytes=max_bytes,
+                        archive_max=archive_max,
+                        output_journal=output_journal,
+                    )
+                except _ManagedOutputRestoreFailure as failure:
+                    rollback_errors = [failure.rollback_error]
+                    try:
+                        output_journal.rollback()
+                    except _ManagedOutputRollbackError as rollback_error:
+                        rollback_errors.append(rollback_error)
+                    _raise_operation_with_rollback_errors(
+                        failure.operation_error,
+                        rollback_errors,
+                    )
+                except _ManagedOutputRollbackError as primary_error:
+                    try:
+                        output_journal.rollback()
+                    except _ManagedOutputRollbackError as rollback_error:
+                        raise primary_error from rollback_error
+                    raise
+                except BaseException as operation_error:
+                    try:
+                        output_journal.rollback()
+                    except _ManagedOutputRollbackError as rollback_error:
+                        _raise_operation_with_rollback_errors(
+                            operation_error,
+                            [rollback_error],
+                        )
+                    raise
+            finally:
+                output_journal.close()

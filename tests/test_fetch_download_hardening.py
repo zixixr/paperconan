@@ -1,0 +1,158 @@
+import urllib.error
+import paperconan.fetch._download as dl
+
+
+class _Resp:
+    def __init__(self, body=b"col1,col2\n1,2\n", ctype="text/csv", clen=None):
+        self._chunks = [body[i:i+4] for i in range(0, len(body), 4)] or [b""]
+        self._ctype, self._clen, self._n = ctype, clen, len(body)
+    def info(self):
+        d = {"Content-Type": self._ctype}
+        if self._clen is not None: d["Content-Length"] = str(self._clen)
+        class H:
+            def __init__(s, m): s.m = m
+            def get(s, k, default=None): return s.m.get(k, default)
+        return H(d)
+    def read(self, n=-1):
+        if not self._chunks: return b""
+        return self._chunks.pop(0)
+    def geturl(self): return "https://x/t.csv"
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+def test_download_retries_then_succeeds(tmp_path, monkeypatch):
+    calls = {"n": 0}
+    errors = []
+
+    def flaky_urlopen(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            error = urllib.error.HTTPError(req.full_url, 500, "err", {}, None)
+            errors.append(error)
+            raise error
+        return _Resp()
+
+    monkeypatch.setattr(dl._http, "open_http", flaky_urlopen)
+    monkeypatch.setattr(dl.time, "sleep", lambda *_: None)  # no real backoff wait
+    dest = tmp_path / "t.csv"
+    res = dl.download_file("https://x/t.csv", str(dest), retries=3, backoff=0.0)
+    assert res["ok"] is True
+    assert calls["n"] == 3
+    assert all(error.closed for error in errors)
+    assert dest.read_bytes() == b"col1,col2\n1,2\n"   # streamed to disk correctly
+
+
+def test_download_gives_up_after_retries(tmp_path, monkeypatch):
+    errors = []
+
+    def always_500(req, timeout=None):
+        error = urllib.error.HTTPError(req.full_url, 500, "err", {}, None)
+        errors.append(error)
+        raise error
+
+    monkeypatch.setattr(dl._http, "open_http", always_500)
+    monkeypatch.setattr(dl.time, "sleep", lambda *_: None)
+    res = dl.download_file("https://x/t.csv", str(tmp_path / "t.csv"), retries=2, backoff=0.0)
+    assert res["ok"] is False
+    assert "HTTP 500" in res["skipped_reason"]
+    assert all(error.closed for error in errors)
+
+
+def test_download_does_not_retry_on_403(tmp_path, monkeypatch):
+    calls = {"n": 0}
+    errors = []
+
+    def auth_fail(req, timeout=None):
+        calls["n"] += 1
+        error = urllib.error.HTTPError(
+            req.full_url, 403, "forbidden", {}, None
+        )
+        errors.append(error)
+        raise error
+
+    monkeypatch.setattr(dl._http, "open_http", auth_fail)
+    monkeypatch.setattr(dl.time, "sleep", lambda *_: None)
+    res = dl.download_file("https://x/t.csv", str(tmp_path / "t.csv"), retries=3, backoff=0.0)
+    assert res["ok"] is False and calls["n"] == 1   # auth errors are terminal, no retry
+    assert all(error.closed for error in errors)
+
+
+def test_download_closes_terminal_http_error(tmp_path, monkeypatch):
+    errors = []
+
+    def not_found(req, timeout=None):
+        error = urllib.error.HTTPError(
+            req.full_url, 404, "not found", {}, None
+        )
+        errors.append(error)
+        raise error
+
+    monkeypatch.setattr(dl._http, "open_http", not_found)
+    res = dl.download_file(
+        "https://x/t.csv", str(tmp_path / "t.csv"), retries=3, backoff=0.0
+    )
+    assert res["ok"] is False
+    assert res["skipped_reason"] == "HTTP 404: not found"
+    assert all(error.closed for error in errors)
+
+
+def test_extract_tabular_tar(tmp_path):
+    import io, tarfile, os
+    import paperconan.fetch._download as dl
+    # Build a small tar.gz with scanner-supported inputs and one ignored file.
+    tar_path = tmp_path / "pkg.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tf:
+        for name, body in [
+            ("PMC1/data1.xlsx", b"x"),
+            ("PMC1/t.csv", b"a,b\n1,2\n"),
+            ("PMC1/fig.pdf", b"%PDF"),
+            ("PMC1/tables.docx", b"PK-stub-docx-bytes"),
+            ("PMC1/notes.txt", b"notes"),
+        ]:
+            data = body
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    out = tmp_path / "out"
+    out.mkdir()
+    extracted = dl._extract_tabular_tar(str(tar_path), str(out))
+    names = sorted(os.path.basename(p) for p in extracted)
+    assert names == ["data1.xlsx", "fig.pdf", "t.csv", "tables.docx"]
+    assert (out / "t.csv").read_bytes() == b"a,b\n1,2\n"
+
+
+def test_download_candidate_extracts_oa_package(tmp_path, monkeypatch):
+    import io, tarfile
+    import paperconan.fetch._download as dl
+    tar_path = tmp_path / "PMC1.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tf:
+        data = b"a,b\n1,2\n"
+        info = tarfile.TarInfo("PMC1/sd.csv"); info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    # make download_file just copy our local tar into the out_dir
+    def stub_dl(url, dest, **k):
+        import shutil; shutil.copy(tar_path, dest)
+        return {"ok": True, "path": dest, "size": tar_path.stat().st_size}
+    monkeypatch.setattr(dl, "download_file", stub_dl)
+    cand = {"cand_id": "europepmc:PMC1", "source": "europepmc", "tabular_files": [],
+            "oa_package": {"url": "https://ftp.ncbi.nlm.nih.gov/x/PMC1.tar.gz", "name": "PMC1.tar.gz"}}
+    res = dl.download_candidate(cand, str(tmp_path / "out"))
+    assert any(p.endswith("sd.csv") for p in res["downloaded"])
+
+
+def test_per_paper_cap_stops_extraction(tmp_path, monkeypatch):
+    import io, tarfile
+    import paperconan.fetch._download as dl
+    monkeypatch.setattr(dl, "_MAX_PAPER_BYTES", 3000)   # tiny per-paper budget
+    tar_path = tmp_path / "many.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tf:
+        for i in range(20):                              # 20 x 1KB tabular files = 20KB
+            data = b"a,b\n" + b"1,2\n" * 250             # ~1KB each
+            info = tarfile.TarInfo(f"P/d{i}.csv"); info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    out = tmp_path / "out"; out.mkdir()
+    extracted = dl._extract_tabular_tar(str(tar_path), str(out))
+    # budget ~3KB -> only a few files extracted, not all 20
+    assert 0 < len(extracted) < 20
+    assert dl._dir_size(str(out)) <= 3000 + 1100        # stopped near the cap

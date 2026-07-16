@@ -29,9 +29,9 @@ not mean probability of a research-integrity issue.
 ## Red Lines
 
 - 只描述文件、sheet、列、行和数值模式，不对论文或作者意图作定性。
-- 不点名作者为作假者；只描述文件、sheet、列、行和数值模式。
+- 不点名作者作个人归因；只描述文件、sheet、列、行和数值模式。
 - 不建议微博 / Twitter / 知乎 / 小红书 / 抖音曝光。
-- 不用"实锤"。
+- 不把统计信号写成最终结论。
 - 不把 paperconan 当统计学审稿工具；它只看数值模式。
 
 ## Normal Scan Summary Template
@@ -61,9 +61,9 @@ not mean probability of a research-integrity issue.
 
 避免结论式：
 
-- "这说明数据是编的。"
-- "作者存在研究完整性问题。"
-- "已经实锤。"
+- "这一模式已经解释了全部上下文。"
+- "无需作者澄清即可下结论。"
+- "已经可以直接定性。"
 
 ## If The User Asks For A Definitive Research-Integrity Verdict
 

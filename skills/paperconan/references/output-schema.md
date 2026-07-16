@@ -9,7 +9,7 @@ essentials; this file is the complete reference (it travels in the skill bundle)
 {
   "schema_version": 2,
   "tool": "paperconan",
-  "tool_version": "0.8.2",        // matches the pyproject version; provenance for archived reports
+  "tool_version": "0.8.3",        // matches the pyproject version; provenance for archived reports
   "scanned_at": null,             // deterministic default; timestamp only when runtime metadata is requested
   "profile": "review",            // which FP profile ran (review|forensic|triage) — severities are post-filter unless "forensic"
   "input_dir": "...",
@@ -37,6 +37,8 @@ essentials; this file is the complete reference (it travels in the skill bundle)
   "scan_stats": {                 // per-file / per-sheet sizing + optional timing
     "files": [...], "sheets": [...], "elapsed_ms": null
   },
+  "n_image_source_files": 2,
+  "n_image_assets": 3,
   "relations_blocks": [
     {
       "file": "ED_Fig8b.xlsx",
@@ -58,7 +60,11 @@ essentials; this file is the complete reference (it travels in the skill bundle)
   "decimal_endings": [...],
   // cross-table statistical signals (same file OR cross-file): position/value overlap,
   // decimal-tail reuse, repeated columns/vectors, and within-table fraction reuse.
-  "cross_sheet_findings": [...]
+  "cross_sheet_findings": [...],
+  // complete registered inventory when --images is enabled
+  "image_assets": [...],
+  // optional deterministic, non-gating hints when --image-diagnostics is enabled
+  "image_findings": [...]
 }
 ```
 
@@ -253,6 +259,99 @@ legacy scan whose detailed coverage status is unavailable.
 `paperconan <dir> --doi <DOI> --title <T>`. It is `null` when neither is present
 (a bare directory audit) — never read `null` as "no paper".
 
+## `image_assets[]`
+
+`paperconan <input-dir> --images` registers every admitted local/fetched image
+and rendered PDF page. A representative asset record is:
+
+```json
+{
+  "asset_id": "img:a",
+  "file": "Figure1.png",
+  "path": "images/native/img-a.png",
+  "preview_path": "images/preview/img-a.png",
+  "source_type": "local_image",
+  "parent_file": null,
+  "page": null,
+  "figure_label": "Fig. 1",
+  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "width": 1600,
+  "height": 900,
+  "mime": "image/png"
+}
+```
+
+The inventory is the coverage source of truth. Full image bytes are not stored
+in `scan.json`; the paths refer to bounded artifacts rooted under the audit
+directory. Agent review status belongs in the verdict rather than this
+deterministic inventory.
+
+## `image_findings[]`
+
+`paperconan <input-dir> --images --image-diagnostics` may add optional,
+non-gating deterministic hints. The current pair helper compares two regions
+inside one registered asset:
+
+```json
+{
+  "finding_id": "image:pair:1",
+  "kind": "image_pair_similarity_signal",
+  "severity": "medium",
+  "rule": "two registered regions retain high structural similarity",
+  "asset_ids": ["img:a"],
+  "regions": [
+    {"asset_id": "img:a", "box": [0, 0, 800, 900]},
+    {"asset_id": "img:a", "box": [800, 0, 1600, 900]}
+  ],
+  "method": "panel_pair_similarity",
+  "score": 0.97,
+  "transform": "identity",
+  "profile_action": "kept"
+}
+```
+
+These hints never replace complete asset review. An empty `image_findings`
+list means only that the optional helper emitted no registered hint.
+
+## `verdict.json` image contract
+
+An external multimodal Agent may add a finding even when no deterministic image
+finding exists:
+
+```json
+{
+  "finding_type": "image",
+  "title": "Registered image regions require contextual review",
+  "finding_ref": null,
+  "image_refs": [
+    {"asset_id": "img:a", "box": [0, 0, 800, 900], "label": "left region"},
+    {"asset_id": "img:a", "box": [800, 0, 1600, 900], "label": "right region"}
+  ],
+  "review_status": "needs_human",
+  "report_md": "The registered regions require figure and Methods context."
+}
+```
+
+Every registered asset must appear in exactly one top-level coverage list:
+
+```json
+{
+  "image_review": {
+    "status": "completed",
+    "reviewed_asset_ids": [],
+    "unresolved_asset_ids": ["img:a"],
+    "unreadable_asset_ids": [],
+    "deferred_asset_ids": [],
+    "note": "all registered assets received a coverage outcome"
+  }
+}
+```
+
+Valid statuses are `completed`, `partial`, `unavailable_no_multimodal`, and
+`not_requested`. Unknown `image_review.status` values normalize to `partial`,
+while unknown image finding `review_status` values normalize to `unresolved`.
+Numeric and image findings share one `findings[]` and one unified report.
+
 ## Adjudicated verdict evidence binding
 
 `paperconan report scan.json --verdict verdict.json` reads scan findings as
@@ -260,8 +359,9 @@ evidence and binds verdict selectors without modifying `scan.json`. Both the
 primary `findings[].finding_ref` shape and the legacy top-level `finding_refs`
 shape use these rules:
 
-- An omitted or `null` `finding_ref` may select the strongest visible scan
-  finding automatically. The HTML labels this as automatic evidence selection.
+- An omitted or `null` numeric `finding_ref` may select the strongest visible
+  numeric scan finding automatically. The HTML labels this as automatic
+  evidence selection and does not cross into image evidence.
 - Every explicit selector must resolve to exactly one visible scan finding.
   `kind` and `rows` match exactly, while `rule` retains substring matching.
 - Canonical exact location identities have priority. Block selectors use exact

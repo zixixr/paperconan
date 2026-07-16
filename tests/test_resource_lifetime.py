@@ -3204,7 +3204,9 @@ def test_deferred_reload_releases_each_source_before_next_load(
         10.875,
     ]
 
-    def stub_load(path):
+    def stub_load(path, *, inspect_formulas=True):
+        if len(calls) >= 2:
+            assert inspect_formulas is False
         if records:
             gc.collect()
             assert records[-1]["sheet"]() is None
@@ -3275,7 +3277,8 @@ def test_deferred_reload_closes_failed_extractor_before_next_source(
         iterator_refs.append(weakref.ref(iterator))
         return iterator
 
-    def load_table(_path):
+    def load_table(_path, *, inspect_formulas=True):
+        assert inspect_formulas is False
         gc.collect()
         assert close_states == [True]
         assert iterator_refs[-1]() is None
@@ -3399,12 +3402,19 @@ def test_deferred_reload_settles_file_and_target_sheet_once(
     monkeypatch.setattr(
         audit,
         "load_table_result",
-        lambda _path: TableLoadResult({"Target": Sheet.from_rows([
-            ["left", "right"],
-            [1.25, 2.25],
-            [2.5, 3.5],
-            [3.75, 4.75],
-        ])}),
+        lambda _path, *, inspect_formulas=True: (
+            TableLoadResult({"Target": Sheet.from_rows([
+                ["left", "right"],
+                [1.25, 2.25],
+                [2.5, 3.5],
+                [3.75, 4.75],
+            ])})
+            if inspect_formulas is False
+            else pytest.fail(
+                "deferred reload inspected formulas",
+                pytrace=False,
+            )
+        ),
     )
     monkeypatch.setattr(audit, "_add_elapsed_ms", record_settlement)
     coverage = ScanCoverage(files_discovered=1)

@@ -74,13 +74,15 @@ def test_runtime_metadata_attributes_deferred_evidence_to_its_source(
         (data / name).write_text("placeholder", encoding="utf-8")
     now = [0.0]
     load_counts = {"a.csv": 0, "b.csv": 0}
+    formula_modes = {"a.csv": [], "b.csv": []}
 
     def perf_counter():
         return now[0]
 
-    def load_table(path):
+    def load_table(path, *, inspect_formulas=True):
         name = os.path.basename(path)
         load_counts[name] += 1
+        formula_modes[name].append(inspect_formulas)
         if name == "a.csv":
             now[0] += 2.0 if load_counts[name] == 1 else 5.0
             return TableLoadResult({
@@ -167,6 +169,10 @@ def test_runtime_metadata_attributes_deferred_evidence_to_its_source(
         for item in scan["scan_stats"]["sheets"]
     }
     assert load_counts == {"a.csv": 2, "b.csv": 1}
+    assert formula_modes == {
+        "a.csv": [True, False],
+        "b.csv": [True],
+    }
     assert files["a.csv"]["elapsed_ms"] == 10000.0
     assert files["b.csv"]["elapsed_ms"] == 4000.0
     assert sheets[("a.csv", "affected")]["elapsed_ms"] == 3000.0

@@ -1,5 +1,6 @@
 # src/paperconan/fetch/_cli.py
-"""`paperconan fetch` subcommand: find and download scanner-supported inputs."""
+"""`paperconan fetch` subcommand: search repositories for a paper's data and
+optionally download a chosen candidate's tabular files."""
 from __future__ import annotations
 import argparse
 import json
@@ -33,14 +34,16 @@ def _print_table(cands):
               f"{' '.join(flags):20} {c.get('title','')[:60]}")
         if ninputs == 0:
             print(
-                f"    (no scanner-supported inputs "
+                "    (no scanner-supported inputs "
                 f"({_SUPPORTED_INPUT_LABEL}) in this dataset)"
             )
 
 
 def fetch_main(argv):
-    ap = argparse.ArgumentParser(prog="paperconan fetch",
-                                 description="Find/download a paper's scanner-supported inputs")
+    ap = argparse.ArgumentParser(
+        prog="paperconan fetch",
+        description="Find/download a paper's scanner-supported inputs",
+    )
     ap.add_argument("query", help="paper DOI or title")
     ap.add_argument("--json", action="store_true", help="print candidates as JSON (listing mode)")
     mode = ap.add_mutually_exclusive_group()
@@ -53,6 +56,11 @@ def fetch_main(argv):
         "--all",
         action="store_true",
         help="download files that are not scanner-supported inputs too",
+    )
+    ap.add_argument(
+        "--images",
+        action="store_true",
+        help="also download public image files and PDFs for image review",
     )
     ap.add_argument("--per-source", type=int, default=5, help="max results per repository (default: 5)")
     args = ap.parse_args(argv)
@@ -104,12 +112,20 @@ def fetch_main(argv):
         return 0
 
     out_dir = args.out or "paperconan_data"
-    summary = download_candidate(target, out_dir, tabular_only=not args.all)
+    summary = download_candidate(
+        target,
+        out_dir,
+        tabular_only=not args.all,
+        include_images=args.images,
+    )
     print(f"downloaded {len(summary['downloaded'])} file(s) from {target['cand_id']} -> {out_dir}")
     for p in summary["downloaded"]:
         print(f"  {p}")
     for s in summary["skipped"]:
         print(f"  skipped {s['name']}: {s['reason']}")
     if summary["downloaded"]:
-        print(f"\n  → now run: paperconan {out_dir}")
+        command = f"paperconan {out_dir}"
+        if args.images:
+            command += " --images"
+        print(f"\n  → now run: {command}")
     return 0

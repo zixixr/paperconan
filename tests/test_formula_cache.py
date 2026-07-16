@@ -5,6 +5,7 @@ from xml.etree import ElementTree as ET
 import openpyxl
 import pytest
 
+import paperconan._audit as audit
 from paperconan._audit import (
     _load_table_sheets,
     load_table,
@@ -134,16 +135,8 @@ def test_oversized_formula_sheet_keeps_structural_rejection_reason(
     assert [
         item["reason"]
         for item in scan["coverage"]["limitations"]
-    ] == ["formula_cache_missing", "cell_limit"]
+    ] == ["cell_limit"]
     assert scan["coverage"]["limitations"][0] == {
-        "scope": "sheet",
-        "reason": "formula_cache_missing",
-        "file": "formula.xlsx",
-        "sheet": "Stats",
-        "count": 1,
-        "cells": ["A3"],
-    }
-    assert scan["coverage"]["limitations"][1] == {
         "scope": "sheet",
         "reason": "cell_limit",
         "file": "formula.xlsx",
@@ -259,6 +252,222 @@ def test_formula_cache_parser_detaches_processed_rows_and_cells(
     }
     assert detached_cells == [True] * 50
     assert detached_rows == [True] * 50
+
+
+def test_formula_cache_metadata_reads_are_bounded(tmp_path, monkeypatch):
+    path = tmp_path / "bounded.xlsx"
+    _write_formula_book(path)
+    real_open = zipfile.ZipFile.open
+    read_sizes = []
+    guarded_members = {
+        "xl/workbook.xml",
+        "xl/_rels/workbook.xml.rels",
+    }
+
+    class GuardedStream:
+        def __init__(self, stream):
+            self._stream = stream
+
+        def read(self, size=-1):
+            read_sizes.append(size)
+            assert size >= 0
+            return self._stream.read(size)
+
+        def __enter__(self):
+            self._stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._stream.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._stream, name)
+
+    def guarded_open(archive, member, *args, **kwargs):
+        stream = real_open(archive, member, *args, **kwargs)
+        name = (
+            member.filename
+            if isinstance(member, zipfile.ZipInfo)
+            else member
+        )
+        if name in guarded_members:
+            return GuardedStream(stream)
+        return stream
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", guarded_open)
+
+    assert inspect_ooxml_formula_cache(str(path)) == {
+        "Stats": {"count": 1, "cells": ["A3"]}
+    }
+    assert read_sizes
+
+
+def test_formula_cache_metadata_byte_limit_keeps_loaded_sheets(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "bounded-metadata.xlsx"
+    _write_formula_book(path)
+    monkeypatch.setattr(
+        input_module,
+        "_OOXML_FORMULA_METADATA_BYTES",
+        1,
+        raising=False,
+    )
+
+    result = load_table_result(str(path))
+
+    assert isinstance(result.sheets["Stats"], Sheet)
+    assert [
+        limitation.to_dict()
+        for limitation in result.limitations
+    ] == [{
+        "scope": "file",
+        "reason": "formula_metadata_byte_limit",
+        "limit": 1,
+        "member": "xl/workbook.xml",
+    }]
+
+
+def test_formula_cache_selected_sheet_limit_keeps_loaded_sheets(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "many-sheets.xlsx"
+    wb = openpyxl.Workbook()
+    wb.active.title = "First"
+    wb.active["A1"] = "=1+1"
+    wb.create_sheet("Second")["A1"] = "=2+2"
+    wb.save(path)
+    monkeypatch.setattr(
+        input_module,
+        "_OOXML_FORMULA_SHEET_LIMIT",
+        1,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        audit,
+        "_try_load_workbook_calamine",
+        lambda *_args, **_kwargs: audit._CALAMINE_READER_ERROR,
+    )
+
+    result = load_table_result(str(path))
+
+    assert set(result.sheets) == {"First", "Second"}
+    assert all(
+        isinstance(sheet, Sheet)
+        for sheet in result.sheets.values()
+    )
+    assert [
+        limitation.to_dict()
+        for limitation in result.limitations
+    ] == [{
+        "scope": "file",
+        "reason": "formula_metadata_sheet_limit",
+        "limit": 1,
+        "selected_sheets": 2,
+    }]
+
+
+def test_formula_cache_path_resolution_retains_only_accepted_sheets(
+    tmp_path,
+):
+    path = tmp_path / "selected-paths.xlsx"
+    wb = openpyxl.Workbook()
+    wb.active.title = "Accepted"
+    wb.create_sheet("Rejected")
+    wb.save(path)
+
+    with zipfile.ZipFile(path) as archive:
+        paths = input_module._worksheet_paths(
+            archive,
+            accepted_sheets={"Accepted"},
+            max_sheets=1,
+            metadata_byte_limit=1024 * 1024,
+        )
+
+    assert paths == [
+        ("Accepted", "xl/worksheets/sheet1.xml")
+    ]
+
+
+def test_formula_cache_skips_unaccepted_worksheet(tmp_path, monkeypatch):
+    path = tmp_path / "selected.xlsx"
+    wb = openpyxl.Workbook()
+    accepted = wb.active
+    accepted.title = "Accepted"
+    accepted["A1"] = "=1+1"
+    rejected = wb.create_sheet("Rejected")
+    rejected["A1"] = "=2+2"
+    wb.save(path)
+
+    real_open = zipfile.ZipFile.open
+
+    def guarded_open(archive, member, *args, **kwargs):
+        name = (
+            member.filename
+            if isinstance(member, zipfile.ZipInfo)
+            else member
+        )
+        if name == "xl/worksheets/sheet2.xml":
+            raise AssertionError("unaccepted worksheet was opened")
+        return real_open(archive, member, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", guarded_open)
+
+    assert inspect_ooxml_formula_cache(
+        str(path),
+        accepted_sheets={"Accepted"},
+    ) == {
+        "Accepted": {"count": 1, "cells": ["A1"]}
+    }
+
+
+def test_rejected_sheets_do_not_trigger_formula_inspection(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "rejected.xlsx"
+    path.write_bytes(b"placeholder")
+    monkeypatch.setattr(
+        audit,
+        "_load_table_sheets",
+        lambda _path, *, _limitations=None: {"Rejected": None},
+    )
+
+    def reject_inspection(*_args, **_kwargs):
+        raise AssertionError("formula inspection should be skipped")
+
+    monkeypatch.setattr(
+        audit,
+        "inspect_ooxml_formula_cache",
+        reject_inspection,
+    )
+
+    result = load_table_result(str(path))
+
+    assert result.sheets == {"Rejected": None}
+
+
+def test_compatibility_loader_skips_formula_inspection(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "compat.xlsx"
+    path.write_bytes(b"placeholder")
+    sheet = Sheet.from_rows([["value"], [1]])
+    monkeypatch.setattr(
+        audit,
+        "_load_table_sheets",
+        lambda _path, *, _limitations=None: {"Stats": sheet},
+    )
+
+    def reject_inspection(*_args, **_kwargs):
+        raise AssertionError("compatibility loader inspected formulas")
+
+    monkeypatch.setattr(
+        audit,
+        "inspect_ooxml_formula_cache",
+        reject_inspection,
+    )
+
+    assert load_table(str(path)) == {"Stats": sheet}
 
 
 def test_formula_gap_order_follows_workbook_and_cell_order(tmp_path):

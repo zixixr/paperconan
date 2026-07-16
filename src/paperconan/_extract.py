@@ -55,6 +55,19 @@ def _raw_cell_has_content(cell):
     return bool(str(cell).strip())
 
 
+def _labeled_table_parts(entry):
+    parts = tuple(entry)
+    if len(parts) == 2:
+        label, table = parts
+        return label, table, 0, 0
+    if len(parts) == 4:
+        label, table, declared_rows, declared_cols = parts
+        return label, table, declared_rows, declared_cols
+    raise ValueError(
+        "labeled table entries must contain 2 or 4 values"
+    )
+
+
 def iter_tables_to_sheets(
     stem,
     labeled_tables,
@@ -65,15 +78,29 @@ def iter_tables_to_sheets(
 ):
     """Yield one normalized, bounded Sheet result at a time."""
     loaded = 0
-    for label, table in labeled_tables:
-        sheet_name = f"{stem}!{label}"
-        table_iter = iter(table if table is not None else ())
-        builder = SheetBuilder(
-            loaded_cells=loaded,
-            max_cells=max_cells,
-            max_sparse_cells=max_sparse_cells,
-            max_sparse_bytes=max_sparse_bytes,
+    for entry in labeled_tables:
+        label, table, declared_rows, declared_cols = (
+            _labeled_table_parts(entry)
         )
+        sheet_name = f"{stem}!{label}"
+        try:
+            builder = SheetBuilder(
+                declared_rows=declared_rows,
+                declared_cols=declared_cols,
+                loaded_cells=loaded,
+                max_cells=max_cells,
+                max_sparse_cells=max_sparse_cells,
+                max_sparse_bytes=max_sparse_bytes,
+            )
+        except SheetBuildLimit as error:
+            _close_iterator(table)
+            yield (
+                sheet_name,
+                None,
+                [_build_limitation(error, sheet_name, max_cells)],
+            )
+            continue
+        table_iter = iter(table if table is not None else ())
         has_content = False
         empty_overflow = None
         rejected = None
@@ -202,6 +229,25 @@ def _stem(path):
     return os.path.splitext(os.path.basename(path))[0]
 
 
+def _pdf_table_geometry(table):
+    cells = getattr(table, "cells", ()) or ()
+    rows = {
+        cell[1]
+        for cell in cells
+        if cell is not None
+    }
+    columns = {
+        cell[0]
+        for cell in cells
+        if cell is not None
+    }
+    return len(rows), len(columns)
+
+
+def _lazy_pdf_rows(table):
+    yield from table.extract()
+
+
 def iter_pdf_tables(
     path,
     *,
@@ -224,9 +270,14 @@ def iter_pdf_tables(
                 for table_index, table in enumerate(
                     page.find_tables(), start=1
                 ):
+                    declared_rows, declared_cols = (
+                        _pdf_table_geometry(table)
+                    )
                     yield (
                         f"p{page_index}_t{table_index}",
-                        table.extract(),
+                        _lazy_pdf_rows(table),
+                        declared_rows,
+                        declared_cols,
                     )
 
         yield from iter_tables_to_sheets(

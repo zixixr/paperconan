@@ -13,12 +13,14 @@
     "limitations": []
   },
   "tool": "paperconan",
-  "tool_version": "0.8.2",
+  "tool_version": "0.8.3",
   "scanned_at": null,
   "profile": "review",
   "input_dir": "examples/demo_paper",
   "paper": null,
   "n_files": 2,
+  "n_image_source_files": 0,
+  "n_image_assets": 0,
   "n_blocks_with_findings": 3,
   "findings_omitted": 0,
   "scan_errors": [],
@@ -115,6 +117,8 @@
             711.8364
           ],
           "rule": "col[2] = col[1] + 120",
+          "profile_action": "kept",
+          "false_positive_context": [],
           "evidence": {
             "headers": [
               "day",
@@ -240,9 +244,7 @@
                 ]
               }
             ]
-          },
-          "profile_action": "kept",
-          "false_positive_context": []
+          }
         },
         {
           "kind": "identical_column",
@@ -273,6 +275,8 @@
             591.8364
           ],
           "rule": "col[3] == col[1]",
+          "profile_action": "kept",
+          "false_positive_context": [],
           "evidence": {
             "headers": [
               "day",
@@ -398,9 +402,7 @@
                 ]
               }
             ]
-          },
-          "profile_action": "kept",
-          "false_positive_context": []
+          }
         },
         {
           "kind": "constant_offset",
@@ -432,6 +434,8 @@
             591.8364
           ],
           "rule": "col[3] = col[2] + -120",
+          "profile_action": "kept",
+          "false_positive_context": [],
           "evidence": {
             "headers": [
               "day",
@@ -557,9 +561,7 @@
                 ]
               }
             ]
-          },
-          "profile_action": "kept",
-          "false_positive_context": []
+          }
         },
         {
           "kind": "small_diff_set",
@@ -594,6 +596,8 @@
             10.1364
           ],
           "rule": "col[5] - col[4] only takes 2 discrete values",
+          "profile_action": "kept",
+          "false_positive_context": [],
           "evidence": {
             "headers": [
               "day",
@@ -719,9 +723,7 @@
                 ]
               }
             ]
-          },
-          "profile_action": "kept",
-          "false_positive_context": []
+          }
         }
       ],
       "progressions": [
@@ -735,6 +737,11 @@
           "first": 0.0,
           "severity": "low",
           "rule": "col[0] = arithmetic progression, step=3",
+          "likely_benign": "an integer-step progression is usually an axis (day / dose / timepoint), not measured data",
+          "profile_action": "demoted",
+          "false_positive_context": [
+            "axis_or_scan_column"
+          ],
           "evidence": {
             "headers": [
               "day",
@@ -859,12 +866,7 @@
                 ]
               }
             ]
-          },
-          "likely_benign": "an integer-step progression is usually an axis (day / dose / timepoint), not measured data",
-          "profile_action": "demoted",
-          "false_positive_context": [
-            "axis_or_scan_column"
-          ]
+          }
         }
       ],
       "equal_pairs": [
@@ -898,6 +900,8 @@
             10.1364
           ],
           "rule": "col[4] == col[5] in 7/8 rows",
+          "profile_action": "kept",
+          "false_positive_context": [],
           "evidence": {
             "headers": [
               "day",
@@ -1023,12 +1027,11 @@
                 ]
               }
             ]
-          },
-          "profile_action": "kept",
-          "false_positive_context": []
+          }
         }
       ],
       "row_pairs": [],
+      "row_relations": [],
       "within_col": [],
       "identical_after_rounding": [],
       "grim": [],
@@ -1051,6 +1054,7 @@
       "progressions": [],
       "equal_pairs": [],
       "row_pairs": [],
+      "row_relations": [],
       "within_col": [
         {
           "kind": "within_col_value_duplication",
@@ -1071,6 +1075,13 @@
           ],
           "severity": "low",
           "rule": "col[1] has value 1.0837 repeated 8/12 times",
+          "profile_action": "demoted",
+          "false_positive_context": [
+            "within_col_structural_filter"
+          ],
+          "prefilter": "drop",
+          "prefilter_reason": "normalized_or_fold_change",
+          "likely_benign": "within_col prefilter matched normalized_or_fold_change; this column pattern is usually categorical/integer-coded, an axis/index, a normalized or derived column, or a large-matrix flood rather than an unexplained measurement repeat",
           "evidence": {
             "headers": [
               "rel_expr",
@@ -1215,14 +1226,7 @@
                 ]
               }
             ]
-          },
-          "profile_action": "demoted",
-          "false_positive_context": [
-            "within_col_structural_filter"
-          ],
-          "prefilter": "drop",
-          "prefilter_reason": "normalized_or_fold_change",
-          "likely_benign": "within_col prefilter matched normalized_or_fold_change; this column pattern is usually categorical/integer-coded, an axis/index, a normalized or derived column, or a large-matrix flood rather than an unexplained measurement repeat"
+          }
         },
         {
           "kind": "within_col_decimal_repetition",
@@ -1243,6 +1247,8 @@
           ],
           "severity": "high",
           "rule": "col[1]: 8/12 values share last-2 decimals '.37'",
+          "profile_action": "kept",
+          "false_positive_context": [],
           "evidence": {
             "headers": [
               "rel_expr",
@@ -1387,9 +1393,7 @@
                 ]
               }
             ]
-          },
-          "profile_action": "kept",
-          "false_positive_context": []
+          }
         },
         {
           "kind": "rounded_to_half_or_int",
@@ -1399,6 +1403,9 @@
           "count_05": 12,
           "severity": "medium",
           "rule": "col[2]: 12/12 values end in 0 or 5",
+          "likely_benign": "values ending in .0/.5 are common for derived or instrument-rounded quantities (cell counts, scores, calibrated readouts)",
+          "profile_action": "kept",
+          "false_positive_context": [],
           "evidence": {
             "headers": [
               "rel_expr",
@@ -1543,10 +1550,7 @@
                 ]
               }
             ]
-          },
-          "likely_benign": "values ending in .0/.5 are common for derived or instrument-rounded quantities (cell counts, scores, calibrated readouts)",
-          "profile_action": "kept",
-          "false_positive_context": []
+          }
         }
       ],
       "identical_after_rounding": [
@@ -1591,6 +1595,9 @@
           ],
           "severity": "medium",
           "rule": "12 cells share rounded value 1.0 but have 12 distinct precise values",
+          "likely_benign": "cells share a rounded value but differ at full precision \u2014 usually display rounding, not duplication",
+          "profile_action": "kept",
+          "false_positive_context": [],
           "evidence": {
             "headers": [
               "rel_expr",
@@ -1742,10 +1749,7 @@
                 ]
               }
             ]
-          },
-          "likely_benign": "cells share a rounded value but differ at full precision \u2014 usually display rounding, not duplication",
-          "profile_action": "kept",
-          "false_positive_context": []
+          }
         }
       ],
       "grim": [],
@@ -1768,6 +1772,7 @@
       "progressions": [],
       "equal_pairs": [],
       "row_pairs": [],
+      "row_relations": [],
       "within_col": [],
       "identical_after_rounding": [
         {
@@ -1811,6 +1816,9 @@
           ],
           "severity": "medium",
           "rule": "13 cells share rounded value 1.0 but have 13 distinct precise values",
+          "likely_benign": "cells share a rounded value but differ at full precision \u2014 usually display rounding, not duplication",
+          "profile_action": "kept",
+          "false_positive_context": [],
           "evidence": {
             "headers": [
               "rel_expr",
@@ -1963,10 +1971,7 @@
                 ]
               }
             ]
-          },
-          "likely_benign": "cells share a rounded value but differ at full precision \u2014 usually display rounding, not duplication",
-          "profile_action": "kept",
-          "false_positive_context": []
+          }
         }
       ],
       "grim": [],
@@ -2078,6 +2083,7 @@
     }
   ],
   "decimal_endings": [],
+  "decimal_tail_clusters": [],
   "cross_sheet_findings": [
     {
       "kind": "cross_sheet_position_identical",
@@ -2190,5 +2196,7 @@
       "profile_action": "kept",
       "false_positive_context": []
     }
-  ]
+  ],
+  "image_assets": [],
+  "image_findings": []
 }

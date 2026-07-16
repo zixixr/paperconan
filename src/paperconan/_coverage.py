@@ -17,6 +17,10 @@ class ScanCoverage:
     blocks_analyzed: int = 0
     blocks_skipped: int = 0
     limitations: list[dict[str, Any]] = field(default_factory=list)
+    _non_block_analyses_completed: int = field(
+        default=0,
+        repr=False,
+    )
 
     def add_limitation(self, scope: str, reason: str, **details: Any) -> None:
         item = {"scope": scope, "reason": reason}
@@ -45,6 +49,12 @@ class ScanCoverage:
     def mark_block_analyzed(self, count: int = 1) -> None:
         self.blocks_analyzed += count
 
+    def mark_non_block_analysis_completed(
+        self, count: int = 1
+    ) -> None:
+        if count > 0:
+            self._non_block_analyses_completed += count
+
     def mark_blocks_skipped(
         self, count: int, *, scope: str, reason: str, **details: Any
     ) -> None:
@@ -55,7 +65,10 @@ class ScanCoverage:
 
     @property
     def status(self) -> ScanStatus:
-        if self.blocks_analyzed == 0:
+        if (
+            self.blocks_analyzed == 0
+            and self._non_block_analyses_completed == 0
+        ):
             return "failed"
         if (
             self.files_failed

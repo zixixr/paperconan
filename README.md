@@ -14,9 +14,9 @@
 
 ## 它是什么
 
-`paperconan` 是一个 **论文源数据 sanity check** 工具。你给它一个目录（`.xlsx` / 旧版 `.xls` / `.xlsm` / `.csv` / `.tsv`，也可以混放补充材料 `.pdf` / `.docx` 里的结构化表格），它跑一组数值取证检测器，把"值得人工复核的位置"找出来。
+`paperconan` 是一个 **论文源数据 sanity check** 工具。你给它一个目录（`.xlsx` / 旧版 `.xls` / `.xlsm` / `.csv` / `.tsv`，也可以混放补充材料 `.pdf` / `.docx` 里的结构化表格，以及经 `--images` 明确启用的本地图像），它运行数值检测器、登记图像资产，并把"值得人工复核的位置"交给外部 Agent 统一判断。
 
-**它输出的是 statistical signal，不是研究完整性审查结论。** 最终判断仍要看原表、figure legend、Methods、作者回应和期刊/机构核实。
+**它输出的是 statistical signal，不是作者意图判断。** 最终判断仍要看原表、figure legend、Methods、作者回应和期刊/机构核实。
 
 它最常见、也最被推荐的用法，是 **让 AI agent（Claude Code / Codex 等）搭配本仓库的 skill 来跑**：你用自然语言提需求，agent 调真实的 Python 检测器、解析结果、按规则解读，而不是肉眼猜数字。下面就以这个场景为主线。纯 CLI / Python 库用法见 [命令行与库参考](docs/cli.md)。
 
@@ -29,9 +29,10 @@
 
 **不做什么：**
 
-- 不判断"是否存在研究完整性问题"，也不替代统计学审稿
-- 不扫 Western blot、显微镜图、凝胶图或图像拼接
+- 不判断作者意图或责任，也不替代统计学审稿
+- 不自主判断 Western blot、显微镜图、凝胶图或图像拼接；图像语义复核由能读取本地图片的外部多模态 Agent 完成
 - 不从柱状图 / 折线图像素里数字化数据点
+- 不配置模型 API、密钥或 provider SDK；确定性 `image_findings` 只是可选提示，不是完整复核清单
 - 不绕付费墙，也不把"没找到公开数据"当成"论文干净"
 
 ---
@@ -101,7 +102,7 @@ echo '@'"$(pwd)"'/paperconan/skills/paperconan/SKILL.md' >> AGENTS.md
 
 [`skills/paperconan/SKILL.md`](skills/paperconan/SKILL.md) 是 agent 的入口，它强制 agent 跑真实检测器、按 `references/` 里的规则解读，并守住 **signal-not-verdict** 红线。
 
-skill 里还包含公开可复用的判定协议：[`adjudication-tiers.md`](skills/paperconan/references/adjudication-tiers.md) 定义 Tier 1/2/3、`KEEP` / `DROP` / `NEEDS_HUMAN`，[`report-templates.md`](skills/paperconan/references/report-templates.md) 定义短报告和正式 8 节报告，[`adversarial-review.md`](skills/paperconan/references/adversarial-review.md) 定义红队复核流程。这里的 Tier 只表示复核优先级和无辜解释难度，**不是研究完整性问题概率**。
+skill 里还包含公开可复用的判定协议：[`adjudication-tiers.md`](skills/paperconan/references/adjudication-tiers.md) 定义 Tier 1/2/3、`KEEP` / `DROP` / `NEEDS_HUMAN`，[`report-templates.md`](skills/paperconan/references/report-templates.md) 定义短报告和正式 8 节报告，[`adversarial-review.md`](skills/paperconan/references/adversarial-review.md) 定义红队复核流程。这里的 Tier 只表示复核优先级和无辜解释难度，**不是研究完整性问题概率，也不是作者意图判断**。
 
 ### 3. 直接用自然语言提需求
 
@@ -112,6 +113,25 @@ skill 里还包含公开可复用的判定协议：[`adjudication-tiers.md`](ski
 - "这条 cross-sheet 命中是不是误报？帮我对照原表看一下"
 
 agent 会自己判断该 `fetch` 还是直接 `scan`、解析 `scan.json`、加载对应 reference、必要时打开原表，再给你一份带证据、带良性解释、带"还需要什么人工背景"的回答。
+
+图像复核走同一条流程。Agent 先确认自己能否打开本地图像，再逐项读取
+`image_assets`：先看整图，再对小面板或未解决细节使用原始像素裁剪。
+`image_findings` 仅用于提示，不能代替完整资产覆盖；每项资产必须落入
+reviewed、unresolved、unreadable 或 deferred 中的一项。数值与图像判断写进同一个
+`verdict.json findings[]`，最后只生成一份判定后报告。
+
+对应的完整命令是：
+
+```bash
+paperconan fetch "<DOI or title>" --auto --images --out data/
+paperconan data/ --images
+paperconan data/ --images --image-diagnostics
+paperconan report data/audit/scan.json --verdict verdict.json --out adjudication.html
+```
+
+如果 Agent 没有本地图像能力，它应把 `image_review.status` 写为
+`unavailable_no_multimodal`，明确说明图像语义复核未完成，并继续数值复核。
+PaperConan 本身不调用或配置模型服务。
 
 > 没有可用 Python 环境的 agent，应当请你本地跑命令，**绝不能把肉眼猜测冒充成 paperconan 输出**。
 
@@ -133,7 +153,7 @@ agent 会自己判断该 `fetch` 还是直接 `scan`、解析 `scan.json`、加�
 
 **请走正规渠道：** 把可疑 signal 提交 PubPeer / 联系期刊 ethics inquiry / 涉及本单位走 research integrity office。
 
-**请不要：** 在社交媒体直接指控具体作者 / 把 paperconan 截图当"实锤" / 跳过作者澄清直接定性。
+**请不要：** 在社交媒体直接指控具体作者 / 把 paperconan 截图当最终结论证据 / 跳过作者澄清直接定性。
 
 工具是中立的，使用方式不能。
 
@@ -176,9 +196,9 @@ open demo_paper/audit/report.html
 
 ## 路线图
 
-已完成：`.xlsx` / 旧版 `.xls` / `.xlsm` / `.csv` / `.tsv` 输入 · HTML 报告与 evidence 高亮 · PDF / Word 表格输入 · `paperconan fetch` 开放源检索下载 · Agent skill bundle · Columnar engine（calamine 快速读取，含旧版 Excel）+ 内存/输出保护 · `review` / `forensic` / `triage` profiles 与确定性 prefilter · 跨 sheet / 跨文件整列复用 + 矩阵小数位复用 + 连续段偏移 + 整数差共享小数 + 固定行向量跨图复发等重复/变换检测器。
+已完成：`.xlsx` / 旧版 `.xls` / `.xlsm` / `.csv` / `.tsv` 输入 · HTML 报告与 evidence 高亮 · PDF / Word 表格输入 · 本地图像与 PDF 页面资产登记 · 可选确定性图像提示 · `paperconan fetch` 开放源检索下载 · Agent skill bundle · Columnar engine（calamine 快速读取，含旧版 Excel）+ 内存/输出保护 · `review` / `forensic` / `triage` profiles 与确定性 prefilter · 跨 sheet / 跨文件整列复用 + 矩阵小数位复用 + 连续段偏移 + 整数差共享小数 + 固定行向量跨图复发等重复/变换检测器。
 
-未完成：跨论文扫描（一个 lab / 作者组多篇一起看复用）· 图表像素数字化 · 图像取证（Western blot / 显微镜重复拼接）· 与 PubPeer Public API 联动。
+未完成：跨论文扫描（一个 lab / 作者组多篇一起看复用）· 图表像素数字化 · PaperConan 自主图像语义判断 · 与 PubPeer Public API 联动。
 
 欢迎 PR —— 加检测器模式、补文档、做 demo 都欢迎。
 

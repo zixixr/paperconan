@@ -97,6 +97,7 @@ def test_non_float_convertible_integer_does_not_abort_full_scan(
         "relations",
         "equal_pairs",
         "row_pairs",
+        "row_relations",
         "arithmetic_progression",
         "within_column",
         "dispersed_repeats",
@@ -211,6 +212,56 @@ def test_numeric_sheet_without_qualifying_block_has_distinct_reason(tmp_path):
     }]
 
 
+def _write_cross_table_only_inputs(data):
+    payload = (
+        "a,b,c\n"
+        "1.123456,2.234567,3.345678\n"
+        "4.456789,5.567891,6.678912\n"
+    )
+    (data / "first.csv").write_text(payload, encoding="utf-8")
+    (data / "second.csv").write_text(payload, encoding="utf-8")
+
+
+def test_cross_table_only_analysis_is_partial(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_cross_table_only_inputs(data)
+
+    scan = scan_dir(
+        str(data), str(tmp_path / "out"), write_html=False
+    )
+
+    assert scan["cross_sheet_findings"][0]["kind"] == (
+        "cross_sheet_position_identical"
+    )
+    assert scan["coverage"]["blocks_analyzed"] == 0
+    assert scan["scan_status"] == "partial"
+
+
+def test_cli_cross_table_only_analysis_returns_zero(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_cross_table_only_inputs(data)
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "paperconan",
+            str(data),
+            "--no-html",
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    scan = json.loads(
+        (data / "audit" / "scan.json").read_text(encoding="utf-8")
+    )
+    assert scan["scan_status"] == "partial"
+
+
 def test_mixed_analyzed_and_text_only_sheets_are_partial(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
@@ -283,9 +334,11 @@ def test_missing_deferred_evidence_makes_scan_partial_deterministically(
     ]
     calls = 0
 
-    def load_table(_path):
+    def load_table(_path, *, inspect_formulas=True):
         nonlocal calls
         calls += 1
+        if calls > 1:
+            assert inspect_formulas is False
         if calls == 1:
             return TableLoadResult({
                 "source": Sheet.from_rows(

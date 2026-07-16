@@ -92,6 +92,7 @@ def _decode_json_string_token(text, start, end):
 _NUMBER_RE = re.compile(
     r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
 )
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class _SidecarParser:
@@ -330,6 +331,216 @@ class _SidecarParser:
                 raise ValueError("invalid managed_files array")
             self._skip_whitespace()
 
+    def _managed_limit_error(
+        self,
+        reason,
+        *,
+        entries_inspected,
+        names,
+        retained_name_bytes,
+        requested_name_bytes=None,
+    ):
+        details = {
+            "managed_entries_inspected": entries_inspected,
+            "managed_entries_retained": len(names),
+            "managed_name_bytes_retained": retained_name_bytes,
+        }
+        if requested_name_bytes is not None:
+            details["requested_name_bytes"] = requested_name_bytes
+        raise SidecarLimitError(reason, **details)
+
+    def _parse_managed_fingerprint(self):
+        self._skip_whitespace()
+        if (
+            self.position >= len(self.text)
+            or self.text[self.position] != "{"
+        ):
+            self._parse_value(retain=False)
+            return None
+        self.position += 1
+        self._skip_whitespace()
+        values = {}
+        valid = True
+        if (
+            self.position < len(self.text)
+            and self.text[self.position] == "}"
+        ):
+            self.position += 1
+            return None
+        while True:
+            key, _length = self._parse_string(retain=True)
+            self._skip_whitespace()
+            if (
+                self.position >= len(self.text)
+                or self.text[self.position] != ":"
+            ):
+                raise ValueError("invalid managed fingerprint")
+            self.position += 1
+            if key in values:
+                valid = False
+                self._parse_value(retain=False)
+            elif key == "size":
+                value = self._parse_value(retain=True)
+                values[key] = value
+                if type(value) is not int or value < 0:
+                    valid = False
+            elif key == "sha256":
+                value = self._parse_value(retain=True)
+                values[key] = value
+                if (
+                    type(value) is not str
+                    or _SHA256_RE.fullmatch(value) is None
+                ):
+                    valid = False
+            else:
+                valid = False
+                self._parse_value(retain=False)
+            self._skip_whitespace()
+            if self.position >= len(self.text):
+                raise ValueError("unterminated managed fingerprint")
+            delimiter = self.text[self.position]
+            self.position += 1
+            if delimiter == "}":
+                break
+            if delimiter != ",":
+                raise ValueError("invalid managed fingerprint")
+            self._skip_whitespace()
+        if set(values) != {"size", "sha256"}:
+            valid = False
+        if not valid:
+            return None
+        return {
+            "size": values["size"],
+            "sha256": values["sha256"],
+        }
+
+    def _parse_managed_object(self):
+        self.position += 1
+        self._skip_whitespace()
+        if (
+            self.position < len(self.text)
+            and self.text[self.position] == "}"
+        ):
+            self.position += 1
+            return {}
+
+        managed = {}
+        decoded_names = set()
+        entries_inspected = 0
+        retained_name_bytes = 0
+        valid = True
+        while True:
+            if entries_inspected >= self.entry_limit:
+                self._managed_limit_error(
+                    "source sidecar managed entry limit",
+                    entries_inspected=entries_inspected,
+                    names=managed,
+                    retained_name_bytes=retained_name_bytes,
+                )
+            entries_inspected += 1
+            self._skip_whitespace()
+            start = self.position
+            end, requested_name_bytes = _scan_json_string_token(
+                self.text, start
+            )
+            requested_name_bytes += 64
+            if (
+                self.retain_managed_names
+                and retained_name_bytes + requested_name_bytes
+                > self.name_byte_limit
+            ):
+                self._managed_limit_error(
+                    "source sidecar managed name byte limit",
+                    entries_inspected=entries_inspected,
+                    names=managed,
+                    retained_name_bytes=retained_name_bytes,
+                    requested_name_bytes=requested_name_bytes,
+                )
+            self.position = end
+            decoded = None
+            normalized = None
+            if self.retain_managed_names:
+                decoded = _decode_json_string_token(
+                    self.text, start, end
+                )
+                if decoded in decoded_names:
+                    valid = False
+                decoded_names.add(decoded)
+                normalized = self.normalize_name(decoded)
+            self._skip_whitespace()
+            if (
+                self.position >= len(self.text)
+                or self.text[self.position] != ":"
+            ):
+                raise ValueError("invalid managed_files object")
+            self.position += 1
+            fingerprint = self._parse_managed_fingerprint()
+            if fingerprint is None:
+                valid = False
+            if (
+                self.retain_managed_names
+                and normalized is not None
+                and fingerprint is not None
+            ):
+                normalized_bytes = (
+                    len(
+                        normalized.encode(
+                            "utf-8",
+                            errors="surrogatepass",
+                        )
+                    )
+                    + 64
+                )
+                if (
+                    retained_name_bytes + normalized_bytes
+                    > self.name_byte_limit
+                ):
+                    self._managed_limit_error(
+                        "source sidecar managed name byte limit",
+                        entries_inspected=entries_inspected,
+                        names=managed,
+                        retained_name_bytes=retained_name_bytes,
+                        requested_name_bytes=normalized_bytes,
+                    )
+                if normalized in managed:
+                    valid = False
+                else:
+                    managed[normalized] = fingerprint
+                    retained_name_bytes += normalized_bytes
+
+            self._skip_whitespace()
+            if self.position >= len(self.text):
+                raise ValueError("unterminated managed_files object")
+            delimiter = self.text[self.position]
+            self.position += 1
+            if delimiter == "}":
+                if not self.retain_managed_names:
+                    return {}
+                if not valid:
+                    return {}
+                return {
+                    name: managed[name]
+                    for name in sorted(managed)
+                }
+            if delimiter != ",":
+                raise ValueError("invalid managed_files object")
+            self._skip_whitespace()
+
+    def _parse_managed_files(self):
+        self._skip_whitespace()
+        if (
+            self.position < len(self.text)
+            and self.text[self.position] == "["
+        ):
+            return self._parse_managed_array()
+        if (
+            self.position < len(self.text)
+            and self.text[self.position] == "{"
+        ):
+            return self._parse_managed_object()
+        self._parse_value(retain=False)
+        return []
+
     def parse_sidecar(self):
         self._skip_whitespace()
         if (
@@ -347,8 +558,12 @@ class _SidecarParser:
             return {}
 
         data = {}
+        decoded_keys = set()
         while True:
             key, _length = self._parse_string(retain=True)
+            if key in decoded_keys:
+                return None
+            decoded_keys.add(key)
             self._skip_whitespace()
             if (
                 self.position >= len(self.text)
@@ -357,7 +572,7 @@ class _SidecarParser:
                 return None
             self.position += 1
             if key == "managed_files":
-                value = self._parse_managed_array()
+                value = self._parse_managed_files()
                 if self.retain_managed_names:
                     data[key] = value
             else:

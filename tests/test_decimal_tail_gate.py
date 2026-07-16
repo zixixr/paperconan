@@ -42,7 +42,7 @@ def test_constant_ratio_is_gated():
 
 
 def test_irregular_differences_not_gated():
-    # genuine leading-digit data-inconsistency pattern (38842-6 style): irregular per-pair diffs
+    # genuine leading-digit edit signal (38842-6 style): irregular per-pair diffs
     p = _pairs([(14.70300997, 6.70300997), (7.592733983, 4.592733983), (9.123456, 2.123456)])
     assert _decimal_tail_constant_transform(p) is False
 
@@ -180,7 +180,7 @@ def test_genuine_seed_38842_6_is_never_gated():
     """HARD regression anchor: the user-confirmed genuine seed (10.1038/s41467-023-38842-6,
     Figure 5 <-> sp Figure 6) must NEVER be demoted. These are the real source-data pairs;
     leading integer/decimal digits were changed while the long fractional tail was preserved,
-    with irregular per-pair differences and many distinct tails -- the data-inconsistency pattern.
+    with irregular per-pair differences and many distinct tails -- the target signal.
     If any threshold change starts gating this, that is a false negative and this test fails."""
     pairs = [
         ((ra, ca), (rb, cb), va, vb, sig)

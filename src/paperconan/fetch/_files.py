@@ -7,8 +7,29 @@ from paperconan._input import (
     is_supported_input,
 )
 
+
 TABULAR_EXTS = set(SUPPORTED_INPUT_EXTS)
-is_tabular = is_supported_input
+IMAGE_EXTS = {"png", "jpg", "jpeg", "tif", "tiff", "webp"}
+DOCUMENT_EXTS = {"pdf", "docx"}
+
+
+def is_tabular(name: str) -> bool:
+    return is_supported_input(name)
+
+
+def is_image(name: str) -> bool:
+    return ext_of(name) in IMAGE_EXTS
+
+
+def asset_type(name: str) -> str:
+    ext = ext_of(name)
+    if ext in IMAGE_EXTS:
+        return "image"
+    if ext in DOCUMENT_EXTS:
+        return "document"
+    if ext in TABULAR_EXTS:
+        return "tabular"
+    return "other"
 
 
 def make_fileref(name: str, size, download_url: str) -> dict:

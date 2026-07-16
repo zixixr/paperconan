@@ -89,7 +89,8 @@ def _demote_or_hide(f: dict, profile: Profile) -> None:
 
 def _names_for(f: dict) -> str:
     return " ".join(str(f.get(k) or "") for k in (
-        "col", "col_a", "col_b", "mean_col", "n_col", "sd_col", "sheet_a", "sheet_b", "file",
+        "col", "col_a", "col_b", "mean_col", "n_col", "sd_col",
+        "row_a", "row_b", "sheet_a", "sheet_b", "file",
     ))
 
 
@@ -126,8 +127,18 @@ def _is_axis_finding(f: dict) -> bool:
 
 
 def _is_derived_relation(f: dict) -> bool:
-    if f.get("kind") not in {"constant_ratio", "exact_linear", "sum_constant"}:
+    if f.get("kind") not in {"constant_ratio", "exact_linear", "sum_constant",
+                             "constant_ratio_row", "scaled_row_reuse", "offset_row_reuse"}:
         return False
+    # Two rows carrying the SAME label related by an arbitrary scalar or offset is a duplicate,
+    # not a unit/normalization derivation: a real unit conversion or %-restatement RELABELS the
+    # row (e.g. "ng/mL" -> "µg/mL"). A unit token in a shared label (e.g. "TNF-α (pg/mL)" in two
+    # panels) must not be read as evidence of derivation and must not downgrade the finding.
+    if f.get("kind") in {"constant_ratio_row", "scaled_row_reuse", "offset_row_reuse"}:
+        a = " ".join(str(f.get("row_a") or "").split()).casefold()
+        b = " ".join(str(f.get("row_b") or "").split()).casefold()
+        if a and a == b:
+            return False
     return bool(_DERIVED_RE.search(_names_for(f)))
 
 

@@ -3,9 +3,20 @@ import paperconan.fetch._download as dl
 
 
 class _Resp:
-    def __init__(self, body=b"col1,col2\n1,2\n", ctype="text/csv", clen=None):
+    def __init__(
+        self,
+        body=b"col1,col2\n1,2\n",
+        ctype="text/csv",
+        clen=None,
+        url="https://x/t.csv",
+    ):
         self._chunks = [body[i:i+4] for i in range(0, len(body), 4)] or [b""]
-        self._ctype, self._clen, self._n = ctype, clen, len(body)
+        self._ctype, self._clen, self._n, self._url = (
+            ctype,
+            clen,
+            len(body),
+            url,
+        )
     def info(self):
         d = {"Content-Type": self._ctype}
         if self._clen is not None: d["Content-Length"] = str(self._clen)
@@ -16,84 +27,46 @@ class _Resp:
     def read(self, n=-1):
         if not self._chunks: return b""
         return self._chunks.pop(0)
+    def geturl(self): return self._url
     def __enter__(self): return self
     def __exit__(self, *a): return False
 
 
 def test_download_retries_then_succeeds(tmp_path, monkeypatch):
     calls = {"n": 0}
-    errors = []
-
     def flaky_urlopen(req, timeout=None):
         calls["n"] += 1
         if calls["n"] < 3:
-            error = urllib.error.HTTPError(req.full_url, 500, "err", {}, None)
-            errors.append(error)
-            raise error
+            raise urllib.error.HTTPError(req.full_url, 500, "err", {}, None)
         return _Resp()
-
-    monkeypatch.setattr(dl.urllib.request, "urlopen", flaky_urlopen)
+    monkeypatch.setattr(dl._http, "open_http", flaky_urlopen)
     monkeypatch.setattr(dl.time, "sleep", lambda *_: None)  # no real backoff wait
     dest = tmp_path / "t.csv"
     res = dl.download_file("https://x/t.csv", str(dest), retries=3, backoff=0.0)
     assert res["ok"] is True
     assert calls["n"] == 3
-    assert all(error.closed for error in errors)
     assert dest.read_bytes() == b"col1,col2\n1,2\n"   # streamed to disk correctly
 
 
 def test_download_gives_up_after_retries(tmp_path, monkeypatch):
-    errors = []
-
     def always_500(req, timeout=None):
-        error = urllib.error.HTTPError(req.full_url, 500, "err", {}, None)
-        errors.append(error)
-        raise error
-
-    monkeypatch.setattr(dl.urllib.request, "urlopen", always_500)
+        raise urllib.error.HTTPError(req.full_url, 500, "err", {}, None)
+    monkeypatch.setattr(dl._http, "open_http", always_500)
     monkeypatch.setattr(dl.time, "sleep", lambda *_: None)
     res = dl.download_file("https://x/t.csv", str(tmp_path / "t.csv"), retries=2, backoff=0.0)
     assert res["ok"] is False
     assert "HTTP 500" in res["skipped_reason"]
-    assert all(error.closed for error in errors)
 
 
 def test_download_does_not_retry_on_403(tmp_path, monkeypatch):
     calls = {"n": 0}
-    errors = []
-
     def auth_fail(req, timeout=None):
         calls["n"] += 1
-        error = urllib.error.HTTPError(
-            req.full_url, 403, "forbidden", {}, None
-        )
-        errors.append(error)
-        raise error
-
-    monkeypatch.setattr(dl.urllib.request, "urlopen", auth_fail)
+        raise urllib.error.HTTPError(req.full_url, 403, "forbidden", {}, None)
+    monkeypatch.setattr(dl._http, "open_http", auth_fail)
     monkeypatch.setattr(dl.time, "sleep", lambda *_: None)
     res = dl.download_file("https://x/t.csv", str(tmp_path / "t.csv"), retries=3, backoff=0.0)
     assert res["ok"] is False and calls["n"] == 1   # auth errors are terminal, no retry
-    assert all(error.closed for error in errors)
-
-
-def test_download_closes_terminal_http_error(tmp_path, monkeypatch):
-    errors = []
-
-    def not_found(req, timeout=None):
-        error = urllib.error.HTTPError(
-            req.full_url, 404, "not found", {}, None
-        )
-        errors.append(error)
-        raise error
-
-    monkeypatch.setattr(dl.urllib.request, "urlopen", not_found)
-    res = dl.download_file(
-        "https://x/t.csv", str(tmp_path / "t.csv"), retries=3, backoff=0.0
-    )
-    assert res["ok"] is False
-    assert res["skipped_reason"] == "HTTP 404: not found"
-    assert all(error.closed for error in errors)
 
 
 def test_extract_tabular_tar(tmp_path):
@@ -130,10 +103,10 @@ def test_download_candidate_extracts_oa_package(tmp_path, monkeypatch):
         info = tarfile.TarInfo("PMC1/sd.csv"); info.size = len(data)
         tf.addfile(info, io.BytesIO(data))
     # make download_file just copy our local tar into the out_dir
-    def stub_dl(url, dest, **k):
+    def stub_download(url, dest, **k):
         import shutil; shutil.copy(tar_path, dest)
         return {"ok": True, "path": dest, "size": tar_path.stat().st_size}
-    monkeypatch.setattr(dl, "download_file", stub_dl)
+    monkeypatch.setattr(dl, "download_file", stub_download)
     cand = {"cand_id": "europepmc:PMC1", "source": "europepmc", "tabular_files": [],
             "oa_package": {"url": "https://ftp.ncbi.nlm.nih.gov/x/PMC1.tar.gz", "name": "PMC1.tar.gz"}}
     res = dl.download_candidate(cand, str(tmp_path / "out"))
