@@ -2640,6 +2640,11 @@ def _vector_is_patterned(vec):
     return False
 
 
+# Per-row cell cap for the within-row pass: bounds the O(width * k) window build so one huge
+# row (a wide genomics matrix) cannot balloon memory before the budget check fires.
+_WR_MAX_ROW_CELLS = int(os.environ.get("PAPERCONAN_WR_MAX_ROW_CELLS", "20000"))
+
+
 def detect_recurring_row_vectors(grid_sheets, profile="review",
                                  min_k=4, max_k=8, max_rows=300, max_findings=20):
     """B2 — a fixed ordered numeric tuple recurring as a contiguous row-slice across >=3 places
@@ -2648,14 +2653,17 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
     is a copy fingerprint. Guarded hard (this is the most FP-prone pass): >=3 distinct values, no
     arithmetic/geometric/round-number ladders, >=3 occurrences in >=2 figure namespaces, and
     all-integer tuples need k>=5 with >=4 distinct values."""
-    # A finding needs >=2 distinct figure namespaces; skip the (expensive, FP-prone) window
-    # build entirely when the corpus can never satisfy that (single sheet, or plainly-named
-    # sheets whose figure_key is None).
-    if len({figure_key(s) for (_f, s) in grid_sheets if figure_key(s) is not None}) < 2:
-        return []
+    # The cross-FIGURE finding needs >=2 distinct figure namespaces; the within-ROW sibling
+    # (a segment repeated inside one row) does not. Build the window index whenever EITHER is
+    # possible — only the truly trivial single-sheet, unnamed corpus with no wide rows is
+    # skipped (bounded by the budget below regardless).
+    cross_figure_possible = (
+        len({figure_key(s) for (_f, s) in grid_sheets if figure_key(s) is not None}) >= 2)
     occ = {}   # rounded tuple -> list of (file, sheet, figure_key, row, start_col)
     budget = 3_000_000   # bound worst-case work on genome-scale papers (linear, but many blocks)
-    for (fname, sname), sheet in grid_sheets.items():
+    # The window index feeds ONLY the cross-figure path; skip building it entirely otherwise
+    # (the within-row pass below scans rows directly).
+    for (fname, sname), sheet in (grid_sheets.items() if cross_figure_possible else ()):
         fk = figure_key(sname)
         for (r0, r1, c0, c1) in find_numeric_blocks(sheet):
             for r in range(r0, min(r1, r0 + max_rows)):
@@ -2679,7 +2687,7 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
             break
 
     cands = []
-    for vec, places in occ.items():
+    for vec, places in (occ.items() if cross_figure_possible else ()):
         if len(places) < 3 or _vector_is_patterned(list(vec)):
             continue
         namespaces = {p[2] for p in places if p[2] is not None}
@@ -2736,6 +2744,95 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
                   f"{len(namespaces)} figures ({loc})")))
         if len(findings) >= max_findings:
             break
+
+    # Within-ROW member of the same family: the identical high-precision segment appearing at
+    # >=2 NON-OVERLAPPING positions of ONE row (two cohorts of a row carrying the same tuple —
+    # JCI196944 Fig S2H's CNO row). Scanned per-row DIRECTLY, not via the block index above: a
+    # sparse sub-panel (S2H sits in columns the grid segmentation never blocks) would otherwise
+    # be invisible. Same gates as the cross-figure path; the repeat corroborates itself, so one
+    # figure namespace is enough.
+    wr_budget = 2_000_000
+    wr_cands = []
+    for (fname, sname), sheet in grid_sheets.items():
+        fk = figure_key(sname)
+        for r in range(sheet.nrows):
+            seq = []
+            for c in range(sheet.ncols):
+                v = sheet.cell(r, c)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    seq.append((c, float(v)))
+                    if len(seq) >= _WR_MAX_ROW_CELLS:  # cap width so one huge row can't OOM
+                        break
+            if len(seq) < 2 * min_k:
+                continue
+            # per-row value frequency, keyed with the SAME quantization as the window (round-6)
+            # so bucket and key agree at every magnitude: a value from a small quantized pool
+            # (k/19 grid, dose plateau) recurs far more than the copies, unlike a copied segment.
+            row_freq = Counter(round(v, 6) for _c, v in seq)
+            wins = {}
+            for start in range(len(seq)):
+                for k in range(min_k, max_k + 1):
+                    if start + k > len(seq):
+                        break
+                    wins.setdefault(tuple(round(seq[start + o][1], 6) for o in range(k)),
+                                    []).append(start)
+                    wr_budget -= 1
+                if wr_budget <= 0:                     # gate INSIDE the loop, not per-row
+                    break
+            for vec, starts in wins.items():
+                if len(starts) < 2 or _vector_is_patterned(list(vec)) or len(set(vec)) < 3:
+                    continue
+                all_int = all(abs(v - round(v)) < 1e-9 for v in vec)
+                if all_int and (len(vec) < 5 or len(set(vec)) < 4):
+                    continue
+                chosen, last_end = [], -1
+                for s in sorted(set(starts)):
+                    if s >= last_end:                 # non-overlapping occurrences only
+                        chosen.append(s)
+                        last_end = s + len(vec)
+                # quantized-pool signature is freq >> copies (not merely > copies): suppress only
+                # when a value recurs beyond twice the copy count, else a genuine repeat whose
+                # value happens to appear a couple extra times in a wide row is wrongly dropped.
+                if len(chosen) >= 2 and max(row_freq[v] for v in vec) <= 2 * len(chosen):
+                    cells = {(fname, sname, r, seq[s + o][0])
+                             for s in chosen for o in range(len(vec))}
+                    wr_cands.append((vec, fname, sname, fk, r, chosen, cells))
+            if wr_budget <= 0:
+                break
+        if wr_budget <= 0:
+            break
+    if wr_budget <= 0:
+        print("[paperconan] detect_recurring_row_vectors: within-row coverage bounded",
+              file=sys.stderr)
+    # One physical repeat yields many overlapping windows (k=4..8) — keep the strongest (most
+    # copies, then longest) per row, dropping >=50%-cell-overlap duplicates.
+    wr_cands.sort(key=lambda x: (-len(x[5]), -len(x[0])))
+    wr_kept = []
+    for c in wr_cands:
+        if any(c[1:5] == kc[1:5] and len(c[6] & kc[6]) >= 0.5 * min(len(c[6]), len(kc[6]))
+               for kc in wr_kept):
+            continue
+        wr_kept.append(c)
+    for vec, fn, sn, fk, r, chosen, _cells in wr_kept:
+        findings.append(dict(
+            kind="within_row_repeated_segment",
+            file=fn, file_a=fn, file_b=fn, same_file=True,
+            sheet=sn, sheet_a=sn, sheet_b=sn, same_sheet=True,
+            vector=[float(v) for v in vec],
+            # same_position_count = matched CELLS (values x copies), consistent with the sibling
+            # cross-sheet kinds, so evidence weighting isn't driven by the bare copy count.
+            size_a=len(vec) * len(chosen), size_b=len(vec) * len(chosen),
+            same_position_count=len(vec) * len(chosen),
+            fraction_of_smaller=1.0, n_occurrences=len(chosen),
+            figure_a=fk, figure_b=fk, same_figure=fk is not None,
+            delta={"pattern": "within_row_repeat"}, pattern="within_row_repeat",
+            examples=[{"value": float(v)} for v in vec],
+            severity="high",
+            rule=(f"the {len(vec)}-value segment {[round(float(v), 6) for v in vec]} repeats at "
+                  f"{len(chosen)} non-overlapping positions within one row of {sn}")))
+        if len(findings) >= max_findings:
+            break
+
     apply_profile_to_findings(findings, profile)
     return findings
 
