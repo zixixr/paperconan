@@ -561,3 +561,78 @@ git push origin codex/project-hardening
 ```
 
 Confirm PR 32 is no longer conflicting and targets the current `main`.
+
+### Task 10: Close Within-Row Review Follow-Ups
+
+**Files:**
+- Modify: `src/paperconan/_summaries.py`
+- Modify: `src/paperconan/_audit.py`
+- Modify: `docs/cli.md`
+- Modify: `skills/paperconan/references/output-schema.md`
+- Test: `tests/test_within_row_repeated_segment.py`
+- Test: `tests/test_report_status.py`
+
+**Interfaces:**
+- Truncated rows contribute a coverage limitation but no candidate finding.
+- `candidate_budget=0` skips candidate allocation and overlap finalization.
+- Candidate overlap work has explicit pair and cell-reference budgets.
+- Low-cardinality pools with at least three uses per value do not produce a
+  within-row repeated-segment signal.
+
+- [ ] **Step 1: Add failing review regressions**
+
+Cover:
+
+```text
+complete row excluded by frequency context + truncated prefix previously hit
+candidate_budget=0 + overlap helper must not be called
+four-value pool repeated three and four times at normal and small scales
+recurring-row and within-row members competing for the shared family cap
+```
+
+- [ ] **Step 2: Verify the failures**
+
+Run:
+```bash
+uv run pytest tests/test_within_row_repeated_segment.py -q
+```
+
+Expected: the new truncation, zero-budget, and low-cardinality-pool tests fail
+against the pre-fix implementation.
+
+- [ ] **Step 3: Skip incomplete rows conservatively**
+
+When `row_cell_limit` is reached, record the existing
+`within_row_repeated_segment_row_cell_limit` limitation and do not call
+`_scan_row` for that row. Do not spend the window budget on an incomplete row.
+
+- [ ] **Step 4: Apply candidate and finalization limits before retained state**
+
+Short-circuit candidate finalization when `candidate_budget` is zero. For
+nonzero budgets, compare candidate quality before constructing retained
+candidate objects. Bound overlap pair comparisons and materialized cell
+references with independent scan-wide counters and expose any exhaustion as a
+lower-bound coverage limitation.
+
+- [ ] **Step 5: Add the structural low-cardinality gate**
+
+Reject a candidate when it draws from at most four distinct values, the row has
+at most one additional distinct value, and every candidate value occurs at
+least three times. Keep the existing localized-repeat coverage where at least
+one segment value occurs only in the two reported copies.
+
+- [ ] **Step 6: Run focused verification**
+
+Run:
+```bash
+uv run pytest tests/test_within_row_repeated_segment.py tests/test_report_status.py tests/test_skill_docs_hardening.py -q
+```
+
+- [ ] **Step 7: Run complete verification**
+
+Run:
+```bash
+uv run pytest
+```
+
+Expected: zero failures; only opt-in live-network tests may skip.
