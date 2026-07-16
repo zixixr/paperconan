@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import paperconan._audit as audit
+import paperconan._summaries as summaries
 from paperconan import scan_dir
 from paperconan._audit import detect_recurring_row_vectors
 from paperconan._sheet import Sheet
@@ -89,6 +90,23 @@ def test_no_false_positive_on_small_magnitude_quantized_pool():
     assert not [f for f in detect_recurring_row_vectors(
         {("f.xlsx", "Fig 1"): _row_sheet(row)})
         if f["kind"] == "within_row_repeated_segment"]
+
+
+def test_no_signal_on_three_or_four_use_low_cardinality_pool():
+    base = [0.125137, 0.250271, 0.375409, 0.500557]
+
+    for scale in (1.0, 0.0001):
+        values = [value * scale for value in base]
+        for copies in (3, 4):
+            row = values * copies
+            findings = detect_recurring_row_vectors({
+                ("pool.csv", "Figure 1"): _row_sheet(row)
+            })
+            assert not [
+                finding for finding in findings
+                if finding["kind"]
+                == "within_row_repeated_segment"
+            ]
 
 
 def test_genuine_repeat_kept_despite_a_few_incidental_extras():
@@ -232,6 +250,42 @@ def test_within_row_index_bounds_row_cell_state():
     assert findings == []
 
 
+def test_truncated_row_does_not_emit_prefix_only_signal():
+    suffix = []
+    for index, value in enumerate(SEG):
+        suffix.extend([
+            value,
+            100.125 + index,
+            value,
+            200.375 + index,
+            value,
+        ])
+    row = [*SEG, 99.125, *SEG, *suffix]
+
+    complete = WithinRowRepeatIndex(row_cell_limit=len(row) + 1)
+    complete.add_sheet(
+        "complete.csv",
+        "Data",
+        Sheet.from_rows([row]),
+        figure_id=None,
+    )
+    complete_findings, _complete_metadata = complete.findings()
+    assert complete_findings == []
+
+    limited = WithinRowRepeatIndex(row_cell_limit=11)
+    metadata = limited.add_sheet(
+        "limited.csv",
+        "Data",
+        Sheet.from_rows([row]),
+        figure_id=None,
+    )
+    findings, _finalization = limited.findings()
+
+    assert metadata["row_cell_limit_exhausted"] is True
+    assert metadata["windows_examined"] == 0
+    assert findings == []
+
+
 def test_zero_work_budget_ignores_rows_without_candidate_window():
     index = WithinRowRepeatIndex(budget=0)
 
@@ -244,6 +298,118 @@ def test_zero_work_budget_ignores_rows_without_candidate_window():
 
     assert metadata["budget_exhausted"] is False
     assert metadata["windows_skipped_is_lower_bound"] is False
+
+
+def test_zero_candidate_budget_skips_overlap_finalization(
+    monkeypatch,
+):
+    def fail_overlap_finalization(*_args, **_kwargs):
+        raise AssertionError(
+            "zero candidate budget entered overlap finalization"
+        )
+
+    monkeypatch.setattr(
+        summaries,
+        "_iter_indexed_candidate_ids",
+        fail_overlap_finalization,
+    )
+    index = WithinRowRepeatIndex(candidate_budget=0)
+
+    index.add_sheet(
+        "bounded.csv",
+        "Data",
+        Sheet.from_rows([[*SEG, 99.125, *SEG]]),
+        figure_id=None,
+    )
+    findings, metadata = index.findings()
+
+    assert findings == []
+    assert metadata["candidate_limit"] == 0
+    assert metadata["candidates_retained"] == 0
+
+
+def test_candidate_limit_precedes_candidate_object_allocation(
+    monkeypatch,
+):
+    real_candidate = summaries._WithinRowCandidate
+    allocations = []
+
+    def tracking_candidate(*args, **kwargs):
+        allocations.append(kwargs["row_idx"])
+        return real_candidate(*args, **kwargs)
+
+    monkeypatch.setattr(
+        summaries,
+        "_WithinRowCandidate",
+        tracking_candidate,
+    )
+    other = [8.238866, 6.724138, 9.418803, 4.727273, 7.380952]
+    index = WithinRowRepeatIndex(candidate_budget=1)
+
+    index.add_sheet(
+        "allocation.csv",
+        "Data",
+        Sheet.from_rows([
+            [*SEG, 99.125, *SEG],
+            [*other, 88.375, *other],
+        ]),
+        figure_id=None,
+    )
+    findings, metadata = index.findings()
+
+    assert len(findings) == 1
+    assert allocations == [0]
+    assert metadata["candidate_findings_omitted"] == 1
+
+
+def test_within_row_index_bounds_overlap_pair_work():
+    index = WithinRowRepeatIndex(
+        candidate_budget=10,
+        finalization_pair_budget=0,
+        finalization_cell_budget=100,
+    )
+
+    index.add_sheet(
+        "pairs.csv",
+        "Data",
+        Sheet.from_rows([[*SEG, 99.125, *SEG]]),
+        figure_id=None,
+    )
+    findings, metadata = index.findings()
+
+    assert len(findings) == 1
+    assert metadata[
+        "candidate_findings_omitted_is_lower_bound"
+    ] is True
+    limitation = metadata["finalization_limitation"]
+    assert limitation["limits_reached"] == ["pair"]
+    assert limitation["pair_limit"] == 0
+    assert limitation["pair_comparisons"] == 0
+
+
+def test_within_row_index_bounds_finalization_cell_state():
+    index = WithinRowRepeatIndex(
+        candidate_budget=10,
+        finalization_pair_budget=100,
+        finalization_cell_budget=0,
+    )
+
+    index.add_sheet(
+        "cells.csv",
+        "Data",
+        Sheet.from_rows([[*SEG, 99.125, *SEG]]),
+        figure_id=None,
+    )
+    findings, metadata = index.findings()
+
+    assert findings == []
+    assert metadata[
+        "candidate_findings_omitted_is_lower_bound"
+    ] is True
+    limitation = metadata["finalization_limitation"]
+    assert limitation["limits_reached"] == ["cell"]
+    assert limitation["cell_limit"] == 0
+    assert limitation["cell_references_retained"] == 0
 
 
 def test_within_row_index_bounds_candidate_state():
@@ -269,6 +435,7 @@ def test_within_row_index_bounds_candidate_state():
         "candidate_limit": 1,
         "candidates_seen": 2,
         "candidates_retained": 1,
+        "candidate_findings_omitted_is_lower_bound": True,
     }
 
 
@@ -377,9 +544,47 @@ def test_scan_counts_within_row_candidate_omissions(tmp_path, monkeypatch):
         "candidates_retained": 1,
         "candidate_findings_omitted": 1,
         "omitted_findings": 1,
+        "candidate_findings_omitted_is_lower_bound": True,
     }]
     assert scan["findings_omitted"] == 1
-    assert "findings_omitted_is_lower_bound" not in scan
+    assert scan["findings_omitted_is_lower_bound"] is True
+
+
+def test_scan_discloses_within_row_finalization_pair_limit(
+    tmp_path,
+    monkeypatch,
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "pairs.csv").write_text(
+        ",".join(str(value) for value in [*SEG, 99.125, *SEG])
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        audit,
+        "_WITHIN_ROW_REPEATED_SEGMENT_FINALIZATION_PAIR_BUDGET",
+        0,
+        raising=False,
+    )
+
+    scan = scan_dir(
+        str(data),
+        str(tmp_path / "out"),
+        write_html=False,
+    )
+
+    limitations = [
+        item
+        for item in scan["coverage"]["limitations"]
+        if item["reason"]
+        == "within_row_repeated_segment_finalization_limit"
+    ]
+    assert len(limitations) == 1
+    assert limitations[0]["pair_limit"] == 0
+    assert limitations[0]["limits_reached"] == ["pair"]
+    assert limitations[0]["pair_comparisons"] == 0
+    assert scan["findings_omitted_is_lower_bound"] is True
 
 
 def test_scan_discloses_within_row_cell_limit(tmp_path, monkeypatch):
@@ -459,3 +664,75 @@ def test_scan_dir_surfaces_within_row_repeated_segment(tmp_path):
     res = scan_dir(str(data), str(tmp_path / "out"), write_html=True)
     assert [f for f in res.get("cross_sheet_findings", []) or []
             if f.get("kind") == "within_row_repeated_segment"]
+
+
+def test_shared_family_cap_prioritizes_recurring_member(
+    tmp_path,
+    monkeypatch,
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    recurring = [220, 188, 122, 166, 128, 166]
+    for figure in range(1, 4):
+        rows = [
+            [*recurring, *[
+                figure * 100 + offset + 0.125
+                for offset in range(5)
+            ]],
+            (
+                [*SEG, 99.125, *SEG]
+                if figure == 1
+                else [
+                    figure * 1000 + offset + 0.375
+                    for offset in range(11)
+                ]
+            ),
+            [
+                figure * 2000 + offset + 0.625
+                for offset in range(11)
+            ],
+        ]
+        (data / f"Figure {figure}.csv").write_text(
+            ",".join(f"c{index}" for index in range(11))
+            + "\n"
+            + "\n".join(
+                ",".join(str(value) for value in row)
+                for row in rows
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(
+        audit,
+        "_RECURRING_ROW_VECTOR_MAX_FINDINGS",
+        1,
+        raising=False,
+    )
+
+    scan = scan_dir(
+        str(data),
+        str(tmp_path / "out"),
+        write_html=False,
+    )
+
+    family = [
+        finding["kind"]
+        for finding in scan["cross_sheet_findings"]
+        if finding["kind"] in {
+            "recurring_row_vector",
+            "within_row_repeated_segment",
+        }
+    ]
+    assert family == ["recurring_row_vector"]
+    assert [
+        item
+        for item in scan["coverage"]["limitations"]
+        if item["reason"]
+        == "within_row_repeated_segment_finding_limit"
+    ] == [{
+        "scope": "scan",
+        "reason": "within_row_repeated_segment_finding_limit",
+        "limit": 0,
+        "output_findings_omitted": 1,
+        "omitted_findings": 1,
+    }]

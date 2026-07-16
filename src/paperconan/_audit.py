@@ -9068,6 +9068,18 @@ _WITHIN_ROW_REPEATED_SEGMENT_ROW_CELL_LIMIT = int(
         "20000",
     )
 )
+_WITHIN_ROW_REPEATED_SEGMENT_FINALIZATION_PAIR_BUDGET = int(
+    os.environ.get(
+        "PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_FINALIZATION_PAIR_BUDGET",
+        "200000",
+    )
+)
+_WITHIN_ROW_REPEATED_SEGMENT_FINALIZATION_CELL_BUDGET = int(
+    os.environ.get(
+        "PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_FINALIZATION_CELL_BUDGET",
+        "1000000",
+    )
+)
 _FRACTION_REUSE_PAIR_BUDGET = int(
     os.environ.get("PAPERCONAN_FRACTION_REUSE_PAIR_BUDGET", "10000")
 )
@@ -10698,6 +10710,12 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             row_cell_limit=(
                 _WITHIN_ROW_REPEATED_SEGMENT_ROW_CELL_LIMIT
             ),
+            finalization_pair_budget=(
+                _WITHIN_ROW_REPEATED_SEGMENT_FINALIZATION_PAIR_BUDGET
+            ),
+            finalization_cell_budget=(
+                _WITHIN_ROW_REPEATED_SEGMENT_FINALIZATION_CELL_BUDGET
+            ),
         ),
         profile=profile,
         evidence=evidence,
@@ -10856,21 +10874,45 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         candidate_omitted = within_row_meta[
             "candidate_findings_omitted"
         ]
-        if candidate_omitted:
+        candidate_lower_bound = bool(
+            within_row_meta.get(
+                "candidate_findings_omitted_is_lower_bound"
+            )
+        )
+        if "candidate_limit" in within_row_meta:
+            candidate_details = {
+                "limit": within_row_meta["candidate_limit"],
+                "candidates_seen": within_row_meta[
+                    "candidates_seen"
+                ],
+                "candidates_retained": within_row_meta[
+                    "candidates_retained"
+                ],
+                "candidate_findings_omitted": candidate_omitted,
+                "omitted_findings": candidate_omitted,
+            }
+            if candidate_lower_bound:
+                candidate_details[
+                    "candidate_findings_omitted_is_lower_bound"
+                ] = True
             coverage.add_limitation(
                 "scan",
                 "within_row_repeated_segment_candidate_limit",
-                limit=within_row_meta["candidate_limit"],
-                candidates_seen=within_row_meta[
-                    "candidates_seen"
-                ],
-                candidates_retained=within_row_meta[
-                    "candidates_retained"
-                ],
-                candidate_findings_omitted=candidate_omitted,
-                omitted_findings=candidate_omitted,
+                **candidate_details,
             )
+        finalization_limitation = within_row_meta.get(
+            "finalization_limitation"
+        )
+        if finalization_limitation is not None:
+            coverage.add_limitation(
+                "scan",
+                "within_row_repeated_segment_finalization_limit",
+                **finalization_limitation,
+            )
+        if candidate_omitted:
             state.findings_omitted += candidate_omitted
+        if candidate_lower_bound or finalization_limitation is not None:
+            state.findings_omitted_is_lower_bound = True
         output_omitted = within_row_meta[
             "output_findings_omitted"
         ]

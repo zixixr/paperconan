@@ -579,7 +579,7 @@ Confirm PR 32 is no longer conflicting and targets the current `main`.
 - Low-cardinality pools with at least three uses per value do not produce a
   within-row repeated-segment signal.
 
-- [ ] **Step 1: Add failing review regressions**
+- [x] **Step 1: Add failing review regressions**
 
 Cover:
 
@@ -590,7 +590,7 @@ four-value pool repeated three and four times at normal and small scales
 recurring-row and within-row members competing for the shared family cap
 ```
 
-- [ ] **Step 2: Verify the failures**
+- [x] **Step 2: Verify the failures**
 
 Run:
 ```bash
@@ -600,13 +600,13 @@ uv run pytest tests/test_within_row_repeated_segment.py -q
 Expected: the new truncation, zero-budget, and low-cardinality-pool tests fail
 against the pre-fix implementation.
 
-- [ ] **Step 3: Skip incomplete rows conservatively**
+- [x] **Step 3: Skip incomplete rows conservatively**
 
 When `row_cell_limit` is reached, record the existing
 `within_row_repeated_segment_row_cell_limit` limitation and do not call
 `_scan_row` for that row. Do not spend the window budget on an incomplete row.
 
-- [ ] **Step 4: Apply candidate and finalization limits before retained state**
+- [x] **Step 4: Apply candidate and finalization limits before retained state**
 
 Short-circuit candidate finalization when `candidate_budget` is zero. For
 nonzero budgets, compare candidate quality before constructing retained
@@ -614,21 +614,21 @@ candidate objects. Bound overlap pair comparisons and materialized cell
 references with independent scan-wide counters and expose any exhaustion as a
 lower-bound coverage limitation.
 
-- [ ] **Step 5: Add the structural low-cardinality gate**
+- [x] **Step 5: Add the structural low-cardinality gate**
 
 Reject a candidate when it draws from at most four distinct values, the row has
 at most one additional distinct value, and every candidate value occurs at
 least three times. Keep the existing localized-repeat coverage where at least
 one segment value occurs only in the two reported copies.
 
-- [ ] **Step 6: Run focused verification**
+- [x] **Step 6: Run focused verification**
 
 Run:
 ```bash
 uv run pytest tests/test_within_row_repeated_segment.py tests/test_report_status.py tests/test_skill_docs_hardening.py -q
 ```
 
-- [ ] **Step 7: Run complete verification**
+- [x] **Step 7: Run complete verification**
 
 Run:
 ```bash

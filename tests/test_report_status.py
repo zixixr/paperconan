@@ -381,6 +381,17 @@ def test_partial_html_lists_escaped_limit_and_retains_findings(tmp_path):
             "PAPERCONAN_MAX_TOTAL_FINDINGS",
             id="within-row-candidate",
         ),
+        pytest.param(
+            [{
+                "scope": "scan",
+                "reason": (
+                    "within_row_repeated_segment_finalization_limit"
+                ),
+            }],
+            "within_row_repeated_segment_finalization_limit",
+            "PAPERCONAN_MAX_TOTAL_FINDINGS",
+            id="within-row-finalization",
+        ),
     ],
 )
 def test_omission_warning_uses_coverage_reason_and_neutral_severity(

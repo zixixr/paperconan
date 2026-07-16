@@ -626,6 +626,15 @@ def _within_row_candidate_qualifies(
         or len(set(vector)) < 4
     ):
         return False
+    vector_values = set(vector)
+    if (
+        len(vector_values) <= 4
+        and len(row_frequency) <= len(vector_values) + 1
+        and min(
+            row_frequency[value] for value in vector_values
+        ) >= 3
+    ):
+        return False
     return max(
         row_frequency[value] for value in vector
     ) <= 2 * record.non_overlapping_count
@@ -701,15 +710,29 @@ class WithinRowRepeatIndex:
         unique_budget=100_000,
         candidate_budget=10_000,
         row_cell_limit=20_000,
+        finalization_pair_budget=200_000,
+        finalization_cell_budget=1_000_000,
     ):
         self._initial_budget = max(0, int(budget))
         self._budget = self._initial_budget
         self._unique_budget = max(0, int(unique_budget))
         self._candidate_budget = max(0, int(candidate_budget))
         self._row_cell_limit = max(0, int(row_cell_limit))
+        self._finalization_pair_budget = max(
+            0, int(finalization_pair_budget)
+        )
+        self._finalization_cell_budget = max(
+            0, int(finalization_cell_budget)
+        )
         self._candidate_heap = []
         self._candidates_seen = 0
         self._candidate_sequence = 0
+        self._candidate_limit_exhausted = False
+        self._candidate_omissions_lower_bound = False
+        self._finalization_limits_reached = []
+        self._finalization_stopped = False
+        self._pair_comparisons = 0
+        self._cell_references_retained = 0
 
     @property
     def initial_budget(self):
@@ -727,20 +750,32 @@ class WithinRowRepeatIndex:
     def row_cell_limit(self):
         return self._row_cell_limit
 
-    def _retain_candidate(self, candidate):
-        self._candidates_seen += 1
-        if self._candidate_budget <= 0:
-            return
-        quality = (
-            candidate.occurrence_count,
-            len(candidate.vector),
-            -candidate.order,
+    def _candidate_quality(
+        self,
+        occurrence_count,
+        vector_length,
+        order,
+    ):
+        return (occurrence_count, vector_length, -order)
+
+    def _candidate_would_be_retained(self, quality):
+        return (
+            len(self._candidate_heap) < self._candidate_budget
+            or quality > self._candidate_heap[0][0]
         )
+
+    def _retain_candidate(self, candidate, quality):
         item = (quality, candidate.order, candidate)
         if len(self._candidate_heap) < self._candidate_budget:
             heapq.heappush(self._candidate_heap, item)
-        elif quality > self._candidate_heap[0][0]:
+        else:
             heapq.heapreplace(self._candidate_heap, item)
+
+    def _stop_finalization(self, dimension):
+        if dimension not in self._finalization_limits_reached:
+            self._finalization_limits_reached.append(dimension)
+        self._finalization_stopped = True
+        self._candidate_omissions_lower_bound = True
 
     def _scan_row(
         self,
@@ -806,9 +841,64 @@ class WithinRowRepeatIndex:
                 item[1].order,
             )
         )
+        row_metadata = {
+            "skipped_new_windows": skipped_new_windows,
+            "max_unique_vectors_retained": len(windows),
+        }
+        if not qualifying:
+            return row_metadata
+        if self._candidate_budget <= 0:
+            self._candidate_limit_exhausted = True
+            self._candidate_omissions_lower_bound = True
+            return row_metadata
+        if self._finalization_stopped:
+            self._candidate_omissions_lower_bound = True
+            return row_metadata
         kept_cells = []
         cell_index = {}
-        for vector, record in qualifying:
+        for candidate_index, (vector, record) in enumerate(
+            qualifying
+        ):
+            order = self._candidate_sequence
+            self._candidate_sequence += 1
+            quality = self._candidate_quality(
+                record.non_overlapping_count,
+                len(vector),
+                order,
+            )
+            heap_full = (
+                len(self._candidate_heap)
+                >= self._candidate_budget
+            )
+            if (
+                heap_full
+                and not self._candidate_would_be_retained(quality)
+            ):
+                self._candidate_limit_exhausted = True
+                if not kept_cells:
+                    self._candidates_seen += 1
+                if kept_cells or candidate_index + 1 < len(qualifying):
+                    self._candidate_omissions_lower_bound = True
+                break
+            if (
+                kept_cells
+                and self._pair_comparisons
+                >= self._finalization_pair_budget
+            ):
+                self._stop_finalization("pair")
+                break
+            candidate_cell_count = (
+                len(vector) * len(record.starts)
+            )
+            if (
+                self._cell_references_retained
+                + candidate_cell_count
+                > self._finalization_cell_budget
+            ):
+                if not kept_cells:
+                    self._candidates_seen += 1
+                self._stop_finalization("cell")
+                break
             cells = frozenset(
                 sequence[start + offset][0]
                 for start in record.starts
@@ -819,6 +909,13 @@ class WithinRowRepeatIndex:
                 cells,
                 cell_index,
             ):
+                if (
+                    self._pair_comparisons
+                    >= self._finalization_pair_budget
+                ):
+                    self._stop_finalization("pair")
+                    break
+                self._pair_comparisons += 1
                 prior_cells = kept_cells[candidate_id]
                 if (
                     len(cells & prior_cells)
@@ -826,8 +923,13 @@ class WithinRowRepeatIndex:
                 ):
                     overlaps_prior = True
                     break
+            if self._finalization_stopped:
+                break
             if overlaps_prior:
                 continue
+            self._candidates_seen += 1
+            if heap_full:
+                self._candidate_limit_exhausted = True
             start_cols = tuple(
                 sequence[start][0] for start in record.starts
             )
@@ -845,18 +947,15 @@ class WithinRowRepeatIndex:
                 cells=cells,
                 start_cols=start_cols,
                 end_cols=end_cols,
-                order=self._candidate_sequence,
+                order=order,
             )
-            self._candidate_sequence += 1
             candidate_id = len(kept_cells)
             kept_cells.append(cells)
             for cell in cells:
                 cell_index.setdefault(cell, []).append(candidate_id)
-            self._retain_candidate(candidate)
-        return {
-            "skipped_new_windows": skipped_new_windows,
-            "max_unique_vectors_retained": len(windows),
-        }
+            self._cell_references_retained += len(cells)
+            self._retain_candidate(candidate, quality)
+        return row_metadata
 
     def add_sheet(
         self,
@@ -898,6 +997,7 @@ class WithinRowRepeatIndex:
                 sequence.append((col_idx, value))
             if row_limited:
                 rows_limited += 1
+                continue
             if len(sequence) < min_k:
                 continue
 
@@ -998,12 +1098,38 @@ class WithinRowRepeatIndex:
             ),
             "output_findings_omitted": output_findings_omitted,
         }
-        if candidate_findings_omitted:
+        if self._candidate_limit_exhausted:
             metadata.update({
                 "candidate_limit": self._candidate_budget,
                 "candidates_seen": self._candidates_seen,
                 "candidates_retained": retained,
             })
+        elif candidate_findings_omitted:
+            metadata.update({
+                "candidates_seen": self._candidates_seen,
+                "candidates_retained": retained,
+            })
+        if self._candidate_omissions_lower_bound:
+            metadata[
+                "candidate_findings_omitted_is_lower_bound"
+            ] = True
+        if self._finalization_limits_reached:
+            metadata["finalization_limitation"] = {
+                "pair_limit": self._finalization_pair_budget,
+                "cell_limit": self._finalization_cell_budget,
+                "candidates_seen": self._candidates_seen,
+                "candidates_retained": retained,
+                "pair_comparisons": self._pair_comparisons,
+                "cell_references_retained": (
+                    self._cell_references_retained
+                ),
+                "limits_reached": list(
+                    self._finalization_limits_reached
+                ),
+                "omitted_findings_lower_bound": (
+                    candidate_findings_omitted
+                ),
+            }
         if output_findings_omitted:
             metadata.update({
                 "output_limit": output_limit,

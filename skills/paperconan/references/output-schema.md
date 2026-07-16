@@ -158,7 +158,7 @@ Within-row repeated-segment work exhaustion uses the same lower-bound rule:
 }
 ```
 
-The detector has three independent retained-state/output controls:
+The detector has five independent retained-state/work/output controls:
 
 - `within_row_repeated_segment_unique_vector_limit` is sheet-scoped and reports
   `limit`, `max_unique_vectors_retained`, `skipped_new_windows`, and
@@ -166,15 +166,23 @@ The detector has three independent retained-state/output controls:
   already-retained vectors continue to receive later occurrences.
 - `within_row_repeated_segment_row_cell_limit` is sheet-scoped and reports
   `limit`, `rows_limited`, `numeric_cells_skipped_lower_bound`, and
-  `omitted_findings_lower_bound`.
+  `omitted_findings_lower_bound`. A truncated row does not emit candidates
+  because its full-row frequency context is unavailable.
 - `within_row_repeated_segment_candidate_limit` and
   `within_row_repeated_segment_finding_limit` are scan-scoped. They distinguish
   `candidate_findings_omitted` from `output_findings_omitted`; both also carry
-  `omitted_findings` for the top-level additive count.
+  `omitted_findings` for the top-level additive count. Candidate omissions use
+  `candidate_findings_omitted_is_lower_bound: true` when lower-ranked overlap
+  variants were not expanded after the retained candidate set filled.
+- `within_row_repeated_segment_finalization_limit` is scan-scoped and reports
+  `pair_limit`, `cell_limit`, `pair_comparisons`,
+  `cell_references_retained`, `limits_reached`, and
+  `omitted_findings_lower_bound`. It bounds overlap finalization independently
+  of the candidate-retention limit.
 
 Work, unique-vector, or row-cell limits can leave additional finding omissions
-unknown, so top-level `findings_omitted_is_lower_bound` is `true`. Candidate
-and output omissions are exact for the candidates that reached finalization.
+unknown, so top-level `findings_omitted_is_lower_bound` is `true`. Output
+omissions remain exact for candidates that completed finalization.
 
 When recurring-row-vector finalization exhausts a retained-state or work
 budget, `coverage.limitations` contains this complete shape:

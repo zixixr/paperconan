@@ -419,6 +419,14 @@ def test_docs_cover_within_row_repeat_resource_contract() -> None:
             "20000",
             "within_row_repeated_segment_row_cell_limit",
         ),
+        "PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_FINALIZATION_PAIR_BUDGET": (
+            "200000",
+            "within_row_repeated_segment_finalization_limit",
+        ),
+        "PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_FINALIZATION_CELL_BUDGET": (
+            "1000000",
+            "within_row_repeated_segment_finalization_limit",
+        ),
     }
 
     for name, (default, reason) in controls.items():
@@ -432,7 +440,10 @@ def test_docs_cover_within_row_repeat_resource_contract() -> None:
         assert reason in schema_text
 
     assert "candidate_findings_omitted" in schema_text
+    assert "candidate_findings_omitted_is_lower_bound" in schema_text
     assert "output_findings_omitted" in schema_text
+    assert "pair_comparisons" in schema_text
+    assert "cell_references_retained" in schema_text
     assert "windows_skipped_is_lower_bound" in schema_text
     assert "start_cols" in schema_text
     assert "non-numeric cells" in schema_text

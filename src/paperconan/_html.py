@@ -252,6 +252,7 @@ def _render_omission_warning(scan: dict, omitted: int) -> str:
         "recurring_row_vector_finding_limit": None,
         "recurring_row_vector_finalization_limit": None,
         "within_row_repeated_segment_candidate_limit": None,
+        "within_row_repeated_segment_finalization_limit": None,
         "within_row_repeated_segment_finding_limit": None,
     }
     reasons = []

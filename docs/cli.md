@@ -131,8 +131,10 @@ write_adjudicated_report(scan, verdict, "adjudication.html")  # scan/verdict 均
 | `PAPERCONAN_RECURRING_ROW_VECTOR_FINALIZATION_CELL_BUDGET` | `1000000` | recurring-row finalization 最多保留的候选 cell 引用数 |
 | `PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_BUDGET` | `2000000` | 同一行重复片段检测器的全 scan 窗口工作预算；未检查后续候选行时记录 `within_row_repeated_segment_budget`，并用 `windows_skipped_is_lower_bound` 标明下界语义 |
 | `PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_UNIQUE_BUDGET` | `100000` | 每行最多保留的唯一窗口向量数；已知向量仍继续更新，新窗口状态被拒绝时记录 `within_row_repeated_segment_unique_vector_limit` |
-| `PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_CANDIDATE_BUDGET` | `10000` | 全 scan 最多保留的已去重候选 finding 数；超限时记录 `within_row_repeated_segment_candidate_limit` 和确定的候选遗漏数 |
-| `PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_ROW_CELL_LIMIT` | `20000` | 单行最多保留的数值 cell 数；达到上限后停止增长该行状态，并记录 `within_row_repeated_segment_row_cell_limit` 与至少跳过的数值 cell 数 |
+| `PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_CANDIDATE_BUDGET` | `10000` | 全 scan 最多保留的已去重候选 finding 数；超限时记录 `within_row_repeated_segment_candidate_limit`，若后续重叠候选未再展开则用 `candidate_findings_omitted_is_lower_bound` 标明下界 |
+| `PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_ROW_CELL_LIMIT` | `20000` | 单行最多保留的数值 cell 数；达到上限后整行不产出候选，并记录 `within_row_repeated_segment_row_cell_limit` 与至少跳过的数值 cell 数 |
+| `PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_FINALIZATION_PAIR_BUDGET` | `200000` | 全 scan 最多执行的 indexed overlap 候选比较数；耗尽时记录 `within_row_repeated_segment_finalization_limit` |
+| `PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_FINALIZATION_CELL_BUDGET` | `1000000` | 全 scan finalization 最多接纳的候选 cell 引用数；耗尽时记录 `within_row_repeated_segment_finalization_limit` |
 | `PAPERCONAN_FRACTION_REUSE_PAIR_BUDGET` | `10000` | 同一 sheet 内 fraction-reuse detector 最多检查的 block pair 数 |
 | `PAPERCONAN_FRACTION_REUSE_CELL_BUDGET` | `1000000` | 同一 sheet 内 fraction-reuse detector 最多检查的位置 cell 数；与 pair 预算分别生效 |
 | `PAPERCONAN_MAX_PAPER_MB` | `1500` | `fetch` 下载/解压到一个 paper 目录的总量上限 |
