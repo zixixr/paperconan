@@ -76,6 +76,7 @@ from ._summaries import (
     CrossSheetSummary,
     RecurringRowIndex,
     SparseLabelContext,
+    WithinRowRepeatIndex,
 )
 from .schema import PaperconanInputError
 
@@ -8534,34 +8535,56 @@ def detect_cross_sheet_column_duplicates(
 
 def detect_recurring_row_vectors(grid_sheets, profile="review",
                                  min_k=4, max_k=8, max_rows=300, max_findings=20):
-    """B2 — a fixed ordered numeric tuple recurring as a contiguous row-slice across >=3 places
-    spanning >=2 figure namespaces. Six independent mice cannot yield the identical six-value
-    vector in several arms; a specific high-information tuple reappearing across unrelated figures
-    is a copy fingerprint. Guarded hard (this is the most FP-prone pass): >=3 distinct values, no
-    arithmetic/geometric/round-number ladders, >=3 occurrences in >=2 figure namespaces, and
-    all-integer tuples need k>=5 with >=4 distinct values."""
-    # A finding needs >=2 distinct figure namespaces; skip the (expensive, FP-prone) window
-    # build entirely when the corpus can never satisfy that (single sheet, or plainly-named
-    # sheets whose figure_key is None).
-    if len({figure_key(s) for (_f, s) in grid_sheets if figure_key(s) is not None}) < 2:
-        return []
-    index = RecurringRowIndex()
+    """Detect high-information row-vector recurrence statistical signals.
+
+    The cross-figure member requires at least three sites across two figure
+    namespaces. The within-row member requires two non-overlapping positions
+    in one numeric row sequence. Both exclude low-information ladders and use
+    stricter gates for integer-only vectors.
+    """
+    cross_figure_possible = (
+        len({
+            figure_key(sheet)
+            for _file, sheet in grid_sheets
+            if figure_key(sheet) is not None
+        })
+        >= 2
+    )
+    recurring_index = RecurringRowIndex()
+    within_row_index = WithinRowRepeatIndex()
     for (fname, sname), sheet in grid_sheets.items():
-        index.add_sheet(
+        figure_id = figure_key(sname)
+        if cross_figure_possible:
+            recurring_index.add_sheet(
+                fname,
+                sname,
+                sheet,
+                blocks=find_numeric_blocks(sheet),
+                figure_id=figure_id,
+                min_k=min_k,
+                max_k=max_k,
+                max_rows=max_rows,
+            )
+        within_row_index.add_sheet(
             fname,
             sname,
             sheet,
-            blocks=find_numeric_blocks(sheet),
-            figure_id=figure_key(sname),
+            figure_id=figure_id,
             min_k=min_k,
             max_k=max_k,
-            max_rows=max_rows,
         )
-    findings, _meta = index.findings(
+    limit = max(0, int(max_findings))
+    recurring_findings, _recurring_meta = recurring_index.findings(
         profile=profile,
-        max_findings=max_findings,
+        max_findings=limit,
     )
-    return findings
+    within_row_findings, _within_row_meta = (
+        within_row_index.findings(
+            profile=profile,
+            max_findings=max(0, limit - len(recurring_findings)),
+        )
+    )
+    return recurring_findings + within_row_findings
 
 
 @dataclass(frozen=True)
@@ -9021,6 +9044,30 @@ _RECURRING_ROW_VECTOR_FINALIZATION_CELL_BUDGET = int(
     )
 )
 _RECURRING_ROW_VECTOR_MAX_FINDINGS = 20
+_WITHIN_ROW_REPEATED_SEGMENT_BUDGET = int(
+    os.environ.get(
+        "PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_BUDGET",
+        "2000000",
+    )
+)
+_WITHIN_ROW_REPEATED_SEGMENT_UNIQUE_BUDGET = int(
+    os.environ.get(
+        "PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_UNIQUE_BUDGET",
+        "100000",
+    )
+)
+_WITHIN_ROW_REPEATED_SEGMENT_CANDIDATE_BUDGET = int(
+    os.environ.get(
+        "PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_CANDIDATE_BUDGET",
+        "10000",
+    )
+)
+_WITHIN_ROW_REPEATED_SEGMENT_ROW_CELL_LIMIT = int(
+    os.environ.get(
+        "PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_ROW_CELL_LIMIT",
+        "20000",
+    )
+)
 _FRACTION_REUSE_PAIR_BUDGET = int(
     os.environ.get("PAPERCONAN_FRACTION_REUSE_PAIR_BUDGET", "10000")
 )
@@ -9049,6 +9096,7 @@ class ScanBudgetState:
     report_blocks_kept: int = 0
     include_runtime: bool = True
     defer_evidence: bool = False
+    within_row_index: WithinRowRepeatIndex | None = None
 
 
 @dataclass
@@ -10101,6 +10149,7 @@ def _process_loaded_sheet(
     sheet, *, file_name, sheet_name, sheet_start, state
 ):
     blocks = find_numeric_blocks(sheet)
+    numeric_cells = sum(1 for _ in sheet.iter_numeric_values())
     report_blocks = _analyze_numeric_blocks(
         sheet,
         file_name=file_name,
@@ -10215,6 +10264,73 @@ def _process_loaded_sheet(
         if recurring_windows_lower_bound:
             state.findings_omitted_is_lower_bound = True
 
+    if state.within_row_index is not None:
+        within_row_meta = state.within_row_index.add_sheet(
+            file_name,
+            sheet_name,
+            sheet,
+            figure_id=figure_key(sheet_name),
+        )
+        if (
+            within_row_meta["windows_examined"] > 0
+            or within_row_meta["budget_exhausted"]
+            or within_row_meta["unique_budget_exhausted"]
+            or within_row_meta["row_cell_limit_exhausted"]
+        ):
+            state.coverage.mark_non_block_analysis_completed()
+        within_row_windows_skipped = within_row_meta[
+            "windows_skipped"
+        ]
+        within_row_windows_lower_bound = bool(
+            within_row_meta["windows_skipped_is_lower_bound"]
+        )
+        if within_row_meta["budget_exhausted"]:
+            state.coverage.add_limitation(
+                "sheet",
+                "within_row_repeated_segment_budget",
+                file=file_name,
+                sheet=sheet_name,
+                limit=state.within_row_index.initial_budget,
+                windows_skipped=within_row_windows_skipped,
+                **(
+                    {"windows_skipped_is_lower_bound": True}
+                    if within_row_windows_lower_bound
+                    else {}
+                ),
+            )
+            if within_row_windows_lower_bound:
+                state.findings_omitted_is_lower_bound = True
+        if within_row_meta["unique_budget_exhausted"]:
+            state.coverage.add_limitation(
+                "sheet",
+                "within_row_repeated_segment_unique_vector_limit",
+                file=file_name,
+                sheet=sheet_name,
+                limit=within_row_meta["unique_limit"],
+                max_unique_vectors_retained=within_row_meta[
+                    "max_unique_vectors_retained"
+                ],
+                skipped_new_windows=within_row_meta[
+                    "skipped_new_windows"
+                ],
+                omitted_findings_lower_bound=0,
+            )
+            state.findings_omitted_is_lower_bound = True
+        if within_row_meta["row_cell_limit_exhausted"]:
+            state.coverage.add_limitation(
+                "sheet",
+                "within_row_repeated_segment_row_cell_limit",
+                file=file_name,
+                sheet=sheet_name,
+                limit=within_row_meta["row_cell_limit"],
+                rows_limited=within_row_meta["rows_limited"],
+                numeric_cells_skipped_lower_bound=within_row_meta[
+                    "numeric_cells_skipped_lower_bound"
+                ],
+                omitted_findings_lower_bound=0,
+            )
+            state.findings_omitted_is_lower_bound = True
+
     summary, summary_limitations = build_cross_sheet_summary(
         file_name,
         sheet_name,
@@ -10245,7 +10361,7 @@ def _process_loaded_sheet(
         "sheet": sheet_name,
         "n_rows": sheet.nrows,
         "n_cols": sheet.ncols,
-        "numeric_cells": sum(1 for _ in sheet.iter_numeric_values()),
+        "numeric_cells": numeric_cells,
         "n_blocks": len(blocks),
         "elapsed_ms": _elapsed_ms(sheet_start),
     }
@@ -10571,6 +10687,18 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 _RECURRING_ROW_VECTOR_FINALIZATION_CELL_BUDGET
             ),
         ),
+        within_row_index=WithinRowRepeatIndex(
+            budget=_WITHIN_ROW_REPEATED_SEGMENT_BUDGET,
+            unique_budget=(
+                _WITHIN_ROW_REPEATED_SEGMENT_UNIQUE_BUDGET
+            ),
+            candidate_budget=(
+                _WITHIN_ROW_REPEATED_SEGMENT_CANDIDATE_BUDGET
+            ),
+            row_cell_limit=(
+                _WITHIN_ROW_REPEATED_SEGMENT_ROW_CELL_LIMIT
+            ),
+        ),
         profile=profile,
         evidence=evidence,
         cross_sheet_summary_budget=CrossSheetSummaryBudget(
@@ -10713,6 +10841,54 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             or state.cross_sheet_work_budget.retain_finding()
         ):
             cross_sheet_findings.append(finding)
+    within_row_index = state.within_row_index
+    if within_row_index is not None:
+        within_row_findings, within_row_meta = (
+            within_row_index.findings(
+                profile=profile,
+                max_findings=max(
+                    0,
+                    _RECURRING_ROW_VECTOR_MAX_FINDINGS
+                    - len(recurring_findings),
+                ),
+            )
+        )
+        candidate_omitted = within_row_meta[
+            "candidate_findings_omitted"
+        ]
+        if candidate_omitted:
+            coverage.add_limitation(
+                "scan",
+                "within_row_repeated_segment_candidate_limit",
+                limit=within_row_meta["candidate_limit"],
+                candidates_seen=within_row_meta[
+                    "candidates_seen"
+                ],
+                candidates_retained=within_row_meta[
+                    "candidates_retained"
+                ],
+                candidate_findings_omitted=candidate_omitted,
+                omitted_findings=candidate_omitted,
+            )
+            state.findings_omitted += candidate_omitted
+        output_omitted = within_row_meta[
+            "output_findings_omitted"
+        ]
+        if output_omitted:
+            coverage.add_limitation(
+                "scan",
+                "within_row_repeated_segment_finding_limit",
+                limit=within_row_meta["output_limit"],
+                output_findings_omitted=output_omitted,
+                omitted_findings=output_omitted,
+            )
+            state.findings_omitted += output_omitted
+        for finding in within_row_findings:
+            if (
+                state.cross_sheet_work_budget is None
+                or state.cross_sheet_work_budget.retain_finding()
+            ):
+                cross_sheet_findings.append(finding)
 
     work_budget = state.cross_sheet_work_budget
     if work_budget is not None:
@@ -10827,7 +11003,10 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
 
     coverage_output = coverage.to_dict()
     if any(
-        item.get("reason") == "recurring_row_vector_budget"
+        item.get("reason") in {
+            "recurring_row_vector_budget",
+            "within_row_repeated_segment_budget",
+        }
         for item in coverage_output["limitations"]
     ):
         coverage_output["truncated"] = True

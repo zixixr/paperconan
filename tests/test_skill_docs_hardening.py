@@ -389,9 +389,53 @@ def test_agent_schema_describes_generic_cross_table_signal_family() -> None:
         "cross_sheet_decimal_tail_reuse",
         "cross_sheet_column_duplicate",
         "recurring_row_vector",
+        "within_row_repeated_segment",
         "within_table_fraction_reuse",
     ]:
         assert kind in text
+
+
+def test_docs_cover_within_row_repeat_resource_contract() -> None:
+    schema_text = (REF_DIR / "output-schema.md").read_text(
+        encoding="utf-8"
+    )
+    cli_text = (ROOT / "docs" / "cli.md").read_text(
+        encoding="utf-8"
+    )
+    controls = {
+        "PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_BUDGET": (
+            "2000000",
+            "within_row_repeated_segment_budget",
+        ),
+        "PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_UNIQUE_BUDGET": (
+            "100000",
+            "within_row_repeated_segment_unique_vector_limit",
+        ),
+        "PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_CANDIDATE_BUDGET": (
+            "10000",
+            "within_row_repeated_segment_candidate_limit",
+        ),
+        "PAPERCONAN_WITHIN_ROW_REPEATED_SEGMENT_ROW_CELL_LIMIT": (
+            "20000",
+            "within_row_repeated_segment_row_cell_limit",
+        ),
+    }
+
+    for name, (default, reason) in controls.items():
+        row = re.search(
+            rf"^\| `{re.escape(name)}` \| `{default}` \| (?P<body>.+) \|$",
+            cli_text,
+            re.MULTILINE,
+        )
+        assert row is not None, f"missing documented control: {name}"
+        assert f"`{reason}`" in row.group("body")
+        assert reason in schema_text
+
+    assert "candidate_findings_omitted" in schema_text
+    assert "output_findings_omitted" in schema_text
+    assert "windows_skipped_is_lower_bound" in schema_text
+    assert "start_cols" in schema_text
+    assert "non-numeric cells" in schema_text
 
 
 def test_detector_reference_describes_exact_column_duplicate_identity() -> None:

@@ -144,6 +144,38 @@ skipped windows from inspected rows, while unread rows may contain more.
 This limitation makes scan coverage partial even when the known lower bound is
 zero.
 
+Within-row repeated-segment work exhaustion uses the same lower-bound rule:
+
+```json
+{
+  "scope": "sheet",
+  "reason": "within_row_repeated_segment_budget",
+  "file": "table.xlsx",
+  "sheet": "Data",
+  "limit": 2000000,
+  "windows_skipped": 0,
+  "windows_skipped_is_lower_bound": true
+}
+```
+
+The detector has three independent retained-state/output controls:
+
+- `within_row_repeated_segment_unique_vector_limit` is sheet-scoped and reports
+  `limit`, `max_unique_vectors_retained`, `skipped_new_windows`, and
+  `omitted_findings_lower_bound`. The unique-vector map is bounded per row;
+  already-retained vectors continue to receive later occurrences.
+- `within_row_repeated_segment_row_cell_limit` is sheet-scoped and reports
+  `limit`, `rows_limited`, `numeric_cells_skipped_lower_bound`, and
+  `omitted_findings_lower_bound`.
+- `within_row_repeated_segment_candidate_limit` and
+  `within_row_repeated_segment_finding_limit` are scan-scoped. They distinguish
+  `candidate_findings_omitted` from `output_findings_omitted`; both also carry
+  `omitted_findings` for the top-level additive count.
+
+Work, unique-vector, or row-cell limits can leave additional finding omissions
+unknown, so top-level `findings_omitted_is_lower_bound` is `true`. Candidate
+and output omissions are exact for the candidates that reached finalization.
+
 When recurring-row-vector finalization exhausts a retained-state or work
 budget, `coverage.limitations` contains this complete shape:
 
@@ -433,6 +465,7 @@ It can contain:
 - `cross_sheet_decimal_tail_reuse`
 - `cross_sheet_column_duplicate`
 - `recurring_row_vector`
+- `within_row_repeated_segment`
 - `within_table_fraction_reuse`
 
 - `same_file`: whether the two sheets live in one workbook or span two files
@@ -445,3 +478,4 @@ It can contain:
   - `column_duplicate` — a full column repeats value-for-value across two panels (`cross_sheet_column_duplicate`; carries `col_a`/`col_b`)
   - `fraction_reuse` — two matrix blocks in ONE sheet share decimal fractions while integer parts differ (`within_table_fraction_reuse`; `same_file=true`, `figure_a/b=null`)
   - `recurring_row_vector` — a fixed row tuple recurs across ≥2 figures (`recurring_row_vector`; carries `vector`, `n_occurrences`, `n_figures`)
+  - `within_row_repeat` — one high-information segment appears at non-overlapping positions within one physical row (`within_row_repeated_segment`; carries `vector`, `row`, `start_cols`, `end_cols`, bounded `occurrences`, and `n_occurrences`). The detector compares the row's numeric sequence: non-numeric cells are omitted from vector construction, while reported columns remain physical 1-based sheet coordinates.

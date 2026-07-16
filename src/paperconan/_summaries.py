@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from fractions import Fraction
 import heapq
@@ -584,3 +585,428 @@ class RecurringRowIndex:
                 "omitted_findings_lower_bound": findings_omitted,
             },
         }
+
+
+@dataclass(slots=True)
+class _WithinRowWindowRecord:
+    order: int
+    non_overlapping_count: int = 0
+    last_end: int = -1
+    starts: list[int] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class _WithinRowCandidate:
+    vector: tuple[int | float, ...]
+    file: str
+    sheet: str
+    figure_id: str | None
+    row_idx: int
+    occurrence_count: int
+    cells: frozenset[int]
+    start_cols: tuple[int, ...]
+    end_cols: tuple[int, ...]
+    order: int
+
+
+def _within_row_candidate_qualifies(
+    vector,
+    record,
+    row_frequency,
+):
+    if (
+        record.non_overlapping_count < 2
+        or len(set(vector)) < 3
+        or _vector_is_patterned(vector)
+    ):
+        return False
+    all_int = all(isinstance(value, int) for value in vector)
+    if all_int and (
+        len(vector) < 5
+        or len(set(vector)) < 4
+    ):
+        return False
+    return max(
+        row_frequency[value] for value in vector
+    ) <= 2 * record.non_overlapping_count
+
+
+def _within_row_finding(candidate):
+    vector = candidate.vector
+    occurrence_count = candidate.occurrence_count
+    matched_cells = len(vector) * occurrence_count
+    figure_id = candidate.figure_id
+    start_cols = [
+        col_idx + 1 for col_idx in candidate.start_cols
+    ]
+    end_cols = [
+        col_idx + 1 for col_idx in candidate.end_cols
+    ]
+    column_text = ", ".join(str(value) for value in start_cols)
+    return dict(
+        kind="within_row_repeated_segment",
+        file=candidate.file,
+        file_a=candidate.file,
+        file_b=candidate.file,
+        same_file=True,
+        sheet=candidate.sheet,
+        sheet_a=candidate.sheet,
+        sheet_b=candidate.sheet,
+        same_sheet=True,
+        vector=list(vector),
+        row=candidate.row_idx + 1,
+        start_cols=start_cols,
+        end_cols=end_cols,
+        occurrences=[
+            {
+                "row": candidate.row_idx + 1,
+                "start_col": start_col + 1,
+                "end_col": end_col + 1,
+            }
+            for start_col, end_col in zip(
+                candidate.start_cols,
+                candidate.end_cols,
+            )
+        ],
+        size_a=matched_cells,
+        size_b=matched_cells,
+        same_position_count=matched_cells,
+        fraction_of_smaller=1.0,
+        n_occurrences=occurrence_count,
+        figure_a=figure_id,
+        figure_b=figure_id,
+        same_figure=figure_id is not None,
+        delta={"pattern": "within_row_repeat"},
+        pattern="within_row_repeat",
+        examples=[{"value": value} for value in vector],
+        severity="high",
+        rule=(
+            f"the {len(vector)}-value segment {list(vector)} appears at "
+            f"{occurrence_count} non-overlapping positions within row "
+            f"{candidate.row_idx + 1} of {candidate.sheet}, starting at "
+            f"columns {column_text}"
+        ),
+        **(
+            {"occurrence_positions_truncated": True}
+            if occurrence_count > len(candidate.start_cols)
+            else {}
+        ),
+    )
+
+
+class WithinRowRepeatIndex:
+    def __init__(
+        self,
+        budget=2_000_000,
+        unique_budget=100_000,
+        candidate_budget=10_000,
+        row_cell_limit=20_000,
+    ):
+        self._initial_budget = max(0, int(budget))
+        self._budget = self._initial_budget
+        self._unique_budget = max(0, int(unique_budget))
+        self._candidate_budget = max(0, int(candidate_budget))
+        self._row_cell_limit = max(0, int(row_cell_limit))
+        self._candidate_heap = []
+        self._candidates_seen = 0
+        self._candidate_sequence = 0
+
+    @property
+    def initial_budget(self):
+        return self._initial_budget
+
+    @property
+    def unique_budget(self):
+        return self._unique_budget
+
+    @property
+    def candidate_budget(self):
+        return self._candidate_budget
+
+    @property
+    def row_cell_limit(self):
+        return self._row_cell_limit
+
+    def _retain_candidate(self, candidate):
+        self._candidates_seen += 1
+        if self._candidate_budget <= 0:
+            return
+        quality = (
+            candidate.occurrence_count,
+            len(candidate.vector),
+            -candidate.order,
+        )
+        item = (quality, candidate.order, candidate)
+        if len(self._candidate_heap) < self._candidate_budget:
+            heapq.heappush(self._candidate_heap, item)
+        elif quality > self._candidate_heap[0][0]:
+            heapq.heapreplace(self._candidate_heap, item)
+
+    def _scan_row(
+        self,
+        file,
+        sheet,
+        figure_id,
+        row_idx,
+        sequence,
+        *,
+        min_k,
+        max_k,
+        accepted_windows,
+    ):
+        row_frequency = Counter(
+            _canonical_vector_value(value)
+            for _col_idx, value in sequence
+        )
+        windows = {}
+        window_order = 0
+        skipped_new_windows = 0
+        run_lengths = [
+            len(sequence) - start
+            for start in range(len(sequence))
+        ]
+        for start, width in _iter_valid_window_specs(
+            run_lengths,
+            min_k,
+            max_k,
+            accepted_windows,
+        ):
+            vector = tuple(
+                _canonical_vector_value(sequence[start + offset][1])
+                for offset in range(width)
+            )
+            record = windows.get(vector)
+            if record is None:
+                if len(windows) >= self._unique_budget:
+                    skipped_new_windows += 1
+                    continue
+                record = _WithinRowWindowRecord(order=window_order)
+                window_order += 1
+                windows[vector] = record
+            if start >= record.last_end:
+                record.non_overlapping_count += 1
+                record.last_end = start + width
+                if len(record.starts) < 16:
+                    record.starts.append(start)
+
+        qualifying = []
+        for vector, record in windows.items():
+            if not _within_row_candidate_qualifies(
+                vector,
+                record,
+                row_frequency,
+            ):
+                continue
+            qualifying.append((vector, record))
+
+        qualifying.sort(
+            key=lambda item: (
+                -item[1].non_overlapping_count,
+                -len(item[0]),
+                item[1].order,
+            )
+        )
+        kept_cells = []
+        cell_index = {}
+        for vector, record in qualifying:
+            cells = frozenset(
+                sequence[start + offset][0]
+                for start in record.starts
+                for offset in range(len(vector))
+            )
+            overlaps_prior = False
+            for candidate_id in _iter_indexed_candidate_ids(
+                cells,
+                cell_index,
+            ):
+                prior_cells = kept_cells[candidate_id]
+                if (
+                    len(cells & prior_cells)
+                    >= 0.5 * min(len(cells), len(prior_cells))
+                ):
+                    overlaps_prior = True
+                    break
+            if overlaps_prior:
+                continue
+            start_cols = tuple(
+                sequence[start][0] for start in record.starts
+            )
+            end_cols = tuple(
+                sequence[start + len(vector) - 1][0]
+                for start in record.starts
+            )
+            candidate = _WithinRowCandidate(
+                vector=vector,
+                file=file,
+                sheet=sheet,
+                figure_id=figure_id,
+                row_idx=row_idx,
+                occurrence_count=record.non_overlapping_count,
+                cells=cells,
+                start_cols=start_cols,
+                end_cols=end_cols,
+                order=self._candidate_sequence,
+            )
+            self._candidate_sequence += 1
+            candidate_id = len(kept_cells)
+            kept_cells.append(cells)
+            for cell in cells:
+                cell_index.setdefault(cell, []).append(candidate_id)
+            self._retain_candidate(candidate)
+        return {
+            "skipped_new_windows": skipped_new_windows,
+            "max_unique_vectors_retained": len(windows),
+        }
+
+    def add_sheet(
+        self,
+        file,
+        sheet,
+        source,
+        *,
+        figure_id,
+        min_k=4,
+        max_k=8,
+    ) -> dict[str, int | bool]:
+        min_k = max(1, int(min_k))
+        max_k = max(min_k, int(max_k))
+        windows_examined = 0
+        windows_skipped = 0
+        windows_skipped_is_lower_bound = False
+        skipped_new_windows = 0
+        max_unique_vectors_retained = 0
+        rows_limited = 0
+        numeric_cells_skipped_lower_bound = 0
+
+        for row_idx in range(source.nrows):
+            if self._budget <= 0:
+                windows_skipped_is_lower_bound = (
+                    source.nrows > row_idx
+                    and source.ncols >= min_k
+                )
+                break
+            sequence = []
+            row_limited = False
+            for col_idx in range(source.ncols):
+                value = _numeric_value(source.cell(row_idx, col_idx))
+                if value is None:
+                    continue
+                if len(sequence) >= self._row_cell_limit:
+                    row_limited = True
+                    numeric_cells_skipped_lower_bound += 1
+                    break
+                sequence.append((col_idx, value))
+            if row_limited:
+                rows_limited += 1
+            if len(sequence) < min_k:
+                continue
+
+            run_lengths = [
+                len(sequence) - start
+                for start in range(len(sequence))
+            ]
+            valid_windows = _valid_window_count(
+                run_lengths,
+                min_k,
+                max_k,
+            )
+            accepted = min(self._budget, valid_windows)
+            windows_examined += accepted
+            windows_skipped += valid_windows - accepted
+            if accepted:
+                row_metadata = self._scan_row(
+                    file,
+                    sheet,
+                    figure_id,
+                    row_idx,
+                    sequence,
+                    min_k=min_k,
+                    max_k=max_k,
+                    accepted_windows=accepted,
+                )
+                skipped_new_windows += row_metadata[
+                    "skipped_new_windows"
+                ]
+                max_unique_vectors_retained = max(
+                    max_unique_vectors_retained,
+                    row_metadata["max_unique_vectors_retained"],
+                )
+            self._budget -= accepted
+            if accepted < valid_windows:
+                windows_skipped_is_lower_bound = True
+                break
+
+        budget_exhausted = (
+            windows_skipped > 0
+            or windows_skipped_is_lower_bound
+        )
+        return {
+            "windows_examined": windows_examined,
+            "budget_exhausted": budget_exhausted,
+            "windows_skipped": windows_skipped,
+            "windows_skipped_is_lower_bound": (
+                windows_skipped_is_lower_bound
+            ),
+            "unique_budget_exhausted": skipped_new_windows > 0,
+            "unique_limit": self._unique_budget,
+            "max_unique_vectors_retained": (
+                max_unique_vectors_retained
+            ),
+            "skipped_new_windows": skipped_new_windows,
+            "row_cell_limit_exhausted": rows_limited > 0,
+            "row_cell_limit": self._row_cell_limit,
+            "rows_limited": rows_limited,
+            "numeric_cells_skipped_lower_bound": (
+                numeric_cells_skipped_lower_bound
+            ),
+        }
+
+    def findings(
+        self,
+        profile="review",
+        max_findings=20,
+    ) -> tuple[list[dict], dict[str, Any]]:
+        candidates = [
+            candidate
+            for _quality, _order, candidate in self._candidate_heap
+        ]
+        candidates.sort(
+            key=lambda candidate: (
+                -candidate.occurrence_count,
+                -len(candidate.vector),
+                candidate.order,
+            )
+        )
+        output_limit = max(0, int(max_findings))
+        retained = len(candidates)
+        findings = [
+            _within_row_finding(candidate)
+            for candidate in candidates[:output_limit]
+        ]
+        apply_profile_to_findings(findings, profile)
+
+        candidate_findings_omitted = (
+            self._candidates_seen - retained
+        )
+        output_findings_omitted = max(
+            0,
+            retained - len(findings),
+        )
+        metadata = {
+            "candidate_findings_omitted": (
+                candidate_findings_omitted
+            ),
+            "output_findings_omitted": output_findings_omitted,
+        }
+        if candidate_findings_omitted:
+            metadata.update({
+                "candidate_limit": self._candidate_budget,
+                "candidates_seen": self._candidates_seen,
+                "candidates_retained": retained,
+            })
+        if output_findings_omitted:
+            metadata.update({
+                "output_limit": output_limit,
+                "candidates_retained": retained,
+            })
+        return findings, metadata

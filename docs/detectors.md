@@ -24,6 +24,7 @@ paperconan 跑一组数值取证检测器，把"值得人工复核的位置"找�
 | `cross_sheet_column_duplicate` | 跨 sheet / 跨文件**整列逐值重复**（含 `cross_sheet_*` 位置检测漏掉的整数 / 一位小数列） | 一张图的"No IR"基线列在另一张图里 60 个值全同 |
 | `within_table_fraction_reuse` | 同一 sheet 两个矩阵块**逐格共享小数位**、只差整数 | 两个剂量-反应矩阵 48/49 格小数位相同 |
 | `recurring_row_vector` | 一个固定高信息行向量在 **≥2 个图**之间反复出现 | `[220,188,122,166,128,166]` 在 Fig 1/Fig 4/ED 2 都出现 |
+| `within_row_repeated_segment` | 同一行内一个高信息数值片段出现在 **≥2 个互不重叠位置** | 两组列各自出现相同的 5 值片段，需核对分组、公式与数据来源 |
 | `grim_inconsistent` / `grimmer_inconsistent` | 报告的均值 / SD 对整数数据不可能 | 计数均值或 SD 与 n 不自洽 |
 | `last_digit_chi_square` | 末位数字偏离均匀分布（χ² 检验） | 整张 sheet 的末位数字集中 |
 | `repeated_two_decimal_endings` | 末两位高度集中 | 多个值集中在少数末两位组合 |

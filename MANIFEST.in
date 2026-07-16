@@ -199,6 +199,7 @@ include tests/test_skill_docs.py
 include tests/test_skill_docs_hardening.py
 include tests/test_smoke.py
 include tests/test_within_col_prefilter.py
+include tests/test_within_row_repeated_segment.py
 include tests/test_within_row_shared_fraction.py
 include tests/test_xls_reading.py
 include uv.lock
