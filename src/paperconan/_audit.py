@@ -39,6 +39,10 @@ import numpy as np
 from scipy import stats
 
 from ._coverage import ScanCoverage
+from ._formula_cache import (
+    OoxmlFormulaInspectionLimit,
+    inspect_ooxml_formula_cache,
+)
 from ._profiles import apply_profile_to_findings, normalize_profile
 from ._sheet import Sheet
 from .schema import PaperconanInputError
@@ -3588,6 +3592,12 @@ _MAX_FILE_BYTES = int(_MAX_FILE_MB * 1024 * 1024)
 # budget now bounds far less RAM. Skip a sheet whose cell count exceeds this, checked from
 # the sheet dimensions BEFORE materializing. Default 10M cells ≈ an 80MB numeric array.
 _MAX_CELLS = int(os.environ.get("PAPERCONAN_MAX_CELLS", "10000000"))
+# Inspect .xlsx/.xlsm formula caches for computed cells that carry no cached value
+# (calamine reads cached values, so those cells are silently under-read). Recorded
+# as coverage limitations, never as findings. Set PAPERCONAN_OOXML_FORMULA_INSPECT=0
+# to skip the extra per-workbook XML pass on throughput-sensitive corpora.
+_OOXML_FORMULA_INSPECT = os.environ.get(
+    "PAPERCONAN_OOXML_FORMULA_INSPECT", "1") not in ("0", "false", "False", "")
 # Wide blocks (dense correlation matrices) blow up the O(col²) relation/equal-pair detectors in
 # both compute time and output size (scan.json / report.html). Skip just those two detectors when
 # a block is wider than this; the cheap column-wise detectors still run. 0 disables the skip.
@@ -3660,6 +3670,34 @@ def _elapsed_ms(start):
     if start is None:
         return None
     return round((time.perf_counter() - start) * 1000, 3)
+
+
+def _record_formula_cache_gaps(coverage, path, accepted_sheets):
+    """Best-effort: note formula cells with no cached value as coverage limits.
+
+    Inspection failure never fails a scan — a malformed package degrades to a
+    single ``file``-scoped limitation instead of raising.
+    """
+    if not _OOXML_FORMULA_INSPECT or not accepted_sheets:
+        return
+    if not str(path).lower().endswith((".xlsx", ".xlsm")):
+        return
+    basename = os.path.basename(path)
+    try:
+        gaps = inspect_ooxml_formula_cache(path, accepted_sheets=accepted_sheets)
+    except OoxmlFormulaInspectionLimit as exc:
+        coverage.add_limitation("file", exc.reason, file=basename)
+        return
+    except Exception:
+        coverage.add_limitation("file", "formula_cache_unreadable", file=basename)
+        return
+    for sheet in sorted(gaps):
+        gap = gaps[sheet]
+        coverage.add_limitation(
+            "sheet", "formula_cache_missing",
+            file=basename, sheet=sheet,
+            count=gap["count"], cells=gap["cells"],
+        )
 
 
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
@@ -3738,6 +3776,10 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         file_stat["elapsed_ms"] = _elapsed_ms(file_start)
         scan_stats["files"].append(file_stat)
         coverage.mark_file_succeeded()
+        _record_formula_cache_gaps(
+            coverage, f,
+            {sn for sn, rows in sheets.items() if rows is not None},
+        )
         for sn, rows in sheets.items():
             sheet_start = time.perf_counter() if runtime_metadata else None
             if rows is None:        # oversized sheet (>_MAX_CELLS): recorded, never audited
