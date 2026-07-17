@@ -3650,9 +3650,20 @@ def _optional_image_error(prefix, exc):
     return {"error": f"{prefix}: {detail}"}
 
 
+def _elapsed_ms(start):
+    """Milliseconds since ``start``, or ``None`` when timing is not recorded.
+
+    ``start`` is ``None`` unless runtime metadata is requested, which keeps the
+    wall clock out of the default (byte-reproducible) scan output.
+    """
+    if start is None:
+        return None
+    return round((time.perf_counter() - start) * 1000, 3)
+
+
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
              profile="review", write_json=True, evidence=True, images=False,
-             image_diagnostics=False):
+             image_diagnostics=False, runtime_metadata=False):
     profile = normalize_profile(profile)
     # The HTML report renders the evidence snippets, so it requires them.
     if write_html:
@@ -3688,10 +3699,10 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     grid_sheets = {}  # (file, sheet) -> Sheet, for local cross-sheet label context
     scan_errors = []
     scan_stats = {"files": [], "sheets": []}
-    scan_start = time.perf_counter()
+    scan_start = time.perf_counter() if runtime_metadata else None
 
     for f in table_files:
-        file_start = time.perf_counter()
+        file_start = time.perf_counter() if runtime_metadata else None
         file_stat = {"file": os.path.basename(f), "path": f}
         # Memory guard: a large workbook expands to many GB of Python objects when fully
         # loaded, so cap file size BEFORE loading. Oversized files are recorded (never
@@ -3707,7 +3718,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             scan_errors.append({"file": os.path.basename(f), "error": msg})
             file_stat["error"] = msg
             file_stat["oversized"] = True
-            file_stat["elapsed_ms"] = round((time.perf_counter() - file_start) * 1000, 3)
+            file_stat["elapsed_ms"] = _elapsed_ms(file_start)
             scan_stats["files"].append(file_stat)
             continue
         try:
@@ -3716,21 +3727,21 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             print(f"  failed to read {os.path.basename(f)}: {e}", file=sys.stderr)
             scan_errors.append({"file": os.path.basename(f), "error": str(e)})
             file_stat["error"] = str(e)
-            file_stat["elapsed_ms"] = round((time.perf_counter() - file_start) * 1000, 3)
+            file_stat["elapsed_ms"] = _elapsed_ms(file_start)
             scan_stats["files"].append(file_stat)
             continue
         file_stat["n_sheets"] = len(sheets)
-        file_stat["elapsed_ms"] = round((time.perf_counter() - file_start) * 1000, 3)
+        file_stat["elapsed_ms"] = _elapsed_ms(file_start)
         scan_stats["files"].append(file_stat)
         for sn, rows in sheets.items():
-            sheet_start = time.perf_counter()
+            sheet_start = time.perf_counter() if runtime_metadata else None
             if rows is None:        # oversized sheet (>_MAX_CELLS): recorded, never audited
                 msg = (f"oversized sheet exceeds {_MAX_CELLS} cells "
                        f"(set PAPERCONAN_MAX_CELLS to raise) — skipped to bound memory")
                 scan_errors.append({"file": os.path.basename(f), "sheet": sn, "error": msg})
                 scan_stats["sheets"].append({
                     "file": os.path.basename(f), "sheet": sn, "oversized": True,
-                    "elapsed_ms": round((time.perf_counter() - sheet_start) * 1000, 3)})
+                    "elapsed_ms": _elapsed_ms(sheet_start)})
                 continue
             sheet = rows if isinstance(rows, Sheet) else Sheet.from_rows(rows)
             grids[(os.path.basename(f), sn)] = _grid_from_rows(sheet)
@@ -3746,7 +3757,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 "n_cols": max_cols,
                 "numeric_cells": len(sheet_nums),
                 "n_blocks": len(blocks),
-                "elapsed_ms": round((time.perf_counter() - sheet_start) * 1000, 3),
+                "elapsed_ms": _elapsed_ms(sheet_start),
             })
             for (r0, r1, c0, c1) in blocks:
                 if len(report_blocks) >= _MAX_REPORT_BLOCKS:   # output budget reached; stop collecting
@@ -3927,7 +3938,9 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
 
     out = dict(tool="paperconan",
                tool_version=_version(),
-               scanned_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+               scanned_at=(
+                   datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+                   if runtime_metadata else None),
                profile=profile,
                input_dir=in_dir,
                paper=_load_provenance(in_dir, paper),
@@ -3938,7 +3951,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                findings_omitted=findings_omitted_total,
                scan_errors=scan_errors,
                scan_stats={**scan_stats,
-                           "elapsed_ms": round((time.perf_counter() - scan_start) * 1000, 3)},
+                           "elapsed_ms": _elapsed_ms(scan_start)},
                relations_blocks=report_blocks,
                digit_distribution=digit_reports,
                decimal_endings=decimal_reports,
@@ -4099,6 +4112,12 @@ def main():
         action="store_true",
         help="also run optional non-gating deterministic image similarity helpers",
     )
+    ap.add_argument(
+        "--runtime-metadata",
+        action="store_true",
+        help="record wall-clock scan timestamp and elapsed times "
+             "(omitted by default so scan.json stays byte-reproducible)",
+    )
     ap.add_argument("--version", action="version", version=f"paperconan {_version()}")
     args = ap.parse_args()
     if args.image_diagnostics and not args.images:
@@ -4112,7 +4131,8 @@ def main():
     try:
         res = scan_dir(args.in_dir, out_dir, write_md=args.md, write_html=write_html,
                        paper=paper, profile=args.profile, images=args.images,
-                       image_diagnostics=args.image_diagnostics)
+                       image_diagnostics=args.image_diagnostics,
+                       runtime_metadata=args.runtime_metadata)
     except PaperconanInputError as e:
         sys.exit(str(e))
     except ImageDependencyError as e:
