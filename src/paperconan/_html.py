@@ -565,6 +565,9 @@ header.top { padding:18px 24px; border-bottom:1px solid var(--border); backgroun
 .stat.sev-medium strong { color:var(--medium); }
 .stat.sev-low strong { color:var(--low); }
 .warn { margin-top:10px; font-size:12px; color:var(--muted); }
+.coverage-status { margin-top:10px; font-size:12px; }
+.coverage-list { margin:6px 0 0; padding-left:18px; max-height:180px; overflow-y:auto; }
+.coverage-list li { font-size:11px; color:var(--muted); }
 .warn::before { content:"⚠ "; color:var(--medium); }
 .how-to-read { background:var(--panel-2); border:1px solid var(--border); border-left:3px solid var(--accent);
   border-radius:6px; padding:12px 16px; margin:0 0 22px; font-size:13px; line-height:1.6; color:var(--text); }
@@ -715,6 +718,55 @@ _JS = """
 """
 
 
+_STATUS_LABELS = {
+    "complete": ("ok", "全部输入均已检测 · full coverage"),
+    "partial": ("warn", "部分输入未检测(见下)· partial coverage"),
+    "failed": ("warn", "没有可检测的输入 · no input analyzed"),
+}
+_MAX_RENDERED_LIMITATIONS = 50
+
+
+def _render_scan_status(scan: dict) -> str:
+    """A bounded coverage banner: what the scan did and did not examine.
+
+    Rendered only when a scan is not fully complete, so a partial or failed run
+    is never read as a clean one. Purely descriptive of scanner reach — no
+    judgement about the data.
+    """
+    coverage = scan.get("coverage")
+    status = scan.get("scan_status")
+    if not isinstance(coverage, dict) or status not in _STATUS_LABELS:
+        return ""
+    if status == "complete":
+        return ""
+    tone, label = _STATUS_LABELS[status]
+    counts = (
+        f'{coverage.get("files_succeeded", 0)}/{coverage.get("files_discovered", 0)} files, '
+        f'{coverage.get("sheets_succeeded", 0)} sheets analyzed, '
+        f'{coverage.get("sheets_skipped", 0)} sheets skipped, '
+        f'{coverage.get("blocks_skipped", 0)} blocks truncated'
+    )
+    limitations = coverage.get("limitations") or []
+    rows = "".join(
+        f'<li>{_esc(item.get("scope"))} · {_esc(item.get("reason"))}'
+        + (f' · <code>{_esc(item.get("file"))}</code>' if item.get("file") else "")
+        + (f' · {_esc(item.get("sheet"))}' if item.get("sheet") else "")
+        + (f' · ×{_esc(item.get("count"))}' if item.get("count") else "")
+        + "</li>"
+        for item in limitations[:_MAX_RENDERED_LIMITATIONS]
+    )
+    hidden = max(0, len(limitations) - _MAX_RENDERED_LIMITATIONS)
+    omitted = int(coverage.get("limitations_omitted") or 0)
+    more = hidden + omitted
+    more_html = f'<li class="muted">… and {more:,} more</li>' if more else ""
+    detail = f'<ul class="coverage-list">{rows}{more_html}</ul>' if rows else ""
+    return (
+        f'<div class="{tone} coverage-status">'
+        f'<strong>Scan coverage: {_esc(label)}</strong> — {_esc(counts)}.'
+        f'{detail}</div>'
+    )
+
+
 def write_html_report(scan: dict, out_path: str) -> None:
     input_dir = scan.get("input_dir", "")
     input_label = os.path.basename(os.path.normpath(input_dir)) or input_dir or "audit"
@@ -799,6 +851,8 @@ def write_html_report(scan: dict, out_path: str) -> None:
             '<code>PAPERCONAN_MAX_TOTAL_FINDINGS</code> to see more.</div>'
         )
 
+    status_html = _render_scan_status(scan)
+
     ver = scan.get("tool_version", "")
     ts = scan.get("scanned_at", "")
     prov = " · ".join(p for p in [
@@ -826,6 +880,7 @@ def write_html_report(scan: dict, out_path: str) -> None:
   <div class="stats">{stats}</div>
   <div class="warn">Statistical anomalies — signal, not verdict. Take findings to PubPeer / journal editor / research integrity office, not social media.</div>
   {omitted_html}
+  {status_html}
 </header>
 <div class="layout">
   {sidebar}

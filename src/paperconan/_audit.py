@@ -38,6 +38,7 @@ import openpyxl
 import numpy as np
 from scipy import stats
 
+from ._coverage import ScanCoverage
 from ._profiles import apply_profile_to_findings, normalize_profile
 from ._sheet import Sheet
 from .schema import PaperconanInputError
@@ -3699,6 +3700,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     grid_sheets = {}  # (file, sheet) -> Sheet, for local cross-sheet label context
     scan_errors = []
     scan_stats = {"files": [], "sheets": []}
+    coverage = ScanCoverage(files_discovered=len(table_files))
     scan_start = time.perf_counter() if runtime_metadata else None
 
     for f in table_files:
@@ -3720,6 +3722,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             file_stat["oversized"] = True
             file_stat["elapsed_ms"] = _elapsed_ms(file_start)
             scan_stats["files"].append(file_stat)
+            coverage.mark_file_failed(os.path.basename(f), "file_too_large")
             continue
         try:
             sheets = load_table(f)
@@ -3729,10 +3732,12 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             file_stat["error"] = str(e)
             file_stat["elapsed_ms"] = _elapsed_ms(file_start)
             scan_stats["files"].append(file_stat)
+            coverage.mark_file_failed(os.path.basename(f), "unreadable")
             continue
         file_stat["n_sheets"] = len(sheets)
         file_stat["elapsed_ms"] = _elapsed_ms(file_start)
         scan_stats["files"].append(file_stat)
+        coverage.mark_file_succeeded()
         for sn, rows in sheets.items():
             sheet_start = time.perf_counter() if runtime_metadata else None
             if rows is None:        # oversized sheet (>_MAX_CELLS): recorded, never audited
@@ -3742,6 +3747,8 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 scan_stats["sheets"].append({
                     "file": os.path.basename(f), "sheet": sn, "oversized": True,
                     "elapsed_ms": _elapsed_ms(sheet_start)})
+                coverage.mark_sheet_skipped(
+                    os.path.basename(f), sn, "sheet_too_large")
                 continue
             sheet = rows if isinstance(rows, Sheet) else Sheet.from_rows(rows)
             grids[(os.path.basename(f), sn)] = _grid_from_rows(sheet)
@@ -3759,11 +3766,13 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 "n_blocks": len(blocks),
                 "elapsed_ms": _elapsed_ms(sheet_start),
             })
+            blocks_analyzed_here = 0
             for (r0, r1, c0, c1) in blocks:
                 if len(report_blocks) >= _MAX_REPORT_BLOCKS:   # output budget reached; stop collecting
                     break
                 if _MAX_TOTAL_FINDINGS > 0 and findings_kept_total >= _MAX_TOTAL_FINDINGS:
                     break   # global finding budget spent; stop collecting (subsequent sheets short-circuit here too)
+                blocks_analyzed_here += 1
                 header = header_for(sheet, r0, c0, c1)
                 # On very wide blocks (dense correlation matrices) the O(col²) relation and
                 # equal-pair detectors explode in compute + output, so skip just those two; the
@@ -3824,6 +3833,16 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                                               identical_after_rounding=groups["identical_after_rounding"],
                                               grim=groups["grim"],
                                               findings_omitted=omitted))
+            coverage.mark_sheet_succeeded()
+            coverage.mark_block_analyzed(blocks_analyzed_here)
+            if blocks_analyzed_here < len(blocks):
+                # An output/finding budget stopped block collection for this sheet;
+                # record the shortfall so a truncated scan is not read as complete.
+                coverage.mark_blocks_skipped(
+                    len(blocks) - blocks_analyzed_here,
+                    scope="sheet", reason="report_block_limit",
+                    file=os.path.basename(f), sheet=sn,
+                )
 
     # Down-weight dense/correlated sheets: judged by per-sheet relation totals, so a
     # wide matrix's expected identical/linear columns don't flood high-severity output.
@@ -3938,6 +3957,9 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
 
     out = dict(tool="paperconan",
                tool_version=_version(),
+               schema_version=2,
+               scan_status=coverage.status,
+               coverage=coverage.to_dict(),
                scanned_at=(
                    datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
                    if runtime_metadata else None),
