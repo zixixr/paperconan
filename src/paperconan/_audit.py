@@ -1521,6 +1521,166 @@ def detect_dispersed_repeats(sheet, r0, r1, c0, c1, header, min_n=30):
     return findings
 
 
+# Block-level "copy fingerprint" thresholds. These are validity gates, NOT
+# sample-size floors: the Poisson birthday test adapts to block size and
+# precision, so a small high-precision panel and a big table with only a few
+# copied values are both judged on the same footing (see
+# docs/superpowers/specs/2026-07-19-block-value-duplication-detector-design.md).
+BLOCK_DUP_MIN_DECIMALS = 2       # a value counts as "high precision" at >=2 decimals
+BLOCK_DUP_QUANT_DECIMALS = 6     # exact-equality quantization (absorbs xlsx float noise)
+BLOCK_DUP_MIN_HP_CELLS = 12      # need at least this many high-precision cells to judge
+BLOCK_DUP_MIN_PAIRS = 2          # a single coincidental pair (a replicate?) never fires alone
+BLOCK_DUP_ALPHA = 1e-4           # Poisson upper-tail significance (Monte-Carlo FP 0/600)
+BLOCK_DUP_SUPPORT_K = 20         # N_eff >= K*m: birthday model is only trustworthy when the
+                                 # value grid is fine enough vs cell count. Coarse, narrow-range,
+                                 # CLUSTERED data (e.g. 2-decimal tumor volumes over [0,2]) collide
+                                 # more than the uniform model predicts; reject rather than
+                                 # false-positive (mirrors detect_dispersed_repeats' support gate).
+
+
+def _poisson_sf(k, lam):
+    """P(Poisson(lam) >= k) for integer k >= 1, computed by the complement of the
+    lower CDF. Stable for the small lam / small k regime this detector uses."""
+    if k <= 0:
+        return 1.0
+    if lam <= 0:
+        return 0.0
+    cdf = 0.0
+    term = math.exp(-lam)          # P(X=0)
+    for i in range(0, k):
+        cdf += term
+        term *= lam / (i + 1)
+    return max(0.0, 1.0 - cdf)
+
+
+def detect_block_value_duplication(sheet, r0, r1, c0, c1, header,
+                                   min_hp=BLOCK_DUP_MIN_HP_CELLS,
+                                   alpha=BLOCK_DUP_ALPHA):
+    """Block-level DISTRIBUTED exact-repeat fingerprint of high-precision values.
+
+    Complements the column-scoped detectors (`detect_within_column_patterns`,
+    `detect_dispersed_repeats`): it aggregates ALL cells in the block, so it sees
+    a copy fingerprint that is spread across different rows AND columns — the
+    signal those column detectors are structurally blind to (JCI179845 Fig 2B:
+    each row's 10 "independent replicates" are 5 distinct values each repeated
+    twice; no single column repeats).
+
+    FP is controlled by a Poisson birthday-significance test, not a hard
+    sample-size floor: under independence the expected number of coincidental
+    exact-collision pairs is lam = C(m,2)/N_eff, where N_eff = value-range x
+    10^median_decimals is the count of resolvable grid points. A block fires only
+    when the observed collision-pair count is Poisson-unlikely (p < alpha). This
+    catches both a whole-panel permuted copy and a big block where only a few
+    high-precision values were pasted in, while random continuous blocks stay
+    quiet. Emits a 统计信号 / data inconsistency, never a verdict.
+    """
+    def _dec_places(v):
+        s = f"{v:.10f}".rstrip("0")
+        return len(s.split(".")[1]) if "." in s else 0
+
+    # Structural-duplicate guard: a column that is a wholesale copy of an earlier
+    # column is the territory of detect_relations' `identical_column`, not a
+    # DISTRIBUTED fingerprint — scoring its structural pairs here would double-report
+    # every copied-column panel. Drop such columns before scoring (keep the first).
+    structural_cols = set()
+    seen_sig = {}
+    for c in range(c0, c1):
+        sig = tuple(round(sheet.cell(r, c), BLOCK_DUP_QUANT_DECIMALS)
+                    if is_num(sheet.cell(r, c)) and not isinstance(sheet.cell(r, c), bool)
+                    else None
+                    for r in range(r0, r1))
+        if all(x is None for x in sig):
+            continue
+        if sig in seen_sig:
+            structural_cols.add(c)
+        else:
+            seen_sig[sig] = c
+
+    # 1) high-precision cells (drop integers / x.0 / 1-decimal: indices, ages,
+    #    counts, 1dp percentages, dose ladders, normalized-to-1.0 controls).
+    hp = []
+    for r in range(r0, r1):
+        for c in range(c0, c1):
+            if c in structural_cols:
+                continue
+            v = sheet.cell(r, c)
+            if is_num(v) and not isinstance(v, bool):
+                fv = float(v)
+                if not (math.isnan(fv) or math.isinf(fv)) and _dec_places(fv) >= BLOCK_DUP_MIN_DECIMALS:
+                    hp.append((r, c, fv))
+    m = len(hp)
+    if m < min_hp:
+        return []
+
+    vals = [v for _, _, v in hp]
+    vmin, vmax = min(vals), max(vals)
+    if vmax == vmin:
+        return []
+
+    # 2) birthday model: resolvable grid points and expected coincidental pairs.
+    dps = sorted(_dec_places(v) for v in vals)
+    med_dp = dps[len(dps) // 2]
+    n_eff = (vmax - vmin) * (10 ** med_dp)
+    if n_eff <= 0:
+        return []
+    # Validity gate: only trust the uniform birthday model when the value grid is
+    # fine enough relative to the cell count. Coarse/narrow-range/clustered blocks
+    # collide more than uniform predicts and cannot be distinguished from copying.
+    if n_eff < BLOCK_DUP_SUPPORT_K * m:
+        return []
+    lam = m * (m - 1) / 2.0 / n_eff
+
+    # 3) observed exact-duplicate groups and collision-pair count.
+    positions = defaultdict(list)
+    for r, c, v in hp:
+        positions[round(v, BLOCK_DUP_QUANT_DECIMALS)].append((r, c))
+    dup = {k: ps for k, ps in positions.items() if len(ps) >= 2}
+    if not dup:
+        return []
+    pairs = sum(len(ps) * (len(ps) - 1) // 2 for ps in dup.values())
+    if pairs < BLOCK_DUP_MIN_PAIRS:
+        return []
+
+    # 4) significance gate (adaptive; no hard sample-size floor).
+    p_value = _poisson_sf(pairs, lam)
+    if p_value >= alpha:
+        return []
+
+    dup_cells = sum(len(ps) for ps in dup.values())
+    excess = sum(len(ps) - 1 for ps in dup.values())
+    dup_fraction = dup_cells / m
+    severity = ("high" if dup_fraction >= 0.50
+                else "medium" if dup_fraction >= 0.20
+                else "low")
+
+    # 5) evidence: cells of the most-repeated values (1-based row,col).
+    ordered = sorted(dup.items(), key=lambda kv: -len(kv[1]))
+    example_cells = []
+    for _, ps in ordered[:6]:
+        for (r, c) in ps[:8]:
+            example_cells.append((r + 1, c + 1))
+    counts = Counter(round(v, 4) for v in vals)
+    return [dict(
+        kind="block_value_duplication",
+        scope="block",
+        n=m,
+        n_repeated_values=len(dup),
+        pairs=int(pairs),
+        excess_copies=int(excess),
+        lambda_=round(lam, 4),
+        p_value=p_value,
+        dup_fraction=round(dup_fraction, 3),
+        n_distinct=int(len(counts)), all_integer=False,
+        value_sample=[float(v) for v, _ in counts.most_common(8)],
+        repeated_values_sample=[[float(k), len(ps)] for k, ps in ordered[:8]],
+        example_cells=example_cells,
+        severity=severity,
+        rule=(f"block has {len(dup)} distinct high-precision values each recurring "
+              f">=2x ({pairs} exact-collision pairs vs Poisson expectation "
+              f"lambda={lam:.3g}, p={p_value:.1e}) — far above the near-zero "
+              f"birthday expectation for independent continuous measurements"))]
+
+
 def detect_identical_after_rounding(sheet, r0, r1, c0, c1, header):
     """Detect pairs/groups of cells that differ at higher precision but match at lower (e.g.
        4.2735 vs 4.2812 — both round to 4.3). Kang Tiebang ED6h/6j signal."""
@@ -3830,6 +3990,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 rr = detect_row_relations(sheet, r0, r1, c0, c1, header)
                 wc = detect_within_column_patterns(sheet, r0, r1, c0, c1, header)
                 wc = wc + detect_dispersed_repeats(sheet, r0, r1, c0, c1, header)
+                wc = wc + detect_block_value_duplication(sheet, r0, r1, c0, c1, header)
                 iar = detect_identical_after_rounding(sheet, r0, r1, c0, c1, header)
                 gg = detect_grim_grimmer(sheet, r0, r1, c0, c1, header)
                 if rel or ap or eq or rp or rr or wc or iar or gg:

@@ -5,8 +5,9 @@
 - 定位：补上「大量高精度连续值散落在本该独立的格子里精确重复」这类**分布式重复指纹**的检测缺口。与既有的
   `detect_within_column_patterns`（单列内部重复）互补，是纯**加法**改动。
 
-> ⚠️ 中立措辞红线：本 detector 产出的是**统计信号 / 数据不一致 / 待作者澄清**，不是造假结论。证据、图注、
-> Methods、作者答复与期刊/机构复核才能定性。文档、代码、变量名、报告文案一律遵守此红线。
+> ⚠️ 中立措辞红线：本 detector 产出的是**统计信号 / 数据不一致 / 待作者澄清 / data inconsistency**，
+> 不构成对任何人的指控。原始记录、图注、Methods、作者答复与期刊/机构复核才能定性。文档、代码、变量名、
+> 报告文案一律遵守此红线。
 
 ---
 
@@ -52,6 +53,35 @@ detector 建成通用 block/panel 级检测器后可一并补上该 pubpeer-loop
 
 ---
 
+## 2.5 设计原则：用显著性过滤，不用硬样本量门槛
+
+（在实现中与用户讨论后确立，同时修正 §3 的初版 `dup_fraction≥0.30` 触发闸门。）
+
+姊妹 detector `detect_dispersed_repeats` 用了一批**硬砍**：`≥30 行`、`distinct≥50`、`≥10 组`。
+这些"够不够大"的门槛会**误杀两类真信号**：①样本本来就少的测量；②只复制了其中几个数的情况。它们
+也违背本仓库原则（README「误报靠 profile/prefilter 控，不靠削弱 detector」）。
+
+要区分门槛的**性质**：
+- **样本量/量级门槛**（行数、distinct、组数）——应改为**随 n 自适应 + 交给 prefilter 降权**，不该不发。
+- **统计有效性门槛**（精确相等到底有没有意义）——保留，但做成**连续显著性**而非硬阈值。
+
+本 detector 用一个**泊松显著性**统一处理，天然自适应，无任何硬样本量 floor：
+
+- 有效格点数 `N_eff = (max−min) × 10^median_decimals`（birthday 模型的可分辨值个数）。
+- 独立假设下的偶然碰撞对数期望 `λ = C(m, 2) / N_eff`（m = 高精度值单元格数）。
+- 观测碰撞对数 `pairs = Σ C(count_v, 2)`（每个重复值贡献 C(k,2) 对）。
+- 显著性 `p = P(Poisson(λ) ≥ pairs)`；`p < α` 才触发。
+
+**实测（400–600 次 Monte-Carlo）：** α=1e-4 时随机连续块 FP = **0/600**；同时能抓到
+「2B 整块排列复制」(p≈2e-16) 和「200 格大表里只复制 2–3 个高精度值」(p≈1e-12, dup_fraction 仅 0.03–0.05——
+旧的 fraction 硬闸门会漏)。`dup_fraction` 因此**降级为 severity 输入**，不再当触发闸门。
+
+> **同技术复用到 `detect_dispersed_repeats`（推荐 fast-follow，待用户确认是否本次一起做）：** 用同一泊松核
+> 替换它的 `≥30 行 / distinct≥50 / ≥10 组` 硬砍，把"漏掉小样本/少量复制"的问题一并解决。会触及其现有
+> golden，故单列。
+
+---
+
 ## 3. block 级 detector：`detect_block_value_duplication`
 
 ### 3.1 接口与集成点
@@ -61,42 +91,64 @@ detector 建成通用 block/panel 级检测器后可一并补上该 pubpeer-loop
 `find_numeric_blocks`、不改任何 golden 覆盖的列/行关系逻辑。
 
 ```
-detect_block_value_duplication(sheet, r0, r1, c0, c1, header, min_hp=12):
-    1. 收集 block 内全部有限数值（sheet.block(...) 去 NaN）
+detect_block_value_duplication(sheet, r0, r1, c0, c1, header, min_hp=12, alpha=1e-4):
+    1. 收集 block 内全部有限数值 (r,c,v)
     2. 高精度过滤：只保留小数位 >= 2 的值（HIGH_PRECISION_MIN_DECIMALS = 2）
        —— 排除整数（索引/周龄/计数）、x.0、1 位小数（多为 1dp 百分比/剂量梯/归一化到 1.0）
-    3. 量化：key = round(v, QUANT_DECIMALS=6)，吸收 float 噪声后按值计数
-    4. dup = {key: count | count >= 2}
-       n_repeated_values = len(dup)
-       excess            = Σ(count - 1)
-       dup_fraction      = (Σ count over dup) / len(high_precision_values)
-    5. 触发闸门（AND）：
-         len(high_precision_values) >= min_hp (=12)     # 小块不判，避免偶然
-         n_repeated_values          >= 4                 # 必须是"很多值各重复"，非单值成模
-         dup_fraction               >= 0.30
-    6. severity：dup_fraction >= 0.60 -> high；>= 0.40 -> medium；否则 low
-       （2B Male: frac 0.74 -> high）
-    7. 证据：把共享同一重复值的格子成组高亮（highlight_cells 按值分组），
-       复现文章那张黄色高亮图；evidence 走既有 _block_evidence，受
-       PAPERCONAN_MAX_EVIDENCE_ROWS/_COLS 上限约束。
+       m = 高精度单元格数；m < min_hp(=12) -> 不判
+    3. birthday 模型 + 有效性闸门：
+         med_dp = 高精度值小数位中位数
+         N_eff  = (max - min) * 10^med_dp            # 可分辨值个数
+         若 N_eff < SUPPORT_K(=20) * m -> 不判        # 均匀 birthday 模型仅在网格够细时可信；
+                                                      # 粗粒度/窄域/聚集数据(如 2 位小数肿瘤体积 [0,2])
+                                                      # 的自然碰撞超过均匀预期，无法与复制区分 -> 宁可不发
+         λ      = C(m, 2) / N_eff                     # 独立假设下偶然碰撞对数期望
+    4. 量化 key = round(v, QUANT_DECIMALS=6)，按值聚位置；dup = {key: cells | count>=2}
+         pairs  = Σ C(count_v, 2)                     # 观测碰撞对数
+         n_repeated_values = len(dup);  excess = Σ(count-1)
+         dup_fraction = (Σ count over dup) / m        # 仅用于 severity
+    5. 触发（AND）：
+         pairs >= MIN_PAIRS(=2)                       # 防单个偶然对（fill-down）
+         p = PoissonSF(pairs, λ) < alpha(=1e-4)       # 自适应显著性，无硬样本量 floor
+    6. severity（由"复制了多少"决定，都要发）：
+         dup_fraction >= 0.50 -> high    (2B 整块排列复制)
+         dup_fraction >= 0.20 -> medium
+         否则                 -> low     (大表里只复制几个数：真信号但量小)
+    7. 证据：把共享同一重复值的格子成组高亮（按值分组），复现文章那张黄色高亮图；
+       走既有 _attach_evidence（highlight_rows/cols），受 PAPERCONAN_MAX_EVIDENCE_* 约束。
 ```
 
 ### 3.2 常量（集中定义，便于 profile 调参）
 
 | 常量 | 值 | 依据 |
 |---|---|---|
-| `HIGH_PRECISION_MIN_DECIMALS` | 2 | 用户选定：放宽召回；FP 由占比闸门兜住 |
+| `HIGH_PRECISION_MIN_DECIMALS` | 2 | 用户选定：放宽召回；有效性由 birthday/泊松显著性兜住，非削弱判据 |
 | `QUANT_DECIMALS` | 6 | 吸收 xlsx 浮点噪声，同引擎既有量化粒度一致 |
-| `MIN_HIGH_PRECISION_CELLS` | 12 | 小块不判 |
-| `MIN_REPEATED_VALUES` | 4 | "多个不同值各重复" 才算指纹 |
-| `MIN_DUP_FRACTION` | 0.30 | 见 §5 标定：良性 ≤0.15、2B=0.74，干净分开 |
+| `MIN_HIGH_PRECISION_CELLS` | 12 | 唯一的样本量 floor：块内至少要有一点数据可判 |
+| `MIN_PAIRS` | 2 | 单个偶然碰撞对（可能是重复测量/fill-down）不单独触发 |
+| `SUPPORT_K` | 20 | 有效性闸门 `N_eff >= K·m`：均匀 birthday 模型只在网格够细时可信；粗粒度/聚集数据挡下（与 `detect_dispersed_repeats` 一致）|
+| `SIGNIFICANCE_ALPHA` | 1e-4 | 见 §5：随机连续块 Monte-Carlo FP = 0/600 |
 
-`triage/review/forensic` profile 可分别放宽/收紧 `MIN_DUP_FRACTION` 与 `MIN_REPEATED_VALUES`
-（沿用 `_profiles.py` 现有机制）。
+`triage/review/forensic` profile 可分别放宽/收紧 `SIGNIFICANCE_ALPHA`（沿用 `_profiles.py` 机制）。
+注意：**不再有 `MIN_DUP_FRACTION` / `MIN_REPEATED_VALUES` 触发闸门**——它们会误杀"只复制几个数"的真信号
+（见 §2.5）；fraction 只进 severity。
 
 ---
 
-## 4. panel 级扩展
+## 4. panel 级扩展（block 级落地后独立分阶段；见 §4.1 实测发现）
+
+### 4.1 实测发现：panel 级有真价值，但需额外的共享轴 FP 守卫（block 级完成后处理）
+
+在 10 篇批次上原型验证 panel 级（合并行区间重叠的兄弟块再打指纹）：**多抓到 13 处 block 级漏掉的真信号**，
+最强的是 p19 `Fig. 7A and 7C`（跨 5 块、m=1217、p=1e-16，正是文章指认的同队列复制）。**但同时重新暴露了
+共享轴 FP**：p19 `Fig. 2B, 2C`/`2E`/`4E` 的 `Fa`（combination-index 的 fraction-affected 剂量轴）在子面板间
+复用属良性，panel union 会把它当重复报。
+
+结论：panel 级的 FP 控制**不能只沿用 block 级**——必须先做**跨兄弟块的"同一列=共享轴"抑制**（复用既有
+`cross_sheet_findings` 的 axis-like 判定 / `_demote_reused_progressions` 思路）。因此 panel 级独立于 block 级
+落地，待共享轴守卫设计确定后再实现。block 级已单独覆盖用户指定的 Fig 2B 目标。
+
+### 4.2 panel 定义与打分（实现时）
 
 **panel** = 一个子表（如标签行 `2B` 之下、到下一个标签行 `Age(weeks)/2C/...` 之前），可能被空列（Con|gutter|KO）
 或空行切成多个兄弟 block。
@@ -115,17 +167,25 @@ detect_block_value_duplication(sheet, r0, r1, c0, c1, header, min_hp=12):
 
 ## 5. 标定数据（阈值依据）
 
-`find_numeric_blocks` 逐块，`HIGH_PRECISION_MIN_DECIMALS=2`：
+**Monte-Carlo（随机连续块，nr∈[4,25]、nc∈[4,16]、精度 2–4 位、值域 1–600）：**
+`α=1e-4` 时 FP = **0/600**；`α=1e-3` 时 FP = 0/600。
 
-| 面板 | 性质 | n_repeated | excess | dup_fraction | 判定 |
+**召回（两类真信号，泊松显著性判定）：**
+
+| 用例 | pairs | λ | p | dup_fraction | severity |
 |---|---|---|---|---|---|
-| p20 F2 `2B Male` (r15-20) | 记事指认 | 24 | 44 | **0.739** | ✅ 触发 (high) |
-| p20 F2 `2A` (r8-13) | 良性体重 | 6 | 6 | 0.152 | ✗ (frac 闸门挡下) |
-| p20 SF4 `GTT` 各块 | 良性 | 1–3 | 1–3 | 0.04–0.12 | ✗ |
-| p19 Fig1B / Fig1E | 良性 | 0–1 | — | — | ✗ |
+| 2B 整块排列复制（5×10，每行 5 值各 2 次） | 25 | 0.39 | 2e-16 | ~0.9 | high |
+| 200 格大表里只复制 3 个高精度值 | 9 | 0.03 | 1e-16 | 0.045 | low |
+| 只复制 2 个值 | 6 | 0.03 | 2e-12 | 0.03 | low |
+| 2A 粗粒度体重（2dec、窄域） | — | — | — | — | ✗ N_eff 太小 |
 
-关键点：良性面板即使在 2 位小数下也会有几处偶然碰撞，但都是"少数值各撞一次"，`dup_fraction ≤ 0.15`；
-复制指纹是"很多值各重复且占比高"。`dup_fraction ≥ 0.30` 是主判别量，`n_repeated_values ≥ 4` 防单值成模。
+关键点：泊松显著性同时拿下"整块复制"和"只复制几个数"（后者 fraction 极低、旧硬闸门必漏），而对粗粒度良性块
+（N_eff 小、λ 大）自动不显著。唯一样本量 floor 是 `min_hp=12`；`N_eff >= 20·m` 是**有效性**闸门（非样本量）。
+
+**真实批次验证（10 篇 JCI sdval，`N_eff/m` 判别 + 支持闸门后）：** 本 detector 独立复现文章逐条指认——
+p19 `Sup Fig.4B`(high)、p20 `Fig 2B`(high, N_eff/m=45)、p23 `Fig 7D/7G/7H`(high)、p24 `Fig 1M`(medium)、
+p27 `Fig 6T`(high)；而对 p28 `Figure 1`（2 位小数肿瘤体积 [0,2]，N_eff/m≈1–4）从 27 个误报降到 0，
+p25 从 7 个 high 降到 1。p22 正确地 0（其信号是 sum≈0 / 组间偏移的 relation 类，非重复指纹）。
 
 ---
 
@@ -137,14 +197,18 @@ detect_block_value_duplication(sheet, r0, r1, c0, c1, header, min_hp=12):
 {
   "kind": "block_value_duplication",     // panel 级则 "panel_value_duplication"
   "scope": "block" | "panel",
-  "rows": "15-19", "cols": "1-20",
+  "n": 92,
   "n_repeated_values": 24,
+  "pairs": 44,
   "excess_copies": 44,
+  "lambda": 0.39,
+  "p_value": 2.2e-16,
   "dup_fraction": 0.739,
   "severity": "high",
   "repeated_values_sample": [[0.2077,5],[0.4657,5],[0.2475,5]],  // 上限 <=8 条
-  "evidence": { "highlight_cells": [...按值分组...] },
-  "summary": "block 内 24 个高精度值各出现 >=2 次（74% 单元格卷入精确重复），远超独立连续测量的偶然水平——数据不一致，请作者澄清原始记录。"
+  "example_cells": [[1,3],[1,9]],        // 1-based (row,col), <=24 条
+  "severity": "high",
+  "rule": "block 内 24 个高精度值各 >=2 次（44 个精确碰撞对，泊松期望 λ=0.39，p=2e-16）——数据不一致，请作者澄清原始记录。"
 }
 ```
 
