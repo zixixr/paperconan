@@ -142,6 +142,63 @@ def test_monte_carlo_continuous_blocks_have_near_zero_fp():
     assert fp <= 2, f"false-positive rate too high: {fp}/{trials}"
 
 
+def test_mixed_precision_minority_copies_fire():
+    # A block dominated by 2-decimal values with a MINORITY of 4-decimal copies:
+    # the grid resolution must come from the duplicated values, not the block-wide
+    # median, or the support gate would wash out the real high-precision fingerprint.
+    rng = np.random.default_rng(2)
+    rows = [[round(float(rng.uniform(1, 50)), 2) for _ in range(10)] for _ in range(8)]
+    hp4 = [round(float(rng.uniform(1, 50)), 4) for _ in range(4)]
+    for i, v in enumerate(hp4):
+        rows[i][0] = v
+        rows[(i + 3) % 8][(i + 5) % 10] = v
+    assert [f for f in _detect(rows) if f["kind"] == "block_value_duplication"]
+
+
+def test_single_dominant_value_alone_does_not_fire():
+    # A single detection-limit floor repeated across many SCATTERED cells (not a
+    # whole column, so the structural guard doesn't collapse it) is
+    # within_col_value_duplication's job, not a distributed fingerprint: only one
+    # distinct value recurs, so the >=2-distinct-value gate must reject it.
+    rng = np.random.default_rng(31)
+    rows = [[round(float(rng.uniform(1, 600)), 3) for _ in range(10)] for _ in range(20)]
+    # scatter one floor value across ~30% of cells at varied (row, col) positions
+    placed = 0
+    for i in range(200):
+        r, c = (i * 7) % 20, (i * 3) % 10
+        if placed < 60 and c != 0:      # keep it off a single column
+            rows[r][c] = 0.05
+            placed += 1
+    hits = [f for f in _detect(rows) if f["kind"] == "block_value_duplication"]
+    assert not hits, f"single dominant value should not fire, got {hits}"
+
+
+def test_poisson_sf_is_stable_and_bounded():
+    from paperconan._audit import _poisson_sf
+    # matches the naive CDF-complement for the small regime
+    def naive(k, lam):
+        cdf, term = 0.0, __import__("math").exp(-lam)
+        for i in range(k):
+            cdf += term
+            term *= lam / (i + 1)
+        return max(0.0, 1.0 - cdf)
+    assert abs(_poisson_sf(5, 0.4) - naive(5, 0.4)) < 1e-12
+    # huge k (would be a ~1e8-iteration loop) returns ~0 instantly, no hang
+    assert _poisson_sf(10 ** 8, 0.5) == 0.0
+    # large lam where exp(-lam) underflows: must NOT collapse to 1.0
+    assert 0.0 < _poisson_sf(900, 745.0) < 1e-6
+
+
+def test_pathologically_large_block_is_skipped():
+    from paperconan._audit import detect_block_value_duplication, BLOCK_DUP_MAX_CELLS
+    from paperconan._sheet import Sheet
+    # a block whose area exceeds the cap is skipped without materializing it
+    ncol = 1000
+    nrow = BLOCK_DUP_MAX_CELLS // ncol + 5
+    s = Sheet.from_rows([[0.12345] * ncol for _ in range(nrow)])
+    assert detect_block_value_duplication(s, 0, nrow, 0, ncol, [f"c{j}" for j in range(ncol)]) == []
+
+
 from paperconan._audit import _attach_evidence
 
 

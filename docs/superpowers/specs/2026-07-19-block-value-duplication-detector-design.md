@@ -159,9 +159,9 @@ detect_block_value_duplication(sheet, r0, r1, c0, c1, header, min_hp=12, alpha=1
 - **panel 级指纹**：对同一 panel 下所有 block 的数值取并集，跑 §3.1 的同一套指标与闸门。
 - **去重**：若某 block 单独已在 block 级触发，panel 级对同一批格子不重复报（按 highlight_cells 交集抑制）；
   panel 级只在"跨兄弟块才显现"的重复上额外加信号（如 age-20 Female 三元组跨 Con/KO）。
-- **小 panel 限制（明确写出，不静默）**：`n_repeated_values` 门槛仍是 4；像 age-20 那种 3 值×2 的小复用
-  （nrep=3）**不会**由本 detector 单独触发——它更贴近"整组跨空列相同"，由 `detect_relations` 的跨 gutter
-  identical-group 扩展覆盖（out of scope，§2）。本 detector 不假装覆盖它，`log`/报告里如实标注。
+- **小 panel 限制（明确写出，不静默）**：触发用 §9 的泊松显著性 + `n_repeated_values >= 2` 定义性门槛。
+  像 age-20 那种"整组三元组跨 Con/KO 相同"更贴近"整组跨空列相同"，也可由 `detect_relations` 的跨 gutter
+  identical-group 扩展覆盖（out of scope，§2）；panel 级与之如何分工，待共享轴守卫设计时一并确定。
 
 ---
 
@@ -232,3 +232,25 @@ p25 从 7 个 high 降到 1。p22 正确地 0（其信号是 sum≈0 / 组间偏
 - 不动 `find_numeric_blocks` / `min_rows`。
 - 不做跨 sheet 的重复指纹（已有 `cross_sheet_findings` 覆盖跨面板整列复制）。
 - panel 分段只读布局、不做语义解析；分段失败时**退化为纯 block 级**（不报错、不静默吞信号）。
+
+---
+
+## 9. Code-review 加固（2026-07-19，high-effort workflow review，9 条 CONFIRMED 全修）
+
+- **路由（关键）**：`block_value_duplication` 曾并入 `within_col` 组 → packet distiller 忽略该 kind、
+  within_col-flood 还会降权，signal 到不了 review。改为**独立 group `block_dups`**（加入 BLOCK_FINDING_GROUPS），
+  自动走 `_distill_block_findings` 的 HIGH 路径。已验证 2B HIGH 现在能进 review packet。
+- **`_poisson_sf` 数值稳定**：旧实现 `for i in range(pairs)` 在 pairs~1e8 时挂起，且 `exp(-lam)` 在 lam>745
+  下溢→对大 m 恒返回 1.0（静默不发）。改为小 λ 精确、大 k/大 λ 用连续性校正正态近似（O(1)、深尾正确）。
+- **med_dp 用重复值精度**（修 FN）：网格分辨率取**被重复的值**的小数位（而非全块中位数），否则"多数 2 位小数 +
+  少数高精度复制"的混合块会被 support 闸门误挡。范围仍用全块。
+- **`n_repeated_values >= 2` 定义性门槛**：分布式指纹须 ≥2 个不同值重复；单一主导值（检测限地板/fill-down）是
+  `within_col_value_duplication` 的活。非样本量硬砍。
+- **dominant/censor 值剥离**：主导值占比 >25% 先剥离（镜像 `detect_dispersed_repeats`），防边界值虚增显著性。
+- **块面积上限 `BLOCK_DUP_MAX_CELLS=500k`**：跳过基因组级大块的 O(cells) 物化（镜像 `wide` 跳过）。
+- **去重/性能**：抽出共享 `_decimal_places` / `_birthday_grid` / `_poisson_sf`（两个 detector 共用，消除
+  copy-paste 漂移）；结构列签名循环每格只读一次 `cell()`；输出字段从 `positions` 派生（去掉与 6dp 网格不一致的
+  4dp Counter 二次遍历）。
+
+全套 1161 passed；golden 无变化；批次结论不变（p19 S4B / p20 2B / p23 7D-7H / p24 1M / p27 2G·6T 仍独立复现，
+p28 粗粒度仍 0 误报）。
