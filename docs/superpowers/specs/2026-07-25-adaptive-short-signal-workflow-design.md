@@ -1,13 +1,15 @@
-# 设计：Agent 默认的分阶段选择性展开工作流
+# 设计：Agent 默认的分阶段短信号工作流（产品交付规范）
 
 - 日期：2026-07-25
-- 状态：待用户书面复核（v2）
+- 状态：待用户书面复核（v3，产品规范）
 - 范围：PaperConan 数值检测、Agent 编排、候选展开、报告链
+- 统计 companion：
+  [短信号自动优先级统计校准规范](2026-07-25-short-signal-statistical-calibration-design.md)
 
 > PaperConan 输出的是统计信号、数据不一致和待解释异常，不是对作者意图的判断。
 > 最终解释仍需原始记录、图例、Methods、作者说明以及期刊或机构复核。
 
-## 1. 背景
+## 1. 本次修订的产品决策
 
 PaperConan 当前主要采用一次性流程：
 
@@ -15,71 +17,96 @@ PaperConan 当前主要采用一次性流程：
 确定性扫描 → profile 过滤 → review packet → Agent 判定
 ```
 
-为了控制假阳性数量和 Agent 上下文压力，若干 detector 使用较严格的最小长度、
-完整覆盖或高精度门槛。这会产生两类覆盖缺口：
+为控制假阳性和 Agent 上下文压力，若干 detector 使用较高的最小样本数或完整覆盖
+门槛。这使只有 3–4 个重复、5/6 局部关系或短向量复用等真实数据不一致，可能在进入
+Agent 前消失。
 
-1. 只有 3–4 个生物学重复的短样本关系在进入 Agent 之前被跳过；
-2. 单个 finding 只达到 medium/low，但同一面板内多个弱信号组合后已值得深查。
+本设计采用“确定性宽召回 + Agent 选择性展开 + 确定性复算 + Agent 谨慎判定”：
 
-已确认需要通用覆盖的数值结构包括：
+1. 裸 CLI 继续提供一次性、无模型、确定性的扫描；
+2. PaperConan skill 默认使用固定 Agent workflow，不让 Agent 选择 detector profile；
+3. 新短信号在 Phase 2 即可以 experimental feature、review-ready evidence 进入 Agent
+   和最终报告；
+4. Agent 可以决定是否分配展开预算，但不能修改阈值、数学结果、所有权或依赖关系；
+5. detector 自动赋予 `direct_confirm` 或默认 `high`，必须另行通过统计 companion；
+6. 统计校准不阻塞工作流交付、Agent 复核或 Agent 默认入口切换；
+7. 每个 Phase 独立 PR，后续 PR 从已合并主干开始，不积累跨 Phase 大分支。
 
-- 3–4 个配对值保留相同高精度小数尾；
-- 5/6 等局部精确比例，允许一个缺失、例外或量级异常；
-- 长度 3–8 的完整短向量重复，并让共享 core 连续覆盖 3–11，避免新的长度空档；
-- 多个布局互异的实体行中反复出现非基线高精度组内碰撞；
-- 上述模式的行列转置、跨 block 和跨 sheet 版本。
+这将核心价值从统计研究工程中解耦：短样本信号先变得可见、可展开、可判定；自动
+优先级再按 calibration slot 逐个验证和启用。
 
-同时必须避免把累计堆叠边界、固定分母计数频率、归一化锚点、检测限、
-低基数量化网格和有证明的技术重复直接升级为高优先级。
+## 2. 目标、边界和权威来源
 
-## 2. 设计目标
+### 2.1 目标
 
-1. PaperConan 与 Agent 搭配时，默认使用分阶段选择性展开流程。
-2. 裸 CLI 保留一次性、无模型的确定性扫描。
-3. Agent workflow 是独立工作流入口，不是第四个 profile；Agent 不选择 profile。
-4. DISCOVER 扩大召回，但只向 Agent 提供压缩候选簇。
-5. Agent 在 ROUTE 只决定注册预算与暂缓处置，在 ADJUDICATE 形成谨慎解释；
-   两个阶段都不决定数学计算结果。
-6. 深查由注册的确定性 recipe 执行，可缓存、可重放、有预算上限。
-7. 三个 canonical abstraction 的数学内核同时服务 seed、confirm 和旧 detector
-   兼容适配层，避免新旧实现漂移。
-8. 最终只向用户交付 Agent 判定后的统一报告。
-9. 所有真实论文数据、DOI 和判定继续保持本地且不进入 git。
-10. shared-axis、固定分母、归一化锚点和公式来源等相关结构不得被重复计算为
-    多份独立支持。
+- 连续覆盖 span 3–11 的短信号，不在 3–4、5–8 或 9–11 形成新空档；
+- 覆盖行、列、转置、跨 block 和在语义允许时的跨 sheet 布局；
+- 把完整向量恒等、局部/近似关系和剩余组内碰撞分配给唯一 canonical owner；
+- 把共享轴、固定分母、归一化锚点、累计边界、检测限、技术重复和公式来源纳入
+  确定性上下文；
+- 防止相关弱 seed 被当成多份独立支持；
+- 让固定输入和固定 Agent 请求可重放，报告证据可追溯；
+- 保持既有裸 CLI、public finding kind 和 `scan.json` 消费者兼容。
 
-## 3. 非目标
+### 2.2 非目标
 
-- PaperConan 不管理模型密钥、模型 SDK 或模型提供商。
-- 不让 Agent 动态编写 detector、修改阈值或执行任意代码。
-- 不尝试仅凭数值模式判断作者意图。
-- 不把只有两个支持点的关系自动升级为 high。
-- 不在本次设计中解决只有图片而没有可读源数据的图表数字化。
-- 不将真实论文工作簿或具体数值写入测试 fixture。
-- 不在一个版本内删除既有 public finding kind 或破坏裸 CLI 的 scan.json 消费者。
-- 不把 workflow 已覆盖等同于旧 detector 的硬门槛迁移已经完成。
+- 不让 PaperConan 管理模型密钥、模型 SDK 或模型提供商；
+- 不让 Agent 动态编写 detector、传入阈值或执行任意代码；
+- 不仅凭数值模式判断作者意图；
+- 不把只有两个支持点的关系自动升级；
+- 不在本设计中完成只有图片而无可读源数据的数字化；
+- 不将真实论文数据、DOI、判定或大规模校准明细提交到 git；
+- 不在一个 PR 中同时改 workflow、legacy activation floor 和统计启用状态；
+- 不规定统计 null、概率阈值和 Monte Carlo 实现；这些属于 companion。
 
-## 4. 两种产品入口
+### 2.3 三份规范的权威边界
 
-### 4.1 裸 CLI
+| 决策 | 权威来源 |
+|---|---|
+| Agent 产品入口、状态机、artifact、3–11 canonical owner、上下文和报告 | 本产品规范 |
+| legacy detector 的 activation floor 是否降低 | 独立、被 git 跟踪的 hard-threshold audit/PR；本规范不授权降低 |
+| 某 calibration slot 能否产生 detector 默认 high | 统计 companion |
+
+三种状态必须分别记录，不得互相推导：
+
+```text
+workflow_covered
+core_adapter_migrated
+hard_floor_resolved
+```
+
+例如，workflow 已能发现 span 5 的关系，不表示裸 CLI 的旧 floor 已改变；旧 detector
+已迁移到共享 core，也不表示该 floor 已完成统计复核。
+
+当前本地草案 `2026-07-19-detector-hard-threshold-audit.md` 若要作为实施依据，必须
+先被单独复核、纳入版本控制并增加对本规范的交叉引用。其中“降低
+`_ROW_REL_MIN_COLS`”只决定 legacy activation；与局部 pair relation 重叠的 matcher
+需求由本规范的共享 core 实现，不再新增第二套检测器。两份规范意见冲突时，按上表
+的权威边界处理。
+
+## 3. 两种产品入口
+
+### 3.1 裸 CLI
 
 ```bash
 paperconan data/
 ```
 
-行为保持一次性：
+裸 CLI：
 
-- 不调用模型；
-- `review`、`triage`、`forensic` 仍是人类可选的显示 profile；
-- 产出 `scan.json` 和确定性证据浏览器；
-- 报告明确提示仍需人工或 Agent 复核。
+- 不调用 Agent；
+- 一次性扫描并写出 `scan.json` 和报告；
+- `review`、`triage`、`forensic` 仍是人类显式选择的显示/过滤 profile；
+- 普通默认 `scan.json` 的 finding 集合不包含 workflow-only experimental candidates；
+- 已稳定发布且通过 calibration 的新 detector 行为须另按版本启用；
+- 报告明确提示所有 finding 仍需人工或 Agent 复核。
 
-### 4.2 Agent 工作流
+### 3.2 Agent 工作流
 
-用户通过 PaperConan skill 请求论文检查时，默认进入固定的选择性展开流程。
-Agent 不向用户询问 profile，也不得将裸 CLI 的原始报告直接作为最终结论。
+通过 PaperConan skill 检查论文时，默认进入固定 workflow。Workflow 是产品入口，
+不是第四个 profile；Agent 不向用户询问应选哪个 profile。
 
-PaperConan 提供确定性工作流命令，skill 负责模型调用和编排：
+建议命令面：
 
 ```bash
 paperconan workflow start data/ --out audit/agent/
@@ -95,11 +122,9 @@ paperconan report audit/agent/scan.json \
   --out audit/agent/adjudicated.html
 ```
 
-`workflow` 子命令不调用模型。
+这些命令只执行确定性工作；模型调用由 skill 编排。
 
-## 5. 固定状态机
-
-Agent 工作流只有一条状态机：
+## 4. 固定状态机和职责
 
 ```text
 DISCOVER
@@ -113,1358 +138,809 @@ ADJUDICATE
 COMPLETE
 ```
 
-### 5.1 状态职责
-
 | 状态 | PaperConan | Agent |
 |---|---|---|
-| `DISCOVER` | 宽召回、候选聚类、压缩 packet | 不作最终判断 |
-| `ROUTE` | 校验请求 schema、recipe 和预算 | 选择展开、结构解释、补充上下文或暂缓 |
-| `EXPAND` | 执行本轮已注册的确定性深查 recipe | 阅读结果；工具完成后回到 ROUTE 或进入 ADJUDICATE |
-| `ADJUDICATE` | 提供原始信号、展开结果、阴性检查和 coverage | 形成谨慎判定 |
-| `COMPLETE` | verdict 已验证且统一报告已原子生成 | 向用户交付结果 |
+| `DISCOVER` | 宽召回、上下文预标记、聚类、压缩 packet | 不作最终判断 |
+| `ROUTE` | 校验请求、recipe、状态和预算 | 决定展开、补上下文、暂缓或进入判定 |
+| `EXPAND` | 执行注册的确定性 recipe | 阅读结果，不修改计算 |
+| `ADJUDICATE` | 提供原始信号、展开结果、阴性检查和 coverage | 形成谨慎 verdict |
+| `COMPLETE` | 验证 verdict 并原子生成统一报告 | 向用户交付 |
 
-### 5.2 Agent 不选择 profile
+### 4.1 Agent 的权限边界
 
-- `DISCOVER` 固定保留 raw signals；
-- `EXPAND` 固定运行候选对应的 confirm 逻辑；
-- `ADJUDICATE` 固定应用 review 上下文；
-- `review`、`triage`、`forensic` 只属于裸 CLI 和报告展示。
+Agent 只允许：
 
-每次工作流操作写出：
+- 在工具给出的 `allowed_recipes` 中分配展开预算；
+- 请求注册的文字、图片或公式来源上下文；
+- 将候选暂缓，或在上下文支持下说明可能的良性数据结构；
+- 在 ADJUDICATE 给出独立于 detector severity 的复核优先级和解释。
 
-```json
-{
-  "workflow_stage": "ROUTE",
-  "next_action": "write_routing_request",
-  "next_artifact_path": "steps/t000/routing_request.json",
-  "allowed_decisions": ["expand", "explained", "needs_context", "defer"],
-  "allowed_recipes": ["partial_pair_relation", "shared_fraction_check"],
-  "route_step": 0,
-  "max_route_steps": 5,
-  "expansion_round": 0,
-  "max_expansion_rounds": 2,
-  "budget_remaining": {
-    "clusters": 8,
-    "evidence_cells": 2000,
-    "context_requests": 4,
-    "context_asset_bytes": 50000000,
-    "render_pixels": 100000000
-  },
-  "allowed_context_requests": ["load_figure_context", "render_image_context"]
-}
-```
+Agent 不允许：
 
-CLI 拒绝非法状态转换、未注册 recipe、超预算请求和第三轮展开。
+- 自定义 matcher、统计量、阈值、容差或 recipe；
+- 新增、删除或改写 dependency key；
+- 修改 finding 的数值参数、support mask 或 canonical owner；
+- 把未校准候选改写成 detector `direct_confirm` 或默认 `high`；
+- 通过拆分请求、重复 cluster 或传入与状态不一致的轮次绕过预算。
 
-`workflow route` 接收一整个 route step 的 envelope，而不是一次只处理一个 cluster：
+Agent verdict 可以把确定性证据评为“强待解释异常”，但这是审阅结论，不会回写
+detector 的 `severity` 或 registry 状态。
 
-```json
-{
-  "schema_version": 1,
-  "workflow_id": "wf:synthetic:01",
-  "parent_packet_sha256": "sha256:...",
-  "route_step": 0,
-  "expansion_round": 0,
-  "decisions": [
-    {
-      "cluster_id": "sheet:synthetic:ratio:1",
-      "decision": "expand",
-      "recipes": ["partial_pair_relation"],
-      "context_requests": [],
-      "context_refs": [],
-      "reason": "5/6 aligned values support a precise non-unit ratio"
-    }
-  ],
-  "proceed_to_adjudicate": false
-}
-```
+### 4.2 路由协议
 
-语义固定为：
-
-- 当前 packet 中每个 actionable cluster 必须恰好出现一次，cluster ID 不得重复；
-- 每次合法 `workflow route` 都令 `route_step += 1`，无论是否执行 numeric expansion；
-- 同一 envelope 中多个 `expand` 合并为一个 expansion round；零个 `expand` 不增加轮次；
-- `needs_context` 必须列出注册的 context request，只消耗 context 预算；
-- `explained` 和 `defer` 只记录路由处置，不改变 finding；
-- 空 `decisions[]` 只在没有 actionable cluster 且 `proceed_to_adjudicate=true` 时合法；
-- 仍有展开或上下文动作时，工具执行后回到 ROUTE 并生成新的 packet；
-- `proceed_to_adjudicate=true` 时不得同时请求 expand/context，且不能遗留未处置候选；
-- 本 step 没有 expand/context 时必须 `proceed_to_adjudicate=true`，false 请求非法；
-- 合法显式结束、所有可用预算耗尽或达到 step 上限时进入 ADJUDICATE；
-- 达到 `max_route_steps` 时记录未完成 coverage 并进入 ADJUDICATE，不得无限请求 context；
-- `workflow finalize` 只接受 ADJUDICATE，验证 verdict 和全部 lineage，原子写出报告并
-  将状态置为 COMPLETE；COMPLETE 状态下只允许同 digest 的幂等 finalize，其他请求拒绝；
-  单独运行 `paperconan report` 只渲染，不修改 workflow state。
-
-JSON Schema 必须用 `if/then/not` 明确编码：任一 decision 含 `expand` 或
-`needs_context` 时 `proceed_to_adjudicate` 必须为 false；不存在这两类动作时必须为
-true。不能只依赖运行时约定。
-
-## 6. 选择性展开数据流
+每个 packet 必须明确：
 
 ```text
-宽召回 raw event / seed
-  → raw core match + provisional raw owner（审计）
-  → 确定性 context evaluation
-  → explained-cell removal
-  → residual core 重算 + final residual owner
-  → residual exact-vector cells 从 collision ledger 扣除
-  → residual source-event 去重
-  → dependency graph / union
-  → 候选簇聚合
-  → 紧凑 candidate packet
-  → Agent 路由
-  → 定向 confirm recipe / 上下文请求
-  → 确定性 expanded findings
-  → Agent 最终判定
-  → adjudicated report
+workflow_stage
+next_action
+next_artifact_path
+allowed_decisions
+allowed_recipes
+route_step / max_route_steps
+expansion_round / max_expansion_rounds
+budget_remaining
+coverage
 ```
 
-### 6.1 Seed 层
+每个 actionable cluster 在一次 route envelope 中恰好出现一次。Decision 只有：
 
-Seed 层门槛较宽，只产生紧凑候选：
+- `expand`：至少一个注册 recipe；
+- `needs_context`：至少一个注册 context request；
+- `explained`：必须引用已加载上下文，仅记录路由处置；
+- `defer`：不执行动作，留给 ADJUDICATE。
 
-- 不嵌入完整证据表；
-- 不把 seed strength 当成最终 severity；
-- 保存支持点、覆盖率、参数、残差、物理位置和可疑上下文；
-- medium/low 可以与其他 dependency components 聚合后触发展开。
+若还有展开或上下文动作，工具完成后回到 ROUTE；无动作时必须显式进入 ADJUDICATE。
+达到轮次或预算上限时也进入 ADJUDICATE，并记录未覆盖部分，不能循环等待。
 
-示例结构：
+最小转换契约：
 
-```json
-{
-  "seed_id": "sheet:synthetic:ratio:1",
-  "kind": "partial_ratio_seed",
-  "sheet": "Synthetic panel",
-  "support": 5,
-  "total": 6,
-  "ratio": 0.73184261,
-  "max_residual": 2e-8,
-  "seed_tier": "direct_confirm",
-  "direct_confirm_reason": "partial_ratio_support_and_information_gate_v1",
-  "routing_rule_version": 1,
-  "calibration_id": "calibration:short-pair:v1",
-  "candidate_strength": 0.94,
-  "cells": ["F3:F8", "H3:H8"],
-  "evidence_unit_id": "f.xlsx:S:panel-1:entity-3:group-a",
-  "dependency_key_version": 1,
-  "dependency_keys": [
-    "axis:4c9d...",
-    "normalization_anchor:none",
-    "formula_source:none"
-  ],
-  "source_finding_refs": ["legacy:constant_ratio_row:17"]
-}
-```
+- 同一 envelope 不能同时请求 expand/context 和进入 ADJUDICATE；
+- context-only step 增加 `route_step`，不增加 `expansion_round`；
+- 同一 envelope 的多个 numeric recipes 合并为一轮 expansion；
+- `explained` 只是带 context ref 的路由记录，仍必须进入最终 ADJUDICATE；
+- `finalize` 只接受 ADJUDICATE；相同 input digest 可幂等重放，不同 digest 必须拒绝；
+- 达到上限时未处理 cluster 以 coverage limitation 进入 verdict/report。
 
-`seed_tier` 由版本化注册规则确定，只能是 `direct_confirm`、`medium` 或 `low`；
-`direct_confirm` 还必须带注册的 `direct_confirm_reason`。Agent 不得重分类。
-`candidate_strength` 只是在同一 tier 内的确定性排序分数，
-不是概率、p 值或最终 severity。
+## 5. 最小 artifact 契约
 
-### 6.2 候选聚合
-
-送入 Agent 前必须：
-
-- 按论文、figure、sheet、panel 和物理单元格聚类；
-- 合并重叠 numeric block；
-- 合并同一数值结构的多个 detector；
-- 标记 shared-axis、累计、固定分母、基线、边界、公式来源和量化上下文；
-- 采用 finding family 多样性配额，防止一种噪声占满 top-K；
-- 保存未进入 packet 的候选数量和原因。
-
-#### 6.2.1 Evidence unit
-
-规范中的“独立”默认只表示布局上互不重叠，不表示已经证明生物学独立。
-确定性的布局证据单元定义为：
+工作流使用以下逻辑产物：
 
 ```text
-distinct_evidence_unit =
-  (file, sheet, panel_id, orientation, entity_span_or_id, replicate_group_id)
+scan.json
+candidate_packet.json
+routing_request.json
+expanded_findings.json
+verdict.json
+adjudicated.html / adjudicated.md
 ```
 
-只有图例、Methods 或明确表头支持时，Agent 才可另外记录
-`semantic_independence` 或 `biological_independence`。PaperConan 不自行推断；
-这些语义字段只供 ADJUDICATE 参考，不改变确定性路由计数或数学结果。
+每个 JSON artifact 至少包含：
 
-这些 ID 来自版本化的 deterministic layout segmentation：
-
-- `panel_id` 优先使用显式 block/sub-block 和表头层级；无可用标签时使用最小
-  canonical block footprint 的稳定 hash；
-- `orientation` 明确为 `row` 或 `column`；
-- `entity_span_or_id` 使用绝对物理行/列 span，不使用可随排序变化的局部序号；
-- `replicate_group_id` 使用有序 replicate span、missing mask 和表头路径；无法识别时
-  写为该 scope 专属的 `unknown:<hash>`，不得把所有 unknown 合并为一组；
-- 分组存在多个同样合理的解释时写 `grouping_unknown=true`，只可出 seed，不得自动 high。
-
-#### 6.2.2 依赖合并
-
-Context evaluator 先标记并剔除 explained cells，再对 residual events 建图。以下任一
-关系成立的 seeds 必须经 union-find 合并为同一 dependency component：
-
-- 共享同一个 residual `source_event_id`；仅处于重叠 block 不算；
-- 同一或等价 X 轴/坐标序列本身仍属于两个 finding 的 residual evidence；
-- 有可追踪证据表明来自同一固定分母或同一个 count/n 来源；
-- 公式或导出结构证明来自同一归一化锚点，而不只是同处一个 normalized panel；
-- 公式直接或间接引用同一上游单元格；
-- 同一数值关系被多个 detector 或多个重叠窗口重复表达。
-
-Union 的传递闭包用于保守计票，但必须保存每条 edge 的 typed reason，避免把“同一
-sheet/panel”当作依赖。强 shared-axis、固定分母、边界、锚点或公式解释的单元格写入
-`explained_cells`，从聚合和 p 值证据中剔除；raw seed 仍保留。
-
-`evidence_unit_id`、`dependency_keys` 和 `dependency_key_version` 必须由 PaperConan
-按注册规则生成；Agent 只能读取，不能新增、删除或改写依赖边。依赖规则版本进入
-candidate packet、缓存键和 replay 输入。
-
-#### 6.2.3 确定性展开下限
-
-所有弱信号门槛按不同 dependency component 计票；evidence unit 只描述 component
-内部的布局支持度。每个 component 按 canonical ownership 得到一个
-`primary_family`，同时保留审计用 `component_family_set`；supporting family 不参与
-family diversity 投票。
-
-单个 `direct_confirm` component 可以单独申请展开。仅依靠 medium/low 时，必须满足：
-
-- 至少两个不同 component 的 `primary_family` 不同，且至少一个为 medium；或
-- 同一 `primary_family` 至少三个不同 component，且 residual evidence 覆盖至少
-  三个不同 evidence units；或
-- 全部为 low 时，至少三个不同 component 且覆盖至少两个 `primary_family`。
-
-同一 dependency component 内无论有多少 detector、family 或 evidence unit 命中，
-对路由都最多贡献一票。输出同时包含 `n_distinct_evidence_units`、
-`n_distinct_dependency_components`、`primary_family` 和 `component_family_set`。
-这些是保守的初始路由下限；shadow/null 校准只能统一调整注册配置，Agent 不能调整。
-
-### 6.3 Agent 路由
-
-`routing_request.json` 中的每个 decision 只允许：
-
-```json
-{
-  "cluster_id": "sheet:synthetic:ratio:1",
-  "decision": "expand",
-  "recipes": [
-    "partial_pair_relation",
-    "transpose_check"
-  ],
-  "context_requests": ["load_figure_context"],
-  "context_refs": [],
-  "reason": "5/6 aligned values support a precise non-unit ratio"
-}
+```text
+schema_version
+run_id
+artifact_id
+parent_refs
+config_digest
+source_finding_refs
+coverage
+created_by_stage
 ```
 
-允许的 decision：
+约束：
 
-- `expand`
-- `explained`
-- `needs_context`
-- `defer`
+1. 原始证据不可被上下文或 Agent verdict 覆盖；
+2. 展开结果必须引用来源 finding、recipe 版本和输入 digest；
+3. Agent request/verdict 是可审计输入，不参与 detector 数学；
+4. 上下文资产至少记录来源、定位和 SHA-256 引用；
+5. 具体目录布局、是否物理拆分 raw/residual、缓存实现留给实施计划；
+6. schema 不兼容时必须显式拒绝，不得静默猜测字段；
+7. 固定 source、配置、request 和 verdict 时，工具产物与报告必须可重放。
 
-这些 decision 只控制预算和下一状态。`explained` 是待 ADJUDICATE 复核的路由记录，
-必须附上下文引用；它不能改写 raw/review severity、dependency、数值参数或 finding。
-PaperConan 只接受达到注册路由下限的 `expand` 请求。Agent 不能通过拆分 envelope、
-重复 cluster 或修改轮次来绕过预算。
+Agent 自由文本本身不要求两次采样完全一致。端到端确定性测试使用固定或 mock 的
+`routing_request.json` 和 `verdict.json`。
 
-`explained.context_refs[]` 必须唯一指向 context artifact digest、已注册 context finding
-或图例/Methods 片段 ID，并通过当前 context asset manifest 校验。Context requests、
-加载字节和渲染像素分别受预算约束；超预算与未知引用均拒绝。
+## 6. 产品数据流
 
-`context_refs[]` item 固定为：
-
-```json
-{
-  "context_artifact_id": "context:t001:0",
-  "asset_id": "asset:figure:0",
-  "region_id": "page-1:region-2",
-  "digest": "sha256:..."
-}
+```text
+deterministic enumeration
+  → raw event / raw match
+  → provisional canonical owner
+  → deterministic context evaluation
+  → explained event 标记
+  → residual evidence 重算
+  → final canonical owner
+  → source-event 去重与 dependency components
+  → compact candidate packet
+  → Agent ROUTE
+  → deterministic expansion
+  → Agent ADJUDICATE
+  → unified report
 ```
 
-Decision schema 使用条件约束：
+规范只要求每一步可追溯、顺序无关且确定；不强制某一种图算法或物理存储模型。
 
-| decision | recipes | context_requests | context_refs |
-|---|---|---|---|
-| `expand` | 至少 1 个 | 可选 | 可选既有引用 |
-| `needs_context` | 空 | 至少 1 个 | 可选既有引用 |
-| `explained` | 空 | 空 | 至少 1 个 |
-| `defer` | 空 | 空 | 空 |
+Workflow 的逻辑 raw stream 必须在 legacy `_cap_block_findings` 和
+`apply_profile_to_findings` 之前冻结，并记录 `workflow_policy_version`。它不等价于
+暗中选择 `review`、`triage` 或 `forensic`：
 
-默认 context budget 的单位是：注册动作数 `context_requests=4`、实际加载资产 bytes
-`context_asset_bytes=50,000,000`、实际渲染像素 `render_pixels=100,000,000`。
-任一维度耗尽后，state 清空相应 allowed action 并记录 coverage；仍可用的 numeric
-action 不受影响，全部动作耗尽或达到 step 上限时进入 ADJUDICATE。
+- profile 对 severity/profile_action 的原地修改不能回流到 workflow raw evidence；
+- CLI per-block/global cap 只能影响 CLI 展示，不能让 workflow candidate 无记录消失；
+- 为满足内存上限，raw stream 可用 streaming index、去重摘要或受控 spill，而不要求
+  全部 materialize；
+- 若安全上限确实阻止完整 enumeration，必须记录 omitted count、scope 和
+  `coverage_complete=false`，不能静默截断；
+- packet top-K 发生在 raw ledger/digest 之后，只限制 Agent 上下文，不改变 eligible
+  universe。
 
-首批注册 recipe：
+### 6.1 Seed 与候选阶段
 
-- `partial_pair_relation`
-- `shared_fraction_check`
-- `repeated_vector_check`
-- `group_collision_aggregation`
-- `transpose_check`
-- `merge_sibling_blocks`
-- `shared_axis_check`
-- `cumulative_boundary_check`
-- `fixed_denominator_check`
-- `formula_provenance_check`
+新短信号使用以下产品状态：
 
-上下文请求与数值 recipe 分开注册：
+```text
+evidence_stage = discovered | expanded | review_ready
+feature_status = experimental | stable
+routing_tier = standalone_review | medium | low | direct_confirm
+registry_status = missing | disabled | enabled | revoked
+```
 
-- `load_figure_context`
-- `render_image_context`
+- `discovered` 表示 raw matcher/event 已记录；
+- `expanded` 表示至少一个注册 numeric/context recipe 已完成；
+- `review_ready` 表示进入 ADJUDICATE 的 packet 已冻结；预算耗尽时仍可进入，但必须
+  带 coverage limitation；
+- `feature_status=experimental` 表示该 detector feature 尚未作为稳定默认行为发布；
+- UI 的 `review_candidate` 是 `evidence_stage=review_ready` 的展示标签，不是校准状态。
 
-上下文请求只负责确定性地定位、加载或渲染图例、Methods 和图片区域；
-图片与文字的解释仍由 Agent 完成，不写入 detector 的数学结论。
+`candidate_strength` 只用于同一 mode 内确定性排序，不是概率、p 值或最终 severity。
+`standalone_review` 表示已通过版本化结构门、可以单独分配一次展开预算，但不表示
+概率或 high；未校准新短信号可以使用它。只有 enabled calibration entry 可以产生
+`direct_confirm`。Evidence stage、feature status、routing tier 和 registry status
+相互正交；同一个 review-ready evidence 可以同时具有任何 registry status。
 
-Agent 不能传入自定义代码、阈值或未注册的上下文动作。
+有限 packet 的合并不能全局比较 `candidate_strength`。确定性规则是：
 
-## 7. Canonical abstraction 与既有 detector 的迁移契约
+1. 先按 routing tier 分层；
+2. 在每层按 primary family/mode 做 round-robin；
+3. 每个含 `direct_confirm` 或 `standalone_review` 的非空 primary family 先保留一个；
+4. `candidate_strength` 只在同一 family/mode partition 内排序；
+5. packet capacity 必须不小于已注册 primary family 数，否则配置拒绝；
+6. 每个 partition 的 omitted count 和最高 omitted tier 写入 coverage。
 
-三个名字是 workflow 中的 canonical abstraction，不是三套与旧 detector 平行运行的
-新扫描器。唯一数学内核为：
+这样噪声较多的 family 不能仅因候选数量或不可比的 strength 挤掉另一类单个短信号。
+
+### 6.2 Evidence unit 与 dependency component
+
+布局 evidence unit 至少由以下字段稳定定义：
+
+```text
+(file, sheet, panel, orientation, entity span, replicate-group span)
+```
+
+“不同 evidence unit”只表示物理布局不同，不自动等于生物学独立。语义独立性只有在
+图例、Methods 或明确表头支持时，才由 Agent 在 verdict 中说明，不改变数学计票。
+
+以下任一关系成立的 seeds 必须合并到同一个 dependency component：
+
+- 共享 residual `source_event_id`；
+- 同一或等价坐标/X 轴本身参与两个 finding；
+- 有证据来自同一固定分母或同一 count/n；
+- 来自同一归一化锚点或同一公式上游；
+- 同一物理数值关系被多个 detector、方向或重叠窗口重复表达。
+
+“同一 sheet/panel”本身不构成 dependency edge。每条 edge 保存 typed reason。
+`dependency_component_id` 和规则版本由工具生成；Agent 只读。
+
+### 6.3 弱 seed 聚合下限
+
+同一 dependency component 无论有多少 detector 或 supporting kind，最多贡献一票。
+单个 `standalone_review` 或已校准的 `direct_confirm` component 可以申请展开。
+仅依靠 medium/low seed 申请展开必须满足：
+
+- 至少两个 component，且 primary family 不同、至少一个为 medium；或
+- 同一 primary family 至少三个 component，覆盖至少三个 evidence units；或
+- 全部为 low 时，至少三个 component且覆盖至少两个 primary families。
+
+共享轴、固定分母、锚点、公式来源或同一关系形成的相关 seeds 不能相互凑足门槛。
+Packet 同时输出 component 数、evidence-unit 数、primary family 和 supporting families。
+这些是版本化、确定性的保守下限；Agent 不得放宽。
+
+Phase 2 至少用 physical footprint、source-event 和重叠 relation 建立保守的
+`provisional_dependency_component`，保证同一物理证据最多展开一次。Phase 3 再加入
+共享轴、分母、锚点和公式来源等语义 edge，并重新生成 final component。§6.3 只约束
+多个弱 seed 聚合；它不阻止单个 `standalone_review` 在全局预算内执行一次有上限的
+confirm/context recipe。
+
+在相关 family 的 final semantic dependency rules 尚未启用时，所有 medium/low seed
+必须设置 `aggregation_eligible=false`：provisional component 只能去重，不能证明
+多个弱 seed 相互独立，也不能触发上述聚合门。此时只有单个 `standalone_review`
+可以执行 bounded expansion；final dependency 完成后才可打开 medium/low 聚合。
+
+## 7. 三个 canonical signal
+
+三个 abstraction 是 workflow 的 canonical owner，不是和旧 detector 平行运行的三套
+扫描器。共享 core 支持任意 span，short ownership 只覆盖 3–11：
 
 ```text
 iter_numeric_vectors()
 match_pair_relation()
-vector_information()
 collect_exact_collision_events()
-collision_stats()
+evaluate_context()
 finding_footprint()
-shared_axis_context()
-cumulative_boundary_context()
 ```
 
-共享数学函数本身支持 legacy 入口需要的任意 span；“3–11”只限定本设计新增的
-short canonical eligibility。扫描对行向和列向对称，保存绝对 Excel 坐标。旧 detector
-继续提供裸 CLI/API 兼容入口，但必须调用上述共享内核，再由 adapter 施加旧 gate；
-不得复制一份阈值、容差或尾数算法。
+旧 detector 继续提供 public kind，但逐步改为调用共享 core，再由 adapter 施加旧 gate。
+同一 scope 不得先运行旧 matcher，再复制运行一份新 matcher。
 
-### 7.1 Legacy migration matrix
-
-| Canonical owner / shared core | 既有入口 | 迁移方式 |
-|---|---|---|
-| `short_pair_relation` / `match_pair_relation()` | `detect_relations` 的 identity/ratio/offset/shared-tail 分支、`detect_row_relations`、`detect_equal_pairs`、`detect_short_row_reuse`、`detect_scaled_row_reuse`、`detect_row_pair_shared_fraction` | 保留旧函数和旧 kind；把任意 span 的匹配、support mask 和容差计算改为共享 core，旧 finding 作为 adapter 输出 |
-| `repeated_short_vector` / `iter_numeric_vectors()` | `detect_recurring_row_vectors`、`within_row_repeated_segment`、上述 relation detector 的 exact identity 分支 | 使用同一双轴向量索引；workflow 聚成一个 `occurrences[]`，旧 identity kind 仅作 supporting ref |
-| `recurrent_group_collision` / `collect_exact_collision_events()` | `detect_block_value_duplication`、`detect_dispersed_repeats` 和精确重复 detector 的碰撞来源 | 先产出未经过 summary gate 的 raw events，再由各消费者施加各自统计和上下文规则；对 dispersed path 这里只代表 event extraction 迁移 |
-
-以下能力只复用局部 helper，不被三个 abstraction 整体取代：
-
-- `detect_within_row_shared_fraction` 复用可靠尾数提取，但保留其行内拓扑；
-- `detect_within_sheet_fraction_reuse` 保留 block-to-block 拓扑；
-- 长度至少 12 的跨 sheet 列复用和长关系 finding 继续由既有 owner 负责，但 matcher
-  仍复用通用 core；
-- `sum_constant`、`exact_linear`、分布/位数类 detector 不属于本次三个 abstraction。
-
-裸 CLI 的 legacy kind、字段和默认行为在迁移期保持兼容。Workflow 的 canonical
-finding 写入 `expanded_findings.json`，并通过 `supporting_kinds` 和
-`source_finding_refs` 关联旧结果。不得在同一 scope 上先跑旧 matcher、再跑一遍新 matcher。
-
-### 7.2 与硬门槛审计的关系
-
-配套的 `2026-07-19-detector-hard-threshold-audit.md` 与本设计共用
-“精确关系靠信息量和显著性控制，不靠任意大样本 floor”的原则，但二者状态分开记录：
+共享 core 必须显式输出：
 
 ```text
-workflow_covered = workflow 已能发现并展开
-core_adapter_migrated = 裸 CLI 旧 detector 已切到共享 core
-hard_floor_resolved = 裸 CLI 的对应硬门槛已经校准并迁移
+match_mode =
+  canonical_exact | strict_numeric | rounded | approximate | partial
 ```
 
-三种状态互不推导。`workflow_covered` 或 `core_adapter_migrated` 均不能自动关闭
-`hard_floor_resolved`；`detect_dispersed_repeats` 即使完成 event extraction adapter，
-其原有 floor 仍单独保持 open。行关系、equal-pair、short reuse 和 shared-tail 的
-重叠条目由本迁移矩阵记录；decimal-tail clustering、dispersed repeats、
-identical-after-rounding、长列跨 sheet 和 block fraction reuse 等硬门槛工作继续留在
-审计中。
+`canonical_exact` 要求两侧版本化 canonical decimal/token 与 missing mask 逐位置完全
+相同，不使用 rtol 或先行 rounding。`strict_numeric` 表示 canonical token 不同，但
+通过注册的 tight numeric tolerance；`rounded` 表示只在明确的 decimal/sig-fig
+rounding rule 后相同。
 
-为保持兼容，legacy 广义 detector 在 adapter 阶段保留其既有有效性 gate；workflow
-允许的 3 点关系走单独的 short eligibility，且必须通过更强的信息量、量化 null 和
-完整 scan 校准。两者在 `hard_floor_resolved` 前不得被描述为同一默认行为。
+Owner 根据物理 evidence、span 和 `match_mode` 决定，不能根据 legacy kind 名决定。
+现有某些 `identical_*` 使用数值容差，某些 recurring vector 使用 round-6 signature；
+只有 `canonical_exact` 的完整有序向量进入 `repeated_short_vector`。其余模式保留 legacy
+兼容输出，并按 pair/rounded relation 语义确定 workflow owner。
 
-新 iterator 必须 sheet-scoped，或显式支持只有两个数值行的布局；不能在
-`find_numeric_blocks(min_rows=3)` 丢弃后才启动。
+### 7.1 `short_pair_relation`
 
-### 7.3 `short_pair_relation`
+接收 span 3–11 的对齐行对或列对：
 
-通用 matcher 支持任意 span；`short_pair_relation` 只接收 `span_length=3–11` 的
-对齐行对或列对。3–8 是首批验收重点，9–11 保证与当前 short/long 分界连续。关系包括：
-
-- exact identity；
 - partial identity；
-- approximate identity，容差与 support mask 由版本化规则记录；
+- approximate identity；
 - constant ratio；
 - constant offset；
 - shared high-precision fractional tail；
 - `k/n` 局部支持；
-- 一个缺失、例外或量级异常。
+- 一个缺失、例外或可能的量级录入不一致。
 
-完整 exact identity 可以由 matcher 识别，但 short scope 的 canonical finding 由
-`repeated_short_vector` 所有。Partial/approximate identity 仍由
-`short_pair_relation` 所有。
+完整严格恒等可由 matcher 识别，但 canonical owner 是
+`repeated_short_vector`。只有部分恒等、近似恒等或带例外的 identity 归
+`short_pair_relation`。
 
-长度字段固定为：
+至少输出：
 
 ```text
-span_length = 对齐物理 span 中的位置数，包含 missing 位置
-n_observed_pairs = 两侧同时有可比 numeric token 的位置数
-n_match = observed pairs 中通过 relation rule 的位置数
-missing_indices / outlier_indices = 相对于 span 的索引
+relation_type
+axis
+span_length
+n_observed_pairs
+n_match
+matched / missing / outlier indices
+parameter
+residual summary
+precision summary
+structural_gate_passed
+source_finding_refs
 ```
 
-Eligibility 使用 `span_length`；coverage 使用 `n_match / n_observed_pairs`，同时必须
-满足各 relation 的最小 observed-pair 数。Exact vector 的 missing token 只有在两侧
-missing mask 相同且规则显式允许时才进入 signature。
+`span_length` 包含物理 span 中的 missing 位置；coverage 使用
+`n_match / n_observed_pairs`。两个支持点永远不能进入 registry promotion。
 
-输出至少包含：
+P2 的 `standalone_review` 结构下限是：至少 3 个 observed match、coverage 至少 75%、
+最多一个 missing/outlier，并通过 relation-specific 的信息量和非平凡参数 gate。
+完整 3 点关系必须 3/3 严格成立。局部比例、近似 identity 和 shared-tail 可以有更强
+的 mode-specific 下限，但不能比本下限更宽；这些规则进入 routing-rule version，
+只控制是否值得展开，不声称已通过统计校准。
 
-```json
-{
-  "relation_type": "ratio",
-  "axis": "column",
-  "span_length": 6,
-  "n_observed_pairs": 6,
-  "n_match": 5,
-  "coverage": 0.8333333333,
-  "matched_indices": [0, 1, 2, 4, 5],
-  "outlier_indices": [3],
-  "parameter": 0.73184261,
-  "max_residual": 2e-8,
-  "structural_gate_passed": true,
-  "support_valid": null,
-  "raw_model_p_value": null,
-  "adjusted_model_p_value": null,
-  "registered_alpha": null,
-  "null_model": "exact_relation_information_gate_v1",
-  "calibration_id": null
-}
-```
+量级候选只能命名为 `possible_scale_entry_inconsistency`。工具不得改写原值，只能
+报告某个 `10^k` 候选是否恢复关系。
 
-#### High 规则
+### 7.2 `repeated_short_vector`
 
-以下只是结构下限；最终 high 还必须满足 §7.6 的 `support_valid` 与 full-scan
-`adjusted_model_p_value` gate：
-
-- 完整 3 点关系：3/3 严格成立、信息量足够并通过相应量化 null；
-- 局部关系：`span_length >= 4`、`n_observed_pairs >= 3`、`n_match >= 3`、
-  覆盖率至少 75%，最多一个例外；
-- 局部精确比例：至少 4 个支持点、至少 3 个不同基准值、比例不是 `10^k`；
-- shared tail：至少 3 个不同尾数，每个尾数至少 4 位；允许一对完整值相同，
-  但必须至少有两个非零整数差且整数差不全相同；
-- 只剩 2 个支持点不得 high。
-
-量级异常只记录为 `possible_scale_entry_inconsistency`。工具不得自动改写原值；
-可以报告某个 `10^k` 缩放候选是否会恢复关系。
-
-### 7.4 `repeated_short_vector`
-
-通用 iterator 支持任意 span；`repeated_short_vector` 只接收长度 3–11、
-顺序敏感的行向量或列向量。3–8 是首批验收重点：
+接收长度 3–11、顺序敏感的严格完整行向量或列向量：
 
 - 同一等价类一次输出整个 `occurrences[]`；
-- 支持同块、跨块、跨 sheet、文本间隔和转置；
-- exact 关系由本 abstraction 所有，不再同时输出 canonical identity ratio；
-- 单侧缺失或单侧异常不算 exact，转给 `short_pair_relation`。
+- 支持同块、跨块、跨 sheet 和转置；
+- signature 包含版本化 numeric token 与 missing mask；
+- 单侧 missing、单侧例外或仅近似相等转给 `short_pair_relation`；
+- 归一化锚点只剔除对应位置，不因存在一个基线值而丢弃其余非基线匹配。
 
-以下任一条件满足结构 eligibility；最终 high 仍须通过 §7.6 的校准 gate：
+严格完整 vector identity 先于 collision family 认领相关 cells，保证一个物理证据只有
+一个 primary finding。
 
-- 一个长度至少 4 的高信息向量完整重复；
-- 同一 panel 至少出现两种不同的重复三元组；
-- 一个高信息三元组跨明确不同的 block 或 figure 重复。
+同一 occurrence pair 命中多个嵌套窗口时，只输出不能再向两侧扩展的 maximal span
+作为 primary；其严格子窗口折叠为 alias/supporting evidence。不得让一个长度 8 的
+重复产生长度 3–7 的多个 primary findings。
 
-归一化锚点只从证据中剔除。若剔除锚点后仍有多个非基线匹配，
-不得因为表中存在 `1` 而整体降级。
+P2 的 `standalone_review` 结构下限是以下之一：一个长度至少 4 的高信息向量完整
+重复；同一 panel 出现至少两种不同的重复三元组；或一个高信息三元组跨明确不同的
+block/sheet scope 重复。该门只分配 Agent 展开预算，不产生 detector high。
 
-### 7.5 `recurrent_group_collision`
+### 7.3 `recurrent_group_collision`
 
-`collect_exact_collision_events()` 在 `min_hp`、结构列剔除、dominant boundary、
-severity 和 summary 截断之前收集带完整坐标的 raw events。现有
-`block_value_duplication` 和本 abstraction 分别消费同一事件流，不互相消费对方的
-最终 finding。
-
-Collector 采用可重放 iterator 或两遍扫描，只物化重复 group；重叠 block 按
-`source_event_id` 去重。每个 raw event 至少包含：
+从完整坐标的 exact-collision raw event 流中识别多个布局互异实体中的组内碰撞。
+Collector 必须在现有 summary gate、severity 截断和 top-K 之前运行，并至少保存：
 
 ```text
 source_event_id
-absolute_cell
-raw_numeric_token / canonical_decimal
-display_precision
-collision_key / collision_key_version
-source_block_ids
-orientation / header_path
-panel_id / evidence_unit_id / replicate_group_id
-measurement_family_key / measurement_family_rule_version
-formula_source_ids
+absolute cell
+canonical decimal and display precision
+collision-key version
+panel / orientation / header path
+evidence unit / replicate group
+measurement-family key and version
+formula-source refs
+coverage completeness
 ```
 
-“Exact”只比较版本化 `canonical_decimal`；按显示精度相同是另一种明确标记的
-rounded relation，不得混入 exact collision。只有
-`coverage_complete_for_scope=true` 时才能计算可升级的概率值；cache 被截断时，
-confirm 必须从源文件重建完整 scope，不能从 examples 外推。
+聚合顺序：
 
-聚合顺序固定为：
+1. 去除重叠 block 对同一 source event 的重复表达；
+2. 标记确定性上下文解释的 events；
+3. 在 residual evidence 上重算 owner；
+4. 由 `repeated_short_vector` 先认领完整有序向量；
+5. 从 collision ledger 扣除这些 exact-vector cells；
+6. 对剩余 events 按预先确定的 measurement family 和 evidence unit 聚合。
 
-1. 合并重叠 numeric block 和重复事件，保存 provisional raw owner；
-2. 剔除强上下文解释的单元格；
-3. 在 residual footprint 上重跑 canonical core 并确定 final residual owner；
-4. 由 residual `repeated_short_vector` 认领完整有序向量；
-5. 从 collision ledger 扣除该 residual exact-vector cells；
-6. 对剩余事件去重，并按 measurement family 和 evidence unit 聚合；
-7. 重新计算支持度与 birthday/Poisson null。
+Measurement family 必须在查看哪些值发生碰撞前由布局、单位、表头、数量级、
+显示精度和 replicate layout 确定。分组不唯一时只保留
+`grouping_unknown=true` 的 experimental candidate。
 
-`measurement_family_key` 必须在观察哪些值发生碰撞之前由 deterministic layout
-segmentation 生成，至少综合 orientation、规范化单位、measurement/assay 表头路径、
-数量级 band、显示精度和 replicate-group layout。不得按已碰撞的值事后拆 family。
-无法唯一分组时写 `grouping_unknown=true`，只出 seed。
+本产品规范只要求输出 exact sufficient statistics、support、coverage 和结构上下文。
+碰撞概率模型、occupancy oracle 和自动 high 条件全部由 companion 定义。
+P2 的 `standalone_review` 至少要求 residual collisions 覆盖 3 个 dependency
+components，并包含 3 个不同的非边界高精度 collision values；否则只作为
+medium/low seed 参与 §6.3 的保守聚合。
 
-默认在单个 sheet 内聚合。跨 sheet 只在规范化表头、单位和 replicate layout 明确
-兼容时启用；每个 file/sheet 仍保留为单独 stratum，不能直接池化背景格点。跨 sheet
-语义不明确时，分别输出 sheet-level seed。
+## 8. Legacy adapter、所有权和 floor 解耦
 
-#### 7.5.1 Collision statistic
-
-对预先确定的 dependency component `d`、其中的 evidence unit `u`、family stratum
-`s` 和 canonical value `v`：
+### 8.1 Ownership 常量
 
 ```text
-c_suv = unit u 内值 v 的出现次数
-m_su = unit u 内 eligible residual observations 数
-pairs_obs,d = Σ_s Σ_(u∈d) Σ_v C(c_suv, 2)
-N_eff,su = 1 / Σ_v p_su(v)^2
-lambda_d = Σ_s Σ_(u∈d) C(m_su, 2) / N_eff,su
+SHORT_CANONICAL_MIN_SPAN = 3
+SHORT_CANONICAL_MAX_SPAN = 11
 ```
 
-只计算同一 evidence unit/replicate-group 内规则允许比较的 pair；跨实体 pair 不得进入
-observed 或 expected。`p_su(v)` 是保留 unit location、scale、quantization 和组内相关
-结构的 hierarchical/conditional occupancy；不得用跨实体池化的宽背景代替。
-已知固定格点用 exact occupancy；连续/显示精度模型使用候选 scope 之外的同类 units，
-采用 leave-one-panel-out 或等价 cross-fit 的保守估计。背景不足时
-`support_valid=false`。
-
-若一个 component 只含一个 unit，或有证据支持其中 units 条件独立，且每个 stratum
-满足注册的稀疏占用条件（v1 同时要求
-`N_eff,su >= 20*m_su`、`max_v p_su(v) <= 1/(20*m_su)` 和已注册的近似误差上界），
-使用：
+这是 schema-versioned canonical ownership boundary，不是 detector activation floor，
+也不从环境变量或 `_ROW_REL_MIN_COLS` 推导。
 
 ```text
-raw_model_p_value,d = P(Poisson(lambda_d) >= pairs_obs,d)
+span <= SHORT_CANONICAL_MAX_SPAN  → short canonical ownership
+span >  SHORT_CANONICAL_MAX_SPAN  → legacy long ownership
 ```
 
-否则使用 component-level joint exact/empirical null，保留 unit random effect、
-paired/serial correlation 和共同漂移。只有不同 dependency components 被模型证明
-条件独立时才卷积分布；相关 components/families 使用联合经验 null。禁止选择最小
-p 值。该值仍是条件模型结果，必须另外经过完整扫描流程的经验校准。
+`_ROW_REL_MIN_COLS` 只表达 legacy detector 是否激活。当前代码若用同一常量同时控制
+legacy activation 和 short-path 上界，Phase 2 必须先拆开。以后即使 legacy floor
+从 12 降到 5，span 5–11 仍由 short canonical owner 负责；legacy finding 只能成为
+supporting ref，span 12+ 仍归 long owner。
 
-`support_valid=true` 至少要求：scope coverage 完整、layout grouping 唯一、family key
-在碰撞前固定、residual evidence 覆盖至少 3 个 dependency components、每个 component
-有 exact/经验 occupancy model 或满足稀疏近似条件，并且 calibration ID 与当前规则
-版本一致。
+### 8.2 明确的 canonical owner
 
-High 规则：
+| 物理证据 | Primary canonical owner | Legacy / supporting 处理 |
+|---|---|---|
+| span 3–11 `canonical_exact` 完整向量恒等 | `repeated_short_vector` | legacy identity kind 仅在语义相符时 supporting |
+| span 3–11 部分或近似 identity | `short_pair_relation` | relation/equal-pair kind 仅 supporting |
+| span 3–11 aligned pair 的 strict-numeric/rounded identity | `short_pair_relation` | 不从 `identical_*` kind 名升级为 exact vector |
+| span 3–11 多 occurrence rounded vector recurrence | 既有 rounded/recurring owner | 不进入 `repeated_short_vector`，不生成 pair owner |
+| span 3–11 ratio、offset、shared-tail | `short_pair_relation` | 对应 legacy kind 仅 supporting |
+| `many_equal_pairs` 且 physical span 3–11 | `short_pair_relation` | 不得仅凭 kind 名或 jointly-finite `n` 推断 strict identity/span |
+| `many_equal_pairs` 且 physical span 12+ | legacy long/equal-pair owner | matcher 可共享，不生成 short primary |
+| 完整向量已经认领的 exact cells | `repeated_short_vector` | collision ledger 扣除 |
+| 剩余的分组 recurring exact collision | `recurrent_group_collision` | block/dispersed kind 仅 supporting |
+| 其他 block-level duplication | `block_value_duplication` | 保留现有 owner |
+| span 12+ 的关系或完整向量 | legacy long owner | matcher 可共享，所有权不变 |
+| `sum_constant`、`exact_linear`、分布/位数类 | 既有 owner | 不纳入三个 abstraction |
 
-- 至少 3 个不同的非边界高精度值发生精确碰撞；
-- 分布于至少 3 个不同 dependency components，且每个 component 至少含一个 residual
-  collision；同一 component 内多个 units 只构成一个复合观测；
-- 碰撞发生在同一 replicate group 布局内，但不把这一点表述成生物学独立；
-- `adjusted_model_p_value < registered_alpha` 且 `support_valid=true`；
-  v1 `registered_alpha` 不高于 `1e-4`；
-- 支持 n=3–11、混合组宽、缺失值和变化的重复位置。
+`many_equal_pairs` 的短 span 归属基于现有语义：它可以只在部分行近似相等，并排除
+严格全列恒等；因此归 pair relation，而不是 repeated vector。现有字段 `n` 是两列
+jointly-finite 的数量，不是 physical span；adapter 必须从绝对 footprint/missing mask
+计算 `span_length` 再分 owner。若未来该 legacy kind 的语义改变，必须先改 adapter
+parity fixture 和 ownership version。
 
-输出必须包含：
+### 8.3 Legacy migration matrix
+
+| Shared core | 既有入口 | 迁移契约 |
+|---|---|---|
+| pair matcher | row/column relation、equal-pair、shared-fraction、short scaled reuse | core 计算 support mask/容差；adapter 保留旧 kind、字段和 gate |
+| vector iterator | recurring row/column vector、short-row reuse、within-row segment | workflow 输出一个 canonical equivalence class；旧输出只作兼容 |
+| collision event collector | block duplication、dispersed repeats、exact repeat 来源 | 共享 raw event extraction；各 consumer 保留自己的 summary gate |
+
+`detect_within_row_shared_fraction`、block-to-block reuse 等具有不同拓扑的 detector 只复用
+局部 helper，不被强制改成新 owner。
+
+迁移顺序固定为：
 
 ```text
-n_distinct_evidence_units
-n_distinct_dependency_components
-evidence_unit_definition
-measurement_family_key
-raw_model_p_value
-adjusted_model_p_value
-registered_alpha
-null_model
-calibration_id
-support_valid
-structural_gate_passed
-explained_cells_removed
-coverage_complete_for_scope
+shared core + parity tests
+→ owner/floor constants split
+→ legacy adapter
+→ workflow canonical output
 ```
 
-默认以一个 panel/sheet 聚合 finding 输出，不为每个实体行单独生成 high；只有满足
-上述跨 sheet compatibility contract 时，才可输出保留 sheet strata 的 workbook-level
-finding。
+不能先降低旧 floor，再依赖尚未完成的 dedup 修复双 finding。
 
-### 7.6 Selection adjustment
+## 9. 确定性上下文和 residual owner
 
-`raw_model_p_value` 只描述预注册局部 null；detector 搜索的窗口、方向、relation family
-和参数都会产生选择效应。Agent 又可只展开合法候选的任意子集，因此 adjustment 不能
-依赖某一次 Agent 路由。
+必须支持以下 context class：
 
-`eligible universe` 必须先由版本化 structural enumeration 固定，再计算 local p、
-seed tier、top-K 或 Agent 选择。每个 `calibration_scope_id` 内登记可比较的
-`statistic_order`，先把异构 local statistic 转换为同一标尺的经验尾概率
-`p_local`，再定义：
-
-```text
-tail_score = -log10(p_local)
-max_tail_score(null workbook) =
-  max over all eligible candidates × registered recipes × calibration scopes
-
-adjusted_model_p_value =
-  (1 + #{null workbooks: max_tail_score >= observed tail_score})
-  / (1 + total_null_workbooks)
-```
-
-不得直接比较 pair tuple、vector tuple 和 collision occupancy statistic。上述是
-paper-wide maxT/Westfall–Young 式 adjustment；改变 packet top-K 或 Agent 选择子集
-不得改变 eligible universe 或 adjusted p。
-
-生成 null workbook 的 `p_local` 时使用 analytic/exact tail、独立校准 split，或
-leave-one-workbook-out rank；同一本 null workbook 不能同时拟合自己的 local tail 又
-评估 maxT。Calibration manifest 固定 split/cross-fit 方案和随机种子。
-
-若一个结构适用于多个预注册 null family，取其中最保守的 adjusted tail probability，
-不得用任意混合权重平均。这样 Agent 之后选择任何子集都不会扩大已校准的检验集合。
-
-实现一个版本化 family calibration registry。每个 relation type、每种 repeated-vector
-结构和 collision mode 必须登记：
-
-```text
-structural_gate
-local_statistic
-raw_null_generator
-dependence_model_set
-full_scan_adjustment
-registered_alpha
-required_output_fields
-calibration_id
-calibration_scope_id
-statistic_order
-cross_scope_adjustment
-```
-
-v1 的局部统计量为：
-
-- pair relation：`(n_match, information_bits, -max_residual)`；
-- repeated vector：`(occurrence_count, span_length, information_bits, cross_scope_count)`；
-- recurrent collision：component-level `pairs_obs` 及其 joint occupancy statistic。
-
-Pair/vector 的 conditional null 必须保留 display precision、magnitude band、
-missing mask、paired correlation、时间/序列自相关、unit random intercept/slope、
-共同漂移和 layout。使用保持这些结构的条件置换，或对 IID、exchangeable、AR(1)、
-random-effect 和 shared-drift 等预注册模型分别校准并取最保守尾概率。经验尾概率使用
-`(1 + extreme_trials) / (1 + total_trials)`。Null generator、依赖模型、trial 数、
-随机种子和 score version 都进入 `calibration_id`。
-
-所有 canonical output 必须含 `structural_gate_passed`、`support_valid`、
-`raw_model_p_value`、`adjusted_model_p_value`、`registered_alpha` 和 `calibration_id`。
-同时记录 `calibration_scope_id` 与 `cross_scope_adjustment`。
-统一 high 判据为：
-
-```text
-structural_gate_passed
-and support_valid
-and adjusted_model_p_value < registered_alpha
-```
-
-校准完成前只能输出 experimental raw result，不得赋 `direct_confirm` 或默认 high。
-
-## 8. 上下文守卫
-
-### 8.1 Legacy context migration contract
-
-上下文守卫不是与 `_prefilter.py` / `_profiles.py` 平行运行的第二套分级系统。
-实现一个纯函数 evaluator：
-
-```text
-evaluate_contexts(finding, context_bundle) -> contexts[]
-```
-
-`context_bundle` 是 typed、版本化且可哈希的输入，至少包含 paper/workbook/sheet scope、
-layout segmentation、sibling panel/sheet index、规范化表头与单位、公式引用 DAG、
-显示精度和 coverage。Context detection 在 DISCOVER 的 dependency/p-value 计算之前
-执行；ADJUDICATE 只把已经确定的 contexts 投影成 review view，不在此时重新猜结构。
-
-它允许多个 context 同时存在，每项统一返回：
-
-```json
-{
-  "context": "cumulative_or_ranked_boundaries",
-  "strength": "strong",
-  "explained_cells": ["C3:C5", "D3:D5"],
-  "explained_source_event_ids": ["event:..."],
-  "applies_to_families": ["repeated_short_vector", "recurrent_group_collision"],
-  "metrics": {}
-}
-```
-
-Deterministic reducer 顺序固定：
-
-1. 收集全部 contexts；只有 `strength=strong` 且 family 适用的 event 可自动解释；
-2. 对 explained source events/cells 取 union，并保留每个 context 的 provenance；
-3. 从 raw footprint 中剔除该 union；
-4. 在 residual footprint 上调用同一 canonical core 重算 support 并重定 final owner；
-5. 扣除 residual exact-vector cells 后，再计算 dependency、collision null 和 severity；
-6. residual 仍通过规则则保留相应 review severity，否则按注册 mapper 降级或隐藏。
-
-Medium context 只供排序和 ADJUDICATE 解释，不自动剔除单元格。Reducer、layout 和
-context rule version 均进入缓存与 artifact lineage。
-
-Provisional raw owner 和 raw finding 只用于审计；candidate、dependency 投票、最终
-canonical report item 和 review severity 均以 final residual owner 为准。Workflow
-不得把两者建模成一个会跨 owner 原地变化的 finding，而是保存两个 linked records：
-
-```text
-raw_finding_record:
-  raw_finding_id / provisional_owner / raw_footprint
-  raw_parameters / raw_null / raw_severity
-residual_finding_record:
-  canonical_finding_id / final_residual_owner / residual_footprint
-  residual_parameters / residual_null / review_severity / profile_action
-  derived_from_raw_ids[] / contexts[]
-```
-
-若 residual 为空，仍写一个 `residual_status=fully_explained` 的 canonical audit
-record，但不生成可投票 evidence。Context 导致 owner 改变时，raw record 不变；
-不得把 residual null、support、severity 或 footprint 写回 raw record。
-
-为兼容现有 schema，view adapter 可临时 materialize 扁平 `raw_severity`、
-`review_severity`、`effective_severity` 和 `profile_action`，但它们只是由两个 records
-投影的 view，不是持久化 source of truth。
-
-`raw_severity` 一经 detector/confirm 产出便不可覆盖。Profile mapper 是唯一写
-residual record 中 `review_severity` 和 `profile_action` 的层：
-
-- `DISCOVER` 和 forensic 读取 raw records；
-- `ADJUDICATE` 和 review 读取 residual records；
-- triage 使用 review view，再通过 `profile_action=hidden` 改变可见性；
-- 旧 `_prefilter.py` 规则经 adapter 产出 context，不得再独立重复降级；
-- 裸 CLI 和 workflow 使用同一个 evaluator。
-
-迁移对应关系：
-
-- shared-axis 复用并扩展现有 progression/axis helpers；
-- 固定分母统一现有 within-column 和 decimal-tail helpers；
-- 检测限/边界扩展现有 boundary context；
-- normalization 标签只提供中等上下文，新的 anchor guard 才能解释具体单元格；
-- ordinary `replicate` 不再自动等同 technical repeat；
-- 现有 OOXML formula-cache 检查继续只报告 coverage；公式来源模板是新增元数据能力。
-
-守卫不得删除 raw finding。Review 根据尚未被解释的证据重新计算
-`review_severity`。
-
-兼容字段真值表：
-
-| 产物/视图 | `effective_severity` | legacy `severity` | 可见性 |
-|---|---|---|---|
-| 裸 CLI forensic | `raw_severity` | mirror effective | visible |
-| 裸 CLI review | `review_severity` | mirror effective | visible/demoted |
-| 裸 CLI triage | `review_severity` | mirror effective；旧 adapter 可保持既有 low 投影 | visible/hidden 由 `profile_action` 决定 |
-| workflow `scan.json` / DISCOVER packet | `raw_severity` | mirror effective | raw routing coverage |
-| `expanded_findings.json` canonical residual records | `review_severity` | mirror effective | 尚未最终渲染 |
-| adjudicated report model | `review_severity` | renderer 只读 effective | 由 verdict + profile action 决定 |
-
-`severity` 仅为兼容镜像，canonical reducer、路由、packet 和新 renderer 均不得把它
-当 source of truth。Phase 1 必须在现有 profile mutation 前冻结 `raw_severity`。
-
-### 8.2 Shared axis / coordinate
-
-该守卫在行列两个方向对称运行，识别：
-
-- 等差 progression；
-- 等比 progression，包括序列稀释轴；
-- 同一 ordered sequence/vector 在 sibling block、panel 或 sheet 的稳定轴位置重复；
-- 明确的 time、dose、concentration、wavelength、coordinate 等轴标签。
-
-一次性等差/等比形状只记 medium context，不能单凭形状认定为 axis。强命中需要：
-
-- 数值序列在至少 3 个 sibling scope 的稳定轴位置复用；或
-- 明确 axis 标签、稳定 layout role 和 progression/ordered-sequence 结构同时成立。
-
-任意 measurement vector 即使重复三次，也不能仅凭重复认定为 axis；必须满足稳定轴
-位置或明确 coordinate role。命中后遵循：
-
-- 只自动解释非完整重复；完整表或完整 measurement vector 不因同时含共享轴而整体降级；
-- 80% axis coverage 和 residual cell 数只作为 context metrics，不能直接决定降级；
-- 始终只移除 axis cells，对剩余 measurement cells 重算 relation、collision 和 severity；
-- 只有 residual evidence 不再通过任何 confirm/aggregation 规则时才可整体降级；
-- axis cells 必须在 birthday/Poisson p 值计算前移除；
-- 若轴外仍有高信息 measurement 重复，finding 必须保留。
-
-### 8.3 累计或排序边界
-
-仅自动降级 equality、repeated vector 和 collision，不自动压低 ratio 或 shared tail。
-
-强命中条件：
-
-- 对行列两个方向都评估；
-- 候选子区间至少 8 个边界、至少 2 条 trace、合计至少 16 个相邻差；
-- 每条 trace 至少 95%、整体至少 98% 的相邻差同方向；
-- 重复短向量在该轴连续相邻，且等值对应零差平台；
-- 至少两个分离平台，或一个长度至少 3 的平台；
-- 参与轴不能明确标为 biological replicate、mouse、patient、sample 或 well。
-
-守卫寻找覆盖至少 85% 候选宽度的共同最长单调子区间，也可用上层非空表头分段。
-不能要求整个 block 完全单调，因为末尾可能存在独立 summary 指标。
-
-只有单调或只有 `frequency` 标签不能降级。显式
-`cumulative`、`stacked`、`cumsum`、`upper boundary`、`running total`
-可以把平台数量要求放宽为一个。
-
-命中后：
-
-- `forensic`：保留 raw high；
-- `review`：先只移除累计/排序 context 解释的 events；residual 不再通过规则时才
-  low + `profile_action=demoted`，否则沿用 residual reducer 的 severity；
-- `triage`：同样先重算 residual；只有不再通过时 hidden。
-
-### 8.4 固定分母或计数网格
-
-- 不得只用候选的 3–4 点拟合分母；
-- 必须使用同一 trace 至少 8 个不同上下文值；
-- 至少 90% 值在显示半个 ULP 内落在共同零锚定格点；
-- 格点至少比显示量化步长粗 4 倍，排除平凡的 `10^d` 解；
-- 至少 6 个不同整数 index；
-- 奇偶位置交叉验证均成立；
-- frequency、percent、count、read、UMI、clonotype 语义或伴随 n 列可增强置信。
-
-该守卫只解释单点碰撞。整段向量重复必须在量化 null 下重算，
-不能仅因固定分母而整体降级。
-
-现有小分母 helper 仅作为 legacy adapter；共享实现必须支持大分母、显示精度和
-交叉验证，不得继续维护多套不同上限。
-
-### 8.5 归一化锚点
-
-- 同一位置在至少 3 组、至少 80% 组中精确为 1；或
-- 同时具有 control/reference/baseline 与 normalized/relative/fold 语义。
-
-只剔除锚点 cell。其他非基线高精度匹配继续参与分级。
-
-### 8.6 检测限和边界
-
-强解释需要：
-
-- LOD、LLOQ、ULOQ、ND、BDL、floor、ceiling、saturation 等明确语义，
-  且值位于局部最小或最大；或
-- 同一边界跨至少 3 组并占 block 至少 25%。
-
-`0`、`1`、`-1`、`100` 本身只算中等上下文，不能整条降级。
-
-### 8.7 技术重复
-
-只有同时存在明确 technical/re-read/duplicate-injection 语义和共同上游观测证明时，
-才能作为强解释。普通 `replicate` 或相邻列不够。
-
-`biological replicate`、mouse、patient、sample、`n=` 是自动降级阻断项。
-
-### 8.8 低基数或量化网格
-
-- 至少 95% 值落在规则格点；
-- 潜在格点数 `G <= max(8, 2m)`，或整数/ordinal 且 distinct 不超过 8；
-- 在相应量化 birthday null 下碰撞并不罕见时降为 low；
-- 若碰撞低于注册的 low-cardinality override alpha，不得仅靠低基数标签降级。
-  v1 可取 `1e-6`，但只有 exact enumeration、importance sampling 或足以解析该量级的
-  校准可用时才启用；否则该 override 保持 disabled，不能用 30,000 次试验外推。
-
-### 8.9 公式蕴含关系
-
-只有公式逻辑本身必然产生关系时才降级，例如：
-
-- 两格引用同一源格；
-- 对应公式是同一平移模板；
-- 显式 `source*k`、`source+c`、`x/x`；
-- 累计公式 `left + increment`。
-
-仅仅“这些格子含公式”或标签含 normalized、mean、densitometry 不够。
-实现该守卫需要扩展现有 OOXML 公式检查，保存公式坐标、引用来源和规范化模板；
-不得把“缺少 cached value”的 coverage limitation 当成公式关系证明。
-
-## 9. 去重和 finding 所有权
-
-每条 finding 规范化为：
-
-```text
-(file, sheet, physical cells, relation family)
-```
-
-所有权分 raw 与 residual 两阶段，不使用会吞掉 exact vector 的静态 severity 优先级：
-
-```text
-raw core match
-  → provisional raw owner（只供审计）
-  → context explained-event union
-  → residual core rematch
-residual exact ordered vector
-  → repeated_short_vector
-  → 从 collision event ledger 扣除 residual cells
-  → 对 residual events 重算 recurrent_group_collision
-residual partial / missing / scale relation
-  → short_pair_relation
-remaining distributed collision without group structure
-  → block_value_duplication
-```
-
-Legacy kind 的 canonical owner：
-
-| Legacy family | Canonical owner |
+| Context | 产品处置 |
 |---|---|
-| span 3–11 的 `identical_column`、`identical_row`、short exact reuse、`recurring_row_vector`、`within_row_repeated_segment` | `repeated_short_vector` |
-| span 3–11 的 ratio、offset、partial/approximate identity、partial relation、row-pair shared fraction | `short_pair_relation` |
-| span ≥12 的 identity/relation | 对应 legacy long owner，经 shared matcher adapter |
-| 跨至少 3 个 dependency components 的残余组内碰撞 | `recurrent_group_collision` |
-| 其他 block 内分布式精确碰撞 | `block_value_duplication` |
+| shared axis / coordinate | 坐标序列本身不作为独立进展关系；依赖 finding 合并 |
+| cumulative / sorted boundary | 标记由累计、堆叠或排序定义的边界 |
+| fixed denominator / count grid | 记录可还原的分母、count/n 与量化步长 |
+| normalization anchor | 只解释锚点 cells，不整块清除非锚点证据 |
+| LOD / boundary / saturation | 标记检测限、0/1 边界或截断平台 |
+| technical repeats | 仅在表头、图例、Methods 或公式来源有证据时标记 |
+| low-cardinality / quantization | 记录显示精度和有效格点，不把舍入碰撞当连续值 |
+| formula provenance | 来源格式/reader 可提供公式时追踪模板、共同上游和派生列；否则 `unknown` |
 
-较弱/兼容 finding 的 residual event-set 被主 finding 完全包含，或
-`intersection / min(size_a, size_b) >= 0.8` 时不再作为独立 candidate，写入主 finding。
-只共享一个 source event 不足以做 finding dedup，但该 event 仍会在 dependency graph
-中阻止双方被当成独立投票：
+上下文规则必须：
 
-```json
-{
-  "supporting_kinds": ["block_value_duplication"],
-  "source_finding_refs": ["..."]
-}
-```
+1. 复用或扩展既有 `_prefilter.py` / `_profiles.py` 语义，不能复制两套互不一致的逻辑；
+2. 输出 typed context finding 和作用 cell/event 范围；
+3. 原始 numeric match 始终可追溯；
+4. 只从 residual evidence 排除被解释的 cell/event；
+5. 排除后重新运行 owner 和 dependency 计算；
+6. 结果与 detector 遍历顺序无关；
+7. 无充分上下文时保留 `unknown`，交给 Agent，不假定良性或异常解释。
 
-全比例与局部比例同时出现时，保留覆盖范围较大的一个。所有被合并 finding 的
-原始坐标、规则和 severity 仍能通过 `source_finding_refs` 追溯。
+本规范不要求所有文件格式都重建完整公式依赖图。Legacy/cached-value reader 不暴露
+公式时，formula provenance 是 unavailable/unknown，不得据此清除 evidence，也不得
+阻塞其他 context 或 workflow 发布。
 
-## 10. 工作流产物
+实施计划必须先列出现有 prefilter/profile 能力矩阵，再决定“复用、提升为 shared
+helper 或新增”。禁止同一个 fixed-denominator 或 normalization 规则分别维护在
+workflow 与 legacy 两处。
 
-Agent 工作目录包含：
+## 10. Calibration fail-closed 接口
 
-- `scan.json`：既有确定性原始扫描，加 bounded `short_signal_seeds[]`；
-- `states/sNNN.json`：不可变的状态、下一动作、预算和 coverage 历史；
-- `workflow_state.json`：只作为指向最新 state digest/path 的可变 index，不作 lineage parent；
-- `steps/tNNN/candidate_packet.json`：该 route step 不可变的压缩候选簇；
-- `steps/tNNN/routing_request.json`：Agent 对该 step 所有候选的不可变路由决定；
-- `steps/tNNN/numeric_results.json`：该 step 的不可变 linked raw/residual numeric
-  records 与阴性结果，可为空；
-- `steps/tNNN/context_results.json`：该 step 的不可变 context artifact/asset refs、digest
-  和 coverage，可为空；
-- `expanded_findings.json`：进入 ADJUDICATE 时生成的一次性 cumulative manifest，
-  顶层含 canonical `findings[]`、阴性 `results[]` 和全部 step child digests；
-- `verdict.json`：Agent 判定；
-- `adjudicated.html`：唯一用户交付报告。
+产品层只消费统计 companion 产生的版本化 registry，不定义其概率模型。
+Fail-closed reader、空 registry 行为、版本校验和 synthetic enabled fixture 由本产品
+规范拥有；companion 只拥有 calibration artifact、entry 内容和 enable/revoke 决策。
 
-后续 route step 不得覆盖早期文件。`route_step` 每次递增，`expansion_round` 只在
-numeric expand 时递增并独立限制为最多两轮。所有 parent digest 只指向不可变
-per-step/state artifact；
-顶层 current index 即使更新，也不参与数学 cache 或 replay identity。
-
-所有 workflow JSON 使用共同 envelope：
+Runtime 至少暴露：
 
 ```text
-schema_version
-workflow_id
-artifact_type
-producer.paperconan_version
-source_manifest_sha256
-context_asset_manifest_sha256
-config_digest
-dependency_key_version
-context_rule_version
-parent_artifact_digests[]
+calibration_unit = canonical family + registered mode
+calibration_slot = calibration_unit + applicability class
+calibration_id
+registry_status = missing | disabled | enabled | revoked
+calibration_runtime_class / version
+version_match
+promotion_eligible
 ```
 
-Source manifest 使用逻辑根下规范化相对路径、每个数值源文件的 bytes SHA-256 和
-资产类型；不把机器绝对路径放入语义 hash。后续加载的图例/图片进入 append-only
-context asset set；每次变化都写不可变、content-addressed 的
-`context/manifests/<sha256>.json`，资产 bytes 同样按 digest 保留。可变 current manifest
-只作 index，每个 child artifact 绑定并可独立读取当时的 manifest digest。
-`routing_request.json` 绑定 parent packet digest；`expanded_findings.json` 还包含
-`source_scan_sha256`、`recipe_versions`、`findings[]` 和阴性 `results[]`；
-`verdict.json` 同时绑定 scan、expanded 与 context asset digests。
-任何 stale 或来源不匹配的 request、expanded artifact 或 verdict 都必须拒绝。
-
-`workflow_id` 是语义 ID，由 source manifest、config digest、PaperConan/rule versions
-确定生成，因此固定输入可重放为相同 bytes。若实现另需随机运行实例标识，只能写
-`workflow_instance_id` runtime audit field，并排除出 stable ID、cache、semantic hash
-和 canonical byte-equality 模式。
-
-Raw collision events 由 recipe 从源数据确定性重建，或写入受内存/证据上限约束的本地
-cache；不得把截断的 `example_cells` 当作完整事件源。发生截断时必须记录 coverage。
-
-最终 report 先构建统一 `report_model`：
+新的 detector 默认 high 必须满足：
 
 ```text
-scan legacy findings
-  + expanded_findings canonical findings
-  + verdict finding references
-  → canonical dedup
-  → adjudicated.html
+structural eligibility
+and context/support eligibility
+and coverage complete
+and registry_status == enabled
+and current runtime is allowed by calibration_runtime_class
+and version_match
+and promotion_eligible
 ```
 
-所有 scan/expanded finding 都分配命名空间稳定 ID。ID 分两层：
+任何字段缺失、registry 不存在、版本不一致、coverage 不完整或 entry 被撤销，都
+fail closed：evidence/feature 状态保持原值，routing tier 不得成为 `direct_confirm`，
+detector severity 不得因该 calibration 升为 high。Agent 不能覆盖此门。
 
-- `raw_finding_id`（例如 `scan:<hash>`）基于 immutable 原始物理 footprint/scope、
-  detector/rule version 和数学参数；没有逐 cell footprint 的 legacy/image/distribution
-  kind 使用注册的 scope-fingerprint fallback；
-- `canonical_finding_id`（例如 `expanded:<hash>`）基于 residual source-event footprint、
-  canonical/context rule versions 和 residual 数学参数。
+映射唯一为：
 
-Context 重定 owner 时不得改写 `raw_finding_id`；它创建新的 canonical ID，并通过
-`derived_from_raw_ids[]` 连接来源。Canonical dedup 输出
-`alias_id -> canonical_id`；verdict 可以
-引用主 ID 或 alias，但必须唯一解析，未知、歧义、重复冲突的 ref 均报错，不得静默
-匹配零条或多条。传统裸 CLI 的
-`paperconan report scan.json --verdict ...` 保持兼容；workflow 最终报告必须显式传入
-`--expanded`，即使它是合法的空 artifact。不得把 canonical finding 塞入
-`cross_sheet_findings` 来绕过接口。
+| Registry/runtime 结果 | Evidence/feature status | Routing tier | Detector severity |
+|---|---|---|---|
+| missing/disabled/revoked/version mismatch | 不改变 | `standalone_review` / medium / low | 不因新校准升级 |
+| enabled，但 `promotion_eligible=false` | 不改变 | 不得 `direct_confirm` | 不因新校准升级 |
+| enabled 且 `promotion_eligible=true` | 不改变 | 必须 `direct_confirm` | 该 canonical finding 必须升 high |
+| 任意状态下的 Agent verdict | 不改变 | 不改变 | 不改变 |
 
-两类 fingerprint 都包含 source manifest、规范化相对文件名和 sheet；不得包含 profile
-projection、自由文本 reason、时间戳或模型审计字段。
+v1 不提供可选 `promotion_action`：同一个 true 同时授权 canonical finding 的
+`routing_tier=direct_confirm` 和 detector `severity=high`。Legacy supporting refs
+不因该映射各自再升一次 high。若未来需要 `direct_confirm_only`，必须新增 schema 和
+mapping version，不能复用 v1 calibration ID。
 
-原始 `report.html` 仍是中间证据浏览器，不是最终结论。
-
-如果 Agent 或工作流中途失败，状态必须为 `workflow_incomplete`，
-并记录停止阶段、未完成候选和 coverage limitation。不得静默退回裸 CLI 后宣称完成。
+Workflow 必须能在 registry 为空时正常到达 COMPLETE。某个 calibration slot 未通过，
+不阻塞其他 slot，也不阻塞 Agent 默认工作流发布。
 
 ## 11. 报告链一致性
 
-当前 `BLOCK_FINDING_GROUPS` 已包含 `block_dups`，packet 可以处理，
-但 HTML 的 per-block group 列表没有使用这份 canonical 定义。
+### 11.1 Finding registry
 
-实现必须：
+HTML、Markdown、packet 和 adjudicated report 必须使用统一、显式排序的 finding
+registry。当前 `block_dups` 已写入 per-block scan 结构并进入 Markdown 汇总，但
+`_html.py::_PER_BLOCK_GROUPS` 未包含它，因此默认 HTML 会遗漏。Phase 0 先独立修复
+这个现存报告链缺口。
 
-- Phase 0 先修复这一现存缺口，并加只有 `block_value_duplication` 的回归 fixture；
-- 将 canonical finding-group 常量移到无循环依赖的共享模块；
-- 让 HTML、Markdown 和 packet 全部从同一集合派生；
-- 保留新 finding 的 support、outlier、坐标和上下文字段；
-- 确保被 shared-axis、累计或其他强守卫降级的 finding 不进入 high-only review packet；
-- 确保 scan.json 中的 high finding 不会因消费者漏 group 而不可见；
-- 确保 `expanded_findings.json` 通过统一 report model 和
-  `paperconan report --expanded` 到达 adjudicated HTML。
-
-“一致”分成三个不变量：所有消费者识别同一 registered group keys；各消费者再显式
-执行自己的 eligibility filter（例如 high-only packet）；所有 eligible canonical item
-都有 renderer，未知 finding kind 使用中立的通用 fallback。新增 synthetic group key
-与新增 unknown kind 分别测试，不能把 group key 和 kind 混为一谈。
-
-## 12. 预算、确定性和安全
-
-- 默认最多两轮 EXPAND；
-- 每轮限制候选簇数、证据单元格数和 detector 计算预算；
-- 同一 source manifest + scan digest + recipe + canonical scope + recipe version +
-  数值/context/dependency 配置采用稳定 ID 并缓存；
-- 自由文本 `reason` 不进入稳定 ID 或数学缓存键；
-- 候选排序、聚类、去重和输出顺序必须确定；
-- 预算耗尽必须写 coverage，不得静默截断；
-- routing request 和 verdict 使用 JSON Schema 及 lineage 验证；
-- Agent reason 作为审计记录，不参与数学计算；
-- 阴性深查结果与支持结果同样保存；
-- 选择性深查产生的概率值标记为条件性结果；
-- 所有路径继续遵守现有内存上限。
-
-### 12.1 确定性边界
-
-Agent 的 request、reason 和 verdict 可能随模型运行变化，不属于 PaperConan 的确定性
-保证。确定性只在以下输入同时固定时成立：
+Registry 至少定义：
 
 ```text
-numeric source manifest: logical root + normalized relative paths + file bytes
-context asset manifest and referenced asset bytes
-PaperConan version
-numeric/configuration values
-recipe, dependency, context and renderer versions
-runtime metadata disabled, or runtime-only fields excluded from comparison
-schema-normalized routing_request.json
-schema-normalized verdict.json
+storage path
+canonical family
+display group
+sort key
+packet inclusion
+HTML inclusion
+Markdown inclusion
+supporting-only rule
 ```
 
-具体保证：
+新增 storage key 没有 registry entry 时测试失败，不能静默从报告消失。
 
-- `workflow start`：固定源文件、版本和配置时，scan、seed、candidate packet 和初始 state 一致；
-- `workflow route`：再固定 routing request 时，expanded findings 和下一 state 一致；
-- `workflow finalize`：再固定 verdict 时，报告和 COMPLETE state 一致；
-- `paperconan report`：再固定 expanded findings 和 verdict 时，HTML 一致；
-- 状态转换校验始终确定。
+### 11.2 统一最终报告
 
-数学 cache/ID 使用排除自由文本 reason 与 runtime audit fields 的 schema-normalized JSON，
-不使用原始请求字节。若关闭 runtime metadata 并采用 canonical serialization，可断言
-整个 artifact bytes 相等；否则只断言数学字段、稳定 ID 和规范化语义内容相等。
+最终报告合并：
 
-Skill 在可获得时记录 model、prompt/skill revision 和运行标识，作为审计元数据；
-这些字段不参与数学计算。不得宣称“同一论文让 Agent 运行两次会得到相同 request
-或 verdict”。
+- 原始 `scan.json`；
+- `expanded_findings.json`；
+- Agent `verdict.json`；
+- calibration slot、registry 状态与 version match；
+- coverage、预算耗尽和未展开候选；
+- raw finding 与 canonical finding 的 alias/supporting refs。
 
-## 13. 测试设计
+报告必须区分：
 
-新增或扩展九个完全合成的测试文件：
+```text
+detector severity
+evidence stage / feature status
+registry status
+Agent adjudication
+```
 
-1. `tests/test_short_pair_relation.py`
-2. `tests/test_repeated_short_vector.py`
-3. `tests/test_recurrent_group_collision.py`
-4. `tests/test_short_signal_context.py`
-5. `tests/test_seed_dependency_aggregation.py`
-6. `tests/test_short_signal_statistics.py`
-7. `tests/test_workflow_replay.py`
-8. `tests/test_short_signal_recall_e2e.py`
-9. `tests/test_finding_group_report_chain.py`
+不得把 Agent 的复核优先级显示成 detector 自动 high。
 
-### 13.1 `short_pair_relation`
+## 12. 预算、确定性和数值序列化
 
-- n=3–11 × row/column，3–8 全组合重点覆盖；
-- exact/partial/approximate identity、ratio、offset、shared tail；
-- n−1 局部支持和一个例外；
-- 缺失一个值；
-- 一个量级异常；
-- 整体缩放 `1e-6`、`1`、`1e6` 后关系不变；
-- `/3`、`/13` 小分母尾数；
-- `0/1/100` 边界、整数 ID、`10^k` 单位换算；
-- 误差刚超过容差；
-- `span_length`、`n_observed_pairs`、missing/outlier mask 的边界；
-- sheet 只有两个数值行时仍可扫描；
-- legacy adapter 与 canonical core 对相同 scope 给出一致数学结果；
-- 通用 matcher 对 >11 span 可用，但 short owner 不吞掉 legacy long finding。
+### 12.1 预算
 
-### 13.2 `repeated_short_vector`
+预算至少覆盖：
 
-- 长度 3–11 × row/column，3–8 全组合重点覆盖；
-- 同一块两种不同重复向量；
-- 跨 block、跨 sheet、文本间隔、稀疏物理列；
-- 相同 missing mask；
-- 单侧缺失、单侧异常和顺序置换负例；
-- same missing mask 进入 signature，different mask 不进入；
-- 低基数、整数编码和量化网格；
-- exact 关系的跨原语和 legacy kind 去重；
-- 9–11 长度不落入 short/long 空档。
+- 候选 cluster 数；
+- evidence cell 数；
+- expansion round 和 route step；
+- 上下文请求数、加载 bytes 和渲染 pixels；
+- 单文件大小、总 cells 和证据行列上限。
 
-### 13.3 `recurrent_group_collision`
+截断、采样或缓存不完整必须显式进入 `coverage`。不完整 scope 可以进入 Agent 复核，
+但不能进入 registry promotion。
 
-- 12–20 个布局互异的实体行、n=3–11；
-- 每行一对不同的非基线高精度重复；
-- 重复位置变化，避免退化为 identical column；
-- 转置、混合组宽、缺失和一个异常；
-- 全 1 基线但其他值重复；
-- 只有 1–2 行碰撞、LOD、边界、小整数、固定分母和随机连续负例；
-- 重叠 numeric block 不得重复计数；
-- raw event 在旧 `min_hp` / boundary / summary gate 前仍可供 confirm 使用；
-- raw event schema、collision-key version、重叠 block event ID 去重；
-- cache 截断时 `coverage_complete_for_scope=false`，回源重建前不能 high；
-- exact vector 认领后，只有 residual events 参与 recurrent 统计；
-- 三个 units 属于同一 dependency component 时不能 high，至少三个 components 才可；
-- measurement family 在碰撞前确定，不同 family 不放入同一个局部 null；
-- grouping ambiguous 只出 `grouping_unknown` seed；
-- 跨 sheet 兼容 family 保留 sheet strata，不兼容时分别输出。
+### 12.2 确定性边界
 
-### 13.4 上下文
+保证确定性的层：
 
-- 等差轴、等比稀释轴、跨 3 个 sibling panel 的不规则重复 ordered sequence；
-- 一次性等差/等比 measurement 只记 medium，不自动降级；
-- 非 axis 位置的三次高信息 measurement vector 重复不降级；
-- shared-axis 的转置版本；
-- 完整表重复不得仅因含共享轴降级；
-- 轴外仍有 measurement 重复时，只剔除轴并保留残余 finding；
-- 轴外恰好 3 个 `direct_confirm` measurement cells 仍保留；
-- axis coverage 79%/80% 与 residual 3/4 的边界只影响 metrics，不直接决定降级；
-- 3×36 累计边界前缀 + 末尾独立 summary；
-- 转置和反向累计；
-- 非单调重复向量不得被累计守卫降级；
-- 只有一个单调 trace 或一个短平台不足以降级；
-- 合成 `N=37`、`181`、`73,117` 的固定分母；
-- 基线 1 只解释 anchor；
-- biological replicate 阻止技术重复降级；
-- normalized 标签不能压低局部精确比例；
-- 同一 finding 同时命中多个 context；
-- 多 context 的 explained-event union 和 residual core 重算顺序固定；
-- raw exact-vector owner 在剔除 context 后变成 residual pair owner 时，两个 records、
-  两组 stats/footprints/IDs 和 `derived_from_raw_ids[]` 均保留；
-- 累计区外的独立 summary residual 仍通过规则时，review/triage 不得整体降级；
-- `raw_severity` 不变，review/triage 只改变 effective review view；
-- forensic/review/triage/workflow scan/expanded/report 的 severity 真值表逐项覆盖；
-- Phase 1 从既有 detector 输出建立 seed 时，在任何现有 profile mutation 之前冻结
-  `raw_severity`，后续 context migration 不得改变它。
+- enumeration、matcher、context、owner、dependency 和排序；
+- 给定 request 的 expansion；
+- artifact schema、stable IDs、digests 和报告渲染；
+- 给定 verdict 的 finalize。
 
-### 13.5 Seed dependency aggregation
+不保证确定性的层：
 
-- 重叠窗口和同一 relation 的多个 detector 只产生一个 dependency component；
-- A–B、B–C dependency edge 产生一个可审计的传递 component；
-- 已被解释并剔除的共同 anchor 不建立 residual overlap edge；
-- 同轴但 residual measurement 互异的 seeds 不因“同一 panel”被过度合并；
-- 有来源证明的同一固定分母、锚点或 formula source 只能贡献一个 component；
-- 两个不同 primary family 的 component 且至少一个 medium 可以申请展开；
-- 同一 primary family 的三个 component 且跨三个 evidence units 可以申请展开；
-- 两个 low 或三个同 component low 不得申请展开；
-- 单个非 `direct_confirm` seed 不得绕过聚合下限；
-- 改变 `candidate_strength` 只影响同 tier 排序，不改变展开资格；
-- Agent 不能覆盖 seed tier、evidence unit、dependency keys 或 component family；
-- orientation/span 与 unknown grouping fallback 的 ID 稳定；
-- `n_distinct_evidence_units` 不得被命名为 biological independence。
+- Agent 如何从允许动作中选择；
+- Agent 的自由文本。
 
-### 13.6 统计 oracle 与 null 校准
+因此 end-to-end replay 测试必须固定/mock request 与 verdict。
 
-- `_poisson_sf` 在覆盖 `p≈1e-4` 的 `(k, lambda)` 网格上与
-  `scipy.stats.poisson.sf` 比较，并验证 p 随 k 增大不增、随 lambda 增大不减；
-- 小格点使用穷举或 occupancy DP 计算 collision-pair 真分布；
-- `pairs_obs,d`、unit-conditioned `lambda_d` 和允许的 component convolution 用手算小例验证；
-- 跨 unit 池化背景导致 `N_eff` 过大的反例走 hierarchical/empirical null；
-- 非均匀 occupancy 不满足 max-probability/误差界时禁止 Poisson shortcut；
-- 相关 components 不做独立卷积；
-- pair/vector matcher 使用独立实现的 brute-force reference oracle；
-- CI 中运行固定种子的快速 Monte-Carlo smoke test；
-- 离线校准分别覆盖 iid、clustered/correlated、单调曲线、shared-axis、固定分母、
-  normalization、LOD、missingness、混合精度和转置；
-- 每个 trial 是完整 synthetic workbook，并对全部合法 eligible candidates × recipes
-  取最大统计量；离线校准统计
-  family-wise candidate、expansion、post-confirm high 和 review-high rate，
-  不只测单个 detector；
-- IID、exchangeable、AR(1)、random-effect、shared-drift 和条件置换 null 均预注册；
-- family calibration registry 对每种 pair/vector/collision mode 的 statistic、null、
-  adjustment、alpha 和 required outputs 做 schema/golden 检查；
-- 异构 statistic 不能直接比较；先转成 `p_local`/tail score，再对全部 scope 做
-  paper-wide maxT adjustment；
-- local-tail 拟合与 maxT 评估使用 independent split 或 leave-one-workbook-out，
-  禁止同一 null workbook 自拟合自评估；
-- 改变 packet top-K 或 Agent 选择子集不改变 eligible universe 与 adjusted p；
-- 若用零事件上界验证 `1e-4`，每个关键 null family 至少约 30,000 次；
-  否则使用精确枚举、重要性抽样或等价的置信界方法；
-- `1e-6` override 只在 exact/importance method 或约数百万量级的相应分辨率校准下测试，
-  否则断言其保持 disabled；
-- 每个 null family 和 paper-level 总目标都在 calibration manifest 中预注册 95%
-  置信上界；初始 family-wise review-high 目标不高于 `1e-4`，总目标单独给出；
-- injected-alternative power 覆盖 n=3/4、一个缺失、转置、混合精度和
-  residual-after-axis-removal；最低 power 在运行前预注册，不得事后改门槛；
-- 校准脚本、随机种子、参数和汇总进入 git，真实论文数据和逐篇结果不进入 git。
+### 12.3 派生浮点最小契约
 
-`adjusted_model_p_value` 和 calibration gate 在上述校准完成前不得产生默认 high。
+为避免跨平台 golden 抖动，产品 artifact 对派生浮点统一使用
+`numeric_canonicalization_version`：
 
-### 13.7 Workflow replay
+- 只规范化派生统计量，不改源单元格、原始 token 或证据值；
+- v1 使用 12 位有效数字，不使用固定小数位；
+- `-0` 规范为 `0`，拒绝 NaN 和无穷值；
+- 同一 canonical 值用于排序、阈值、stable ID/cache 和 JSON/golden；
+- 概率、经验计数和数值尾部的更完整规则由 companion 定义。
 
-- `workflow start` 在固定输入、版本、配置且关闭 runtime metadata 时运行两次，
-  工具产物一致；
-- 用冻结的多 decision / 零 expand `routing_request.json` replay 两次，
-  expanded findings 和 state 一致；
-- context-only step 递增 route step、不递增 expansion round，且不覆盖早期 artifact；
-- 四类 decision、回到 ROUTE、无展开进入 ADJUDICATE 的转换均覆盖；
-- 用冻结的 `verdict.json` finalize 两次，adjudicated HTML 和 COMPLETE state 一致；
-- Agent 新生成的 request/verdict 不做跨运行相等断言；
-- stable ID 不受自由文本 reason 影响；
-- 修改输入 bytes、config、packet 或 expanded digest 后，旧 cache/request/verdict 被拒绝；
-- 未知、重复、冲突 finding ref 被拒绝，dedup alias 可唯一重定向；
-- `explained` 缺少上下文引用时被拒绝，合法记录也不改写 finding 数学字段；
-- decision 的 recipes/context requests/context refs 条件矩阵和三维 context budget 均覆盖；
-- 历史 content-addressed context manifests/assets 在追加后仍可独立 replay；
-- 语义 `workflow_id` 固定；随机 instance audit ID 不影响 cache 或 byte-equality 模式；
-- 重复/遗漏 actionable cluster、带 expand 的 `proceed_to_adjudicate=true` 被拒绝；
-- 非法状态转换、未注册 recipe、第三轮展开和超预算请求被拒绝；
-- runtime metadata 开启时测 semantic equality，关闭时测 canonical artifact byte equality；
-- legacy report 可省略 `--expanded`，workflow finalize 要求合法的 expanded artifact；
-- workflow 与 report 的 console script / `python -m paperconan` 入口均有分派测试。
+若实现发现既有 public artifact 不能立即改为 canonical float，必须以 schema-versioned
+新字段并存迁移，不能静默改变旧字段。
 
-### 13.8 端到端
+## 13. 产品测试矩阵
 
-一个多 sheet 合成工作簿同时包含：
+全部 fixture 使用合成数据，不提交真实论文工作簿、DOI 或判断。
 
-- short pair；
-- repeated vector；
-- recurrent collision；
-- shared axis；
-- cumulative boundaries。
+### 13.1 Canonical signal
 
-用固定的 routing request 和 verdict 验证：
+| 场景 | 必须断言 |
+|---|---|
+| 3/3、4/4、5/6 relation | span、support mask、missing/outlier、转置一致 |
+| ratio/offset/shared-tail/partial identity | relation type、参数、精度和 residual |
+| 量级候选 | 只报告候选，不改原值 |
+| 长度 3–11 vector | equivalence class、occurrences、转置和跨 block |
+| group collision | event 去重、预先分 family、完整 coverage |
+| 只有两个 numeric rows 的 sheet | 不被 block `min_rows=3` 前置丢弃 |
 
-- 前三类 confirm 后为 high；
-- shared-axis 单元格从聚合和 p 值中移除；
-- 累计类存在于 raw scan，但 review 为 low；
-- forensic 保留 raw high；
-- candidate packet、expanded findings、verdict 和 HTML 连通；
-- 两轮预算和 coverage 生效；
-- 全量 pytest 和 golden 通过。
+### 13.2 Ownership 和 legacy parity
 
-### 13.9 报告链
+至少参数化 span 3–13，并在 legacy floor=5、12 和大于 12 的配置运行：
 
-- 只有 `block_value_duplication` 的 scan 在 HTML、Markdown 和 packet 中均可见；
-- 新增 synthetic group key 后三个消费者均识别，再分别执行 eligibility filter；
-- 未知 synthetic finding kind 走中立通用 renderer fallback；
-- expanded finding 经 `--expanded` 进入统一 report model；
-- supporting legacy finding 不重复显示为独立主 finding；
-- finding ID 在 scan、expanded、verdict 和 HTML 间可追踪。
+1. strict full identity，span 3–11 → `repeated_short_vector`；
+2. 6/8 partial identity → `short_pair_relation`；
+3. 8/8 仅在 loose tolerance 相等、但 strict identity 不成立 →
+   `short_pair_relation`；
+4. `many_equal_pairs` physical span 3–11 → pair owner，legacy kind 只 supporting；
+5. physical span 12–13（包括 missing 使 `n < span_length`）→ legacy long owner；
+6. vector cells 不再形成第二个 collision primary finding；
+7. missing/exception 会从 vector owner 转给 pair owner；
+8. legacy near-equal `identical_*` 与 round-6 recurring vector 不被误标为
+   `canonical_exact`；
+9. 长向量只输出 maximal primary，嵌套短窗口只作 supporting；
+10. adapter 对旧 kind、字段、顺序、gate、evidence 和 profile 投影保持 parity；
+11. floor 改变时 workflow ownership 不出现空档或两个 primary finding。
 
-## 14. 验收标准
+Legacy floor 大于 12 时，裸 CLI 是否激活仍由独立 hard-threshold audit 决定；
+workflow 的 generic enumeration 仍按 physical span 把 12+ 交给 long owner，不能把
+activation floor 当 ownership 边界。
 
-1. 同类短样本关系不再因全局最小长度在 Agent 看到之前消失。
-2. 多个 medium/low seed 只有在通过 dependency 合并并满足确定性 component
-   下限后才触发深查。
-3. 完整 null/power 校准通过后，下列完全合成结构在 confirm 后均为 high：
-   - 4 个配对值中至少 3 对保留各自至少 4 位且互不相同的小数尾，允许一对全值相同，
-     但至少有两个非零且不全相同的整数差；
-   - 5/6 局部精确比例；
-   - 同一 panel 的两种不同重复三元组；
-   - 至少 3 个 dependency components 的多值组内残余碰撞。
-4. shared-axis 和累计布局先保留 raw signal，再只解释相应单元格；review 根据残余证据
-   降级或保留。
-5. Agent 只遵循状态文件的 `next_action`，不选择 profile。
-6. 裸 CLI 仍可独立完成一次性扫描。
-7. 固定 routing request/verdict 后，原始信号、展开动作、阴性结果、最终报告和 coverage
-   均可重放；不要求 Agent 两次生成相同判断。
-8. HTML、Markdown、review packet 对 registered group 的识别一致，并分别执行明确的
-   eligibility filter；expanded finding 通过统一 report model 渲染。
-9. 同一数学证据不会因 legacy/canonical 双路径产生两个主 finding。
-10. 硬门槛审计分别记录 `workflow_covered`、`core_adapter_migrated` 与
-    `hard_floor_resolved`。
-11. 不提交任何真实论文数据、标识、数值或判定。
+### 13.3 Context 和 dependency
 
-## 15. 实施分期
+- shared-axis、固定分母、归一化锚点、累计边界、LOD、技术重复、量化和公式 fixture；
+- context 只影响命中的 cells/events；
+- residual owner 重算与输入顺序无关；
+- 同一 dependency component 最多一票；
+- shared-axis 等相关 signals 不能聚合触发展开；
+- final semantic dependency 前，provisional components 的 medium/low
+  `aggregation_eligible=false`；
+- 两个真正不相交 component 可以按 §6.3 规则触发展开；
+- grouping unknown 只能进入 experimental。
 
-### Phase 0：现存报告链缺口
+### 13.4 Workflow 和报告
 
-- 修复 `block_dups` 在默认 HTML 中不可见的问题；
-- canonical finding-group 常量移到共享模块；
-- HTML、Markdown、packet 消费同一集合；
-- 加报告链回归，不改 detector 结论。
+- 非法状态转换、未知 recipe、超预算和第三轮 expansion 被拒绝；
+- 无 registry 时，单个 `standalone_review` 完成 bounded route/expand/adjudicate；
+- 不可比 family/mode 用分层 round-robin 进入 packet，不能全局比较 strength；
+- 固定 request/verdict 可重放，Agent 文本不作重复采样断言；
+- registry 为空时 workflow 仍可 COMPLETE；
+- `experimental` finding 能进入 packet、expanded artifact 和最终报告；
+- report 区分 detector severity、evidence/feature status、registry 与 Agent verdict；
+- stable feature + missing/disabled registry 的组合可序列化且不升级；
+- `block_dups` 和未来新增 group 均受 registry 完整性测试保护；
+- 裸 CLI 的默认 detector golden 在 Phase 2 前后不增加 high。
 
-### Phase 1：工作流骨架
+### 13.5 Companion 接口
 
-- 可执行的 route/finalize 状态机、共同 artifact envelope、lineage 验证和预算；
-- candidate packet 与 routing request；
-- route step / expansion round 分离、不可变 step/state artifacts 和 content-addressed
-  context manifests；
-- legacy/raw finding stable ID 与 scope-fingerprint fallback；
-- 先从既有原始 finding/中间事件构造 bounded `short_signal_seeds[]`；允许 schema
-  先落地而没有新 detector 数学，但不得把已被 profile 改写的 severity 当作 raw；
-- `workflow_main(argv)` 接入现有手写 CLI 分派并保留 `paperconan <dir>`；
-- report 明确接收并合并 `expanded_findings.json`；
-- 固定 request/verdict 的 replay 测试；
-- 不改变现有 detector 结论；
-- 本阶段只能 opt-in/synthetic replay，不得切成生产默认 workflow。
+- 未登记、disabled/revoked、runtime class/version 不符、coverage 不完整一律 fail closed；
+- enabled entry 只能影响其注册 applicability；
+- `promotion_eligible=true` 同时映射 canonical direct_confirm/high，supporting refs 不重复升级；
+- canonical serializer/reader fixture 在支持的产品 runtime 稳定；校准重建使用
+  companion 冻结的 authoritative environment；
+- 统计 oracle、full-scan selection、FP/power 和 registry activation 测试引用 companion，
+  不在产品测试中复制。
 
-### Phase 2：共享内核与 legacy adapters
+## 14. PR 纪律和分期
 
-- seed、confirm 和旧 detector adapter 共用底层函数；
-- 行列双向；
-- sheet-scoped 2-row 覆盖与 3–11 连续范围；
-- raw collision event ledger；
-- deterministic layout segmentation、measurement-family key 和 grouping-unknown fallback；
-- footprint 去重；
-- legacy migration matrix 和兼容字段；
-- 通用合成回归；
-- 新 canonical 结果保持 experimental/raw，不赋默认 high。
+### 14.1 所有 PR 的共同门禁
 
-### Phase 3：统一上下文与 residual reducer
+- 一个 PR 不跨 Phase；Phase 大时继续拆成更小 PR；
+- 每个 PR 从前一 PR 已合并的主干开始；
+- 每个 PR 只引入一个可独立验证的行为变化；
+- 全量 pytest 和 golden 通过；
+- finding/report 数量差异有机器可读或书面 diff；
+- 新 family 在校准启用前保持关闭或 experimental；
+- schema 变化兼容旧 artifact，或显式拒绝不兼容版本；
+- 不提交真实论文数据、DOI、判定或敏感本地产物；
+- 不顺带降低 hard-threshold audit 的 activation floor；
+- detector 数学、calibration registry enable 和 Agent 默认切换分别审查。
 
-- shared-axis；
-- 累计边界；
-- 固定分母、锚点、边界、量化；
-- 公式蕴含关系；
-- typed context bundle、explained-event union 和 residual core 重算；
-- linked raw/residual records、final owner 和 canonical ID/alias；
-- `raw_severity` / `review_severity` / `effective_severity` 三视图；
-- 既有 prefilter/profile adapter；
-- review/forensic/triage 行为。
+### 14.2 Phase 0：报告链缺口
 
-### Phase 4：Dependency aggregation 与统计校准
+拆成两个独立 PR：
 
-- distinct evidence unit、dependency component 和版本化 routing tier；
-- shared measurement family 分层；
-- brute-force/解析 oracle；
-- selection-aware null、Monte-Carlo 和 injected-alternative power 校准；
-- 在 Phase 3 contexts 生效后重跑完整流程；
-- 只有校准通过的规则才能成为 `direct_confirm` 或默认 high。
+- **P0a**：只修复 `block_dups` 默认 HTML 可见性并添加定向回归测试；
+- **P0b**：建立统一 finding registry，再添加 HTML、Markdown、packet 完整性测试。
 
-### Phase 5：Agent skill 默认切换
+退出条件：
 
-- 先以 opt-in/shadow 方式更新 skill 编排，但不改变默认交付；
-- 裸 CLI 文档保持一次性定位；
-- 对缓存语料做 shadow 运行，比较候选量、dependency 合并率、shared-axis 解释率、
-  展开率、最终保留/暂缓原因、校准指标和 Agent token 消耗；
-- 预注册 go/no-go 指标通过后，才让 Agent 审核默认进入 workflow 并启用选择性展开交付。
+- detector 结论不变；
+- 只有预期报告 fixture 变化；
+- 全量测试和 golden 通过。
+
+### 14.3 Phase 1：opt-in workflow 骨架
+
+交付：
+
+- 状态机、最小 artifact envelope 和 lineage；
+- route/expand/finalize/status；
+- 在 cap/profile 前冻结 workflow raw stream，并从既有 finding 构造 seed；
+- expanded finding 与 verdict 的统一报告；
+- 固定 request/verdict replay；
+- 明确预算和 coverage；
+- 产品侧 fail-closed registry reader、空 registry 和 synthetic enabled compatibility fixture。
+
+当前 `main()` 对 `fetch`、`report` 使用手写 `sys.argv[1]` 分派，而不是完整
+subparser 树。Phase 1 必须在实施计划中明确是延续这一兼容模式，还是用独立机械 PR
+统一迁移到 `add_subparsers`；不能只让 `workflow` 使用第三种混合分派。
+
+退出条件：
+
+- 裸 CLI 默认行为不变；
+- detector golden 零变化；
+- workflow 仅 opt-in；
+- workflow seed 不随 CLI profile 改写或 packet cap 消失；
+- 不要求任何 enabled calibration。
+
+### 14.4 Phase 2：短信号 experimental 价值出口
+
+Phase 2 按纵向价值切片，不等待三个 family 同时完成：
+
+1. **P2a pair**：shared pair core、legacy parity、owner/floor 解耦、Agent/report 端到端；
+2. **P2b vector**：vector iterator、maximal containment、legacy parity、Agent/report；
+3. **P2c collision**：raw event collector、vector-cell 扣除、分组、Agent/report。
+
+每个切片都是独立 PR 序列；P2a 通过即可交付 pair 的 experimental 用户价值，不等待
+P2b/P2c。P2c 可以在 P3 的 final dependency 完成前先输出保守 candidate，但其
+`standalone_review` 必须等所需 dependency 语义可用。
+
+用户价值出口：
+
+> 在 opt-in Agent workflow 中，3–4 个重复、5/6 局部关系和短向量复用可以进入
+> 候选、执行确定性展开并出现在最终报告中。它们不再在 Agent 之前消失，但不会在
+> 未校准时获得 detector 默认 high。
+
+宽召回的 experimental candidates 只写入 workflow namespace 的 packet/expanded
+artifacts；普通裸 CLI 的默认 `scan.json` schema、finding 集合和 high 数量保持不变。
+未来若要让裸 CLI 显示这些候选，必须另设显式 opt-in/schema 版本，不能静默改变旧
+消费者。
+
+退出条件：
+
+- span 3–13 在 legacy floor=5、12 和大于 12 时均无 workflow owner 空档、无双 primary；
+- `many_equal_pairs` short/long owner、missing span 和 adapter parity 有测试；
+- 本切片的 experimental finding 可完整走通 workflow；
+- 裸 CLI 默认 high 数量不增加。
+
+### 14.5 Phase 3：context、dependency 和 final owner
+
+交付：
+
+- 按 family 需要逐步交付 context taxonomy 与既有 prefilter/profile 的共享 helper；
+- explained event 范围与 residual owner；
+- dependency component 单次计票；
+- raw evidence 和 supporting ref 可追溯；
+- 相关 seed 聚合保护。
+
+退出条件：
+
+- shared-axis、固定分母、归一化等合成反例不会被重复聚合；
+- context removal 只影响明确范围；
+- residual owner 与遍历顺序无关；
+- 未校准 slot 仍不产生默认 high。
+
+### 14.6 Phase 4：shadow 与 Agent 默认入口
+
+交付：
+
+- 先以“既有 findings + 已完成 family feature flags”在本地 corpus shadow，比较候选量、
+  展开率、coverage、token 和运行时间；
+- 通过 shadow 的最小 workflow 即可让 skill 默认切换，裸 CLI 仍为一次性入口；
+- 后续 family/context 分别 shadow 后逐个打开 feature flag；
+- registry 为空和部分 slot enabled 两种路径均可运行；
+- per-slot revoke/rollback 和 workflow fallback。
+
+退出条件：
+
+- P0、P1 以及本次默认启用 family 所需的 P2/P3 slice 已通过；
+- 当前 feature set 的 shadow 指标满足预注册产品 go/no-go；
+- Agent 不需要选择 profile 或 calibration mode；
+- signal 明确显示 evidence stage、feature status 和 registry status；stable feature
+  可以保持 registry missing/disabled；
+- 默认切换有回滚路径。
+
+统计 companion 的 C0、纵向 slot 校准和启用 PR 可与产品 Phase 独立推进。
+某个 calibration slot 未通过，不能阻塞 Phase 2 价值出口或 Phase 4 Agent 默认入口。
+
+## 15. 产品验收
+
+本规范完成的必要条件：
+
+1. Agent workflow 与裸 CLI 的入口和语义不混淆；
+2. span 3–11 连续覆盖，3–4 个重复和局部关系可进入 Agent；
+3. `many_equal_pairs`、strict identity、long owner 和 collision owner 无真空或重叠；
+4. canonical ownership 与 legacy activation floor 明确解耦；
+5. 相关 seed 不会因 shared axis、分母、锚点、公式或重复 detector 被多次计票；
+6. Agent 只控制预算和 verdict，不控制数学结果；
+7. 无 enabled calibration 时 workflow 仍能完成和报告；
+8. 新短信号在未校准时不会自动赋 detector high；
+9. 固定 request/verdict 的确定性边界可测试；
+10. 报告包含 expanded finding、coverage、registry 状态和 Agent adjudication；
+11. 每个 Phase 可作为独立 PR 交付、回滚和复核；
+12. 全部 detector、artifact、golden 和报告测试通过。
+
+本规范获得书面批准后，先为 Phase 0 编写独立实施计划；统计 companion 另行批准、
+另行计划，不与产品 Phase 合并实施。
