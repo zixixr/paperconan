@@ -50,11 +50,6 @@ def _esc(s: Any) -> str:
 
 # ---------- finding extraction ----------
 
-def canonical_block_groups() -> tuple[str, ...]:
-    """The registered per-block group keys every consumer must recognise."""
-    return BLOCK_FINDING_GROUPS
-
-
 def _iter_block_findings(
     scan: dict,
     *,

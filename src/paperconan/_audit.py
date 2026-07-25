@@ -4080,6 +4080,22 @@ def _record_formula_cache_gaps(coverage, path, accepted_sheets):
         )
 
 
+# The block-finding groups scan_dir actually produces. Checked against the
+# canonical registry at import: a detector group nobody registered (or a
+# registered group that lost its producer) would vanish from every report
+# silently — the failure that hid block_dups. Catching it here rather than
+# mid-scan means the drift can never reach a user's run.
+_PRODUCED_BLOCK_GROUPS = {
+    "relations", "progressions", "equal_pairs", "row_pairs", "row_relations",
+    "within_col", "identical_after_rounding", "grim", "block_dups",
+}
+if _PRODUCED_BLOCK_GROUPS != set(BLOCK_FINDING_GROUPS):
+    raise RuntimeError(
+        "detector output does not match the canonical finding-group registry: "
+        f"produced {sorted(_PRODUCED_BLOCK_GROUPS)}, "
+        f"registered {sorted(BLOCK_FINDING_GROUPS)}"
+    )
+
 TABLE_PATTERNS = (
     "*.xlsx", "*.xls", "*.xlsm", "*.xlsb",
     "*.csv", "*.tsv", "*.pdf", "*.docx",
@@ -4245,16 +4261,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                               "row_pairs": rp, "row_relations": rr, "within_col": wc,
                               "identical_after_rounding": iar, "grim": gg,
                               "block_dups": bd}
-                    if set(groups) != set(BLOCK_FINDING_GROUPS):
-                        # A detector produced a group nobody registered, or a
-                        # registered group lost its producer. Either way findings
-                        # would vanish from every report silently — the exact
-                        # failure that hid block_dups. Fail loudly instead.
-                        raise RuntimeError(
-                            "detector output does not match the canonical finding-group "
-                            f"registry: produced {sorted(groups)}, "
-                            f"registered {sorted(BLOCK_FINDING_GROUPS)}"
-                        )
+                    assert set(groups) == _PRODUCED_BLOCK_GROUPS  # keyed by the literal above
                     # Effective cap = the tighter of the per-block limit and the remaining global
                     # budget; None means unlimited (both caps disabled). A spent global budget
                     # yields 0, which drops the whole block (recorded via `omitted`).
@@ -4626,8 +4633,8 @@ def _run_workflow(args: argparse.Namespace) -> None:
                   f"next: {state['next_action']} → {state['next_artifact_path']}")
             print(f"  clusters routed: {state['coverage']['clusters_total'] - state['coverage']['clusters_omitted']}"
                   f" of {state['coverage']['clusters_total']}")
-            if state["coverage"]["truncated"]:
-                print(f"  coverage: {state['coverage']['omitted_reason']}")
+            for limitation in state["coverage"].get("limitations") or []:
+                print(f"  coverage: {limitation}")
             return
         status = workflow_status(args.workflow_dir)
         print(f"stage: {status['workflow_stage']}")

@@ -123,31 +123,88 @@ def test_cross_sheet_findings_reach_the_seed_stream(tmp_path):
 
 
 def test_coverage_names_families_it_does_not_seed(tmp_path):
+    """Asserts a real family is named, not merely that the key exists.
+
+    An earlier version only checked for the presence of two keys, so it passed
+    against an `_UNSEEDED_FAMILIES` that was empty in practice.
+    """
     data = tmp_path / "data"
-    _panel(data / "p.csv")
+    # digit_distribution fires on this shape and is not seeded by Phase 1
+    rows = ["sample,value"] + [
+        f"s{i},{round(0.1234567 + i * 0.0173219, 7)}" for i in range(40)
+    ]
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "d.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
 
     start_workflow(str(data), str(tmp_path / "out"))
+    scan = _read(tmp_path / "out" / "scan.json")
     coverage = _packet(tmp_path / "out")["coverage"]
 
-    assert "families_not_seeded" in coverage
-    assert "coverage_complete" in coverage
+    present = [f for f in ("digit_distribution", "decimal_endings",
+                           "decimal_tail_clusters") if scan.get(f)]
+    assert present, "fixture produced none of the unseeded families"
+
+    for family in present:
+        assert family in coverage["families_not_seeded"], (
+            f"{family} is in scan.json but the packet does not admit it is unrouted"
+        )
+        assert coverage["families_not_seeded"][family] > 0
+    assert coverage["coverage_complete"] is False
+
+
+def test_an_incomplete_scan_makes_the_packet_admit_it(tmp_path, monkeypatch):
+    """Blocks dropped by the report-block limit never reach findings_omitted."""
+    import paperconan._audit as audit
+    monkeypatch.setattr(audit, "_MAX_REPORT_BLOCKS", 1)
+
+    data = tmp_path / "data"
+    for name in ("a.csv", "b.csv", "c.csv"):
+        _panel(data / name)
+
+    start_workflow(str(data), str(tmp_path / "out"))
+    scan = _read(tmp_path / "out" / "scan.json")
+    coverage = _packet(tmp_path / "out")["coverage"]
+
+    assert scan["scan_status"] != "complete", "fixture did not trip the block limit"
+    assert coverage["scan_incomplete"] is True
+    assert coverage["coverage_complete"] is False
+    assert any("scan was not complete" in x for x in coverage["limitations"])
 
 
 # ---------- I7 / I8: stable, well-separated identity ----------
 
+def _seed_map(out):
+    """finding identity -> seed_id, for the findings that exist in both runs."""
+    return {
+        (s["file"], s["sheet"], s["block_rows"], s["block_cols"], s["group"], s["rule"]):
+            s["seed_id"]
+        for c in _packet(out)["clusters"] for s in c["seeds"]
+    }
+
+
 def test_seed_ids_do_not_shift_when_an_unrelated_file_is_added(tmp_path):
-    """P1d's routing request cites seeds by id; positional ids would renumber."""
+    """P1d's routing request cites seeds by id; positional ids would renumber.
+
+    Compares the id assigned to *the same finding* across runs. An earlier
+    version asserted `before <= after` on the id sets, which a positional scheme
+    satisfies for free: run 2 has more seeds, so `seed:0000..N` is a superset of
+    run 1's regardless of which finding each id points at.
+    """
     data = tmp_path / "data"
     _panel(data / "zebra.csv")
 
     start_workflow(str(data), str(tmp_path / "a"))
-    before = {s["seed_id"] for c in _packet(tmp_path / "a")["clusters"] for s in c["seeds"]}
+    before = _seed_map(tmp_path / "a")
+    assert before, "fixture produced no seeds"
 
     _panel(data / "alpha.csv", scale=3)  # sorts first, would shift every index
     start_workflow(str(data), str(tmp_path / "b"))
-    after = {s["seed_id"] for c in _packet(tmp_path / "b")["clusters"] for s in c["seeds"]}
+    after = _seed_map(tmp_path / "b")
 
-    assert before <= after, "existing seed ids changed when a new file was added"
+    shared = set(before) & set(after)
+    assert shared, "no finding survived the second run; test would be vacuous"
+    for key in sorted(shared):
+        assert before[key] == after[key], f"seed id for {key} changed: {before[key]} -> {after[key]}"
 
 
 def test_side_by_side_panels_are_separate_clusters(tmp_path):
@@ -238,3 +295,156 @@ def test_a_damaged_workflow_directory_reports_a_workflow_error(tmp_path, damage)
 
     with pytest.raises(WorkflowError):
         workflow_status(str(out))
+
+
+def test_a_path_escaping_index_is_refused_even_when_the_target_exists(tmp_path):
+    """Plants a real file outside the dir: otherwise this passes as 'missing'."""
+    out = tmp_path / "out"
+    _panel(tmp_path / "data" / "p.csv")
+    start_workflow(str(tmp_path / "data"), str(out))
+
+    planted = tmp_path / "outside.json"
+    planted.write_text((out / "states" / "s000.json").read_text(encoding="utf-8"),
+                       encoding="utf-8")
+    (out / "workflow_state.json").write_text(
+        '{"schema_version": 1, "current_state_path": "../outside.json"}', encoding="utf-8"
+    )
+
+    with pytest.raises(WorkflowError, match="outside the workflow directory"):
+        workflow_status(str(out))
+
+
+def test_a_sibling_directory_sharing_a_path_prefix_is_allowed(tmp_path):
+    """/tmp/data and /tmp/data2 are siblings; naive prefix matching would refuse."""
+    data = tmp_path / "data"
+    _panel(data / "p.csv")
+
+    start_workflow(str(data), str(tmp_path / "data2"))  # must not raise
+
+    assert (tmp_path / "data2" / "workflow_state.json").exists()
+
+
+def test_force_clears_the_previous_runs_artifacts(tmp_path):
+    """Rewinding the index over surviving states would mix two runs."""
+    data = tmp_path / "data"
+    _panel(data / "p.csv")
+    out = tmp_path / "out"
+    start_workflow(str(data), str(out))
+    orphan = out / "states" / "s001.json"
+    orphan.write_text('{"stale": true}', encoding="utf-8")
+
+    start_workflow(str(data), str(out), force=True)
+
+    assert not orphan.exists(), "a state from the previous run survived --force"
+    workflow_status(str(out))  # index and state must still agree
+
+
+def test_an_index_pointing_at_another_runs_state_is_refused(tmp_path):
+    """Per-artifact digests cannot see this: the orphan verifies fine alone."""
+    data = tmp_path / "data"
+    _panel(data / "p.csv")
+    out_a, out_b = tmp_path / "a", tmp_path / "b"
+    start_workflow(str(data), str(out_a))
+    _panel(data / "other.csv", scale=7)
+    start_workflow(str(data), str(out_b))
+
+    # graft run B's state into run A's directory
+    (out_a / "states" / "s000.json").write_text(
+        (out_b / "states" / "s000.json").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    with pytest.raises(WorkflowError, match="mixes runs|does not point at"):
+        workflow_status(str(out_a))
+
+
+def test_an_artifact_missing_an_envelope_field_is_refused(tmp_path):
+    out = tmp_path / "out"
+    _panel(tmp_path / "data" / "p.csv")
+    start_workflow(str(tmp_path / "data"), str(out))
+
+    state_path = out / "states" / "s000.json"
+    state = _read(state_path)
+    del state["source_finding_refs"]
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(WorkflowError, match="missing envelope fields"):
+        workflow_status(str(out))
+
+
+def test_an_index_from_an_unsupported_schema_is_refused(tmp_path):
+    out = tmp_path / "out"
+    _panel(tmp_path / "data" / "p.csv")
+    start_workflow(str(tmp_path / "data"), str(out))
+
+    index_path = out / "workflow_state.json"
+    index = _read(index_path)
+    index["schema_version"] = 999
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+    with pytest.raises(WorkflowError, match="schema_version"):
+        workflow_status(str(out))
+
+
+def test_writes_leave_no_partial_file_behind(tmp_path):
+    """Atomic write: no .tmp survives a completed run."""
+    out = tmp_path / "out"
+    _panel(tmp_path / "data" / "p.csv")
+    start_workflow(str(tmp_path / "data"), str(out))
+
+    assert not list(out.rglob("*.tmp"))
+
+
+def test_a_write_that_dies_midway_does_not_corrupt_the_previous_artifact(tmp_path,
+                                                                        monkeypatch):
+    """The reason writes go through tmp+replace, rather than straight to target."""
+    import json as json_mod
+
+    from paperconan import _workflow
+
+    out = tmp_path / "out"
+    _panel(tmp_path / "data" / "p.csv")
+    start_workflow(str(tmp_path / "data"), str(out))
+
+    target = out / "states" / "s000.json"
+    intact = target.read_text(encoding="utf-8")
+
+    real_dump = json_mod.dump
+
+    def dying_dump(obj, fh, **kw):
+        fh.write('{"half-written":')
+        raise OSError("disk full")
+
+    monkeypatch.setattr(_workflow.json, "dump", dying_dump)
+    with pytest.raises(OSError):
+        _workflow._write(str(target), {"schema_version": 1})
+    monkeypatch.setattr(_workflow.json, "dump", real_dump)
+
+    assert target.read_text(encoding="utf-8") == intact, "a failed write clobbered the artifact"
+    workflow_status(str(out))  # still readable
+
+
+def test_the_manifest_ignores_files_the_scan_does_not_read(tmp_path):
+    """Images are not inventoried on this path, so they must not move run_id."""
+    data = tmp_path / "data"
+    _panel(data / "p.csv")
+
+    first = start_workflow(str(data), str(tmp_path / "a"))["run_id"]
+    (data / "figure1.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    second = start_workflow(str(data), str(tmp_path / "b"))["run_id"]
+
+    assert first == second
+
+
+def test_provenance_sidecar_changes_the_run_identity(tmp_path):
+    """It is not a table file, but the scan embeds it — same inputs must differ."""
+    data = tmp_path / "data"
+    _panel(data / "p.csv")
+
+    first = start_workflow(str(data), str(tmp_path / "a"))["run_id"]
+    (data / "paperconan_source.json").write_text(
+        json.dumps({"doi": "10.0000/synthetic-fixture", "title": "Synthetic"}),
+        encoding="utf-8",
+    )
+    second = start_workflow(str(data), str(tmp_path / "b"))["run_id"]
+
+    assert first != second, "provenance change left run_id untouched"

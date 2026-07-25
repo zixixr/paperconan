@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 from typing import Any
 
 from ._finding_groups import BLOCK_FINDING_GROUPS
@@ -71,22 +72,37 @@ def _file_digest(path: str) -> str:
     return h.hexdigest()
 
 
-def _source_manifest(in_dir: str) -> list[dict[str, str]]:
-    """Digests of exactly the files `scan_dir` will read.
+#  scan_dir reads this sidecar for provenance and embeds it as scan["paper"], so
+#  it changes scan output and has to be part of the identity.
+_PROVENANCE_SIDECAR = "paperconan_source.json"
 
-    Two properties this has to hold, both learned the hard way:
 
-    * It covers the *scanned* file set, not everything under `in_dir`. Walking
-      the tree let a stray `.DS_Store` change `run_id` while the scan output was
-      byte-identical, and — worse — hashed the workflow's own artifacts whenever
-      `out_dir` lived inside `in_dir`, so `run_id` never reached a fixed point.
-    * Paths are relative and content-addressed, so the same source data replays
-      to the same `run_id` on another machine.
+def _source_manifest(in_dir: str, *, images: bool = False) -> list[dict[str, str]]:
+    """Digests of exactly the inputs this workflow's scan reads.
+
+    "Exactly" is load-bearing in both directions, and both were wrong before:
+
+    * Over-covering moves `run_id` for files that never touched the output. The
+      original walked the whole tree, so a stray `.DS_Store` changed the id while
+      the scan stayed byte-identical — and with `out_dir` nested under `in_dir` it
+      hashed the run's own artifacts and the id never reached a fixed point.
+    * Under-covering is worse: two materially different runs collapse onto one
+      identity. `paperconan_source.json` is not a table file, but the scan embeds
+      it as `paper` provenance, so it belongs here.
+
+    Images are only included when the scan is actually inventorying them.
     """
     from ._audit import find_local_images, find_table_files
 
+    paths = set(find_table_files(in_dir))
+    if images:
+        paths |= set(find_local_images(in_dir))
+    sidecar = os.path.join(in_dir, _PROVENANCE_SIDECAR)
+    if os.path.isfile(sidecar):
+        paths.add(sidecar)
+
     entries = []
-    for path in sorted(set(find_table_files(in_dir)) | set(find_local_images(in_dir))):
+    for path in sorted(paths):
         rel = os.path.relpath(path, in_dir).replace(os.sep, "/")
         try:
             entries.append({"path": rel, "sha256": _file_digest(path)})
@@ -163,14 +179,19 @@ def require_envelope(art: dict[str, Any], *, expected_type: str | None = None) -
 # ---------- seeds ----------
 
 def _reject_nested_out_dir(in_dir: str, out_dir: str) -> None:
-    """A workflow dir inside the source dir would feed its own output back in."""
-    in_abs = os.path.abspath(in_dir)
-    out_abs = os.path.abspath(out_dir)
+    """Keep the workflow's own artifacts out of the directory it treats as source.
+
+    The manifest is non-recursive and matches no artifact name, so this is
+    defence in depth rather than the sole guard — but a workflow directory living
+    inside the source tree still invites confusion about what is input.
+    realpath, not abspath, so a symlinked out_dir cannot slip past.
+    """
+    in_abs = os.path.realpath(in_dir)
+    out_abs = os.path.realpath(out_dir)
     if in_abs == out_abs or out_abs.startswith(in_abs + os.sep):
         raise WorkflowError(
             f"workflow --out ({out_dir}) must live outside the source directory "
-            f"({in_dir}); a nested workflow directory would be re-read as source "
-            "data on the next run and run_id would never settle"
+            f"({in_dir}); keep workflow artifacts separate from the data they describe"
         )
 
 
@@ -289,28 +310,44 @@ def _build_clusters(scan: dict[str, Any], max_clusters: int) -> tuple[list[dict]
     return kept, coverage
 
 
-# Finding families the Phase 1 seed layer does not route yet. Named explicitly so
-# `coverage_complete` can be false rather than the packet implying full coverage.
-_UNSEEDED_FAMILIES = ("image_findings",)
+# Finding families carried in scan.json that the Phase 1 seed layer does not route
+# yet. Named explicitly so `coverage_complete` can be false rather than letting the
+# packet imply it covered everything.
+_UNSEEDED_FAMILIES = (
+    "image_findings",
+    "digit_distribution",
+    "decimal_endings",
+    "decimal_tail_clusters",
+)
 
 
 def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any]:
     limitations: list[str] = []
 
-    # The scan's own per-block/global finding caps run before the workflow ever
-    # sees a finding, so their omissions have to be carried through here. Without
-    # this the packet reported truncated=false while seeds had already been cut.
-    scan_omitted = int(scan.get("findings_omitted") or 0)
-    block_omitted = sum(
-        int(blk.get("findings_omitted") or 0)
-        for blk in scan.get("relations_blocks", []) or []
-    )
-    upstream_omitted = max(scan_omitted, block_omitted)
+    # The scan's own caps run before the workflow ever sees a finding. There are
+    # two distinct channels and the packet has to carry both: the finding cap
+    # (counted in findings_omitted) and everything the scan itself recorded as
+    # incomplete — blocks dropped by the report-block limit, files that failed to
+    # parse — which never reaches findings_omitted at all.
+    upstream_omitted = int(scan.get("findings_omitted") or 0)
     if upstream_omitted:
         limitations.append(
             f"{upstream_omitted} findings were dropped by the scan's finding caps "
             "before seeding (see scan.json findings_omitted)"
         )
+
+    scan_status = scan.get("scan_status")
+    scan_coverage = scan.get("coverage") or {}
+    scan_incomplete = bool(scan_coverage.get("truncated")) or (
+        scan_status not in (None, "complete")
+    )
+    if scan_incomplete:
+        limitations.append(
+            f"the underlying scan was not complete (scan_status={scan_status!r}); "
+            "seeds cover only what it analysed"
+        )
+        for entry in scan_coverage.get("limitations") or []:
+            limitations.append(f"scan: {entry}" if isinstance(entry, str) else f"scan: {entry!r}")
 
     unseeded = {
         family: len(scan.get(family) or [])
@@ -332,6 +369,8 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
         "clusters_omitted": len(omitted),
         "truncated": bool(omitted),
         "upstream_findings_omitted": upstream_omitted,
+        "scan_status": scan_status,
+        "scan_incomplete": scan_incomplete,
         "families_not_seeded": unseeded,
         "coverage_complete": not limitations,
         "limitations": limitations,
@@ -348,11 +387,18 @@ def start_workflow(in_dir: str, out_dir: str, *, profile: str = "review",
 
     max_clusters = DEFAULT_BUDGET["clusters"] if max_clusters is None else max_clusters
     _reject_nested_out_dir(in_dir, out_dir)
-    if not force and os.path.exists(os.path.join(out_dir, "workflow_state.json")):
-        raise WorkflowError(
-            f"{out_dir} already holds a workflow; restarting would rewind its index "
-            "and orphan later states. Use force=True (CLI --force) to overwrite."
-        )
+    if os.path.exists(os.path.join(out_dir, "workflow_state.json")):
+        if not force:
+            raise WorkflowError(
+                f"{out_dir} already holds a workflow; restarting would rewind its "
+                "index and orphan later states. Use force=True (CLI --force)."
+            )
+        # Clear the prior run's artifacts rather than rewinding the index over
+        # them: a mixed directory is exactly the orphan state the guard exists to
+        # prevent, and per-artifact digests cannot detect it (an orphaned state
+        # from the previous run is internally consistent).
+        for stale in ("states", "steps"):
+            shutil.rmtree(os.path.join(out_dir, stale), ignore_errors=True)
 
     # Manifest first: hashing after the scan would fold this run's own artifacts
     # into the digest whenever out_dir sits under in_dir, and run_id would never
@@ -466,4 +512,17 @@ def workflow_status(out_dir: str) -> dict[str, Any]:
 
     state = _read_json(state_path, what="workflow state")
     require_envelope(state, expected_type="workflow_state")
+
+    # Per-artifact digests cannot catch a mixed directory: a state left behind by
+    # an earlier run verifies fine on its own. Cross-check it against the index.
+    if index.get("run_id") != state.get("run_id"):
+        raise WorkflowError(
+            f"workflow index belongs to run {index.get('run_id')} but its current "
+            f"state belongs to {state.get('run_id')}; the directory mixes runs"
+        )
+    if index.get("current_state_id") != state.get("artifact_id"):
+        raise WorkflowError(
+            "workflow index does not point at the state it claims "
+            f"({index.get('current_state_id')} vs {state.get('artifact_id')})"
+        )
     return state

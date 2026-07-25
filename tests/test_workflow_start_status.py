@@ -207,6 +207,35 @@ def test_cli_start_then_status(tmp_path):
     assert "ROUTE" in status.stdout
 
 
+def test_cli_start_prints_coverage_limitations_when_it_truncates(tmp_path):
+    """The honesty message has to survive the path it was written for.
+
+    An earlier revision renamed the coverage field and left this print statement
+    reading the old key, so `workflow start` raised KeyError on exactly the runs
+    that had something to disclose. The one-file fixture above never truncates,
+    so nothing caught it.
+    """
+    import subprocess
+    import sys
+
+    data = tmp_path / "data"
+    data.mkdir()
+    for k in range(12):  # more clusters than the default budget of 8
+        rows = ["a,b"] + [f"{i + 1},{(i + 1) * (k + 2)}" for i in range(12)]
+        (data / f"f{k}.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    res = subprocess.run(
+        [sys.executable, "-m", "paperconan", "workflow", "start",
+         str(data), "--out", str(tmp_path / "agent")],
+        text=True, capture_output=True,
+    )
+
+    assert res.returncode == 0, res.stderr
+    assert "Traceback" not in res.stderr
+    assert "coverage:" in res.stdout
+    assert "cluster budget" in res.stdout
+
+
 def test_cli_status_on_a_plain_directory_exits_with_a_message(tmp_path):
     import subprocess
     import sys
