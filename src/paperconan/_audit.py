@@ -4617,6 +4617,24 @@ def _run_workflow(args: argparse.Namespace) -> None:
         sys.exit(str(exc))
 
 
+def _scan_options_section(scan_p: argparse.ArgumentParser) -> str:
+    """The scan parser's own options block, lifted verbatim.
+
+    `paperconan <dir>` is the documented default invocation, so its flags have to
+    stay discoverable from the bare `--help`. Deriving the text from the parser
+    rather than restating it keeps the two from drifting apart.
+    """
+    help_text = scan_p.format_help()
+    marker = "options:"
+    idx = help_text.find(marker)
+    if idx < 0:  # pragma: no cover - argparse always emits an options section
+        return ""
+    body = help_text[idx + len(marker):].rstrip()
+    # -h is already documented on the top-level parser; don't list it twice.
+    kept = [ln for ln in body.split("\n") if not ln.lstrip().startswith("-h, --help")]
+    return "scan options (for `paperconan <in_dir>`):" + "\n".join(kept)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="paperconan",
@@ -4624,6 +4642,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "Scan a paper's source data (xlsx/csv/tsv, or tables inside "
             "pdf/docx) for statistical signals and data inconsistencies"
         ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--version", action="version", version=f"paperconan {_version()}")
     sub = ap.add_subparsers(dest="cmd")
@@ -4634,6 +4653,8 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Scan a paper's source data for statistical signals and data inconsistencies",
     )
     _add_scan_arguments(scan_p)
+    # Route usage errors back to the parser the flags actually belong to.
+    scan_p.set_defaults(_parser=scan_p)
 
     sub.add_parser(
         "fetch",
@@ -4671,6 +4692,11 @@ def _build_parser() -> argparse.ArgumentParser:
     wf_status = wf_sub.add_parser("status", help="print the current stage and budget")
     wf_status.add_argument("workflow_dir", help="Workflow working directory")
 
+    ap.epilog = (
+        "default invocation:\n"
+        "  paperconan <in_dir> [options]   equivalent to `paperconan scan <in_dir>`\n\n"
+        + _scan_options_section(scan_p)
+    )
     return ap
 
 
@@ -4697,7 +4723,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.cmd == "workflow":
         _run_workflow(args)
         return
-    _run_scan(ap, args)
+    _run_scan(getattr(args, "_parser", ap), args)
 
 
 if __name__ == "__main__":
