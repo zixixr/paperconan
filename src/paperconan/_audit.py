@@ -52,10 +52,9 @@ from .schema import PaperconanInputError
 # SINGLE SOURCE OF TRUTH: the markdown report, the packet distiller, and the
 # paperconan-watch severity counters / triage gate all iterate this set, so a
 # HIGH finding in ANY group (notably row_pairs) is counted and can reach review.
-BLOCK_FINDING_GROUPS = (
-    "relations", "equal_pairs", "progressions", "row_pairs", "row_relations",
-    "within_col", "identical_after_rounding", "grim", "block_dups",
-)
+# Canonical registry lives in a leaf module so _html/packet can read it without
+# pulling this one in; re-exported here for the existing public import path.
+from ._finding_groups import BLOCK_FINDING_GROUPS  # noqa: E402,F401
 
 
 def _version():
