@@ -138,7 +138,8 @@ def test_packet_records_coverage_for_what_it_left_out(tmp_path):
     assert len(packet["clusters"]) == 1
     assert packet["coverage"]["clusters_omitted"] == total - 1
     assert packet["coverage"]["truncated"] is True
-    assert packet["coverage"]["omitted_reason"]
+    assert packet["coverage"]["coverage_complete"] is False
+    assert any("cluster budget" in x for x in packet["coverage"]["limitations"])
 
 
 def test_fixed_input_replays_to_identical_artifacts(tmp_path):
