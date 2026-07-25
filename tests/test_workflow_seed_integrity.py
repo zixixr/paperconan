@@ -13,6 +13,7 @@ import pytest
 
 from paperconan._workflow import (
     REQUIRED_ENVELOPE_FIELDS,
+    SCHEMA_VERSION,
     WorkflowError,
     start_workflow,
     workflow_status,
@@ -173,13 +174,78 @@ def test_an_incomplete_scan_makes_the_packet_admit_it(tmp_path, monkeypatch):
 
 # ---------- I7 / I8: stable, well-separated identity ----------
 
+def _all_seeds(out):
+    return [s for c in _packet(out)["clusters"] for s in c["seeds"]]
+
+
 def _seed_map(out):
-    """finding identity -> seed_id, for the findings that exist in both runs."""
-    return {
-        (s["file"], s["sheet"], s["block_rows"], s["block_cols"], s["group"], s["rule"]):
-            s["seed_id"]
-        for c in _packet(out)["clusters"] for s in c["seeds"]
+    """finding identity -> seed_id, for the findings that exist in both runs.
+
+    Keyed on the finding's own locator fields rather than on whatever the id is
+    hashed from, so a scheme that maps two findings onto one id shows up as a
+    collision here instead of being silently overwritten.
+    """
+    seeds = _all_seeds(out)
+    mapping = {}
+    for s in seeds:
+        key = (s["scope"], s["file"], s["sheet"], s["block_rows"], s["block_cols"],
+               s["group"], s["kind"], s["rule"], s["n"])
+        assert key not in mapping, f"two findings share a locator: {key}"
+        mapping[key] = s["seed_id"]
+    return mapping
+
+
+def test_cross_sheet_seeds_differing_only_in_row_get_different_ids():
+    """Unit-level: the locator has to distinguish findings the sheet pair shares.
+
+    Hashing only (file, sheet pair, kind, rule) is not injective — repeated row
+    labels make `rule` repeat too. Tested directly rather than through a scan,
+    because the end-to-end shape that collides is hard to synthesise on demand
+    and the property is a contract of this function either way.
+    """
+    from paperconan._workflow import _cross_sheet_seed
+
+    base = {
+        "kind": "identical_row_reuse",
+        "rule": "row 'CTRL' == row 'CTRL' over a run of 16 values",
+        "file_a": "a.csv", "file_b": "b.csv",
+        "sheet_a": "panelA", "sheet_b": "panelB",
+        "severity": "high",
     }
+
+    first = _cross_sheet_seed({**base, "row_a": 3, "row_b": 9})
+    second = _cross_sheet_seed({**base, "row_a": 4, "row_b": 11})
+
+    assert first["seed_id"] != second["seed_id"], (
+        "two distinct row pairs collapsed onto one seed id"
+    )
+
+
+def test_the_packet_refuses_to_ship_colliding_seed_ids(tmp_path, monkeypatch):
+    """The invariant fires even if a future locator change loses information."""
+    from paperconan import _workflow
+
+    monkeypatch.setattr(_workflow, "_stable_id", lambda prefix, parts: f"{prefix}:same")
+
+    data = tmp_path / "data"
+    _panel(data / "p.csv")
+
+    with pytest.raises(WorkflowError, match="seed ids are not unique"):
+        start_workflow(str(data), str(tmp_path / "out"))
+
+
+def test_seed_ids_are_unique_within_a_packet(tmp_path):
+    """A routing decision cites a seed id; two findings sharing one is ambiguous."""
+    data = tmp_path / "data"
+    _duplicated_across_files(data)
+    _panel(data / "extra.csv", scale=3)
+
+    start_workflow(str(data), str(tmp_path / "out"))
+    seeds = _all_seeds(tmp_path / "out")
+
+    ids = [s["seed_id"] for s in seeds]
+    assert len(set(ids)) == len(ids), "seed ids collide"
+    assert len(ids) == _packet(tmp_path / "out")["coverage"]["seeds_total"]
 
 
 def test_seed_ids_do_not_shift_when_an_unrelated_file_is_added(tmp_path):
@@ -279,17 +345,20 @@ def test_a_damaged_workflow_directory_reports_a_workflow_error(tmp_path, damage)
     index_path = out / "workflow_state.json"
 
     if damage == "truncate_index":
-        index_path.write_text('{"schema_version": 1, "curr', encoding="utf-8")
+        index_path.write_text('{"schema_version": %d, "curr' % SCHEMA_VERSION,
+                              encoding="utf-8")
     elif damage == "truncate_state":
         (out / "states" / "s000.json").write_text('{"schema_ver', encoding="utf-8")
     elif damage == "state_is_a_dir":
         os.remove(out / "states" / "s000.json")
         (out / "states" / "s000.json").mkdir()
     elif damage == "index_without_path":
-        index_path.write_text('{"schema_version": 1}', encoding="utf-8")
+        index_path.write_text('{"schema_version": %d}' % SCHEMA_VERSION,
+                              encoding="utf-8")
     else:
         index_path.write_text(
-            '{"schema_version": 1, "current_state_path": "../../escape.json"}',
+            '{"schema_version": %d, "current_state_path": "../../escape.json"}'
+            % SCHEMA_VERSION,
             encoding="utf-8",
         )
 
@@ -307,7 +376,8 @@ def test_a_path_escaping_index_is_refused_even_when_the_target_exists(tmp_path):
     planted.write_text((out / "states" / "s000.json").read_text(encoding="utf-8"),
                        encoding="utf-8")
     (out / "workflow_state.json").write_text(
-        '{"schema_version": 1, "current_state_path": "../outside.json"}', encoding="utf-8"
+        '{"schema_version": %d, "current_state_path": "../outside.json"}' % SCHEMA_VERSION,
+        encoding="utf-8",
     )
 
     with pytest.raises(WorkflowError, match="outside the workflow directory"):
@@ -369,6 +439,100 @@ def test_an_artifact_missing_an_envelope_field_is_refused(tmp_path):
 
     with pytest.raises(WorkflowError, match="missing envelope fields"):
         workflow_status(str(out))
+
+
+def test_a_payload_may_not_shadow_an_envelope_field(tmp_path):
+    from paperconan import _workflow
+
+    with pytest.raises(WorkflowError, match="shadow"):
+        _workflow._envelope(
+            run_id="wf:test", artifact_type="workflow_state", stage="DISCOVER",
+            parent_refs=[], config_digest="sha256:x", coverage={},
+            payload={"coverage": "hijacked"},
+        )
+
+
+def test_a_symlinked_output_directory_cannot_hide_nesting(tmp_path):
+    """realpath, not abspath: a symlink must not smuggle out_dir into in_dir."""
+    data = tmp_path / "data"
+    _panel(data / "p.csv")
+    link = tmp_path / "link"
+    link.symlink_to(data, target_is_directory=True)
+
+    with pytest.raises(WorkflowError, match="outside the source directory"):
+        start_workflow(str(data), str(link / "audit"))
+
+
+def test_status_rejects_an_index_naming_a_foreign_run(tmp_path):
+    """Isolates the run_id cross-check from the artifact_id one."""
+    data = tmp_path / "data"
+    _panel(data / "p.csv")
+    out = tmp_path / "out"
+    start_workflow(str(data), str(out))
+
+    index_path = out / "workflow_state.json"
+    index = _read(index_path)
+    index["run_id"] = "wf:someotherrun"
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+    with pytest.raises(WorkflowError, match="mixes runs"):
+        workflow_status(str(out))
+
+
+def test_status_rejects_an_index_pointing_at_a_stale_artifact_id(tmp_path):
+    """Isolates the artifact_id cross-check from the run_id one."""
+    data = tmp_path / "data"
+    _panel(data / "p.csv")
+    out = tmp_path / "out"
+    start_workflow(str(data), str(out))
+
+    index_path = out / "workflow_state.json"
+    index = _read(index_path)
+    index["current_state_id"] = "sha256:stale"
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+    with pytest.raises(WorkflowError, match="does not point at"):
+        workflow_status(str(out))
+
+
+def test_force_does_not_destroy_the_directory_when_the_rescan_fails(tmp_path):
+    """Clearing before a successful scan would leave an unreadable directory."""
+    data = tmp_path / "data"
+    _panel(data / "p.csv")
+    out = tmp_path / "out"
+    start_workflow(str(data), str(out))
+
+    (data / "p.csv").unlink()  # nothing left to scan
+    with pytest.raises(Exception):
+        start_workflow(str(data), str(out), force=True)
+
+    workflow_status(str(out))  # the previous run must still be readable
+
+
+def test_the_profile_is_part_of_the_run_configuration(tmp_path):
+    """The packet stays profile-invariant, but config_digest must not claim to
+    describe a run while omitting the only knob the CLI exposes."""
+    data = tmp_path / "data"
+    _panel(data / "p.csv")
+
+    a = start_workflow(str(data), str(tmp_path / "a"), profile="review")
+    b = start_workflow(str(data), str(tmp_path / "b"), profile="forensic")
+
+    assert a["config_digest"] != b["config_digest"]
+    # seeds themselves are unaffected — that is the point of the raw stream
+    assert (_packet(tmp_path / "a")["clusters"]
+            == _packet(tmp_path / "b")["clusters"])
+
+
+def test_coverage_admits_detector_caps_are_not_reported(tmp_path):
+    """Several detectors stop at their own max_findings and say so only on
+    stderr, so coverage_complete cannot mean "every finding was seeded"."""
+    data = tmp_path / "data"
+    _panel(data / "p.csv")
+
+    start_workflow(str(data), str(tmp_path / "out"))
+
+    assert _packet(tmp_path / "out")["coverage"]["detector_caps_reported"] is False
 
 
 def test_an_index_from_an_unsupported_schema_is_refused(tmp_path):

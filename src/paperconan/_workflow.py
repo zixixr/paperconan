@@ -27,7 +27,11 @@ from typing import Any
 
 from ._finding_groups import BLOCK_FINDING_GROUPS
 
-SCHEMA_VERSION = 1
+# 2: envelope requires source_finding_refs; coverage replaced `omitted_reason`
+#    with `limitations` and gained scan_status / scan_incomplete / coverage_complete.
+#    A v1 directory is not readable by this build, and says so rather than
+#    failing later with a missing-field error.
+SCHEMA_VERSION = 2
 # Bumped whenever seeding, clustering or coverage semantics change, so artifacts
 # from an older policy are never silently compared against a newer one.
 WORKFLOW_POLICY_VERSION = 1
@@ -238,6 +242,16 @@ def _block_seed(blk: dict[str, Any], group: str, f: dict[str, Any]) -> dict[str,
     }
 
 
+# Fields that pin down *which* cross-sheet finding this is. The locator alone is
+# not enough: several findings can share one sheet pair, and repeated row labels
+# make `rule` repeat too, so hashing only (locator, kind, rule) is not injective.
+_CROSS_SHEET_LOCATOR_FIELDS = (
+    "file_a", "file_b", "sheet_a", "sheet_b",
+    "row_a", "row_b", "col_a", "col_b", "block_a", "block_b",
+    "figure_a", "figure_b", "same_position_count", "size_a", "size_b",
+)
+
+
 def _cross_sheet_seed(f: dict[str, Any]) -> dict[str, Any]:
     locator = {
         "scope": "cross_sheet",
@@ -246,11 +260,15 @@ def _cross_sheet_seed(f: dict[str, Any]) -> dict[str, Any]:
         "block_rows": None,
         "block_cols": None,
     }
+    detail = {k: f.get(k) for k in _CROSS_SHEET_LOCATOR_FIELDS if f.get(k) is not None}
     return {
-        "seed_id": _stable_id("seed", [locator, "cross_sheet", f.get("kind"), f.get("rule")]),
+        "seed_id": _stable_id(
+            "seed", [locator, "cross_sheet", f.get("kind"), f.get("rule"), detail]
+        ),
         "kind": f.get("kind"),
         "group": "cross_sheet_findings",
         **locator,
+        "cross_sheet_locator": detail,
         "raw_severity": _raw_severity_of(f),
         "rule": f.get("rule"),
         "n": f.get("same_position_count") or f.get("size_a"),
@@ -272,6 +290,19 @@ def _cluster_key(seed: dict[str, Any]) -> tuple:
 def _build_clusters(scan: dict[str, Any], max_clusters: int) -> tuple[list[dict], dict]:
     seeds = [_block_seed(blk, group, f) for blk, group, f in _iter_raw_findings(scan)]
     seeds += [_cross_sheet_seed(f) for f in scan.get("cross_sheet_findings", []) or []]
+
+    # A routing request cites seeds by id, so a content-derived id is only an
+    # identifier if the hashed tuple is a key. Two findings sharing an id would
+    # make a routing decision ambiguous and inflate seeds_total; catch it here
+    # rather than letting the packet ship indistinguishable entries.
+    ids = [s["seed_id"] for s in seeds]
+    if len(set(ids)) != len(ids):
+        from collections import Counter
+        dupes = sorted(i for i, n in Counter(ids).items() if n > 1)
+        raise WorkflowError(
+            f"seed ids are not unique ({len(ids) - len(set(ids))} collisions, "
+            f"first: {dupes[0]}); the seed locator does not distinguish these findings"
+        )
 
     grouped: dict[tuple, list[dict]] = {}
     for seed in seeds:
@@ -374,6 +405,12 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
         "families_not_seeded": unseeded,
         "coverage_complete": not limitations,
         "limitations": limitations,
+        # Known blind spot, stated rather than implied: several detectors stop at
+        # their own `max_findings` or compute budget and report that only on
+        # stderr, so it reaches neither scan_status nor findings_omitted. Until
+        # those are wired into ScanCoverage, `coverage_complete` means "complete
+        # as far as the scan reported", not "every finding was seeded".
+        "detector_caps_reported": False,
     }
 
 
@@ -387,18 +424,12 @@ def start_workflow(in_dir: str, out_dir: str, *, profile: str = "review",
 
     max_clusters = DEFAULT_BUDGET["clusters"] if max_clusters is None else max_clusters
     _reject_nested_out_dir(in_dir, out_dir)
-    if os.path.exists(os.path.join(out_dir, "workflow_state.json")):
-        if not force:
-            raise WorkflowError(
-                f"{out_dir} already holds a workflow; restarting would rewind its "
-                "index and orphan later states. Use force=True (CLI --force)."
-            )
-        # Clear the prior run's artifacts rather than rewinding the index over
-        # them: a mixed directory is exactly the orphan state the guard exists to
-        # prevent, and per-artifact digests cannot detect it (an orphaned state
-        # from the previous run is internally consistent).
-        for stale in ("states", "steps"):
-            shutil.rmtree(os.path.join(out_dir, stale), ignore_errors=True)
+    restarting = os.path.exists(os.path.join(out_dir, "workflow_state.json"))
+    if restarting and not force:
+        raise WorkflowError(
+            f"{out_dir} already holds a workflow; restarting would rewind its "
+            "index and orphan later states. Use force=True (CLI --force)."
+        )
 
     # Manifest first: hashing after the scan would fold this run's own artifacts
     # into the digest whenever out_dir sits under in_dir, and run_id would never
@@ -407,10 +438,25 @@ def start_workflow(in_dir: str, out_dir: str, *, profile: str = "review",
 
     os.makedirs(out_dir, exist_ok=True)
     scan = scan_dir(in_dir, out_dir, write_md=False, write_html=False, profile=profile)
+
+    # Only now that the rescan succeeded is it safe to drop the previous run's
+    # artifacts. Clearing first would leave an unreadable directory — index
+    # present, states gone — if the scan then failed. No ignore_errors: a partial
+    # clean leaves the mixed-run directory this is meant to prevent.
+    if restarting:
+        for stale in ("states", "steps"):
+            path = os.path.join(out_dir, stale)
+            if os.path.exists(path):
+                shutil.rmtree(path)
+
     config = {
         "schema_version": SCHEMA_VERSION,
         "workflow_policy_version": WORKFLOW_POLICY_VERSION,
         "numeric_canonicalization_version": NUMERIC_CANONICALIZATION_VERSION,
+        # The packet is deliberately profile-invariant (seeds come from the raw
+        # stream), but config_digest describes what produced the run, and profile
+        # is the one knob the CLI exposes.
+        "profile": profile,
         "max_clusters": max_clusters,
         "max_expansion_rounds": MAX_EXPANSION_ROUNDS,
         "max_route_steps": MAX_ROUTE_STEPS,
