@@ -138,7 +138,8 @@ def test_packet_records_coverage_for_what_it_left_out(tmp_path):
     assert len(packet["clusters"]) == 1
     assert packet["coverage"]["clusters_omitted"] == total - 1
     assert packet["coverage"]["truncated"] is True
-    assert packet["coverage"]["omitted_reason"]
+    assert packet["coverage"]["coverage_complete"] is False
+    assert any("cluster budget" in x for x in packet["coverage"]["limitations"])
 
 
 def test_fixed_input_replays_to_identical_artifacts(tmp_path):
@@ -204,6 +205,58 @@ def test_cli_start_then_status(tmp_path):
     )
     assert status.returncode == 0, status.stderr
     assert "ROUTE" in status.stdout
+
+
+def test_cli_start_prints_coverage_limitations_when_it_truncates(tmp_path):
+    """The honesty message has to survive the path it was written for.
+
+    An earlier revision renamed the coverage field and left this print statement
+    reading the old key, so `workflow start` raised KeyError on exactly the runs
+    that had something to disclose. The one-file fixture above never truncates,
+    so nothing caught it.
+    """
+    import subprocess
+    import sys
+
+    data = tmp_path / "data"
+    data.mkdir()
+    for k in range(12):  # more clusters than the default budget of 8
+        rows = ["a,b"] + [f"{i + 1},{(i + 1) * (k + 2)}" for i in range(12)]
+        (data / f"f{k}.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    res = subprocess.run(
+        [sys.executable, "-m", "paperconan", "workflow", "start",
+         str(data), "--out", str(tmp_path / "agent")],
+        text=True, capture_output=True,
+    )
+
+    assert res.returncode == 0, res.stderr
+    assert "Traceback" not in res.stderr
+    assert "coverage:" in res.stdout
+    assert "cluster budget" in res.stdout
+
+
+def test_cli_force_flag_is_wired_through(tmp_path):
+    """A one-line wire a refactor can cut silently: without it `--force` fails
+    with "Use force=True (CLI --force)", which reads as a tool bug."""
+    import subprocess
+    import sys
+
+    data = _paper(tmp_path / "data")
+    out = tmp_path / "agent"
+    cmd = [sys.executable, "-m", "paperconan", "workflow", "start",
+           str(data), "--out", str(out)]
+
+    assert subprocess.run(cmd, text=True, capture_output=True).returncode == 0
+
+    # second run without --force is refused
+    again = subprocess.run(cmd, text=True, capture_output=True)
+    assert again.returncode != 0
+    assert "already holds a workflow" in (again.stderr + again.stdout)
+
+    forced = subprocess.run(cmd + ["--force"], text=True, capture_output=True)
+    assert forced.returncode == 0, forced.stderr
+    assert "Traceback" not in forced.stderr
 
 
 def test_cli_status_on_a_plain_directory_exits_with_a_message(tmp_path):

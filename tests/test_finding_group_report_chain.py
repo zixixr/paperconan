@@ -72,8 +72,26 @@ def test_adjudicated_report_resolves_a_ref_into_every_canonical_block_group(grou
     assert "无匹配证据（finding_ref 未命中扫描结果）" not in html
 
 
-def test_html_does_not_keep_a_private_copy_of_the_canonical_group_set():
-    """A newly registered group must reach HTML without editing the renderer."""
-    from paperconan import _html
+def test_the_scanner_emits_exactly_the_registered_groups(tmp_path):
+    """Closes the loop on the producer side.
 
-    assert set(_html.canonical_block_groups()) == set(BLOCK_FINDING_GROUPS)
+    The parametrised tests above iterate *over* the registry, so they can only
+    check consumers — deleting an entry deletes its own test case. This asserts
+    the other direction against a real scan: the block keys `scan_dir` writes
+    are exactly the registered ones, so a producer that invents a key without
+    registering it (which is how `block_dups` went missing) fails here.
+    """
+    from paperconan import scan_dir
+
+    data = tmp_path / "data"
+    data.mkdir()
+    rows = ["a,b,c"] + [f"{i + 1},{(i + 1) * 2},{round((i + 1) * 1.5, 4)}" for i in range(12)]
+    (data / "panel.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+    blocks = scan.get("relations_blocks") or []
+    assert blocks, "fixture produced no blocks"
+
+    structural = {"file", "sheet", "block", "findings_omitted"}
+    for block in blocks:
+        assert set(block) - structural == set(BLOCK_FINDING_GROUPS)

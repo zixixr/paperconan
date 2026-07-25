@@ -4080,6 +4080,48 @@ def _record_formula_cache_gaps(coverage, path, accepted_sheets):
         )
 
 
+# The block-finding groups scan_dir actually produces. Checked against the
+# canonical registry at import: a detector group nobody registered (or a
+# registered group that lost its producer) would vanish from every report
+# silently — the failure that hid block_dups. Catching it here rather than
+# mid-scan means the drift can never reach a user's run.
+_PRODUCED_BLOCK_GROUPS = {
+    "relations", "progressions", "equal_pairs", "row_pairs", "row_relations",
+    "within_col", "identical_after_rounding", "grim", "block_dups",
+}
+if _PRODUCED_BLOCK_GROUPS != set(BLOCK_FINDING_GROUPS):
+    raise RuntimeError(
+        "detector output does not match the canonical finding-group registry: "
+        f"produced {sorted(_PRODUCED_BLOCK_GROUPS)}, "
+        f"registered {sorted(BLOCK_FINDING_GROUPS)}"
+    )
+
+TABLE_PATTERNS = (
+    "*.xlsx", "*.xls", "*.xlsm", "*.xlsb",
+    "*.csv", "*.tsv", "*.pdf", "*.docx",
+)
+
+
+def find_table_files(in_dir: str) -> list[str]:
+    """Tabular source files `scan_dir` will read. Non-recursive, sorted."""
+    return sorted({
+        p for pattern in TABLE_PATTERNS
+        for p in glob.glob(os.path.join(in_dir, pattern))
+    })
+
+
+def find_local_images(in_dir: str) -> list[str]:
+    """Image files `scan_dir` will inventory when `images=True`."""
+    from .fetch._files import is_image
+    return sorted(
+        (
+            path for path in glob.glob(os.path.join(in_dir, "*"))
+            if os.path.isfile(path) and is_image(os.path.basename(path))
+        ),
+        key=lambda path: (os.path.basename(path).casefold(), os.path.basename(path)),
+    )
+
+
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
              profile="review", write_json=True, evidence=True, images=False,
              image_diagnostics=False, runtime_metadata=False):
@@ -4087,21 +4129,8 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     # The HTML report renders the evidence snippets, so it requires them.
     if write_html:
         evidence = True
-    table_files = sorted({
-        p for pattern in (
-            "*.xlsx", "*.xls", "*.xlsm", "*.xlsb",
-            "*.csv", "*.tsv", "*.pdf", "*.docx",
-        )
-        for p in glob.glob(os.path.join(in_dir, pattern))
-    })
-    from .fetch._files import is_image
-    local_images = sorted(
-        (
-            path for path in glob.glob(os.path.join(in_dir, "*"))
-            if os.path.isfile(path) and is_image(os.path.basename(path))
-        ),
-        key=lambda path: (os.path.basename(path).casefold(), os.path.basename(path)),
-    )
+    table_files = find_table_files(in_dir)
+    local_images = find_local_images(in_dir)
     if not table_files and not (images and local_images):
         supported = ".xlsx / .xls / .xlsm / .xlsb / .csv / .tsv / .pdf / .docx"
         if images:
@@ -4232,6 +4261,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                               "row_pairs": rp, "row_relations": rr, "within_col": wc,
                               "identical_after_rounding": iar, "grim": gg,
                               "block_dups": bd}
+                    assert set(groups) == _PRODUCED_BLOCK_GROUPS  # keyed by the literal above
                     # Effective cap = the tighter of the per-block limit and the remaining global
                     # budget; None means unlimited (both caps disabled). A spent global budget
                     # yields 0, which drops the whole block (recorded via `omitted`).
@@ -4250,17 +4280,15 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                         _attach_benign(group)
                         apply_profile_to_findings(group, profile,
                                                   sheet_context=sheet_context)
-                    report_blocks.append(dict(file=os.path.basename(f), sheet=sn,
-                                              block=dict(rows=f"{r0+1}-{r1}", cols=f"{c0+1}-{c1}", header=header),
-                                              relations=groups["relations"], progressions=groups["progressions"],
-                                              equal_pairs=groups["equal_pairs"],
-                                              row_pairs=groups["row_pairs"],
-                                              row_relations=groups["row_relations"],
-                                              within_col=groups["within_col"],
-                                              identical_after_rounding=groups["identical_after_rounding"],
-                                              grim=groups["grim"],
-                                              block_dups=groups["block_dups"],
-                                              findings_omitted=omitted))
+                    # Emitted from the canonical registry, not a second literal:
+                    # a newly registered group reaches scan.json automatically,
+                    # and a producer/consumer mismatch is impossible by construction.
+                    report_blocks.append(dict(
+                        file=os.path.basename(f), sheet=sn,
+                        block=dict(rows=f"{r0+1}-{r1}", cols=f"{c0+1}-{c1}", header=header),
+                        findings_omitted=omitted,
+                        **{group: groups[group] for group in BLOCK_FINDING_GROUPS},
+                    ))
             coverage.mark_sheet_succeeded()
             coverage.mark_block_analyzed(blocks_analyzed_here)
             if blocks_analyzed_here < len(blocks):
@@ -4597,15 +4625,16 @@ def _run_workflow(args: argparse.Namespace) -> None:
 
     try:
         if args.workflow_cmd == "start":
-            state = start_workflow(args.in_dir, args.out, profile=args.profile)
+            state = start_workflow(args.in_dir, args.out, profile=args.profile,
+                                   force=args.force)
             print(f"wrote {args.out}/scan.json, {args.out}/states/s000.json, "
                   f"{args.out}/steps/t000/candidate_packet.json")
             print(f"  stage: {state['workflow_stage']} · "
                   f"next: {state['next_action']} → {state['next_artifact_path']}")
             print(f"  clusters routed: {state['coverage']['clusters_total'] - state['coverage']['clusters_omitted']}"
                   f" of {state['coverage']['clusters_total']}")
-            if state["coverage"]["truncated"]:
-                print(f"  coverage: {state['coverage']['omitted_reason']}")
+            for limitation in state["coverage"].get("limitations") or []:
+                print(f"  coverage: {limitation}")
             return
         status = workflow_status(args.workflow_dir)
         print(f"stage: {status['workflow_stage']}")
@@ -4688,6 +4717,8 @@ def _build_parser() -> argparse.ArgumentParser:
                           default="review",
                           help="Display profile for scan.json; workflow seeds always "
                                "come from the raw pre-profile stream")
+    wf_start.add_argument("--force", action="store_true",
+                          help="Overwrite an existing workflow directory")
 
     wf_status = wf_sub.add_parser("status", help="print the current stage and budget")
     wf_status.add_argument("workflow_dir", help="Workflow working directory")
