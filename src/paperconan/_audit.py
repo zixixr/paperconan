@@ -4504,43 +4504,13 @@ def write_markdown_report(out, path):
         fh.write("\n".join(lines))
 
 
-def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "fetch":
-        from .fetch._cli import fetch_main
-        sys.exit(fetch_main(sys.argv[2:]))
-    if len(sys.argv) > 1 and sys.argv[1] == "report":
-        import json
-        from ._adjudicated_html import write_adjudicated_report
+# Every command lives in one subparser tree. Dispatch has a single rule: a first
+# argument that is not one of these names is the scan target, which is what keeps
+# `paperconan <dir>` working without giving any command its own argv branch.
+SUBCOMMANDS = ("scan", "fetch", "report")
 
-        rp = argparse.ArgumentParser(
-            prog="paperconan report",
-            description="Render an adjudicated HTML report from scan.json and verdict.json",
-        )
-        rp.add_argument("scan_json", help="Path to paperconan scan.json")
-        rp.add_argument("--verdict", required=True, help="Path to verdict JSON")
-        rp.add_argument("--out", required=True, help="Output HTML path")
-        rargs = rp.parse_args(sys.argv[2:])
-        try:
-            with open(rargs.scan_json, encoding="utf-8") as fh:
-                scan = json.load(fh)
-            with open(rargs.verdict, encoding="utf-8") as fh:
-                verdict = json.load(fh)
-            write_adjudicated_report(
-                scan,
-                verdict,
-                rargs.out,
-                artifact_dir=os.path.dirname(os.path.abspath(rargs.scan_json)),
-            )
-        except ValueError as exc:
-            sys.exit(str(exc))
-        print(f"wrote {rargs.out}")
-        return
-    ap = argparse.ArgumentParser(
-        description=(
-            "Scan a paper's source data (xlsx/csv/tsv, or tables inside "
-            "pdf/docx) for statistical signals and data inconsistencies"
-        )
-    )
+
+def _add_scan_arguments(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("in_dir", help="Directory with the paper's source data (*.xlsx/*.csv/*.tsv, or *.pdf/*.docx supplements)")
     ap.add_argument("--out", default=None, help="Output directory (default: <in_dir>/audit)")
     ap.add_argument("--md", action="store_true",
@@ -4570,8 +4540,9 @@ def main():
         help="record wall-clock scan timestamp and elapsed times "
              "(omitted by default so scan.json stays byte-reproducible)",
     )
-    ap.add_argument("--version", action="version", version=f"paperconan {_version()}")
-    args = ap.parse_args()
+
+
+def _run_scan(ap: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.image_diagnostics and not args.images:
         ap.error("--image-diagnostics requires --images")
     out_dir = args.out or os.path.join(args.in_dir, "audit")
@@ -4599,6 +4570,85 @@ def main():
     print(f"  digit anomaly sheets: {len(res['digit_distribution'])}, decimal anomaly sheets: {len(res['decimal_endings'])}")
     if write_html:
         print(f"\n  → open {out_dir}/report.html in a browser to review findings")
+
+
+def _run_report(args: argparse.Namespace) -> None:
+    import json
+    from ._adjudicated_html import write_adjudicated_report
+
+    try:
+        with open(args.scan_json, encoding="utf-8") as fh:
+            scan = json.load(fh)
+        with open(args.verdict, encoding="utf-8") as fh:
+            verdict = json.load(fh)
+        write_adjudicated_report(
+            scan,
+            verdict,
+            args.out,
+            artifact_dir=os.path.dirname(os.path.abspath(args.scan_json)),
+        )
+    except ValueError as exc:
+        sys.exit(str(exc))
+    print(f"wrote {args.out}")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="paperconan",
+        description=(
+            "Scan a paper's source data (xlsx/csv/tsv, or tables inside "
+            "pdf/docx) for statistical signals and data inconsistencies"
+        ),
+    )
+    ap.add_argument("--version", action="version", version=f"paperconan {_version()}")
+    sub = ap.add_subparsers(dest="cmd")
+
+    scan_p = sub.add_parser(
+        "scan",
+        help="scan a directory of source data (the default when no subcommand is given)",
+        description="Scan a paper's source data for statistical signals and data inconsistencies",
+    )
+    _add_scan_arguments(scan_p)
+
+    sub.add_parser(
+        "fetch",
+        help="download a paper's supplementary source data",
+        add_help=False,
+    )
+
+    report_p = sub.add_parser(
+        "report",
+        help="render an adjudicated HTML report from scan.json and verdict.json",
+        description="Render an adjudicated HTML report from scan.json and verdict.json",
+    )
+    report_p.add_argument("scan_json", help="Path to paperconan scan.json")
+    report_p.add_argument("--verdict", required=True, help="Path to verdict JSON")
+    report_p.add_argument("--out", required=True, help="Output HTML path")
+
+    return ap
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # `fetch` keeps its own parser: it owns a large flag surface of its own and
+    # is dispatched straight through, so it is registered above for --help only.
+    if argv and argv[0] == "fetch":
+        from .fetch._cli import fetch_main
+        sys.exit(fetch_main(argv[1:]))
+
+    # The single dispatch rule: anything that is not a subcommand is a scan
+    # target, so `paperconan <dir>` and `paperconan --no-html <dir>` still work.
+    if not argv or argv[0] not in SUBCOMMANDS:
+        if not (argv and argv[0] in ("-h", "--help", "--version")):
+            argv.insert(0, "scan")
+
+    ap = _build_parser()
+    args = ap.parse_args(argv)
+    if args.cmd == "report":
+        _run_report(args)
+        return
+    _run_scan(ap, args)
 
 
 if __name__ == "__main__":
