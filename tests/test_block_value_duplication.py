@@ -11,6 +11,7 @@ few high-precision values were copied — while random continuous blocks stay qu
 import numpy as np
 from paperconan._sheet import Sheet
 from paperconan._audit import detect_block_value_duplication
+from paperconan._html import write_html_report
 
 
 def _block_sheet(matrix):
@@ -209,3 +210,38 @@ def test_finding_gets_evidence_with_highlighted_cells():
     _attach_evidence(out, s, 1, 6, 0, 10, [f"c{j}" for j in range(10)])
     ev = out[0]["evidence"]
     assert ev.get("highlight_rows") or ev.get("highlight_cols"), "expected highlighted cells"
+
+
+def test_default_html_includes_block_value_duplication(tmp_path):
+    scan = {
+        "tool_version": "0.test",
+        "profile": "review",
+        "input_dir": "synthetic",
+        "n_files": 1,
+        "relations_blocks": [{
+            "file": "synthetic.xlsx",
+            "sheet": "Panel",
+            "block": {
+                "rows": "2-6",
+                "cols": "1-3",
+                "header": ["a", "b", "c"],
+            },
+            "block_dups": [{
+                "kind": "block_value_duplication",
+                "severity": "medium",
+                "rule": "synthetic distributed exact-value collision signal",
+                "profile_action": "kept",
+            }],
+        }],
+        "cross_sheet_findings": [],
+        "digit_distribution": [],
+        "decimal_endings": [],
+        "decimal_tail_clusters": [],
+    }
+    report = tmp_path / "report.html"
+
+    write_html_report(scan, str(report))
+
+    html = report.read_text(encoding="utf-8")
+    assert "block_value_duplication" in html
+    assert "synthetic distributed exact-value collision signal" in html
