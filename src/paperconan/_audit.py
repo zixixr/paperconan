@@ -4507,7 +4507,7 @@ def write_markdown_report(out, path):
 # Every command lives in one subparser tree. Dispatch has a single rule: a first
 # argument that is not one of these names is the scan target, which is what keeps
 # `paperconan <dir>` working without giving any command its own argv branch.
-SUBCOMMANDS = ("scan", "fetch", "report")
+SUBCOMMANDS = ("scan", "fetch", "report", "workflow")
 
 
 def _add_scan_arguments(ap: argparse.ArgumentParser) -> None:
@@ -4592,6 +4592,31 @@ def _run_report(args: argparse.Namespace) -> None:
     print(f"wrote {args.out}")
 
 
+def _run_workflow(args: argparse.Namespace) -> None:
+    from ._workflow import WorkflowError, start_workflow, workflow_status
+
+    try:
+        if args.workflow_cmd == "start":
+            state = start_workflow(args.in_dir, args.out, profile=args.profile)
+            print(f"wrote {args.out}/scan.json, {args.out}/states/s000.json, "
+                  f"{args.out}/steps/t000/candidate_packet.json")
+            print(f"  stage: {state['workflow_stage']} · "
+                  f"next: {state['next_action']} → {state['next_artifact_path']}")
+            print(f"  clusters routed: {state['coverage']['clusters_total'] - state['coverage']['clusters_omitted']}"
+                  f" of {state['coverage']['clusters_total']}")
+            if state["coverage"]["truncated"]:
+                print(f"  coverage: {state['coverage']['omitted_reason']}")
+            return
+        status = workflow_status(args.workflow_dir)
+        print(f"stage: {status['workflow_stage']}")
+        print(f"next: {status['next_action']} → {status['next_artifact_path']}")
+        print(f"route_step: {status['route_step']}/{status['max_route_steps']} · "
+              f"expansion_round: {status['expansion_round']}/{status['max_expansion_rounds']}")
+        print(f"budget_remaining: {status['budget_remaining']}")
+    except (WorkflowError, PaperconanInputError) as exc:
+        sys.exit(str(exc))
+
+
 def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="paperconan",
@@ -4625,6 +4650,27 @@ def _build_parser() -> argparse.ArgumentParser:
     report_p.add_argument("--verdict", required=True, help="Path to verdict JSON")
     report_p.add_argument("--out", required=True, help="Output HTML path")
 
+    wf = sub.add_parser(
+        "workflow",
+        help="deterministic Agent-workflow steps (opt-in; never calls a model)",
+        description=(
+            "Run the deterministic half of the Agent review workflow. These commands "
+            "only produce and validate artifacts; model calls are the skill's job."
+        ),
+    )
+    wf_sub = wf.add_subparsers(dest="workflow_cmd", required=True)
+
+    wf_start = wf_sub.add_parser("start", help="scan and write the DISCOVER artifacts")
+    wf_start.add_argument("in_dir", help="Directory with the paper's source data")
+    wf_start.add_argument("--out", required=True, help="Workflow working directory")
+    wf_start.add_argument("--profile", choices=("review", "forensic", "triage"),
+                          default="review",
+                          help="Display profile for scan.json; workflow seeds always "
+                               "come from the raw pre-profile stream")
+
+    wf_status = wf_sub.add_parser("status", help="print the current stage and budget")
+    wf_status.add_argument("workflow_dir", help="Workflow working directory")
+
     return ap
 
 
@@ -4647,6 +4693,9 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
     if args.cmd == "report":
         _run_report(args)
+        return
+    if args.cmd == "workflow":
+        _run_workflow(args)
         return
     _run_scan(ap, args)
 
