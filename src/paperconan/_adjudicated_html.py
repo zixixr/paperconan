@@ -723,6 +723,8 @@ table.ev th { background:#f8fafc; color:var(--muted); text-align:left; }
 .hi-col { background:#fff6d6; }
 .hi-row { background:#fffaf0; }
 .no-evidence { color:var(--muted); padding:0 12px; }
+.fallback-evidence { margin:0 12px 8px; padding:8px 12px; background:#fff6d6;
+  border-left:3px solid #d9a441; border-radius:4px; color:#5c4708; font-size:13px; }
 .scope-note { margin:0 0 12px; padding:8px 12px; background:var(--panel); border-radius:6px;
   color:#344054; font-size:13px; }
 footer { margin-top:20px; color:var(--muted); font-size:12px; }
@@ -920,10 +922,18 @@ def _render_finding_block(
         if matched is not None:
             evidence += _render_key_finding(matched, idx)
     else:
+        fallback_notice = ""
         if legacy_fallback and matched is None and scan_findings:
             matched = scan_findings[0]
+            # The narrative above describes the cited signal; this card is the
+            # strongest scan signal instead. Say so, or the two read as one.
+            if ref:
+                fallback_notice = (
+                    '<p class="fallback-evidence">finding_ref 未命中扫描结果；'
+                    "以下展示本次扫描中最强的统计信号，供定位参考。</p>"
+                )
         evidence = (
-            _render_key_finding(matched, idx)
+            fallback_notice + _render_key_finding(matched, idx)
             if matched is not None
             else '<p class="no-evidence">无匹配证据（finding_ref 未命中扫描结果）</p>'
         )

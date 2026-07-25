@@ -679,6 +679,37 @@ def test_finding_refs_with_no_match_falls_back_to_strongest_finding():
     assert "constant_offset" in html
 
 
+def test_unmatched_ref_fallback_evidence_is_labeled_as_a_fallback():
+    """An unmatched ref still falls back, but the card must say so.
+
+    The fallback keeps a legacy single-finding report useful, yet the narrative
+    in report_md describes the cited signal while the rendered evidence is the
+    strongest scan signal. Without a label a reader cannot tell the two apart.
+    """
+    scan = _scan_two_findings()
+    verdict = {"verdict": "KEEP", "report_md": "## t", "finding_refs": [{"sheet": "Nonexistent"}]}
+
+    html = render_adjudicated_report(scan, verdict)
+
+    assert 'class="fallback-evidence"' in html
+    # the intended fallback behaviour is unchanged
+    assert html.count('class="finding-card"') == 1
+    assert "constant_offset" in html
+
+
+def test_matched_ref_evidence_is_not_labeled_as_a_fallback():
+    scan = _scan_two_findings()
+    verdict = {
+        "verdict": "KEEP",
+        "report_md": "## t",
+        "finding_refs": [{"sheet": "Alpha", "kind": "constant_offset"}],
+    }
+
+    html = render_adjudicated_report(scan, verdict)
+
+    assert 'class="fallback-evidence"' not in html
+
+
 def test_legacy_null_finding_refs_preserves_strongest_finding_fallback():
     html = render_adjudicated_report(
         _scan_two_findings(),
