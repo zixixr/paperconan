@@ -66,6 +66,9 @@ def normalize_profile(profile: str | None) -> Profile:
 
 def initialize_profile_fields(findings: Iterable[dict]) -> None:
     for f in findings:
+        # Freeze what the detector produced before any profile rewrites `severity`
+        # in place. setdefault keeps it authoritative across repeated passes.
+        f.setdefault("raw_severity", f.get("severity"))
         f.setdefault("profile_action", "kept")
         f.setdefault("false_positive_context", [])
 

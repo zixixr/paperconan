@@ -13,6 +13,7 @@
         "kind": "arithmetic_progression",
         "n": 10,
         "profile_action": "kept",
+        "raw_severity": "high",
         "rule": "col[3] = arithmetic progression, step=0.1",
         "severity": "high",
         "step": 0.09999999999999432
@@ -39,6 +40,7 @@
         "kind": "arithmetic_progression",
         "n": 10,
         "profile_action": "kept",
+        "raw_severity": "high",
         "rule": "col[3] = arithmetic progression, step=2.5",
         "severity": "high",
         "step": 2.5
@@ -65,6 +67,7 @@
         "likely_benign": "values ending in .0/.5 are common for derived or instrument-rounded quantities (cell counts, scores, calibrated readouts)",
         "n": 10,
         "profile_action": "kept",
+        "raw_severity": "medium",
         "rule": "col[3]: 10/10 values end in 0 or 5",
         "severity": "medium"
       },
@@ -90,6 +93,7 @@
         "kind": "identical_column",
         "n": 10,
         "profile_action": "kept",
+        "raw_severity": "high",
         "rule": "col[2] == col[0]",
         "severity": "high"
       },
@@ -115,6 +119,7 @@
         "kind": "identical_column",
         "n": 10,
         "profile_action": "kept",
+        "raw_severity": "high",
         "rule": "col[2] == col[0]",
         "severity": "high"
       },
@@ -158,6 +163,7 @@
         "n_failed": 1,
         "n_rows_checked": 1,
         "profile_action": "kept",
+        "raw_severity": "high",
         "rule": "1/1 rows report a mean impossible for integer data at the stated n (GRIM): col 'cell count mean'",
         "sd_col": "sd",
         "severity": "high"
@@ -246,6 +252,7 @@
         "text": "mass(kg) vol(mL) copy_of_mass mass(kg) vol(mL) copy_of_mass ap_col"
       },
       "profile_action": "kept",
+      "raw_severity": "high",
       "rule": "Sheet1 and Sheet2 share 29/29 (100%) decimal values at SAME (row,col) across 2 sheets",
       "same_figure": false,
       "same_file": true,
