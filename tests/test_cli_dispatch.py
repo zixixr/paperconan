@@ -72,6 +72,42 @@ def test_help_lists_every_subcommand():
         assert name in res.stdout, f"{name} missing from --help"
 
 
+# `paperconan <dir>` is the documented default invocation, so the bare help has
+# to keep documenting its flags. Asserting only on subcommand names passed even
+# when every scan flag had vanished from the help.
+SCAN_FLAGS = ("--out", "--profile", "--md", "--no-html", "--doi", "--images")
+
+
+@pytest.mark.parametrize("flag", SCAN_FLAGS)
+def test_bare_help_still_documents_the_scan_flags(flag):
+    res = _run(["--help"])
+
+    assert res.returncode == 0, res.stderr
+    assert flag in res.stdout, f"{flag} is undiscoverable from `paperconan --help`"
+
+
+@pytest.mark.parametrize("flag", SCAN_FLAGS)
+def test_scan_subcommand_help_documents_the_scan_flags(flag):
+    res = _run(["scan", "--help"])
+
+    assert res.returncode == 0, res.stderr
+    assert flag in res.stdout
+
+
+def test_scan_usage_errors_point_at_the_scan_parser(tmp_path):
+    """`--image-diagnostics requires --images` must show scan usage, not the top level."""
+    data = _tiny_csv(tmp_path / "data")
+
+    res = _run([str(data), "--image-diagnostics"])
+
+    assert res.returncode != 0
+    combined = res.stderr + res.stdout
+    assert "--image-diagnostics requires --images" in combined
+    assert "{scan,fetch,report,workflow}" not in combined, (
+        "error reported against the top-level parser instead of the scan parser"
+    )
+
+
 def test_scan_is_addressable_explicitly(tmp_path):
     """The explicit form disambiguates a directory named like a subcommand."""
     data = _tiny_csv(tmp_path / "data")
