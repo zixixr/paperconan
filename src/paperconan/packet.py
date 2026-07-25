@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._audit import BLOCK_FINDING_GROUPS
+from ._finding_groups import BLOCK_FINDING_GROUPS
 from ._prefilter import evidence_confidence
 from ._profiles import _is_axis_finding
 from .detectors import prefilter_relation_finding

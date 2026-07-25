@@ -828,7 +828,13 @@ def test_findings_array_renders_per_finding_blocks_with_own_evidence():
     assert "findings-index" in html
 
 
-def test_modern_block_duplication_ref_remains_unmatched_in_adjudicated_report():
+def test_adjudicated_report_resolves_a_block_duplication_finding_ref():
+    """A verdict may cite any canonical per-block group, block_dups included.
+
+    P0a deliberately scoped its fix to default HTML and left this reference
+    unmatched. P0b makes every consumer read the same canonical group set, so
+    the adjudicated report — the deliverable — can now render the cited card.
+    """
     scan = {
         "relations_blocks": [{
             "file": "synthetic.xlsx",
@@ -845,7 +851,7 @@ def test_modern_block_duplication_ref_remains_unmatched_in_adjudicated_report():
     verdict = {
         "verdict": "NEEDS_HUMAN",
         "findings": [{
-            "title": "Unmatched synthetic signal",
+            "title": "Cited synthetic signal",
             "finding_ref": {"kind": "block_value_duplication"},
             "report_md": "This signal requires contextual review.",
         }],
@@ -853,9 +859,9 @@ def test_modern_block_duplication_ref_remains_unmatched_in_adjudicated_report():
 
     html = render_adjudicated_report(scan, verdict)
 
-    assert "block_value_duplication" not in html
-    assert "synthetic block duplication signal" not in html
-    assert "无匹配证据（finding_ref 未命中扫描结果）" in html
+    assert "block_value_duplication" in html
+    assert "synthetic block duplication signal" in html
+    assert "无匹配证据（finding_ref 未命中扫描结果）" not in html
 
 
 @pytest.mark.parametrize("selector", ["sheet", "file", "rows", "kind"])
