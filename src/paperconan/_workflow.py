@@ -36,6 +36,10 @@ SCHEMA_VERSION = 2
 # from an older policy are never silently compared against a newer one.
 WORKFLOW_POLICY_VERSION = 1
 NUMERIC_CANONICALIZATION_VERSION = 1
+# Flip to True in the PR that wires detector max_findings / compute budgets into
+# ScanCoverage. Until then coverage_complete is false by construction.
+DETECTOR_CAPS_REPORTED = False
+
 MAX_EXPANSION_ROUNDS = 2
 # Route steps are bounded so a context-only loop cannot spin forever; the cap is
 # generous relative to the two expansion rounds it has to accommodate.
@@ -394,6 +398,20 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
             f"{len(omitted)} lower-ranked clusters were not routed"
         )
 
+    # Several detectors stop at their own max_findings or compute budget and
+    # report it to no channel at all — not scan_status, not findings_omitted,
+    # and for some paths not even stderr. Until they are wired into ScanCoverage
+    # (a scan-layer change, separate PR) the workflow cannot know whether a block
+    # was fully enumerated, so it must not claim it was. Stating it here rather
+    # than only in a side field means `coverage_complete` is false by
+    # construction and the caveat reaches the CLI, which prints `limitations`.
+    if not DETECTOR_CAPS_REPORTED:
+        limitations.append(
+            "detector-level caps are not reported to the scan layer, so a detector "
+            "that stopped at its own max_findings or compute budget is not counted "
+            "here (see coverage.detector_caps_reported)"
+        )
+
     return {
         "seeds_total": len(seeds),
         "clusters_total": len(clusters),
@@ -410,7 +428,7 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
         # stderr, so it reaches neither scan_status nor findings_omitted. Until
         # those are wired into ScanCoverage, `coverage_complete` means "complete
         # as far as the scan reported", not "every finding was seeded".
-        "detector_caps_reported": False,
+        "detector_caps_reported": DETECTOR_CAPS_REPORTED,
     }
 
 
@@ -438,16 +456,6 @@ def start_workflow(in_dir: str, out_dir: str, *, profile: str = "review",
 
     os.makedirs(out_dir, exist_ok=True)
     scan = scan_dir(in_dir, out_dir, write_md=False, write_html=False, profile=profile)
-
-    # Only now that the rescan succeeded is it safe to drop the previous run's
-    # artifacts. Clearing first would leave an unreadable directory — index
-    # present, states gone — if the scan then failed. No ignore_errors: a partial
-    # clean leaves the mixed-run directory this is meant to prevent.
-    if restarting:
-        for stale in ("states", "steps"):
-            path = os.path.join(out_dir, stale)
-            if os.path.exists(path):
-                shutil.rmtree(path)
 
     config = {
         "schema_version": SCHEMA_VERSION,
@@ -496,6 +504,13 @@ def start_workflow(in_dir: str, out_dir: str, *, profile: str = "review",
         },
     )
 
+    # Last possible moment: everything that can fail — the rescan, seeding,
+    # clustering, envelope construction — has already run. Clearing any earlier
+    # leaves an index pointing at deleted states if one of them raises, which is
+    # the unreadable directory this guard exists to prevent.
+    if restarting:
+        _clear_previous_run(out_dir)
+
     _write(os.path.join(out_dir, "steps", "t000", "candidate_packet.json"), packet)
     _write(os.path.join(out_dir, "states", "s000.json"), state)
     _write(os.path.join(out_dir, "workflow_state.json"),
@@ -503,6 +518,25 @@ def start_workflow(in_dir: str, out_dir: str, *, profile: str = "review",
             "current_state_path": "states/s000.json",
             "current_state_id": state["artifact_id"]})
     return state
+
+
+def _clear_previous_run(out_dir: str) -> None:
+    """Drop the prior run's artifacts. No ignore_errors — a half-cleaned
+    directory is the mixed-run state this is meant to prevent, and it must
+    surface as a WorkflowError rather than a bare OSError the CLI won't catch.
+    """
+    for stale in ("states", "steps"):
+        path = os.path.join(out_dir, stale)
+        if not os.path.exists(path):
+            continue
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            raise WorkflowError(
+                f"could not clear the previous run's {stale}/ in {out_dir}: {exc}. "
+                "The directory now holds artifacts from more than one run; remove "
+                "it and re-run `paperconan workflow start`."
+            ) from None
 
 
 def _write(path: str, art: dict[str, Any]) -> None:
@@ -543,7 +577,8 @@ def workflow_status(out_dir: str) -> dict[str, Any]:
     if index.get("schema_version") != SCHEMA_VERSION:
         raise WorkflowError(
             f"workflow index schema_version {index.get('schema_version')!r} is not "
-            f"supported (this build reads {SCHEMA_VERSION})"
+            f"supported (this build reads {SCHEMA_VERSION}); "
+            "re-run `paperconan workflow start --force`"
         )
 
     rel = index.get("current_state_path")

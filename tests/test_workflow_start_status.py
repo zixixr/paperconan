@@ -236,6 +236,29 @@ def test_cli_start_prints_coverage_limitations_when_it_truncates(tmp_path):
     assert "cluster budget" in res.stdout
 
 
+def test_cli_force_flag_is_wired_through(tmp_path):
+    """A one-line wire a refactor can cut silently: without it `--force` fails
+    with "Use force=True (CLI --force)", which reads as a tool bug."""
+    import subprocess
+    import sys
+
+    data = _paper(tmp_path / "data")
+    out = tmp_path / "agent"
+    cmd = [sys.executable, "-m", "paperconan", "workflow", "start",
+           str(data), "--out", str(out)]
+
+    assert subprocess.run(cmd, text=True, capture_output=True).returncode == 0
+
+    # second run without --force is refused
+    again = subprocess.run(cmd, text=True, capture_output=True)
+    assert again.returncode != 0
+    assert "already holds a workflow" in (again.stderr + again.stdout)
+
+    forced = subprocess.run(cmd + ["--force"], text=True, capture_output=True)
+    assert forced.returncode == 0, forced.stderr
+    assert "Traceback" not in forced.stderr
+
+
 def test_cli_status_on_a_plain_directory_exits_with_a_message(tmp_path):
     import subprocess
     import sys

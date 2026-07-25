@@ -495,6 +495,65 @@ def test_status_rejects_an_index_pointing_at_a_stale_artifact_id(tmp_path):
         workflow_status(str(out))
 
 
+def test_a_v1_workflow_directory_is_refused(tmp_path):
+    """Pins the bump itself. Every other schema test uses the constant, so all of
+    them keep passing if SCHEMA_VERSION is reverted — this one must not."""
+    assert SCHEMA_VERSION > 1, "this guard is about rejecting the pre-bump on-disk format"
+
+    out = tmp_path / "out"
+    _panel(tmp_path / "data" / "p.csv")
+    start_workflow(str(tmp_path / "data"), str(out))
+
+    index_path = out / "workflow_state.json"
+    index = _read(index_path)
+    index["schema_version"] = 1  # what the shipped pre-bump build wrote
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+    with pytest.raises(WorkflowError) as exc:
+        workflow_status(str(out))
+    assert "--force" in str(exc.value), "the error must name the way out"
+
+
+def test_force_does_not_destroy_the_directory_when_seeding_fails(tmp_path,
+                                                                 monkeypatch):
+    """The cleanup window closed on a failing scan, but seeding can raise too.
+
+    `_build_clusters` gained a raise of its own, so clearing anywhere before the
+    writes reopens the same door: index present, states gone.
+    """
+    from paperconan import _workflow
+
+    data = tmp_path / "data"
+    _panel(data / "p.csv")
+    out = tmp_path / "out"
+    start_workflow(str(data), str(out))
+
+    monkeypatch.setattr(_workflow, "_stable_id", lambda prefix, parts: f"{prefix}:collide")
+    with pytest.raises(WorkflowError, match="not unique"):
+        start_workflow(str(data), str(out), force=True)
+
+    workflow_status(str(out))  # previous run must still be readable
+
+
+def test_a_partial_clean_raises_a_workflow_error(tmp_path):
+    """Without ignore_errors the rmtree raises — but it must not raise OSError,
+    which the CLI does not catch and which surfaces as a bare traceback."""
+    data = tmp_path / "data"
+    _panel(data / "p.csv")
+    out = tmp_path / "out"
+    start_workflow(str(data), str(out))
+
+    locked = out / "states" / "locked"
+    locked.mkdir()
+    (locked / "x.json").write_text("{}", encoding="utf-8")
+    os.chmod(locked, 0o500)
+    try:
+        with pytest.raises(WorkflowError, match="previous run"):
+            start_workflow(str(data), str(out), force=True)
+    finally:
+        os.chmod(locked, 0o700)
+
+
 def test_force_does_not_destroy_the_directory_when_the_rescan_fails(tmp_path):
     """Clearing before a successful scan would leave an unreadable directory."""
     data = tmp_path / "data"
@@ -524,15 +583,28 @@ def test_the_profile_is_part_of_the_run_configuration(tmp_path):
             == _packet(tmp_path / "b")["clusters"])
 
 
-def test_coverage_admits_detector_caps_are_not_reported(tmp_path):
-    """Several detectors stop at their own max_findings and say so only on
-    stderr, so coverage_complete cannot mean "every finding was seeded"."""
+def test_coverage_cannot_claim_completeness_while_detector_caps_go_unreported(tmp_path):
+    """Several detectors stop at their own max_findings or compute budget and
+    report it to no channel at all — for some paths not even stderr.
+
+    A side field saying so is not enough: the CLI prints `limitations`, and a
+    reader who sees `coverage_complete: true` has no reason to look further. So
+    the caveat has to be a limitation, which makes `coverage_complete` false by
+    construction until the detector-layer PR flips the flag.
+    """
     data = tmp_path / "data"
     _panel(data / "p.csv")
 
     start_workflow(str(data), str(tmp_path / "out"))
+    coverage = _packet(tmp_path / "out")["coverage"]
 
-    assert _packet(tmp_path / "out")["coverage"]["detector_caps_reported"] is False
+    assert coverage["detector_caps_reported"] is False
+    assert coverage["coverage_complete"] is False, (
+        "the packet claims complete coverage while detector caps are unreported"
+    )
+    assert any("detector-level caps" in x for x in coverage["limitations"]), (
+        "the caveat must reach the channel the CLI actually prints"
+    )
 
 
 def test_an_index_from_an_unsupported_schema_is_refused(tmp_path):
