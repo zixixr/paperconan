@@ -797,6 +797,36 @@ def test_findings_array_renders_per_finding_blocks_with_own_evidence():
     assert "findings-index" in html
 
 
+def test_modern_block_duplication_ref_remains_unmatched_in_adjudicated_report():
+    scan = {
+        "relations_blocks": [{
+            "file": "synthetic.xlsx",
+            "sheet": "Panel",
+            "block": {"rows": "2-6", "cols": "A-C", "header": ["a", "b", "c"]},
+            "block_dups": [{
+                "kind": "block_value_duplication",
+                "severity": "medium",
+                "rule": "synthetic block duplication signal",
+            }],
+        }],
+        "cross_sheet_findings": [],
+    }
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "title": "Unmatched synthetic signal",
+            "finding_ref": {"kind": "block_value_duplication"},
+            "report_md": "This signal requires contextual review.",
+        }],
+    }
+
+    html = render_adjudicated_report(scan, verdict)
+
+    assert "block_value_duplication" not in html
+    assert "synthetic block duplication signal" not in html
+    assert "无匹配证据（finding_ref 未命中扫描结果）" in html
+
+
 @pytest.mark.parametrize("selector", ["sheet", "file", "rows", "kind"])
 def test_multi_finding_unmatched_visible_selector_is_neutral_validated(selector):
     blocked = "mis" + "conduct"
