@@ -51,18 +51,27 @@ def _esc(s: Any) -> str:
 
 _PER_BLOCK_GROUPS = ("relations", "progressions", "equal_pairs", "row_pairs",
                      "row_relations", "within_col", "identical_after_rounding", "grim")
+_DEFAULT_HTML_PER_BLOCK_GROUPS = _PER_BLOCK_GROUPS + ("block_dups",)
 
 
-def _iter_block_findings(scan: dict) -> Iterable[tuple[dict, dict]]:
+def _iter_block_findings(
+    scan: dict,
+    *,
+    per_block_groups: tuple[str, ...] = _PER_BLOCK_GROUPS,
+) -> Iterable[tuple[dict, dict]]:
     for blk in scan.get("relations_blocks", []) or []:
-        for group in _PER_BLOCK_GROUPS:
+        for group in per_block_groups:
             for f in blk.get(group, []) or []:
                 yield blk, f
 
 
-def _all_findings(scan: dict) -> list[dict]:
+def _all_findings(
+    scan: dict,
+    *,
+    per_block_groups: tuple[str, ...] = _PER_BLOCK_GROUPS,
+) -> list[dict]:
     out = []
-    for blk, f in _iter_block_findings(scan):
+    for blk, f in _iter_block_findings(scan, per_block_groups=per_block_groups):
         out.append({
             "scope": "block",
             "file": blk["file"],
@@ -781,7 +790,10 @@ def write_html_report(scan: dict, out_path: str) -> None:
     input_label = os.path.basename(os.path.normpath(input_dir)) or input_dir or "audit"
     artifact_dir = os.path.dirname(os.path.abspath(out_path))
     image_budget = EvidenceBudget(report_image_evidence_bytes())
-    findings = _all_findings(scan)
+    findings = _all_findings(
+        scan,
+        per_block_groups=_DEFAULT_HTML_PER_BLOCK_GROUPS,
+    )
     n_sheets = len({(it["file"], it["sheet"]) for it in findings if it["scope"] == "block"})
     sev = _severity_counts(findings)
 
