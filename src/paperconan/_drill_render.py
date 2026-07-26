@@ -131,21 +131,27 @@ def _render_evidence(ev: dict[str, Any] | None) -> list[str]:
     shown = rows[:_EVIDENCE_ROW_LIMIT]
     # A row may carry more values than there are headers; widen rather than zip
     # them away, or whole columns vanish with no trace.
-    n_cols = max([len(headers)] + [len(r.get("values") or []) for r in shown] or [0])
+    n_cols = max([len(headers)] + [len(r.get("values") or []) for r in shown])
     labels = [headers[i] if i < len(headers) else f"col {col_offset + i + 1}"
               for i in range(n_cols)]
-    widths = [
-        max(len(labels[i]), *(len(cell((r.get("values") or [None] * n_cols)[i]))
-                              for r in shown) if shown else 0, 3)
-        if n_cols else 0
-        for i in range(n_cols)
-    ]
+
+    # Plain loop, not a comprehension: rows may be ragged, and indexing past a
+    # short row here is how the widths pass crashed while the render loop below
+    # (which has the same guard) was fine.
+    widths = []
+    for i in range(n_cols):
+        width = max(len(labels[i]), 3)
+        for row in shown:
+            values = row.get("values") or []
+            if i < len(values):
+                width = max(width, len(cell(values[i])))
+        widths.append(width)
 
     head = "  row │ " + " ".join(
         f"{labels[i]:>{widths[i]}}" + ("*" if col_offset + i in hi_cols else " ")
         for i in range(n_cols)
     )
-    out = [head, "  " + _rule(min(len(head), 200))]
+    out = [head, "  " + _rule(len(head))]
     for row in shown:
         idx = int(row.get("row_idx") or 0)
         mark = "▸" if idx in hi_rows else " "

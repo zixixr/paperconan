@@ -310,6 +310,94 @@ def test_evidence_values_are_never_silently_shortened():
     assert "98765432.123456" in text, "a long value was clipped"
 
 
+def test_each_value_lands_under_its_own_header_in_its_own_row():
+    """The evidence table's job is to let a reviewer point at a cell.
+
+    Asserting that a number appears "somewhere on the page" leaves column order,
+    dropped trailing columns, row numbering and the highlight markers all
+    unguarded — a reviewer could read the right digits against the wrong header.
+    """
+    from paperconan._drill_render import _render_evidence
+
+    # five columns, not three: a three-column fixture cannot tell "render all"
+    # from "render the first three", which is the realistic refactor slip
+    labels = ["alpha", "beta", "gamma", "delta", "epsilon"]
+    ev = {
+        "headers": labels,
+        "col_offset": 0,
+        "highlight_cols": [1],
+        "highlight_rows": [7],
+        "rows": [{"row_idx": 7, "values": [1.5, 2.5, 3.5, 4.5, 5.5]},
+                 {"row_idx": 8, "values": [6.5, 7.5, 8.5, 9.5, 10.5]}],
+    }
+
+    lines = _render_evidence(ev)
+    head = lines[0]
+    body = [ln for ln in lines if "│" in ln][1:]
+
+    assert len(body) == 2, "one line per row"
+    # Each value sits under its own header, so column order cannot silently
+    # flip. Columns are right-aligned, so it is the right edges that line up.
+    for label, value in zip(labels, ["1.5", "2.5", "3.5", "4.5", "5.5"]):
+        label_end = head.index(label) + len(label)
+        value_end = body[0].index(value) + len(value)
+        assert abs(label_end - value_end) <= 1, f"{value} is not under {label}"
+    # trailing columns are rendered, not dropped
+    assert "9.5" in body[1] and "10.5" in body[1]
+    # spreadsheet row numbers survive, so the reviewer can find the row again
+    assert "7" in body[0] and "8" in body[1]
+    # the markers that say which cell matters
+    assert body[0].lstrip().startswith("▸"), "highlighted row is not marked"
+    assert body[1].lstrip()[0] != "▸", "a non-highlighted row was marked"
+    assert "beta*" in head.replace(" ", "") or head.count("*") == 1
+
+
+def test_evidence_says_how_many_rows_it_did_not_print():
+    """The scan keeps up to 50 rows; the renderer shows 20 — live, not theoretical."""
+    from paperconan._drill_render import _render_evidence
+
+    ev = {"headers": ["a"], "col_offset": 0,
+          "rows": [{"row_idx": i, "values": [float(i)]} for i in range(2, 33)]}
+
+    text = "\n".join(_render_evidence(ev))
+
+    assert "11 more rows in this window" in text
+
+
+def test_evidence_handles_ragged_rows_without_crashing():
+    """The widths pass indexed past a short row; the old zip() truncated instead.
+
+    Not reachable from a scan paperconan writes — its windows are rectangular —
+    but a foreign or older scan.json would surface as a raw traceback.
+    """
+    from paperconan._drill_render import _render_evidence
+
+    short_then_long = {"headers": ["a", "b"], "rows": [
+        {"row_idx": 2, "values": [1.0]},
+        {"row_idx": 3, "values": [2.0, 3.0, 4.0]},
+    ]}
+    long_then_short = {"headers": ["a", "b"], "rows": [
+        {"row_idx": 2, "values": [2.0, 3.0, 4.0]},
+        {"row_idx": 3, "values": [1.0]},
+    ]}
+
+    for ev in (short_then_long, long_then_short):
+        text = "\n".join(_render_evidence(ev))
+        assert "4.0" in text, "the widest row lost a column"
+
+
+@pytest.mark.parametrize("ev", [
+    {"headers": [], "rows": [{"row_idx": 2, "values": [1.0]}]},
+    {"headers": ["a"], "rows": [{"row_idx": 2, "values": [None, None]}]},
+    {"headers": ["a"], "rows": [{"row_idx": 2, "values": ["text", 1]}]},
+    {"headers": ["a"], "rows": [{"row_idx": 2, "values": []}]},
+])
+def test_evidence_renders_edge_shapes_without_raising(ev):
+    from paperconan._drill_render import _render_evidence
+
+    assert _render_evidence(ev)
+
+
 def test_evidence_says_when_the_scan_itself_trimmed_the_window():
     from paperconan._drill_render import _render_evidence
 
