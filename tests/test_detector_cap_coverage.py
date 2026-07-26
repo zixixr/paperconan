@@ -230,9 +230,15 @@ def test_a_detector_below_its_cap_records_nothing(name):
 
     coverage = ScanCoverage(files_discovered=1)
 
-    getattr(audit, name)(_two_sheets(), profile="review", max_findings=10**6,
-                         coverage=coverage)
+    # _grids_for, not _two_sheets: that fixture yields nothing for three of the
+    # five detectors, so `_capped` was unreachable and this assertion held by
+    # construction. Making a detector report its finding limit whenever it found
+    # anything then left the suite green -- the exact bug named above.
+    grids = _grids_for(name)
+    found = getattr(audit, name)(grids, profile="review", max_findings=10**6,
+                                 coverage=coverage)
 
+    assert found, f"{name}'s fixture produces nothing, so 'below its cap' is vacuous"
     assert not coverage.to_dict()["limitations"], (
         f"{name} reported a cap it never reached"
     )
@@ -548,10 +554,21 @@ def test_the_caveat_makes_no_claim_the_list_is_exhaustive():
     scan = {"scan_status": "partial", "coverage": ScanCoverage(files_discovered=1).to_dict()}
     blob = " ".join(_coverage_for(scan, [], [], [], 100)["limitations"]).lower()
 
-    for claim in ("what is reported appears in this list",
-                  "all limitations are listed",
-                  "this list is complete"):
-        assert claim not in blob, f"the caveat asserts completeness it does not have: {claim!r}"
+    # Pinned exactly rather than screened against a list of phrasings. A
+    # blacklist only catches the three wordings someone thought of: rewriting the
+    # closing sentence into a fresh, unhedged completeness claim passed it. An
+    # exact match cannot be worded around, and forces a deliberate decision on
+    # every edit to text whose whole job is to not overstate coverage.
+    expected = (
+        "some detector caps are still not reported: a detector that skipped a "
+        "block for being too wide or too tall, or stopped at an internal limit, "
+        "may not appear above. This line does not enumerate what is not reported."
+    )
+    assert expected.lower() in blob, (
+        "the unreported-cap caveat changed. Re-read it before updating this "
+        "string: every clause must say what MAY be missing, and none may assert "
+        f"that the list is complete.\nnow: {blob!r}"
+    )
 
 
 # ---------- a known gap, held honestly ----------
@@ -833,14 +850,20 @@ def test_every_scan_line_quoted_in_the_skill_is_one_the_code_can_emit():
     import re
     from pathlib import Path
 
+    import paperconan._audit as audit
     from paperconan._workflow import _coverage_for
 
     coverage = ScanCoverage(files_discovered=2)
     coverage.mark_file_failed("big.xlsx", "file_too_large")
+    # Read from production, not hardcoded: with both sides self-supplied, moving
+    # a default left SKILL.md quoting a limit the code no longer emits while this
+    # test stayed green.
     coverage.add_limitation("detector", "detector_candidate_pool_limit",
-                            detector="detect_short_row_reuse", limit=400)
+                            detector="detect_short_row_reuse",
+                            limit=audit._SHORT_ROW_MAX_ROWS_PER_SHEET)
     coverage.add_limitation("detector", "detector_finding_limit",
-                            detector="detect_row_pair_digit_coupling", limit=25)
+                            detector="detect_row_pair_digit_coupling",
+                            limit=audit._ROW_PAIR_MAX_FINDINGS_PER_BLOCK)
     coverage.add_limitation("detector", "detector_compute_budget_limit",
                             detector="detect_row_relations")
     scan = {"scan_status": "partial", "coverage": coverage.to_dict()}
@@ -928,4 +951,59 @@ def test_every_limitation_reason_is_either_quoted_in_the_skill_or_listed_as_unqu
         f"{len(undecided)} limitation reason(s) are neither shown in SKILL.md nor "
         f"listed as deliberately unquoted: {undecided}. Add an example to the skill, "
         f"or add the reason to _SCAN_REASONS_NOT_IN_SKILL with a note saying why."
+    )
+
+
+def test_one_detector_hitting_two_limits_records_both():
+    """The `reason` half of the dedup key, which had no test.
+
+    `detector` is pinned by test_two_detectors_capped_at_once_are_both_named, so
+    dropping it turns the suite red. Dropping `reason` did not: nothing recorded
+    two different limits for the same detector, and detectors really do reach
+    several -- detect_recurring_row_vectors has two budgets, and a detector can
+    exhaust a budget and fill its result cap in one scan. Merging them leaves a
+    survivor that implies the other pass ran to completion, which is the silent
+    shortening this file exists to prevent.
+    """
+    coverage = ScanCoverage(files_discovered=1)
+    coverage.add_limitation("detector", "detector_compute_budget_limit",
+                            detector="detect_recurring_row_vectors")
+    coverage.add_limitation("detector", "detector_finding_limit",
+                            detector="detect_recurring_row_vectors", limit=60)
+    coverage.add_limitation("detector", "detector_candidate_pool_limit",
+                            detector="detect_recurring_row_vectors", limit=400)
+
+    reasons = {i["reason"] for i in coverage.to_dict()["limitations"]}
+
+    assert reasons == {"detector_compute_budget_limit", "detector_finding_limit",
+                       "detector_candidate_pool_limit"}, (
+        f"one detector's distinct limits collapsed into {reasons}; the survivor "
+        f"implies the other passes ran to completion"
+    )
+
+
+def test_two_budgets_in_one_detector_survive_a_real_scan(tmp_path, monkeypatch):
+    """The same property end-to-end, since the unit test above builds records by hand.
+
+    detect_recurring_row_vectors has a cross-figure budget and a within-row
+    budget. Starving both is the production shape that a `reason`-less dedup key
+    would collapse.
+    """
+    import paperconan._audit as audit
+    monkeypatch.setattr(audit, "_RECURRING_VEC_BUDGET", 1)
+    monkeypatch.setattr(audit, "_WITHIN_ROW_VEC_BUDGET", 1)
+
+    # Two figure-named files: the cross-figure pass is skipped outright unless two
+    # distinct figure keys are present, so a single panel can only ever starve the
+    # within-row budget and the test would pin half the property.
+    _panel(tmp_path / "d" / "Figure 1a.csv")
+    _panel(tmp_path / "d" / "Figure 2b.csv")
+    scan = scan_dir(str(tmp_path / "d"), str(tmp_path / "out"), write_html=False)
+
+    reasons = {i["reason"] for i in (scan.get("coverage") or {}).get("limitations") or []
+               if i.get("detector") == "detect_recurring_row_vectors"}
+
+    assert len(reasons) >= 2, (
+        f"both starved budgets collapsed to {reasons}; a reader is told one pass "
+        f"was bounded and cannot learn the other was too"
     )
