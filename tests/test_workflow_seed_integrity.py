@@ -583,28 +583,35 @@ def test_the_profile_is_part_of_the_run_configuration(tmp_path):
             == _packet(tmp_path / "b")["clusters"])
 
 
-def test_coverage_cannot_claim_completeness_while_detector_caps_go_unreported(tmp_path):
-    """Several detectors stop at their own max_findings or compute budget and
-    report it to no channel at all — for some paths not even stderr.
-
-    A side field saying so is not enough: the CLI prints `limitations`, and a
-    reader who sees `coverage_complete: true` has no reason to look further. So
-    the caveat has to be a limitation, which makes `coverage_complete` false by
-    construction until the detector-layer PR flips the flag.
+def test_an_incomplete_scan_makes_the_packet_declare_itself_incomplete(tmp_path, monkeypatch):
+    """Detector caps used to reach no channel, so the packet carried a blanket
+    caveat instead. Now that they record into ScanCoverage, the packet must
+    carry the real one — and only when a cap actually bit.
     """
+    import paperconan._audit as audit
+    monkeypatch.setattr(audit, "_ROW_REL_BUDGET", 1)
+
     data = tmp_path / "data"
-    _panel(data / "p.csv")
+    rows = ["," .join(f"c{j}" for j in range(14))]
+    for i in range(40):
+        rows.append(",".join(str(round((i + 1) * (j + 1) * 1.017, 6)) for j in range(14)))
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "p.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
 
     start_workflow(str(data), str(tmp_path / "out"))
     coverage = _packet(tmp_path / "out")["coverage"]
 
-    assert coverage["detector_caps_reported"] is False
-    assert coverage["coverage_complete"] is False, (
-        "the packet claims complete coverage while detector caps are unreported"
+    assert coverage["scan_incomplete"] is True
+    # Not `coverage_complete is False`: DETECTOR_CAPS_REPORTED is a hardcoded
+    # False, so the blanket caveat is always appended and that flag is always
+    # False -- it cannot discriminate. Assert the specific cap instead, which
+    # makes the monkeypatch above load-bearing: without it the budget is never
+    # exhausted and this line does not appear.
+    blob = " ".join(coverage["limitations"])
+    assert "detect_row_relations" in blob, (
+        f"the exhausted budget did not reach the packet by name: {coverage['limitations']}"
     )
-    assert any("detector-level caps" in x for x in coverage["limitations"]), (
-        "the caveat must reach the channel the CLI actually prints"
-    )
+    assert any("scan was not complete" in x for x in coverage["limitations"])
 
 
 def test_an_index_from_an_unsupported_schema_is_refused(tmp_path):

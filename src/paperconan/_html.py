@@ -733,7 +733,6 @@ _JS = """
 
 
 _STATUS_LABELS = {
-    "complete": ("ok", "全部输入均已检测 · full coverage"),
     "partial": ("warn", "部分输入未检测(见下)· partial coverage"),
     "failed": ("warn", "没有可检测的输入 · no input analyzed"),
 }
@@ -751,8 +750,7 @@ def _render_scan_status(scan: dict) -> str:
     status = scan.get("scan_status")
     if not isinstance(coverage, dict) or status not in _STATUS_LABELS:
         return ""
-    if status == "complete":
-        return ""
+
     tone, label = _STATUS_LABELS[status]
     counts = (
         f'{coverage.get("files_succeeded", 0)}/{coverage.get("files_discovered", 0)} files, '
@@ -765,6 +763,12 @@ def _render_scan_status(scan: dict) -> str:
         f'<li>{_esc(item.get("scope"))} · {_esc(item.get("reason"))}'
         + (f' · <code>{_esc(item.get("file"))}</code>' if item.get("file") else "")
         + (f' · {_esc(item.get("sheet"))}' if item.get("sheet") else "")
+        # Detector records carry no file/sheet — without the detector name every
+        # capped detector renders as an identical row the reader cannot tell apart.
+        + (f' · <code>{_esc(item.get("detector"))}</code>' if item.get("detector") else "")
+        + (f' · {_esc(item.get("candidates"))} candidates'
+           if item.get("candidates") else "")
+        + (f' · limit={_esc(item.get("limit"))}' if item.get("limit") else "")
         + (f' · ×{_esc(item.get("count"))}' if item.get("count") else "")
         + "</li>"
         for item in limitations[:_MAX_RENDERED_LIMITATIONS]

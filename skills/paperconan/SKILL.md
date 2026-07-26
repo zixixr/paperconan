@@ -71,9 +71,50 @@ Three things to hold onto while reading:
   They state what was not shown and why: locations beyond
   the listed count, findings beyond a listing limit, families this layer does not
   route (digit distributions, decimal endings, image findings), findings the scan's
-  own caps dropped before the layers saw them, and detector-level caps that are
-  reported nowhere at all. Raise `--max-locations` / `--max-findings` to reach the
+  own caps dropped before the layers saw them, and detector-level caps that still
+  reach no channel. Raise `--max-locations` / `--max-findings` to reach the
   remainder; the rest are limits of the scan, not of the view.
+- **`scan:` lines carry scan-layer limitations, not just detector ones.** The
+  shapes below are the ones you will meet most often, quoted verbatim; the code
+  emits others in the same form (a sheet-scoped line appends the sheet name after
+  the file). Whole-detector skips are the exception — they reach no channel and
+  are never named here at all.
+  - `scan: file too large in big.xlsx` — a file that was not read at all.
+    `scan: unreadable in notes.xlsx` is the same class: nothing in that file was
+    examined.
+  - `scan: formula cache missing in m.xlsx Fig 3b (cells=['C4', 'C5', 'C6'], count=812)`
+    — `count` is how many formula cells stored no cached value; `cells` is a
+    short list of examples, not the whole set. paperconan never saw the numbers
+    those cells compute, so they were **not** audited and the sheet is partly
+    unread.
+  - `scan: formula cache unreadable in m.xlsx` — the formula-cache inspection
+    itself did not complete, so paperconan cannot say whether that file has
+    unread formula cells. Absence of a `formula cache missing` line for it
+    proves nothing. `formula metadata byte limit` and `formula metadata sheet
+    limit` are the same class, naming which bound stopped the inspection.
+  - `scan: report block limit in m.xlsx Fig 3b (count=3)` — block collection for
+    that sheet stopped at an output budget, so later blocks were never analysed.
+    Two budgets emit this same line: raise `PAPERCONAN_MAX_REPORT_BLOCKS`, and if
+    that changes nothing raise `PAPERCONAN_MAX_TOTAL_FINDINGS`.
+  - `scan: detector candidate pool limit in detect_short_row_reuse (limit=400)` —
+    a detector stopped building candidates at its cap, so rows past it were never
+    compared.
+  - `scan: detector finding limit in detect_row_pair_digit_coupling (limit=25)` —
+    a detector stopped emitting at its cap.
+  - `scan: detector compute budget limit in detect_row_relations` — a detector ran
+    out of its work budget.
+
+  Any of these means `scan_status` is not `complete` (`partial`, or `failed` when
+  nothing could be read at all) and the search was cut short, so a
+  quiet result on that input is not evidence of a clean one. Detector lines name
+  **no file or sheet**: the record does not carry one, so the line cannot tell you
+  *where* the truncation bit — it may have been one block or many. Re-running
+  unchanged proves nothing: the scan is deterministic, so it reproduces the same
+  truncation byte for byte. Re-run with the matching `PAPERCONAN_*` cap raised
+  (`PAPERCONAN_SHORT_ROW_MAX_ROWS`, `PAPERCONAN_ROW_PAIR_MAX_ROWS`, the
+  `*_BUDGET` vars), or on a narrowed input. Some caps are bare defaults with no
+  knob; for those, narrowing the input is the only remedy. A separate caveat covers whole-detector skips (a block too wide or too
+  tall), which reach no channel at all and so are never named here.
 - **A quiet overview is not a clean paper.** It means these detectors found
   nothing at these thresholds in the data that was supplied.
 

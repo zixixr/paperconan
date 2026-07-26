@@ -48,7 +48,7 @@ def _clusters_of(scan: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, 
 
     That second value is not optional bookkeeping. It carries the upstream
     finding caps, an incomplete scan, the families this layer does not route, and
-    the detector-level caps nothing reports — i.e. most of the ways a real signal
+    the detector-level caps still reaching no channel — i.e. most of the ways a real signal
     fails to reach the reader. Discarding it here made `overview` print an empty
     `limitations` list on a scan where thousands of findings had been dropped.
     """

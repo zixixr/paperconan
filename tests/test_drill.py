@@ -507,8 +507,11 @@ def test_raising_the_limit_actually_reaches_the_declared_remainder(scan):
     )
     # gone once nothing is held back...
     assert not any("raise max_findings" in x for x in full["coverage"]["limitations"])
-    # ...but scan-wide caveats are not this layer's to drop
-    assert any("detector-level caps" in x for x in full["coverage"]["limitations"])
+    # ...but scan-wide caveats are not this layer's to drop. The fixture always
+    # carries unrouted families, so that is the standing representative here.
+    assert any("does not route" in x for x in full["coverage"]["limitations"]), (
+        f"L3 dropped the scan-wide caveats: {full['coverage']['limitations']}"
+    )
 
 
 def test_a_family_present_but_unreachable_is_named_in_coverage(scan):
