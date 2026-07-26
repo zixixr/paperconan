@@ -36,9 +36,10 @@ SCHEMA_VERSION = 2
 # from an older policy are never silently compared against a newer one.
 WORKFLOW_POLICY_VERSION = 1
 NUMERIC_CANONICALIZATION_VERSION = 1
-# Flip to True in the PR that wires detector max_findings / compute budgets into
-# ScanCoverage. Until then coverage_complete is false by construction.
-DETECTOR_CAPS_REPORTED = False
+# Detector max_findings / compute budgets now record into ScanCoverage, so a
+# search that was cut short reaches scan_status and this layer's limitations
+# rather than passing as complete. coverage_complete can mean what it says again.
+DETECTOR_CAPS_REPORTED = True
 
 MAX_EXPANSION_ROUNDS = 2
 # Route steps are bounded so a context-only loop cannot spin forever; the cap is
@@ -356,6 +357,28 @@ _UNSEEDED_FAMILIES = (
 )
 
 
+def _describe_scan_limitation(entry: Any) -> str:
+    """A sentence, not a Python repr — these reach a reader's terminal."""
+    if isinstance(entry, str):
+        return entry
+    if not isinstance(entry, dict):
+        return str(entry)
+    reason = str(entry.get("reason") or "unspecified").replace("_", " ")
+    where = " ".join(
+        str(entry[k]) for k in ("detector", "file", "sheet") if entry.get(k)
+    )
+    extra = ", ".join(
+        f"{k}={entry[k]}" for k in sorted(entry)
+        if k not in ("scope", "reason", "detector", "file", "sheet")
+    )
+    text = reason
+    if where:
+        text += f" in {where}"
+    if extra:
+        text += f" ({extra})"
+    return text
+
+
 def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any]:
     limitations: list[str] = []
 
@@ -382,7 +405,7 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
             "seeds cover only what it analysed"
         )
         for entry in scan_coverage.get("limitations") or []:
-            limitations.append(f"scan: {entry}" if isinstance(entry, str) else f"scan: {entry!r}")
+            limitations.append("scan: " + _describe_scan_limitation(entry))
 
     unseeded = {
         family: len(scan.get(family) or [])

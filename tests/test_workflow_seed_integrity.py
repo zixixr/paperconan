@@ -583,28 +583,41 @@ def test_the_profile_is_part_of_the_run_configuration(tmp_path):
             == _packet(tmp_path / "b")["clusters"])
 
 
-def test_coverage_cannot_claim_completeness_while_detector_caps_go_unreported(tmp_path):
-    """Several detectors stop at their own max_findings or compute budget and
-    report it to no channel at all — for some paths not even stderr.
-
-    A side field saying so is not enough: the CLI prints `limitations`, and a
-    reader who sees `coverage_complete: true` has no reason to look further. So
-    the caveat has to be a limitation, which makes `coverage_complete` false by
-    construction until the detector-layer PR flips the flag.
+def test_a_detector_cap_reaches_the_packet(tmp_path, monkeypatch):
+    """Detector caps used to reach no channel, so the packet carried a blanket
+    caveat instead. Now that they record into ScanCoverage, the packet must
+    carry the real one — and only when a cap actually bit.
     """
+    import paperconan._audit as audit
+    monkeypatch.setattr(audit, "_ROW_REL_BUDGET", 1)
+
+    data = tmp_path / "data"
+    rows = ["," .join(f"c{j}" for j in range(14))]
+    for i in range(40):
+        rows.append(",".join(str(round((i + 1) * (j + 1) * 1.017, 6)) for j in range(14)))
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "p.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    start_workflow(str(data), str(tmp_path / "out"))
+    coverage = _packet(tmp_path / "out")["coverage"]
+
+    assert coverage["detector_caps_reported"] is True
+    assert coverage["scan_incomplete"] is True
+    assert coverage["coverage_complete"] is False
+    assert any("scan was not complete" in x for x in coverage["limitations"])
+
+
+def test_a_clean_scan_no_longer_carries_a_blanket_caveat(tmp_path):
+    """The blanket 'detector caps are unreported' line was true of every scan
+    ever produced, so it said nothing about any particular one."""
     data = tmp_path / "data"
     _panel(data / "p.csv")
 
     start_workflow(str(data), str(tmp_path / "out"))
     coverage = _packet(tmp_path / "out")["coverage"]
 
-    assert coverage["detector_caps_reported"] is False
-    assert coverage["coverage_complete"] is False, (
-        "the packet claims complete coverage while detector caps are unreported"
-    )
-    assert any("detector-level caps" in x for x in coverage["limitations"]), (
-        "the caveat must reach the channel the CLI actually prints"
-    )
+    assert coverage["detector_caps_reported"] is True
+    assert not any("detector-level caps" in x for x in coverage["limitations"])
 
 
 def test_an_index_from_an_unsupported_schema_is_refused(tmp_path):

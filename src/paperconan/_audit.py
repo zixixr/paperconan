@@ -955,6 +955,20 @@ _ROW_REL_RTOL = float(os.environ.get("PAPERCONAN_ROW_REL_RTOL", "1e-3"))
 _ROW_REL_BUDGET = int(os.environ.get("PAPERCONAN_ROW_REL_BUDGET", "6000000"))
 
 
+def _note_detector_cap(coverage, detector: str, reason: str, **details) -> None:
+    """Record that a detector stopped before exhausting its search space.
+
+    These caps bound worst-case work on genome-scale supplements, which is
+    correct — but a search that was cut short must not be reportable as a
+    complete one. Routing them into ScanCoverage flips scan_status to "partial"
+    and carries the reason to every consumer, instead of the stderr line (or, on
+    several paths, the silence) they used to get.
+    """
+    if coverage is None:
+        return
+    coverage.add_limitation("detector", reason, detector=detector, **details)
+
+
 def _row_label(sheet, r, c0):
     labels = []
     for c in range(max(0, c0 - 4), c0):
@@ -1233,7 +1247,7 @@ def _demote_reused_progressions(report_blocks):
     return report_blocks
 
 
-def detect_row_relations(sheet, r0, r1, c0, c1, header):
+def detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=None):
     """Row-oriented mirror of `detect_relations`: flag two ROWS that hold an exact
     relationship across many columns.
 
@@ -1253,6 +1267,12 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header):
     n_rows = r1 - r0
     n_cols = c1 - c0
     if n_rows < 2 or n_cols < _ROW_REL_MIN_COLS or n_rows > _ROW_REL_MAX_ROWS:
+        if n_rows > _ROW_REL_MAX_ROWS and n_cols >= _ROW_REL_MIN_COLS:
+            # Reported on no channel at all before: the block was simply skipped.
+            _note_detector_cap(
+                coverage, "detect_row_relations", "detector_block_rows_limit",
+                rows=n_rows, limit=_ROW_REL_MAX_ROWS,
+            )
         return findings
 
     budget = _ROW_REL_BUDGET
@@ -1267,6 +1287,10 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header):
             if budget <= 0:
                 print(f"[paperconan] detect_row_relations: column-op budget exhausted on a "
                       f"{n_rows}x{n_cols} block — coverage bounded", file=sys.stderr)
+                _note_detector_cap(
+                    coverage, "detect_row_relations", "detector_compute_budget_limit",
+                    rows=n_rows, cols=n_cols,
+                )
                 return findings
             label_b = labels[rb]
             if _AXIS_CONTEXT_LABEL_RE.search(label_b):
@@ -2889,7 +2913,8 @@ _WR_MAX_ROW_CELLS = int(os.environ.get("PAPERCONAN_WR_MAX_ROW_CELLS", "20000"))
 
 
 def detect_recurring_row_vectors(grid_sheets, profile="review",
-                                 min_k=4, max_k=8, max_rows=300, max_findings=20):
+                                 min_k=4, max_k=8, max_rows=300, max_findings=20,
+                                 coverage=None):
     """B2 — a fixed ordered numeric tuple recurring as a contiguous row-slice across >=3 places
     spanning >=2 figure namespaces. Six independent mice cannot yield the identical six-value
     vector in several arms; a specific high-information tuple reappearing across unrelated figures
@@ -3053,6 +3078,8 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
     if wr_budget <= 0:
         print("[paperconan] detect_recurring_row_vectors: within-row coverage bounded",
               file=sys.stderr)
+        _note_detector_cap(coverage, "detect_recurring_row_vectors",
+                           "detector_compute_budget_limit")
     # One physical repeat yields many overlapping windows (k=4..8) — keep the strongest (most
     # copies, then longest) per row, dropping >=50%-cell-overlap duplicates.
     wr_cands.sort(key=lambda x: (-len(x[5]), -len(x[0])))
@@ -3100,6 +3127,9 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
         if len(findings) >= max_findings:
             break
 
+    if len(findings) >= max_findings:
+        _note_detector_cap(coverage, "detect_recurring_row_vectors", "detector_finding_limit",
+                           limit=max_findings)
     apply_profile_to_findings(findings, profile)
     return findings
 
@@ -3242,7 +3272,7 @@ def _scaled_row_candidates(grid_sheets):
 
 
 def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
-                            max_findings=40):
+                            max_findings=40, coverage=None):
     """Two DATA ROWS in DIFFERENT blocks (cross-block within a sheet) or different
     sheets that hold `row_B == row_A * k` over a long contiguous run of positionally-
     aligned columns — the scalar-multiple case (k != 1, `scaled_row_reuse`) and its
@@ -3324,6 +3354,11 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
         print(f"[paperconan] detect_scaled_row_reuse: coverage bounded "
               f"(candidates={len(cands)}{'+truncated' if truncated else ''}, "
               f"budget_exhausted={budget <= 0})", file=sys.stderr)
+        _note_detector_cap(coverage, "detect_scaled_row_reuse",
+                           "detector_compute_budget_limit", candidates=len(cands))
+    if len(findings) >= max_findings:
+        _note_detector_cap(coverage, "detect_scaled_row_reuse", "detector_finding_limit",
+                           limit=max_findings)
     apply_profile_to_findings(findings, profile)
     return findings
 
@@ -3499,7 +3534,8 @@ def _short_row_candidates(grid_sheets):
     return cands
 
 
-def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60):
+def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
+                           coverage=None):
     """SHORT high-precision identical or constant-ratio runs (3..11 columns) between two
     data rows of one sheet — the JCI "Supporting Data Values" fingerprint that the >=12
     column `detect_scaled_row_reuse` and `detect_row_relations` cannot see: a control
@@ -3703,6 +3739,11 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60):
     if budget <= 0:
         print("[paperconan] detect_short_row_reuse: coverage bounded (budget exhausted)",
               file=sys.stderr)
+        _note_detector_cap(coverage, "detect_short_row_reuse",
+                           "detector_compute_budget_limit")
+    if len(findings) >= max_findings:
+        _note_detector_cap(coverage, "detect_short_row_reuse", "detector_finding_limit",
+                           limit=max_findings)
     apply_profile_to_findings(findings, profile)
     return findings
 
@@ -3764,7 +3805,8 @@ def _shared_frac_is_small_denominator(frac, max_q=128):
     return False
 
 
-def detect_within_row_shared_fraction(grid_sheets, profile="review", max_findings=60):
+def detect_within_row_shared_fraction(grid_sheets, profile="review", max_findings=60,
+                                      coverage=None):
     """Two cells of ONE row that share a long high-precision fractional tail while their
     integer parts differ (e.g. 20.316768 and 102.316768) — a copy-then-shift: a value or a
     whole row-slice reused with the integer part rewritten but the decimals left intact.
@@ -3834,11 +3876,17 @@ def detect_within_row_shared_fraction(grid_sheets, profile="review", max_finding
     if budget <= 0:
         print("[paperconan] detect_within_row_shared_fraction: coverage bounded "
               "(budget exhausted)", file=sys.stderr)
+        _note_detector_cap(coverage, "detect_within_row_shared_fraction",
+                           "detector_compute_budget_limit")
+    if len(findings) >= max_findings:
+        _note_detector_cap(coverage, "detect_within_row_shared_fraction", "detector_finding_limit",
+                           limit=max_findings)
     apply_profile_to_findings(findings, profile)
     return findings
 
 
-def detect_row_pair_shared_fraction(grid_sheets, profile="review", max_findings=60):
+def detect_row_pair_shared_fraction(grid_sheets, profile="review", max_findings=60,
+                                    coverage=None):
     """Two ROWS that share the same high-precision decimal fraction at a contiguous run of
     aligned columns while their integer parts differ — the row-oriented twin of
     `integer_diff_shared_fraction` (which only compares two COLUMNS). A concentration row
@@ -3943,6 +3991,11 @@ def detect_row_pair_shared_fraction(grid_sheets, profile="review", max_findings=
     if budget <= 0:
         print("[paperconan] detect_row_pair_shared_fraction: coverage bounded "
               "(global budget exhausted)", file=sys.stderr)
+        _note_detector_cap(coverage, "detect_row_pair_shared_fraction",
+                           "detector_compute_budget_limit")
+    if len(findings) >= max_findings:
+        _note_detector_cap(coverage, "detect_row_pair_shared_fraction", "detector_finding_limit",
+                           limit=max_findings)
     apply_profile_to_findings(findings, profile)
     return findings
 
@@ -4236,7 +4289,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 # Runs UNCONDITIONALLY (not gated by `wide`): row-oriented condition/measurement
                 # layouts are exactly the wide blocks the column detectors skip, and this is
                 # where a "row B = row A * k" relationship lives. Self-gates on rows/cols.
-                rr = detect_row_relations(sheet, r0, r1, c0, c1, header)
+                rr = detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=coverage)
                 wc = detect_within_column_patterns(sheet, r0, r1, c0, c1, header)
                 wc = wc + detect_dispersed_repeats(sheet, r0, r1, c0, c1, header)
                 # Block-scoped (not column-scoped): its own group so the packet
@@ -4314,22 +4367,22 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     # B3: matrix-to-matrix decimal-fraction reuse between two blocks of the same sheet.
     cross_sheet_findings += detect_within_sheet_fraction_reuse(grid_sheets, profile=profile)
     # B2: a fixed high-information row-vector recurring across >=2 figures.
-    cross_sheet_findings += detect_recurring_row_vectors(grid_sheets, profile=profile)
+    cross_sheet_findings += detect_recurring_row_vectors(grid_sheets, profile=profile, coverage=coverage)
     # B6: a condition ROW that is an exact scalar multiple of a row in another block /
     # sheet (cross-block sibling of detect_row_relations; the Extended Data Fig. 5B case).
-    cross_sheet_findings += detect_scaled_row_reuse(grid_sheets, profile=profile)
+    cross_sheet_findings += detect_scaled_row_reuse(grid_sheets, profile=profile, coverage=coverage)
     # B6b: the SHORT high-precision variant — a 3-11 column identical/scaled run between two
     # rows (incl. isolated single-row panels) that the >=12 column detectors above miss. No
     # dedup against the long-run detector is needed: it only emits runs >=12 columns and this
     # one only runs <12, so the two never report the same relation on the same pair.
-    cross_sheet_findings += detect_short_row_reuse(grid_sheets, profile=profile)
+    cross_sheet_findings += detect_short_row_reuse(grid_sheets, profile=profile, coverage=coverage)
     # B6c: copy-then-integer-shift WITHIN a row — two cells sharing a long fractional tail
     # with different integer parts (the column- and block-pair shared-fraction detectors
     # never look across the columns of a single row).
-    cross_sheet_findings += detect_within_row_shared_fraction(grid_sheets, profile=profile)
+    cross_sheet_findings += detect_within_row_shared_fraction(grid_sheets, profile=profile, coverage=coverage)
     # B6d: the row-PAIR twin of integer_diff_shared_fraction — two rows sharing a decimal
     # fraction at aligned columns with different integer parts (copy-then-shift across rows).
-    cross_sheet_findings += detect_row_pair_shared_fraction(grid_sheets, profile=profile)
+    cross_sheet_findings += detect_row_pair_shared_fraction(grid_sheets, profile=profile, coverage=coverage)
     _attach_benign(cross_sheet_findings)
 
     digit_reports, decimal_reports, tail_cluster_reports = [], [], []
