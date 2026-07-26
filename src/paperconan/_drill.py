@@ -23,7 +23,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._workflow import _build_clusters
+from ._finding_groups import BLOCK_FINDING_GROUPS
+from ._workflow import _block_seed, _build_clusters, _cross_sheet_seed
 
 # Kept generous: these are read straight into a reviewer's context, and the
 # limit exists to bound a pathological scan, not to curate.
@@ -42,11 +43,16 @@ def _location_label(cluster: dict[str, Any]) -> str:
     return where
 
 
-def _clusters_of(scan: dict[str, Any]) -> list[dict[str, Any]]:
-    """Every cluster, unbounded. Truncation is a presentation choice made by the
-    caller, so it can be reported — not something baked into the grouping."""
-    clusters, _ = _build_clusters(scan, max_clusters=10**9)
-    return clusters
+def _clusters_of(scan: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Every cluster plus what the seeding layer already knows it could not cover.
+
+    That second value is not optional bookkeeping. It carries the upstream
+    finding caps, an incomplete scan, the families this layer does not route, and
+    the detector-level caps nothing reports — i.e. most of the ways a real signal
+    fails to reach the reader. Discarding it here made `overview` print an empty
+    `limitations` list on a scan where thousands of findings had been dropped.
+    """
+    return _build_clusters(scan, max_clusters=10**9)
 
 
 def _families(cluster: dict[str, Any]) -> list[str]:
@@ -62,7 +68,8 @@ def _families(cluster: dict[str, Any]) -> list[str]:
 def overview(scan: dict[str, Any], *,
              max_locations: int = DEFAULT_MAX_LOCATIONS) -> dict[str, Any]:
     """Which locations carry signal, how strong, and of what kinds."""
-    clusters = _clusters_of(scan)
+    clusters, seeding = _clusters_of(scan)
+    max_locations = max(0, max_locations)
     shown, hidden = clusters[:max_locations], clusters[max_locations:]
 
     locations = []
@@ -79,7 +86,10 @@ def overview(scan: dict[str, Any], *,
         })
 
     hidden_signals = sum(len(c["seeds"]) for c in hidden)
-    limitations = []
+    # Everything the seeding layer already declared, then what this layer itself
+    # holds back. Both have to reach the reader, or "read coverage" is advice
+    # about a field that does not say anything.
+    limitations = list(seeding.get("limitations") or [])
     if hidden:
         limitations.append(
             f"{len(hidden)} lower-ranked locations ({hidden_signals} signals) are not "
@@ -94,6 +104,11 @@ def overview(scan: dict[str, Any], *,
             "locations_total": len(clusters),
             "locations_not_shown": len(hidden),
             "signals_not_shown": hidden_signals,
+            "families_not_seeded": seeding.get("families_not_seeded") or {},
+            "upstream_findings_omitted": seeding.get("upstream_findings_omitted", 0),
+            "scan_incomplete": seeding.get("scan_incomplete", False),
+            "detector_caps_reported": seeding.get("detector_caps_reported", False),
+            "complete": not limitations,
             "limitations": limitations,
         },
     }
@@ -117,7 +132,8 @@ def _resolve(clusters: list[dict[str, Any]], location: int | str) -> dict[str, A
 def drill(scan: dict[str, Any], location: int | str, *, kind: str | None = None,
           max_findings: int = DEFAULT_MAX_FINDINGS) -> dict[str, Any]:
     """One location — grouped by kind, or listing the findings of a single kind."""
-    cluster = _resolve(_clusters_of(scan), location)
+    clusters, _seeding = _clusters_of(scan)
+    cluster = _resolve(clusters, location)
     label = _location_label(cluster)
 
     if kind is None:
@@ -140,9 +156,22 @@ def drill(scan: dict[str, Any], location: int | str, *, kind: str | None = None,
             "scope": cluster["scope"],
             "signals": len(cluster["seeds"]),
             "by_kind": by_kind,
+            # every kind at this location is listed, but the scan-wide caveats
+            # still apply here — the reader is told to check coverage at each layer
+            "coverage": {
+                "kinds_total": len(by_kind),
+                "kinds_shown": len(by_kind),
+                "limitations": list(_seeding.get("limitations") or []),
+            },
         }
 
+    available = sorted({s["kind"] or "?" for s in cluster["seeds"]})
+    if kind not in available:
+        raise ValueError(
+            f"no such kind at this location: {kind!r}; available: {', '.join(available)}"
+        )
     matching = [s for s in cluster["seeds"] if (s["kind"] or "?") == kind]
+    max_findings = max(0, max_findings)
     shown = matching[:max_findings]
     limitations = []
     if len(shown) < len(matching):
@@ -174,28 +203,35 @@ def drill(scan: dict[str, Any], location: int | str, *, kind: str | None = None,
 # ---------- L4 ----------
 
 def _iter_findings_with_seeds(scan: dict[str, Any]):
-    for cluster in _clusters_of(scan):
+    clusters, _seeding = _clusters_of(scan)
+    for cluster in clusters:
         for seed in cluster["seeds"]:
             yield cluster, seed
 
 
 def _match_raw_finding(scan: dict[str, Any], seed: dict[str, Any]) -> dict[str, Any] | None:
-    """Find the scan finding a seed was derived from, to recover its evidence."""
-    from ._finding_groups import BLOCK_FINDING_GROUPS
+    """Recover the scan finding a seed came from, to show its evidence.
 
+    Matched on the same tuple `seed_id` is hashed from — anything weaker is not
+    injective where the id is, so `explain` would serve one finding's evidence
+    under another's heading. `rule` alone repeats readily: several detectors
+    build it from labels or omit the column index, so two side-by-side panels
+    produce byte-identical strings.
+    """
     if seed["scope"] == "cross_sheet":
         for f in scan.get("cross_sheet_findings") or []:
-            if f.get("kind") == seed["kind"] and f.get("rule") == seed.get("rule"):
+            if _cross_sheet_seed(f)["seed_id"] == seed["seed_id"]:
                 return f
         return None
     for blk in scan.get("relations_blocks") or []:
         if blk.get("file") != seed["file"] or blk.get("sheet") != seed["sheet"]:
             continue
-        if (blk.get("block") or {}).get("rows") != seed["block_rows"]:
+        block = blk.get("block") or {}
+        if block.get("rows") != seed["block_rows"] or block.get("cols") != seed["block_cols"]:
             continue
         for group in BLOCK_FINDING_GROUPS:
             for f in blk.get(group) or []:
-                if f.get("kind") == seed["kind"] and f.get("rule") == seed.get("rule"):
+                if _block_seed(blk, group, f)["seed_id"] == seed["seed_id"]:
                     return f
     return None
 

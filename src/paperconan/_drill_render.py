@@ -26,18 +26,28 @@ def render_overview(view: dict[str, Any]) -> str:
         f"{view['signals_total']} signals across {cov['locations_total']} locations"
         f" in {view.get('files') or '?'} file(s)",
         "",
-        f"  {'#':>2}  {'location':<46} {'strongest':>9} {'signals':>8}",
-        f"  {_rule(70)}",
+        f"  {'#':>2}  {'location':<44} {'strongest':>9} {'signals':>8} {'high':>6}",
+        f"  {_rule(78)}",
     ]
     for loc in view["locations"]:
         label = loc["location"]
-        if len(label) > 46:
-            label = "…" + label[-45:]
+        if len(label) > 44:
+            label = "…" + label[-43:]
         out.append(
-            f"  {loc['n']:>2}  {label:<46} {loc['strongest']:>9} "
-            f"{loc['signals']:>8}"
+            f"  {loc['n']:>2}  {label:<44} {loc['strongest']:>9} "
+            f"{loc['signals']:>8} {loc['high']:>6}"
         )
-        out.append(f"      {', '.join(loc['families'][:4])}")
+        families = loc["families"][:4]
+        # say when the list is cut, rather than quietly dropping the tail in the
+        # one layer whose job is to declare what it left out
+        more = len(loc["families"]) - len(families)
+        suffix = f", … {more} more" if more > 0 else ""
+        out.append(f"      {', '.join(families)}{suffix}")
+    if not view["locations"]:
+        out.append("  (no locations carry signal)")
+        out.append("")
+        out.append("  This means these detectors found nothing at these thresholds in")
+        out.append("  the data supplied — not that the paper is free of problems.")
     out.append("")
     out += _coverage_lines(cov)
     if cov.get("limitations"):
@@ -63,6 +73,9 @@ def render_drill(view: dict[str, Any]) -> str:
                 f"  {group['kind']:<34} {group['n']:>5} {group['high']:>5}  {example}"
             )
         out.append("")
+        out += _coverage_lines(view.get("coverage") or {})
+        if (view.get("coverage") or {}).get("limitations"):
+            out.append("")
         out.append("next: paperconan drill <scan.json> <#> --kind <kind>")
         return "\n".join(out)
 

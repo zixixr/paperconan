@@ -65,10 +65,14 @@ Three things to hold onto while reading:
   a dense block or a repeated axis is often a fair call, but an exactly duplicated
   column can be demoted merely for sharing a block with many other relations.
   Do not skip a finding because its displayed severity is low.
-- **Read `coverage` at every layer.** It states what was not shown and why —
-  locations beyond the listed count, findings beyond a listing limit, families the
-  layer does not route, and detector-level caps that are not reported at all.
-  Raise `--max-locations` / `--max-findings` to reach the remainder.
+- **Read `coverage` — it is printed after the table, as lines starting with `!`.**
+  `overview` and both `drill` forms carry it; `explain` describes a single
+  finding and has none. It states what was not shown and why: locations beyond
+  the listed count, findings beyond a listing limit, families this layer does not
+  route (digit distributions, decimal endings, image findings), findings the scan's
+  own caps dropped before the layers saw them, and detector-level caps that are
+  reported nowhere at all. Raise `--max-locations` / `--max-findings` to reach the
+  remainder; the rest are limits of the scan, not of the view.
 - **A quiet overview is not a clean paper.** It means these detectors found
   nothing at these thresholds in the data that was supplied.
 

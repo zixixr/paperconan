@@ -4678,6 +4678,17 @@ def _run_drill_command(args: argparse.Namespace) -> None:
     except json.JSONDecodeError as exc:
         sys.exit(f"{args.scan_json} is not valid JSON: {exc}")
 
+    # Valid JSON that is not a scan would otherwise surface as an AttributeError
+    # traceback, or — worse — render as "0 signals", which reads as a clean paper.
+    if not isinstance(scan, dict) or not (
+        "relations_blocks" in scan or "tool" in scan or "schema_version" in scan
+    ):
+        sys.exit(
+            f"{args.scan_json} does not look like a paperconan scan.json "
+            "(no relations_blocks/tool/schema_version); point at the file written "
+            "by `paperconan <dir>`"
+        )
+
     try:
         if args.cmd == "overview":
             view = overview(scan, max_locations=args.max_locations)

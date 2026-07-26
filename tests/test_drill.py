@@ -37,10 +37,32 @@ def scan(tmp_path_factory):
     return scan_dir(str(d), str(d.parent / "out"), write_html=False)
 
 
-def _all_finding_count(scan):
+# Every finding-bearing list a scan can carry. Deliberately enumerated from the
+# scan's own shape rather than from the seeding layer's BLOCK_FINDING_GROUPS: an
+# earlier version counted only what the implementation seeds, so families it
+# skips were absent from both the reachable set and the expected total, and the
+# reachability test was green while six findings were unaccounted for.
+_SCAN_FINDING_KEYS = (
+    "cross_sheet_findings", "image_findings",
+    "digit_distribution", "decimal_endings", "decimal_tail_clusters",
+)
+
+
+def _seeded_finding_count(scan):
+    """What the layers are expected to route."""
     n = sum(len(b.get(g) or []) for b in scan.get("relations_blocks") or []
             for g in BLOCK_FINDING_GROUPS)
     return n + len(scan.get("cross_sheet_findings") or [])
+
+
+def _families_present(scan):
+    """Every finding-bearing family actually in this scan, with its count."""
+    present = {k: len(scan.get(k) or []) for k in _SCAN_FINDING_KEYS if scan.get(k)}
+    blocks = sum(len(b.get(g) or []) for b in scan.get("relations_blocks") or []
+                 for g in BLOCK_FINDING_GROUPS)
+    if blocks:
+        present["relations_blocks"] = blocks
+    return present
 
 
 # ---------- L1 overview ----------
@@ -50,7 +72,7 @@ def test_overview_fits_in_a_glance(scan):
 
     assert len(json.dumps(view)) < 4096, "overview must stay small enough to read at once"
     assert view["locations"], "expected at least one location"
-    assert view["signals_total"] == _all_finding_count(scan)
+    assert view["signals_total"] == _seeded_finding_count(scan)
 
 
 def test_overview_names_the_families_at_each_location(scan):
@@ -148,6 +170,67 @@ def test_explain_separates_raw_severity_from_the_projected_one(scan):
             )
 
 
+def test_explain_never_serves_another_findings_evidence(scan):
+    """`explain` is where a reviewer decides whether to act, so the evidence has
+    to belong to the id asked for.
+
+    The lookup must key on the same tuple `seed_id` is hashed from. Anything
+    weaker is not injective where the id is: several detectors build `rule` from
+    row labels or omit the column index, so two side-by-side panels can produce
+    byte-identical rule strings.
+    """
+    view = overview(scan)
+    pairs = []
+    for loc in view["locations"]:
+        for group in drill(scan, loc["n"])["by_kind"]:
+            for f in drill(scan, loc["n"], kind=group["kind"])["findings"]:
+                detail = explain(scan, f["finding_id"])
+                pairs.append((f["finding_id"], detail))
+
+    assert pairs, "fixture produced no findings"
+    for fid, detail in pairs:
+        assert detail["finding_id"] == fid
+        # the evidence must come from the block the heading names
+        if detail.get("evidence") and detail["location"]:
+            assert detail["kind"], "a finding with evidence must name its kind"
+
+    # distinct ids must not collapse onto one evidence table
+    by_evidence = {}
+    for fid, detail in pairs:
+        ev = json.dumps(detail.get("evidence"), sort_keys=True)
+        by_evidence.setdefault((detail["location"], detail["kind"], ev), []).append(fid)
+    for key, ids in by_evidence.items():
+        if len(ids) > 1:
+            rules = {explain(scan, i)["rule"] for i in ids}
+            assert len(rules) == len(ids) or len(rules) == 1, (
+                f"{len(ids)} ids share one evidence table at {key[0]}"
+            )
+
+
+def test_match_is_keyed_on_the_same_tuple_as_the_seed_id():
+    """Unit-level: two blocks differing only in columns must not cross-match."""
+    from paperconan._drill import _match_raw_finding
+    from paperconan._workflow import _block_seed
+
+    finding = {"kind": "block_value_duplication", "rule": "same rule text",
+               "severity": "high", "raw_severity": "high", "evidence": {"rows": [1]}}
+    other = dict(finding, evidence={"rows": [2]})
+    scan = {"relations_blocks": [
+        {"file": "f.csv", "sheet": "s", "block": {"rows": "2-41", "cols": "1-3"},
+         "block_dups": [finding]},
+        {"file": "f.csv", "sheet": "s", "block": {"rows": "2-41", "cols": "5-7"},
+         "block_dups": [other]},
+    ]}
+
+    seed_b = _block_seed(scan["relations_blocks"][1], "block_dups", other)
+    matched = _match_raw_finding(scan, seed_b)
+
+    assert matched is not None
+    assert matched["evidence"] == {"rows": [2]}, (
+        "panel 2's id resolved to panel 1's evidence"
+    )
+
+
 def test_explain_rejects_an_unknown_finding(scan):
     with pytest.raises(ValueError, match="no such finding"):
         explain(scan, "seed:doesnotexist")
@@ -194,6 +277,54 @@ def test_raising_the_limit_actually_reaches_the_declared_remainder(scan):
     assert capped["coverage"]["shown"] == 1
     assert full["coverage"]["shown"] == full["coverage"]["total"] == biggest["n"]
     assert not full["coverage"]["limitations"]
+
+
+def test_a_family_present_but_unreachable_is_named_in_coverage(scan):
+    """The reachability claim covers the whole scan, not just what gets seeded.
+
+    Some families (digit_distribution, decimal_endings, …) are not routed by the
+    layers at all. Counting them out of the expected total hides that; they have
+    to be named instead, or a reviewer has no way to learn they exist.
+    """
+    view = overview(scan)
+    present = _families_present(scan)
+
+    reachable_families = {"relations_blocks", "cross_sheet_findings"}
+    unreachable = {k: n for k, n in present.items() if k not in reachable_families}
+    assert unreachable, "fixture no longer exercises an unrouted family"
+
+    declared = json.dumps(view["coverage"], ensure_ascii=False)
+    for family, count in unreachable.items():
+        assert family in declared, (
+            f"{count} {family} are in the scan but no coverage field mentions them"
+        )
+
+
+def test_overview_carries_the_limitations_the_seeding_layer_recorded(scan,
+                                                                    monkeypatch):
+    """overview must not drop what _build_clusters already knew it missed."""
+    import paperconan._audit as audit
+    monkeypatch.setattr(audit, "_MAX_FINDINGS_PER_BLOCK", 1)
+
+    from paperconan import scan_dir
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        d = __import__("pathlib").Path(td) / "d"
+        d.mkdir()
+        rows = ["a,b,c,d"] + [
+            ",".join(str(round((i + 1) * (j + 1) * 1.017, 6)) for j in range(4))
+            for i in range(20)
+        ]
+        (d / "p.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        capped = scan_dir(str(d), str(d.parent / "out"), write_html=False)
+
+    view = overview(capped)
+
+    assert capped.get("findings_omitted"), "fixture did not trip the finding cap"
+    assert any("finding caps" in x for x in view["coverage"]["limitations"]), (
+        "overview dropped the upstream cap the seeding layer reported"
+    )
+    assert view["coverage"]["complete"] is False
 
 
 def test_a_truncated_overview_declares_what_it_left_out(scan):
@@ -290,6 +421,63 @@ def test_cli_unknown_reference_exits_with_a_message_not_a_traceback(scan_path, a
     assert res.returncode != 0
     assert "Traceback" not in res.stderr
     assert "no such" in (res.stderr + res.stdout)
+
+
+def test_an_unknown_kind_is_an_error_not_an_empty_list(scan):
+    """Silence would read as "this location has none of those", which is a
+    different claim from "you typed a kind that does not exist here"."""
+    with pytest.raises(ValueError, match="no such kind"):
+        drill(scan, 1, kind="totally_made_up_kind")
+
+
+def test_cli_unknown_kind_lists_what_is_available(scan_path):
+    res = _cli("drill", scan_path, "1", "--kind", "totally_made_up_kind")
+
+    assert res.returncode != 0
+    assert "Traceback" not in res.stderr
+    assert "no such kind" in (res.stderr + res.stdout)
+
+
+@pytest.mark.parametrize("content", ["[]", "null", '{"a": 1}', '"text"'])
+def test_cli_rejects_json_that_is_not_a_scan(tmp_path, content):
+    """Valid JSON that is not a scan must not render as "0 signals" — that reads
+    as a clean paper when it actually means the wrong file was opened."""
+    bad = tmp_path / f"bad{abs(hash(content))}.json"
+    bad.write_text(content, encoding="utf-8")
+
+    res = _cli("overview", str(bad))
+
+    assert res.returncode != 0
+    assert "Traceback" not in res.stderr
+    assert "does not look like" in (res.stderr + res.stdout)
+
+
+def test_cli_empty_overview_says_that_quiet_is_not_clean(tmp_path):
+    empty = tmp_path / "empty.json"
+    empty.write_text(json.dumps({
+        "tool": "paperconan", "schema_version": 1, "n_files": 1,
+        "relations_blocks": [], "cross_sheet_findings": [],
+    }), encoding="utf-8")
+
+    res = _cli("overview", str(empty))
+
+    assert res.returncode == 0, res.stderr
+    assert "not that the paper is free of problems" in res.stdout
+
+
+def test_cli_overview_shows_the_high_count_per_location(scan_path):
+    """strongest alone cannot distinguish 1 high among 200 from 60 among 60."""
+    res = _cli("overview", scan_path)
+
+    assert "high" in res.stdout.splitlines()[2], "no high column in the header"
+
+
+def test_cli_drill_prints_coverage_at_the_kind_grouping_layer(scan_path):
+    """SKILL.md tells the agent to read coverage at every layer."""
+    res = _cli("drill", scan_path, "1")
+
+    assert res.returncode == 0, res.stderr
+    assert "!" in res.stdout, "no coverage line at the grouping layer"
 
 
 def test_cli_rejects_a_scan_that_is_not_json(tmp_path):
