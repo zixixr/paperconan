@@ -42,10 +42,16 @@ def test_no_false_positive_on_diffuse_tails():
     assert detect_decimal_tail_clustering(_diffuse(300), "Fig X") is None
 
 
-def test_partial_cluster_below_threshold_does_not_fire():
-    # only ~30% clustered, rest diffuse — below the concentration threshold
+def test_a_partial_cluster_is_reported_when_it_is_improbable():
+    """~30% of 200 values sharing two 3-digit tails.
+
+    The old 40% share cut-off called this "not concentrated enough". Measured
+    against chance it is 870 collision pairs where 19.9 are expected — 44x, at
+    p ~ 2e-16. The share threshold was answering a different question, and
+    answering it differently depending on how much unrelated data sat alongside.
+    """
     vals = _clustered(60, ["714", "286"]) + _diffuse(140)
-    assert detect_decimal_tail_clustering(vals, "Fig Y") is None
+    assert detect_decimal_tail_clustering(vals, "Fig Y") is not None
 
 
 def test_low_precision_values_are_ignored():
@@ -54,9 +60,15 @@ def test_low_precision_values_are_ignored():
     assert detect_decimal_tail_clustering(vals, "Fig Z") is None
 
 
-def test_small_n_does_not_fire():
+def test_a_small_panel_with_the_same_concentration_is_reported():
+    """40 values on 6 tails — 114 collision pairs against 0.78 expected, 146x.
+
+    This is the shape the hard-threshold audit records as a real miss: the old
+    count floor of 100 made it invisible, and the previous version of this test
+    fixed that miss in place as expected behaviour.
+    """
     vals = _clustered(40, ["714", "286", "572", "428", "143", "857"])
-    assert detect_decimal_tail_clustering(vals, "Fig S") is None
+    assert detect_decimal_tail_clustering(vals, "Fig S") is not None
 
 
 def test_common_denominator_column_is_not_flagged():
@@ -84,11 +96,17 @@ def test_negative_values_counted_by_magnitude():
     assert r is not None and r["top_share"] >= 0.9
 
 
-def test_min_n_boundary():
-    tails = ["714", "286", "572", "428", "143", "857"]
-    assert detect_decimal_tail_clustering(_clustered(99, tails), "a") is None
-    assert detect_decimal_tail_clustering(_clustered(100, tails), "b") is not None
+def test_below_the_validity_floor_nothing_is_reported():
+    """A floor stays, but it is a validity one: with a handful of values there
+    is no concentration to measure. What went is the sample-size floor above it.
+    """
+    from paperconan._audit import _TAIL_CLUSTER_MIN_VALUES
 
+    tails = ["714", "286"]
+    assert detect_decimal_tail_clustering(
+        _clustered(_TAIL_CLUSTER_MIN_VALUES - 1, tails), "Fig B") is None
+    assert detect_decimal_tail_clustering(
+        _clustered(_TAIL_CLUSTER_MIN_VALUES * 3, tails), "Fig B") is not None
 
 def _triplicate_means(n):
     # n DISTINCT means of three limited-precision readings: mean = (a+b+c)/3.

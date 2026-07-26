@@ -1922,8 +1922,12 @@ def detect_repeated_decimals(values, label):
     return dict(label=label, n=n, n_unique=len(counts), top=flags)
 
 
-_TAIL_CLUSTER_MIN_N = int(os.environ.get("PAPERCONAN_TAIL_CLUSTER_MIN_N", "100"))
-_TAIL_CLUSTER_SHARE = float(os.environ.get("PAPERCONAN_TAIL_CLUSTER_SHARE", "0.40"))
+# Validity floor: fewer than this and there is nothing to be concentrated. Not a
+# statistical-power floor — tail collision is an exact-coincidence test, so the
+# evidence comes from the collisions, not from the number of values.
+_TAIL_CLUSTER_MIN_VALUES = int(os.environ.get("PAPERCONAN_TAIL_CLUSTER_MIN_VALUES", "12"))
+# Poisson upper-tail cut for observed vs expected tail-collision pairs.
+_TAIL_CLUSTER_ALPHA = float(os.environ.get("PAPERCONAN_TAIL_CLUSTER_ALPHA", "1e-6"))
 
 
 def detect_decimal_tail_clustering(values, label, top_k=6):
@@ -1953,18 +1957,33 @@ def detect_decimal_tail_clustering(values, label, top_k=6):
             full.append(frac)
             hp_vals.append(av)
     n = len(tails)
-    if n < _TAIL_CLUSTER_MIN_N:
+    # Validity floor, not a sample-size floor: below a handful of values there is
+    # no concentration to measure. The old count floor of 100 was the latter, and
+    # it made an 87%-concentrated panel of 99 values invisible while the same
+    # concentration at 120 read as high — the evidence never came from the count.
+    if n < _TAIL_CLUSTER_MIN_VALUES:
         return None
-    # Quantized / common-denominator data (few distinct fractions) shares tails trivially.
-    # The genuine fingerprint is MANY independent values that nonetheless collide on a few
-    # tails, so require the full fractional parts to be mostly distinct.
-    if len(set(full)) < max(50, n // 2):
+    # Quantized / common-denominator data (few distinct fractions) shares tails
+    # trivially. The genuine fingerprint is independent values that nonetheless
+    # collide on a few tails, so require the full fractional parts to be mostly
+    # distinct. Scaled to n: a fixed floor of 50 was itself unreachable below 50
+    # values, a third hidden count gate.
+    if len(set(full)) < max(_TAIL_CLUSTER_MIN_VALUES, (2 * n) // 3):
         return None
     counts = Counter(tails)
     top = counts.most_common(top_k)
     top_sum = sum(c for _, c in top)
     share = top_sum / n
-    if share < _TAIL_CLUSTER_SHARE:
+
+    # Significance, not a share threshold. Two values sharing a 3-digit tail is a
+    # 1-in-1000 coincidence; the surprise is in how many such pairs occur against
+    # how many could, which is exactly the birthday model the duplication
+    # detectors already use. A share cut-off answers a different question and
+    # answers it differently depending on how much unrelated data sits alongside.
+    pairs_obs = sum(c * (c - 1) // 2 for c in counts.values())
+    lam = (n * (n - 1) / 2) / 1000.0        # 1000 equiprobable 3-digit tails
+    p_value = _poisson_sf(pairs_obs, lam)
+    if p_value > _TAIL_CLUSTER_ALPHA:
         return None
     top_tails = [t for t, _ in top]
     # Averaging artifact: a reported MEAN of d replicates is (sum of d limited-precision
