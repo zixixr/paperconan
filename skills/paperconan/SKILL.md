@@ -22,9 +22,60 @@ Tool repository: https://github.com/zixixr/paperconan
    - DOI or title: run `paperconan fetch "<DOI or title>"`, choose a matched tabular dataset, download it, then scan the downloaded directory.
    - Only an existing audit: read `audit/scan.json` and use `audit/report.html` as the evidence browser to triage — then give an adjudicated answer. Do not hand the raw `report.html` over as "the result" (see Report Positioning below).
 2. Prefer the real CLI. Do not invent findings from eyeballing tables.
-3. Parse `scan.json`, then load the reference file needed for the task.
+3. Read the scan in layers — start with `paperconan overview`, not by parsing the
+   whole `scan.json` (see Reading A Scan In Layers below). Load the reference file
+   needed for the task.
 4. Open the original table when describing a serious finding as worth follow-up. If the original data is unavailable, say the finding is unverified.
 5. Answer cautiously: explain the anomaly, plausible benign explanations, and what human context is needed.
+
+## Reading A Scan In Layers
+
+One paper's supplement routinely produces hundreds to thousands of findings and a
+multi-megabyte `scan.json`. Reading all of it wastes the attention you need for
+judgement, and the few signals worth acting on get buried among many routine ones.
+
+Detectors deliberately run wide so real signals are not lost to a threshold, so
+the narrowing happens here, in how you read — not in what was detected. Nothing is
+filtered; you reach it in stages.
+
+```bash
+paperconan overview audit/scan.json                    # which locations carry signal
+paperconan drill    audit/scan.json 2                  # that location, grouped by kind
+paperconan drill    audit/scan.json 2 --kind identical_column
+paperconan explain  audit/scan.json seed:17942ad206854a66
+```
+
+Add `--json` to any of them when you need the structure rather than the text.
+
+Work down, and stop at the shallowest layer that answers the question:
+
+1. **overview** — which locations, how strong, what families. Often enough to see
+   that a location is one derived relation restated many times.
+2. **drill \<n\>** — the kinds at that location, with one concrete example each.
+   A kind with a large `n` and a formulaic example is usually one structure
+   expressed repeatedly; a kind with `n=1` may still be the strongest signal there.
+3. **drill \<n\> --kind \<kind\>** — the individual findings, each with an id.
+4. **explain \<id\>** — one finding with its parameters and evidence table. Open
+   the original table before calling anything worth follow-up.
+
+Three things to hold onto while reading:
+
+- **`detector=high  displayed=low` means a display profile down-weighted it, not
+  that it is benign.** `explain` prints the recorded reason. Judge that reason —
+  a dense block or a repeated axis is often a fair call, but an exactly duplicated
+  column can be demoted merely for sharing a block with many other relations.
+  Do not skip a finding because its displayed severity is low.
+- **Read the `!` lines — every layer has them.** `overview` and both `drill`
+  forms carry a `coverage` block; `explain` states its own limits inline (an
+  evidence window the scan trimmed, structured parameters only `--json` shows).
+  They state what was not shown and why: locations beyond
+  the listed count, findings beyond a listing limit, families this layer does not
+  route (digit distributions, decimal endings, image findings), findings the scan's
+  own caps dropped before the layers saw them, and detector-level caps that are
+  reported nowhere at all. Raise `--max-locations` / `--max-findings` to reach the
+  remainder; the rest are limits of the scan, not of the view.
+- **A quiet overview is not a clean paper.** It means these detectors found
+  nothing at these thresholds in the data that was supplied.
 
 ## Adaptive Image Review
 

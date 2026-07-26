@@ -390,7 +390,10 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
         if scan.get(family)
     }
     for family, count in unseeded.items():
-        limitations.append(f"{count} {family} are not seeded by the Phase 1 workflow")
+        limitations.append(
+            f"{count} {family} are present in the scan but this view does not route "
+            "them; read them from scan.json directly"
+        )
 
     if omitted:
         limitations.append(
