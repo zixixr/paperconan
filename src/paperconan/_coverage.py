@@ -55,11 +55,12 @@ class ScanCoverage:
         # Deduplicate identical events so a repeated cause records once, and cap
         # the retained list so a pathological input cannot balloon the report
         # (GH#15-class size guard). The identity is
-        # (scope, reason, file, sheet, detector) — `detector` is in it because
-        # detector records carry no file or
-        # sheet, so without it every capped detector after the first collapses into
-        # it and is silently discarded, so a scan that capped three detectors
-        # would name only one of them.
+        # (scope, reason, file, sheet, detector). `detector` has to be part of
+        # it because detector records carry no file and no sheet: on a 4-tuple
+        # key every capped detector after the first matches the first and is
+        # silently discarded, so a scan that capped three detectors would name
+        # only one. Detector records still collapse across blocks and sheets --
+        # one entry per detector per scan -- which is why they carry no counts.
         key = (scope, reason, item.get("file"), item.get("sheet"),
                item.get("detector"))
         if key in self._limitation_keys:

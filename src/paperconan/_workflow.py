@@ -56,9 +56,10 @@ DETECTOR_CAPS_REPORTED = False
 # Measured consequence of wiring these, recorded so it is a decision and not a
 # surprise: on ten real supplementary-data sets, `scan_status` went from
 # "partial" on 3 to "partial" on essentially all of them, because the
-# candidate-pool and per-block result caps genuinely truncate on ordinary
-# inputs (a 14x14 block hits detect_row_pair_digit_coupling's cap of 25 with 91
-# pairs found). Reporting it is right — those searches really were cut short —
+# candidate-pool caps genuinely truncate on ordinary inputs: any sheet with
+# more than 400 candidate rows trips _SHORT_ROW_MAX_ROWS_PER_SHEET or
+# _ROW_PAIR_MAX_ROWS_PER_SHEET, and supplements that size are routine.
+# Reporting it is right — those searches really were cut short —
 # but it means `partial` is now the normal state and carries little information
 # on its own. What carries information is the `limitations` list, which names
 # the detector and its limit. Two consequences worth keeping in view: anything

@@ -75,18 +75,25 @@ Three things to hold onto while reading:
   reach no channel. Raise `--max-locations` / `--max-findings` to reach the
   remainder; the rest are limits of the scan, not of the view.
 - **`scan:` lines carry every scan-layer limitation, not just detector ones.**
-  They come in two shapes. A **file or sheet** line names what was not read at
-  all — `scan: file too large limit in big.xlsx (size_mb=250.0)`. A **detector**
-  line names a detector that stopped early —
-  `scan: detector finding limit in detect_short_row_reuse (limit=60)`, or
-  `scan: detector candidate pool limit in detect_scaled_row_reuse (candidates=1500, limit=1500)`,
-  where `candidates` is the pool before truncation and `limit` the cap. Either
-  way `scan_status` is `partial` and the search was cut short, so do not read a
-  quiet result on that input as clean. Detector lines name **no file or sheet** —
-  the whole scan is affected, not one location — so re-run with the matching
-  `PAPERCONAN_*` variable raised rather than looking for a sheet to re-check.
-  A separate caveat covers whole-detector skips (a block too wide or too tall),
-  which reach no channel at all and so are never named here.
+  Verbatim shapes the code emits:
+  - `scan: file too large in big.xlsx` — a file or sheet that was not read at all.
+  - `scan: detector candidate pool limit in detect_short_row_reuse (limit=400)` —
+    a detector stopped building candidates at its cap, so rows past it were never
+    compared.
+  - `scan: detector finding limit in detect_row_pair_digit_coupling (limit=25)` —
+    a detector stopped emitting at its cap.
+  - `scan: detector compute budget limit in detect_row_relations` — a detector ran
+    out of its work budget.
+
+  Any of these means `scan_status` is `partial` and the search was cut short, so a
+  quiet result on that input is not evidence of a clean one. Detector lines name
+  **no file or sheet**: the record does not carry one, so the line cannot tell you
+  *where* the truncation bit — it may have been one block or many. Re-run the scan
+  before concluding anything about the sheets that detector covers. Some caps have
+  a `PAPERCONAN_*` override (the compute budgets, the per-sheet row caps); others
+  are bare defaults with no knob, and for those the only remedy is narrowing the
+  input. A separate caveat covers whole-detector skips (a block too wide or too
+  tall), which reach no channel at all and so are never named here.
 - **A quiet overview is not a clean paper.** It means these detectors found
   nothing at these thresholds in the data that was supplied.
 

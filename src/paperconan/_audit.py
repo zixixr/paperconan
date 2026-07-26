@@ -1179,10 +1179,18 @@ def detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header, min_n=10,
     if len(findings) > _ROW_PAIR_MAX_FINDINGS_PER_BLOCK:
         # A result cap like any other, and it truncates before _cap_block_findings
         # runs, so without this the drop reaches neither findings_omitted nor
-        # scan_status. Reported per block: unlike the detector-level records this
-        # one has a file and sheet, so the dedup key keeps each block distinct.
+        # scan_status.
+        #
+        # No per-block count: this goes through _note_detector_cap, so the record
+        # carries no file or sheet and the dedup key collapses every overflowing
+        # block in the scan into one entry. A `found` here would be the first
+        # such block's count while reading as the total — the same trap that cost
+        # detect_row_relations its rows/cols. The limit alone is honest; the
+        # stderr line below stays per-block.
+        print(f"[paperconan] detect_row_pair_digit_coupling: {len(findings)} findings "
+              f"capped at {_ROW_PAIR_MAX_FINDINGS_PER_BLOCK} in one block", file=sys.stderr)
         _note_detector_cap(coverage, "detect_row_pair_digit_coupling",
-                           "detector_finding_limit", found=len(findings),
+                           "detector_finding_limit",
                            limit=_ROW_PAIR_MAX_FINDINGS_PER_BLOCK)
     return findings[:_ROW_PAIR_MAX_FINDINGS_PER_BLOCK]
 

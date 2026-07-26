@@ -602,7 +602,15 @@ def test_an_incomplete_scan_makes_the_packet_declare_itself_incomplete(tmp_path,
     coverage = _packet(tmp_path / "out")["coverage"]
 
     assert coverage["scan_incomplete"] is True
-    assert coverage["coverage_complete"] is False
+    # Not `coverage_complete is False`: DETECTOR_CAPS_REPORTED is a hardcoded
+    # False, so the blanket caveat is always appended and that flag is always
+    # False -- it cannot discriminate. Assert the specific cap instead, which
+    # makes the monkeypatch above load-bearing: without it the budget is never
+    # exhausted and this line does not appear.
+    blob = " ".join(coverage["limitations"])
+    assert "detect_row_relations" in blob, (
+        f"the exhausted budget did not reach the packet by name: {coverage['limitations']}"
+    )
     assert any("scan was not complete" in x for x in coverage["limitations"])
 
 

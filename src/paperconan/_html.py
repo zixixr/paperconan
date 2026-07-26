@@ -766,6 +766,8 @@ def _render_scan_status(scan: dict) -> str:
         # Detector records carry no file/sheet — without the detector name every
         # capped detector renders as an identical row the reader cannot tell apart.
         + (f' · <code>{_esc(item.get("detector"))}</code>' if item.get("detector") else "")
+        + (f' · {_esc(item.get("candidates"))} candidates'
+           if item.get("candidates") else "")
         + (f' · limit={_esc(item.get("limit"))}' if item.get("limit") else "")
         + (f' · ×{_esc(item.get("count"))}' if item.get("count") else "")
         + "</li>"

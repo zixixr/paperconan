@@ -780,8 +780,9 @@ def test_the_row_pair_digit_coupling_block_cap_reaches_coverage(tmp_path):
     blind-spot note had been rewritten to claim was empty.
 
     No monkeypatching: 14 rows of 14 columns whose pairwise differences are
-    multiples of 10 produce all C(14,2)=91 pairs and hit the default cap of 25,
-    so this fires on an ordinary block and loses 66 findings.
+    multiples of 10 produce all C(14,2)=91 pairs and hit the default cap of 25.
+    That shape is synthetic -- random blocks of the same size yield nothing --
+    but the cap it reaches is the real default.
     """
     cols = 14
     base = [round(12.34 + j * 7.91, 2) for j in range(cols)]
@@ -799,5 +800,45 @@ def test_the_row_pair_digit_coupling_block_cap_reaches_coverage(tmp_path):
         f"the per-block result cap recorded nothing under its own reason: "
         f"{[(i.get('detector'), i.get('reason')) for i in (scan.get('coverage') or {}).get('limitations') or []]}"
     )
-    assert records[0]["found"] > records[0]["limit"], records[0]
+    assert records[0]["limit"] == 25, records[0]
+    assert "found" not in records[0], (
+        "a per-block count on a record that collapses scan-wide reads as a total"
+    )
     assert scan["scan_status"] != "complete"
+
+
+def test_every_scan_line_quoted_in_the_skill_is_one_the_code_can_emit():
+    """SKILL.md is what an agent reads to interpret a scan; its examples must be real.
+
+    Hand-written example strings in that file have been wrong repeatedly -- a
+    detail field the record does not carry, a shape the code cannot produce, a
+    remediation knob that does not exist. Each is invisible until an agent acts
+    on it. This renders the real thing through the real formatter and requires
+    every `scan: ...` line quoted in the skill to match exactly.
+    """
+    import re
+    from pathlib import Path
+
+    from paperconan._workflow import _coverage_for
+
+    coverage = ScanCoverage(files_discovered=2)
+    coverage.mark_file_failed("big.xlsx", "file_too_large")
+    coverage.add_limitation("detector", "detector_candidate_pool_limit",
+                            detector="detect_short_row_reuse", limit=400)
+    coverage.add_limitation("detector", "detector_finding_limit",
+                            detector="detect_row_pair_digit_coupling", limit=25)
+    coverage.add_limitation("detector", "detector_compute_budget_limit",
+                            detector="detect_row_relations")
+    scan = {"scan_status": "partial", "coverage": coverage.to_dict()}
+    emitted = {line for line in _coverage_for(scan, [], [], [], 100)["limitations"]
+               if line.startswith("scan:")}
+
+    skill = Path(__file__).resolve().parents[1] / "skills" / "paperconan" / "SKILL.md"
+    quoted = re.findall(r"`(scan: [^`]+)`", skill.read_text(encoding="utf-8"))
+
+    assert quoted, "no scan: examples found in SKILL.md; did the section move?"
+    unemittable = [q for q in quoted if q not in emitted]
+    assert not unemittable, (
+        f"SKILL.md quotes {len(unemittable)} scan: line(s) the code does not emit: "
+        f"{unemittable}\nemitted here: {sorted(emitted)}"
+    )
