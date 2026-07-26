@@ -42,16 +42,21 @@ def test_no_false_positive_on_diffuse_tails():
     assert detect_decimal_tail_clustering(_diffuse(300), "Fig X") is None
 
 
-def test_a_partial_cluster_is_reported_when_it_is_improbable():
-    """~30% of 200 values sharing two 3-digit tails.
+def test_a_partial_cluster_below_the_share_gate_does_not_fire():
+    """~30% of 200 values on two tails — improbable, but still not reported.
 
-    The old 40% share cut-off called this "not concentrated enough". Measured
-    against chance it is 870 collision pairs where 19.9 are expected — 44x, at
-    p ~ 2e-16. The share threshold was answering a different question, and
-    answering it differently depending on how much unrelated data sat alongside.
+    Measured, this is 870 collision pairs against 19.9 expected. The Poisson gate
+    passes it easily. The share gate does not, and that gate is deliberately kept:
+    it is the only thing separating a copied tail from data on a coarse grid, and
+    the margin is thin — benign quantised shapes reach 24% (a constant
+    denominator) against this case's 32%.
+
+    So this is a known miss, held conservatively rather than bought with an
+    eight-point empirical margin. Closing it properly means modelling the tail
+    space the data can actually reach instead of using concentration as a proxy.
     """
     vals = _clustered(60, ["714", "286"]) + _diffuse(140)
-    assert detect_decimal_tail_clustering(vals, "Fig Y") is not None
+    assert detect_decimal_tail_clustering(vals, "Fig Y") is None
 
 
 def test_low_precision_values_are_ignored():
@@ -99,14 +104,16 @@ def test_negative_values_counted_by_magnitude():
 def test_below_the_validity_floor_nothing_is_reported():
     """A floor stays, but it is a validity one: with a handful of values there
     is no concentration to measure. What went is the sample-size floor above it.
+
+    Literal sizes, not sizes derived from the constant: deriving them makes the
+    test pass for any value of it, which is how the boundary went unpinned.
     """
     from paperconan._audit import _TAIL_CLUSTER_MIN_VALUES
 
+    assert _TAIL_CLUSTER_MIN_VALUES == 12, "update the literals below deliberately"
     tails = ["714", "286"]
-    assert detect_decimal_tail_clustering(
-        _clustered(_TAIL_CLUSTER_MIN_VALUES - 1, tails), "Fig B") is None
-    assert detect_decimal_tail_clustering(
-        _clustered(_TAIL_CLUSTER_MIN_VALUES * 3, tails), "Fig B") is not None
+    assert detect_decimal_tail_clustering(_clustered(11, tails), "Fig B") is None
+    assert detect_decimal_tail_clustering(_clustered(12, tails), "Fig B") is not None
 
 def _triplicate_means(n):
     # n DISTINCT means of three limited-precision readings: mean = (a+b+c)/3.

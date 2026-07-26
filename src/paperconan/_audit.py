@@ -1926,6 +1926,9 @@ def detect_repeated_decimals(values, label):
 # statistical-power floor — tail collision is an exact-coincidence test, so the
 # evidence comes from the collisions, not from the number of values.
 _TAIL_CLUSTER_MIN_VALUES = int(os.environ.get("PAPERCONAN_TAIL_CLUSTER_MIN_VALUES", "12"))
+_TAIL_CLUSTER_SHARE = float(os.environ.get("PAPERCONAN_TAIL_CLUSTER_SHARE", "0.40"))
+# Reachable 3-digit tails. The last digit cannot be 0 (see the collision gate).
+_TAIL_SPACE = 900
 # Poisson upper-tail cut for observed vs expected tail-collision pairs.
 _TAIL_CLUSTER_ALPHA = float(os.environ.get("PAPERCONAN_TAIL_CLUSTER_ALPHA", "1e-6"))
 
@@ -1975,13 +1978,26 @@ def detect_decimal_tail_clustering(values, label, top_k=6):
     top_sum = sum(c for _, c in top)
     share = top_sum / n
 
-    # Significance, not a share threshold. Two values sharing a 3-digit tail is a
-    # 1-in-1000 coincidence; the surprise is in how many such pairs occur against
-    # how many could, which is exactly the birthday model the duplication
-    # detectors already use. A share cut-off answers a different question and
-    # answers it differently depending on how much unrelated data sits alongside.
+    # Concentration still has to be high. Removing this alongside the count floor
+    # was a mistake: it is the only thing separating a copied tail from data that
+    # merely lives on a coarse grid. Measured, the gap is wide — an instrument
+    # readout step gives top-6 shares of 4-7%, a constant denominator 14-24%,
+    # while the reuse this detector exists for sits at 87-92%. What made the old
+    # gate unusable was pairing this with a 100-value floor, not the share itself.
+    if share < _TAIL_CLUSTER_SHARE:
+        return None
+
+    # And the concentration has to be improbable, not just high — the birthday
+    # model the duplication detectors already use. This is what replaces the
+    # count floor: the evidence comes from the collisions, so a small panel with
+    # a strong pattern now clears the bar that 100 values used to guard.
     pairs_obs = sum(c * (c - 1) // 2 for c in counts.values())
-    lam = (n * (n - 1) / 2) / 1000.0        # 1000 equiprobable 3-digit tails
+    # 900, not 1000: the tail is read off a `rstrip("0")` string, so its last
+    # digit can never be 0 and the space is 10 x 10 x 9. Assuming 1000 understates
+    # the expectation by 1.111x, and since the Poisson test gains power with n
+    # that fixed bias crosses p < 1e-6 on pure noise somewhere past n = 2000 —
+    # exactly the size an ordinary supplement reaches.
+    lam = (n * (n - 1) / 2) / _TAIL_SPACE
     p_value = _poisson_sf(pairs_obs, lam)
     if p_value > _TAIL_CLUSTER_ALPHA:
         return None

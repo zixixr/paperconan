@@ -54,19 +54,25 @@ def test_a_local_tail_reuse_is_found_below_the_old_count_floor():
     assert found is not None, "a strong local tail reuse was not reported"
 
 
-def test_the_signal_survives_dilution_by_the_rest_of_the_sheet():
-    """Reaching the old count meant widening scope, which killed the share.
+def test_dilution_still_hides_a_local_reuse_at_sheet_scope():
+    """Records what this change does NOT fix, so the gap is not mistaken for closed.
 
-    The reuse is the same; only unrelated values around it changed. A detector
-    whose answer flips on that is measuring the sheet, not the signal.
+    The audit asks for two things: significance instead of a count floor, and
+    running at block/panel granularity instead of per sheet. Only the first is
+    done here. Concentration is still measured over everything the sheet holds,
+    so a reuse confined to one panel is diluted by the columns around it —
+    which is the same failure mode as before, reached from the other side.
+
+    Kept as a test rather than a comment because it should fail, loudly, on the
+    day the granularity half lands.
     """
     core = _tail_concentrated(24)
 
-    tight = detect_decimal_tail_clustering(core, "panel")
-    diluted = detect_decimal_tail_clustering(core + _independent(4 * len(core)), "sheet")
-
-    assert tight is not None
-    assert diluted is not None, "the reuse vanished once unrelated values were added"
+    assert detect_decimal_tail_clustering(core, "panel") is not None
+    assert detect_decimal_tail_clustering(core + _independent(96), "sheet") is None, (
+        "dilution no longer hides the reuse — the granularity work has landed, "
+        "so update this test and the module docstring"
+    )
 
 
 @pytest.mark.parametrize("n", [24, 40, 99])
@@ -114,14 +120,46 @@ def test_too_few_values_report_nothing():
 
 @pytest.mark.parametrize("n", [12, 24, 40, 99, 200])
 def test_independent_values_stay_quiet_across_sizes(n):
-    """Lowering a floor is only safe if the noise does not follow it down.
-
-    Measured over 400 trials per size before this was pinned: zero reports.
-    """
+    """Lowering a floor is only safe if the noise does not follow it down."""
     rng = np.random.default_rng(2024)
     for _ in range(40):
         vals = [round(float(v), 6) for v in rng.uniform(0.5, 5000, n)]
         assert detect_decimal_tail_clustering(vals, "x") is None
+
+
+@pytest.mark.parametrize("n", [1000, 3000, 10000])
+def test_large_sheets_of_pure_noise_stay_quiet(n):
+    """The size where a wrong null shows up — and where real supplements live.
+
+    The tail is read off a `rstrip("0")` string, so its last digit is never 0
+    and the space is 900, not 1000. Assuming 1000 understates the expectation by
+    1.111x; the Poisson test gains power with n, so that fixed bias eventually
+    crosses the alpha on data with nothing wrong with it. It did: three of four
+    sheets of synthetic noise reported severity=high, with an evidence line
+    reading "2% of values".
+
+    A grid that stops at 200 cannot see this. This case is the reason the grid
+    goes to 10000.
+    """
+    rng = np.random.default_rng(2024)
+    for _ in range(3):
+        vals = [round(float(v), 6) for v in rng.uniform(0.5, 5000, n)]
+        assert detect_decimal_tail_clustering(vals, "x") is None
+
+
+def test_the_tail_space_matches_what_the_extraction_can_produce():
+    """Pins the null itself, not just its consequences."""
+    from paperconan._audit import _TAIL_SPACE
+
+    rng = np.random.default_rng(4)
+    seen = set()
+    for v in rng.uniform(0.5, 5000, 50000):
+        frac = f"{abs(float(v)):.10f}".rstrip("0").split(".")[-1]
+        if len(frac) >= 3:
+            seen.add(frac[-3:])
+
+    assert not any(t.endswith("0") for t in seen), "a trailing zero survived rstrip"
+    assert _TAIL_SPACE == 900, "the null must match the reachable tail space"
 
 
 def _benign_shapes():
