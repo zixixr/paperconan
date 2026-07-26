@@ -956,7 +956,14 @@ _ROW_REL_BUDGET = int(os.environ.get("PAPERCONAN_ROW_REL_BUDGET", "6000000"))
 
 
 def _note_detector_cap(coverage, detector: str, reason: str, **details) -> None:
-    """Record that a detector stopped before exhausting its search space.
+    """Record that a detector stopped at one of its own limits.
+
+    Known boundary: `detector_finding_limit` fires whenever a result cap was
+    reached, including the case where the detector had nothing further to find
+    anyway (natural output == the cap). That errs toward saying "there may be
+    more" rather than toward a false all-clear, which is the safe direction for
+    this tool; distinguishing the two needs per-break-site knowledge of what
+    remained unexamined.
 
     These caps bound worst-case work on genome-scale supplements, which is
     correct — but a search that was cut short must not be reportable as a
@@ -1266,13 +1273,13 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=None):
     findings = []
     n_rows = r1 - r0
     n_cols = c1 - c0
+    # Not a truncation: this detector looks for relations *between rows across
+    # many columns*, so a tall narrow matrix is out of scope rather than cut
+    # short. _scaled_row_candidates gates on the same constant and calls it
+    # scope. Reporting it as a limitation fired on 61x14 — the commonest
+    # supplementary shape there is — and would have trained readers to ignore
+    # the coverage line entirely.
     if n_rows < 2 or n_cols < _ROW_REL_MIN_COLS or n_rows > _ROW_REL_MAX_ROWS:
-        if n_rows > _ROW_REL_MAX_ROWS and n_cols >= _ROW_REL_MIN_COLS:
-            # Reported on no channel at all before: the block was simply skipped.
-            _note_detector_cap(
-                coverage, "detect_row_relations", "detector_block_rows_limit",
-                rows=n_rows, limit=_ROW_REL_MAX_ROWS,
-            )
         return findings
 
     budget = _ROW_REL_BUDGET
@@ -2987,6 +2994,7 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
         kept.append(c)
 
     findings = []
+    _capped = False   # set only where a loop is actually abandoned
     for vec, places, namespaces, sites, _cells in kept:
         sheets_hit = sorted({p[1] for p in places})
         loc = "; ".join(sheets_hit[:6])
@@ -3011,6 +3019,7 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
             rule=(f"the {len(vec)}-value vector {list(vec)} recurs at {len(sites)} places across "
                   f"{len(namespaces)} figures ({loc})")))
         if len(findings) >= max_findings:
+            _capped = True
             break
 
     # Within-ROW member of the same family: the identical high-precision segment appearing at
@@ -3125,9 +3134,10 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
                   f"{len(chosen)} non-overlapping positions within row {r + 1} of {sn} "
                   f"({coordinate_text})")))
         if len(findings) >= max_findings:
+            _capped = True
             break
 
-    if len(findings) >= max_findings:
+    if _capped:
         _note_detector_cap(coverage, "detect_recurring_row_vectors", "detector_finding_limit",
                            limit=max_findings)
     apply_profile_to_findings(findings, profile)
@@ -3292,6 +3302,7 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
     if truncated:
         cands = cands[:max_candidates]
     findings = []
+    _capped = False   # set only where a loop is actually abandoned
     budget = 4_000_000
     for i in range(len(cands)):
         A = cands[i]
@@ -3345,8 +3356,10 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
                 rule=(f"row '{A['label']}' ({sa_name}) {rel} over a run of {run_len} "
                       f"positionally-aligned columns across 2 {scope}")))
             if len(findings) >= max_findings:
+                _capped = True
                 break
         if budget <= 0 or len(findings) >= max_findings:
+            _capped = True
             break
     if truncated or budget <= 0:
         # Never silently cap coverage — say what was bounded (stderr only; scan.json stays
@@ -3356,7 +3369,7 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
               f"budget_exhausted={budget <= 0})", file=sys.stderr)
         _note_detector_cap(coverage, "detect_scaled_row_reuse",
                            "detector_compute_budget_limit", candidates=len(cands))
-    if len(findings) >= max_findings:
+    if _capped:
         _note_detector_cap(coverage, "detect_scaled_row_reuse", "detector_finding_limit",
                            limit=max_findings)
     apply_profile_to_findings(findings, profile)
@@ -3548,6 +3561,7 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
     for c in _short_row_candidates(grid_sheets):
         by_sheet.setdefault((c["file"], c["sheet"]), []).append(c)
     findings = []
+    _capped = False   # set only where a loop is actually abandoned
     budget = 4_000_000
     for (fname, sname), rows in by_sheet.items():
         fig = figure_key(sname)
@@ -3649,8 +3663,10 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
                 _add_finding(A["label"], B["label"], A["row"], B["row"],
                              kind, k, run_len, x_run)
                 if len(findings) >= max_findings:
+                    _capped = True
                     break
             if budget <= 0 or len(findings) >= max_findings:
+                _capped = True
                 break
 
         # Second pass — isolated low-precision divisor case: B = k * A over a PARTIAL run where
@@ -3730,18 +3746,21 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
                     _add_finding(nlbl, B["label"], nbr, B["row"],
                                  "scaled_row_reuse", k, run_len, dv_run)
                     if len(findings) >= max_findings:
+                        _capped = True
                         break
                 if len(findings) >= max_findings:
+                    _capped = True
                     break
 
         if budget <= 0 or len(findings) >= max_findings:
+            _capped = True
             break
     if budget <= 0:
         print("[paperconan] detect_short_row_reuse: coverage bounded (budget exhausted)",
               file=sys.stderr)
         _note_detector_cap(coverage, "detect_short_row_reuse",
                            "detector_compute_budget_limit")
-    if len(findings) >= max_findings:
+    if _capped:
         _note_detector_cap(coverage, "detect_short_row_reuse", "detector_finding_limit",
                            limit=max_findings)
     apply_profile_to_findings(findings, profile)
@@ -3816,6 +3835,7 @@ def detect_within_row_shared_fraction(grid_sheets, profile="review", max_finding
     different integers is ~1e-6 by chance, so requiring that tail length is the FP control.
     Signal, not verdict — confirm against the legend/Methods before drawing a conclusion."""
     findings = []
+    _capped = False   # set only where a loop is actually abandoned
     budget = 8_000_000
     for (fname, sname), sheet in grid_sheets.items():
         fig = figure_key(sname)
@@ -3870,15 +3890,17 @@ def detect_within_row_shared_fraction(grid_sheets, profile="review", max_finding
                       f"the integer part (e.g. {sample}) — a copy-then-integer-shift pattern "
                       f"in {sname}")))
             if len(findings) >= max_findings:
+                _capped = True
                 break
         if budget <= 0 or len(findings) >= max_findings:
+            _capped = True
             break
     if budget <= 0:
         print("[paperconan] detect_within_row_shared_fraction: coverage bounded "
               "(budget exhausted)", file=sys.stderr)
         _note_detector_cap(coverage, "detect_within_row_shared_fraction",
                            "detector_compute_budget_limit")
-    if len(findings) >= max_findings:
+    if _capped:
         _note_detector_cap(coverage, "detect_within_row_shared_fraction", "detector_finding_limit",
                            limit=max_findings)
     apply_profile_to_findings(findings, profile)
@@ -3922,6 +3944,7 @@ def detect_row_pair_shared_fraction(grid_sheets, profile="review", max_findings=
         if len(rows) >= 2:
             by_sheet[(fname, sname)] = rows
     findings = []
+    _capped = False   # set only where a loop is actually abandoned
     budget = 40_000_000                       # global compute bound across all sheets
     for (fname, sname), rows in by_sheet.items():
         fig = figure_key(sname)
@@ -3983,17 +4006,20 @@ def detect_row_pair_shared_fraction(grid_sheets, profile="review", max_findings=
                           f"(e.g. {sample}) — a copy-then-integer-shift across two rows "
                           f"in {sname}")))
                 if len(findings) >= max_findings:
+                    _capped = True
                     break
             if budget <= 0 or len(findings) >= max_findings:
+                _capped = True
                 break
         if budget <= 0 or len(findings) >= max_findings:
+            _capped = True
             break
     if budget <= 0:
         print("[paperconan] detect_row_pair_shared_fraction: coverage bounded "
               "(global budget exhausted)", file=sys.stderr)
         _note_detector_cap(coverage, "detect_row_pair_shared_fraction",
                            "detector_compute_budget_limit")
-    if len(findings) >= max_findings:
+    if _capped:
         _note_detector_cap(coverage, "detect_row_pair_shared_fraction", "detector_finding_limit",
                            limit=max_findings)
     apply_profile_to_findings(findings, profile)

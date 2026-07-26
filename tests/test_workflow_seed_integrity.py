@@ -601,23 +601,11 @@ def test_a_detector_cap_reaches_the_packet(tmp_path, monkeypatch):
     start_workflow(str(data), str(tmp_path / "out"))
     coverage = _packet(tmp_path / "out")["coverage"]
 
-    assert coverage["detector_caps_reported"] is True
     assert coverage["scan_incomplete"] is True
     assert coverage["coverage_complete"] is False
     assert any("scan was not complete" in x for x in coverage["limitations"])
 
 
-def test_a_clean_scan_no_longer_carries_a_blanket_caveat(tmp_path):
-    """The blanket 'detector caps are unreported' line was true of every scan
-    ever produced, so it said nothing about any particular one."""
-    data = tmp_path / "data"
-    _panel(data / "p.csv")
-
-    start_workflow(str(data), str(tmp_path / "out"))
-    coverage = _packet(tmp_path / "out")["coverage"]
-
-    assert coverage["detector_caps_reported"] is True
-    assert not any("detector-level caps" in x for x in coverage["limitations"])
 
 
 def test_an_index_from_an_unsupported_schema_is_refused(tmp_path):

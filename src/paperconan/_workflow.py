@@ -36,10 +36,13 @@ SCHEMA_VERSION = 2
 # from an older policy are never silently compared against a newer one.
 WORKFLOW_POLICY_VERSION = 1
 NUMERIC_CANONICALIZATION_VERSION = 1
-# Detector max_findings / compute budgets now record into ScanCoverage, so a
-# search that was cut short reaches scan_status and this layer's limitations
-# rather than passing as complete. coverage_complete can mean what it says again.
-DETECTOR_CAPS_REPORTED = True
+# Detector *result* caps (max_findings) and the row-relation compute budget now
+# record into ScanCoverage. Many resource caps still do not — an audit of the
+# detector layer found 17, including whole-detector skips like _MAX_BLOCK_COLS,
+# where a 130-column block loses detect_relations entirely and the scan reports
+# itself complete. So this stays False: the caveat below is over-broad, but it
+# is true, and a wrong all-clear is worse than a broad warning.
+DETECTOR_CAPS_REPORTED = False
 
 MAX_EXPANSION_ROUNDS = 2
 # Route steps are bounded so a context-only loop cannot spin forever; the cap is
@@ -433,9 +436,10 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
     # construction and the caveat reaches the CLI, which prints `limitations`.
     if not DETECTOR_CAPS_REPORTED:
         limitations.append(
-            "detector-level caps are not reported to the scan layer, so a detector "
-            "that stopped at its own max_findings or compute budget is not counted "
-            "here (see coverage.detector_caps_reported)"
+            "some detector resource caps are still not reported: a detector that "
+            "skipped a block for being too wide or too tall, or stopped at an "
+            "internal compute budget, may not appear above. Result caps "
+            "(max_findings) and the row-relation budget are reported."
         )
 
     return {
