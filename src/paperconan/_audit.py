@@ -4535,7 +4535,7 @@ def write_markdown_report(out, path):
 # Every command lives in one subparser tree. Dispatch has a single rule: a first
 # argument that is not one of these names is the scan target, which is what keeps
 # `paperconan <dir>` working without giving any command its own argv branch.
-SUBCOMMANDS = ("scan", "fetch", "report", "workflow")
+SUBCOMMANDS = ("scan", "fetch", "report", "workflow", "overview", "drill", "explain")
 
 
 def _add_scan_arguments(ap: argparse.ArgumentParser) -> None:
@@ -4664,6 +4664,37 @@ def _scan_options_section(scan_p: argparse.ArgumentParser) -> str:
     return "scan options (for `paperconan <in_dir>`):" + "\n".join(kept)
 
 
+def _run_drill_command(args: argparse.Namespace) -> None:
+    import json
+
+    from ._drill import drill, explain, overview
+    from ._drill_render import render_drill, render_explain, render_overview
+
+    try:
+        with open(args.scan_json, encoding="utf-8") as fh:
+            scan = json.load(fh)
+    except OSError as exc:
+        sys.exit(f"could not read {args.scan_json}: {exc}")
+    except json.JSONDecodeError as exc:
+        sys.exit(f"{args.scan_json} is not valid JSON: {exc}")
+
+    try:
+        if args.cmd == "overview":
+            view = overview(scan, max_locations=args.max_locations)
+            text = render_overview(view)
+        elif args.cmd == "drill":
+            location = int(args.location) if args.location.isdigit() else args.location
+            view = drill(scan, location, kind=args.kind, max_findings=args.max_findings)
+            text = render_drill(view)
+        else:
+            view = explain(scan, args.finding_id)
+            text = render_explain(view)
+    except ValueError as exc:
+        sys.exit(str(exc))
+
+    print(json.dumps(view, ensure_ascii=False, indent=2) if args.json else text)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="paperconan",
@@ -4723,6 +4754,29 @@ def _build_parser() -> argparse.ArgumentParser:
     wf_status = wf_sub.add_parser("status", help="print the current stage and budget")
     wf_status.add_argument("workflow_dir", help="Workflow working directory")
 
+    # Layered read-only views: read a scan one screenful at a time instead of
+    # loading all of it. See skills/paperconan/SKILL.md for the drill protocol.
+    ov = sub.add_parser("overview", help="list the locations carrying signal (start here)")
+    ov.add_argument("scan_json", help="Path to paperconan scan.json")
+    ov.add_argument("--max-locations", type=int, default=20,
+                    help="Locations to list (default 20; the rest are reported in coverage)")
+
+    dr = sub.add_parser("drill", help="open one location, or one kind within it")
+    dr.add_argument("scan_json", help="Path to paperconan scan.json")
+    dr.add_argument("location", help="Location number from `overview`, or a cluster id")
+    dr.add_argument("--kind", default=None,
+                    help="List the individual findings of this kind")
+    dr.add_argument("--max-findings", type=int, default=50,
+                    help="Findings to list (default 50; the rest are reported in coverage)")
+
+    ex = sub.add_parser("explain", help="one finding in full, with its evidence table")
+    ex.add_argument("scan_json", help="Path to paperconan scan.json")
+    ex.add_argument("finding_id", help="Finding id from `drill --kind`")
+
+    for parser in (ov, dr, ex):
+        parser.add_argument("--json", action="store_true",
+                            help="Emit the raw structure instead of formatted text")
+
     ap.epilog = (
         "default invocation:\n"
         "  paperconan <in_dir> [options]   equivalent to `paperconan scan <in_dir>`\n\n"
@@ -4753,6 +4807,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.cmd == "workflow":
         _run_workflow(args)
+        return
+    if args.cmd in ("overview", "drill", "explain"):
+        _run_drill_command(args)
         return
     _run_scan(getattr(args, "_parser", ap), args)
 
