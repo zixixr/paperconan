@@ -195,7 +195,10 @@ def drill(scan: dict[str, Any], location: int | str, *, kind: str | None = None,
         "coverage": {
             "total": len(matching),
             "shown": len(shown),
-            "limitations": limitations,
+            # scan-wide caveats belong here too: this is the layer where a
+            # reader concludes "that is all of them", so it is where a silently
+            # capped detector or an unrouted family matters most.
+            "limitations": limitations + list(_seeding.get("limitations") or []),
         },
     }
 

@@ -14,6 +14,7 @@ never detected.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -37,15 +38,12 @@ def scan(tmp_path_factory):
     return scan_dir(str(d), str(d.parent / "out"), write_html=False)
 
 
-# Every finding-bearing list a scan can carry. Deliberately enumerated from the
-# scan's own shape rather than from the seeding layer's BLOCK_FINDING_GROUPS: an
-# earlier version counted only what the implementation seeds, so families it
-# skips were absent from both the reachable set and the expected total, and the
-# reachability test was green while six findings were unaccounted for.
-_SCAN_FINDING_KEYS = (
-    "cross_sheet_findings", "image_findings",
-    "digit_distribution", "decimal_endings", "decimal_tail_clusters",
-)
+# Structural keys — scan bookkeeping, not findings.
+_NON_FINDING_KEYS = {
+    "relations_blocks", "image_assets", "scan_errors", "scan_stats", "paper",
+    "coverage", "tool", "tool_version", "schema_version", "profile", "input_dir",
+    "scanned_at", "scan_status",
+}
 
 
 def _seeded_finding_count(scan):
@@ -56,8 +54,20 @@ def _seeded_finding_count(scan):
 
 
 def _families_present(scan):
-    """Every finding-bearing family actually in this scan, with its count."""
-    present = {k: len(scan.get(k) or []) for k in _SCAN_FINDING_KEYS if scan.get(k)}
+    """Every finding-bearing family in this scan, discovered from its own shape.
+
+    Deliberately not a constant. A previous version listed the families by hand
+    and the list turned out to equal `_workflow._UNSEEDED_FAMILIES`, so the test
+    could only ever find families the implementation already declared — the same
+    scoping error it was written to replace, one constant over. Detecting the key
+    structurally means a newly added family fails this test on the day it lands.
+    """
+    present = {}
+    for key, value in scan.items():
+        if key in _NON_FINDING_KEYS or not isinstance(value, list) or not value:
+            continue
+        if all(isinstance(item, dict) for item in value):
+            present[key] = len(value)
     blocks = sum(len(b.get(g) or []) for b in scan.get("relations_blocks") or []
                  for g in BLOCK_FINDING_GROUPS)
     if blocks:
@@ -194,17 +204,25 @@ def test_explain_never_serves_another_findings_evidence(scan):
         if detail.get("evidence") and detail["location"]:
             assert detail["kind"], "a finding with evidence must name its kind"
 
-    # distinct ids must not collapse onto one evidence table
-    by_evidence = {}
-    for fid, detail in pairs:
-        ev = json.dumps(detail.get("evidence"), sort_keys=True)
-        by_evidence.setdefault((detail["location"], detail["kind"], ev), []).append(fid)
-    for key, ids in by_evidence.items():
-        if len(ids) > 1:
-            rules = {explain(scan, i)["rule"] for i in ids}
-            assert len(rules) == len(ids) or len(rules) == 1, (
-                f"{len(ids)} ids share one evidence table at {key[0]}"
+    # Distinct ids must resolve to distinct raw findings. Checked against the
+    # rule text rather than the evidence blob, since two genuinely different
+    # findings can legitimately share an evidence window over the same block.
+    from paperconan._drill import _match_raw_finding
+    from paperconan._workflow import _build_clusters
+
+    clusters, _ = _build_clusters(scan, max_clusters=10**9)
+    resolved = {}
+    for cluster in clusters:
+        for seed in cluster["seeds"]:
+            raw = _match_raw_finding(scan, seed)
+            if raw is None:
+                continue
+            key = id(raw)
+            assert key not in resolved, (
+                f"{seed['seed_id']} and {resolved[key]} both resolved to the same "
+                "raw finding; explain would serve one of them the other's evidence"
             )
+            resolved[key] = seed["seed_id"]
 
 
 def test_match_is_keyed_on_the_same_tuple_as_the_seed_id():
@@ -276,7 +294,10 @@ def test_raising_the_limit_actually_reaches_the_declared_remainder(scan):
 
     assert capped["coverage"]["shown"] == 1
     assert full["coverage"]["shown"] == full["coverage"]["total"] == biggest["n"]
-    assert not full["coverage"]["limitations"]
+    # the listing's own truncation notice is gone once nothing is held back...
+    assert not any("raise max_findings" in x for x in full["coverage"]["limitations"])
+    # ...but scan-wide caveats are not this layer's to drop
+    assert any("detector-level caps" in x for x in full["coverage"]["limitations"])
 
 
 def test_a_family_present_but_unreachable_is_named_in_coverage(scan):
@@ -452,6 +473,56 @@ def test_cli_rejects_json_that_is_not_a_scan(tmp_path, content):
     assert "does not look like" in (res.stderr + res.stdout)
 
 
+def test_cli_rejects_the_workflow_artifacts_that_sit_beside_a_scan(tmp_path):
+    """The realistic wrong-file case, not a synthetic one.
+
+    Every workflow artifact carries `schema_version`, so a one-of gate let
+    `overview states/s000.json` render "0 signals" — and the empty-overview text
+    then asserts the detectors found nothing about a file never scanned.
+    """
+    from paperconan._workflow import start_workflow
+
+    data = tmp_path / "data"
+    data.mkdir()
+    rows = ["a,b"] + [f"{i + 1},{(i + 1) * 2}" for i in range(12)]
+    (data / "p.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    out = tmp_path / "wf"
+    start_workflow(str(data), str(out))
+
+    for rel in ("workflow_state.json", "states/s000.json",
+                "steps/t000/candidate_packet.json"):
+        res = _cli("overview", str(out / rel))
+        assert res.returncode != 0, f"{rel} was accepted as a scan"
+        assert "does not look like" in (res.stderr + res.stdout), rel
+
+
+def test_cli_explain_names_parameters_it_cannot_render(scan_path):
+    """Sample values live in list parameters — the numbers a reviewer checks
+    against the paper. Dropping them silently from the text is the same defect
+    the family list had at L1."""
+    with open(scan_path, encoding="utf-8") as fh:
+        s = json.load(fh)
+    fid = None
+    for loc in overview(s)["locations"]:
+        for group in drill(s, loc["n"])["by_kind"]:
+            for f in drill(s, loc["n"], kind=group["kind"])["findings"]:
+                params = explain(s, f["finding_id"])["parameters"]
+                if any(isinstance(v, (list, dict)) for v in params.values()):
+                    fid = f["finding_id"]
+                    break
+            if fid:
+                break
+        if fid:
+            break
+    assert fid, "fixture has no finding with structured parameters"
+
+    out = _cli("explain", scan_path, fid).stdout
+
+    assert "structured parameter" in out, (
+        "list/dict parameters were dropped from the text with no notice"
+    )
+
+
 def test_cli_empty_overview_says_that_quiet_is_not_clean(tmp_path):
     empty = tmp_path / "empty.json"
     empty.write_text(json.dumps({
@@ -465,11 +536,44 @@ def test_cli_empty_overview_says_that_quiet_is_not_clean(tmp_path):
     assert "not that the paper is free of problems" in res.stdout
 
 
-def test_cli_overview_shows_the_high_count_per_location(scan_path):
-    """strongest alone cannot distinguish 1 high among 200 from 60 among 60."""
+def test_cli_overview_renders_the_high_count_value(scan_path):
+    """strongest alone cannot distinguish 1 high among 200 from 60 among 60.
+
+    Asserts the rendered number, not the column label — an earlier version
+    checked only the header and stayed green with the value removed.
+    """
+    with open(scan_path, encoding="utf-8") as fh:
+        expected = overview(json.load(fh))["locations"][0]
+
     res = _cli("overview", scan_path)
 
-    assert "high" in res.stdout.splitlines()[2], "no high column in the header"
+    assert res.returncode == 0, res.stderr
+    row = next(ln for ln in res.stdout.splitlines() if ln.strip().startswith("1 "))
+    trailing = [int(x) for x in re.findall(r"\d+", row)][-2:]
+    assert trailing == [expected["signals"], expected["high"]], (
+        f"row ends with {trailing}, expected signals={expected['signals']} "
+        f"then high={expected['high']}"
+    )
+
+
+def test_cli_overview_marks_a_truncated_family_list(tmp_path):
+    """L1 must not silently drop the tail of a long family list."""
+    from paperconan._drill_render import render_overview
+
+    view = {
+        "files": 1, "signals_total": 9,
+        "locations": [{
+            "n": 1, "cluster_id": "cluster:x", "scope": "block",
+            "location": "f.csv :: s", "strongest": "high", "signals": 9, "high": 9,
+            "families": ["a", "b", "c", "d", "e", "f"],
+        }],
+        "coverage": {"locations_total": 1, "locations_not_shown": 0,
+                     "signals_not_shown": 0, "limitations": []},
+    }
+
+    text = render_overview(view)
+
+    assert "2 more" in text, "families were truncated without saying so"
 
 
 def test_cli_drill_prints_coverage_at_the_kind_grouping_layer(scan_path):

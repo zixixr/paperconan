@@ -147,12 +147,18 @@ def render_explain(view: dict[str, Any]) -> str:
             out.append(f"      · {reason}")
         if sev.get("likely_benign"):
             out.append(f"      · {sev['likely_benign']}")
-    params = {k: v for k, v in (view.get("parameters") or {}).items()
-              if not isinstance(v, (list, dict))}
+    all_params = view.get("parameters") or {}
+    params = {k: v for k, v in all_params.items() if not isinstance(v, (list, dict))}
     if params:
         out.append("  parameters:")
         for k, v in sorted(params.items()):
             out.append(f"      {k} = {v}")
+    # Sample values and prefilter flags live in list/dict parameters — exactly
+    # what a reviewer checks against the paper. Naming them beats dropping them.
+    structured = sorted(set(all_params) - set(params))
+    if structured:
+        out.append(f"      … {len(structured)} structured parameter(s) not shown "
+                   f"({', '.join(structured)}); use --json")
     out.append("")
     out.append("  evidence:")
     out += _render_evidence(view.get("evidence"))

@@ -4680,14 +4680,20 @@ def _run_drill_command(args: argparse.Namespace) -> None:
 
     # Valid JSON that is not a scan would otherwise surface as an AttributeError
     # traceback, or — worse — render as "0 signals", which reads as a clean paper.
-    if not isinstance(scan, dict) or not (
-        "relations_blocks" in scan or "tool" in scan or "schema_version" in scan
-    ):
+    # `relations_blocks` is required rather than one-of: the workflow artifacts
+    # that sit beside scan.json all carry schema_version, so a looser gate let
+    # `overview states/s000.json` report a quiet paper for a file never scanned.
+    if not isinstance(scan, dict) or not isinstance(scan.get("relations_blocks"), list):
+        detail = ""
+        if isinstance(scan, dict) and scan.get("artifact_type"):
+            detail = f" (this is a workflow {scan['artifact_type']} artifact)"
         sys.exit(
-            f"{args.scan_json} does not look like a paperconan scan.json "
-            "(no relations_blocks/tool/schema_version); point at the file written "
-            "by `paperconan <dir>`"
+            f"{args.scan_json} does not look like a paperconan scan.json"
+            f"{detail}; point at the scan.json written by `paperconan <dir>`"
         )
+    for key in ("cross_sheet_findings", "image_findings"):
+        if key in scan and not isinstance(scan[key], list):
+            sys.exit(f"{args.scan_json} is malformed: {key} is not a list")
 
     try:
         if args.cmd == "overview":
