@@ -1041,7 +1041,8 @@ def _row_pair_low_cardinality_integer_like(x, y):
     return bool(near_integer >= 0.9 and max_abs <= 20 and distinct <= max(5, len(finite) // 4))
 
 
-def detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header, min_n=10):
+def detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header, min_n=10,
+                                   coverage=None):
     """Detect suspicious paired rows that preserve low-order digits across many cells.
 
     This targets source-data layouts where replicate/condition rows are aligned by
@@ -1175,6 +1176,14 @@ def detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header, min_n=10):
         -f["coarse_10_diff_frac"],
         -f["n"],
     ))
+    if len(findings) > _ROW_PAIR_MAX_FINDINGS_PER_BLOCK:
+        # A result cap like any other, and it truncates before _cap_block_findings
+        # runs, so without this the drop reaches neither findings_omitted nor
+        # scan_status. Reported per block: unlike the detector-level records this
+        # one has a file and sheet, so the dedup key keeps each block distinct.
+        _note_detector_cap(coverage, "detect_row_pair_digit_coupling",
+                           "detector_finding_limit", found=len(findings),
+                           limit=_ROW_PAIR_MAX_FINDINGS_PER_BLOCK)
     return findings[:_ROW_PAIR_MAX_FINDINGS_PER_BLOCK]
 
 
@@ -1299,9 +1308,10 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=None):
     # deliberately over-broad caveat ("too wide or too tall") is what covers it,
     # and test_a_block_past_the_row_cap_loses_relations_and_says_nothing pins
     # the loss so it cannot widen unnoticed. That caveat reaches the workflow
-    # packet and the layered views (`paperconan overview` / `drill` / `explain`,
-    # which read it through _build_clusters); a plain `paperconan <dir>` run gets
-    # scan.json and report.html, neither of which carries it.
+    # packet and the layered views that render a coverage block — `paperconan
+    # overview` and both `drill` forms, via _build_clusters. `explain` renders no
+    # coverage block, and a plain `paperconan <dir>` run gets scan.json and
+    # report.html, neither of which carries it either.
     #
     # _ROW_REL_MAX_ROWS is also the gate in _scaled_row_candidates, so the same
     # constant drops a second detector; that site has its own note.
@@ -3427,7 +3437,7 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
         # watching the run and in scan.json for every downstream consumer. Real
         # condition-layout papers stay far under these limits.
         print(f"[paperconan] detect_scaled_row_reuse: coverage bounded "
-              f"(candidates={len(cands)}{'+truncated' if truncated else ''}, "
+              f"(candidates={pool_size}{'+truncated' if truncated else ''}, "
               f"budget_exhausted={budget <= 0})", file=sys.stderr)
         # Two distinct causes, reported separately: a truncated candidate pool is
         # not a spent compute budget, and naming the wrong one sends a reader to
@@ -4169,9 +4179,10 @@ _MAX_CELLS = int(os.environ.get("PAPERCONAN_MAX_CELLS", "10000000"))
 # to skip the extra per-workbook XML pass on throughput-sensitive corpora.
 _OOXML_FORMULA_INSPECT = os.environ.get(
     "PAPERCONAN_OOXML_FORMULA_INSPECT", "1") not in ("0", "false", "False", "")
-# Wide blocks (dense correlation matrices) blow up the O(col²) relation, equal-pair and
-# row-pair-digit-coupling detectors in both compute time and output size (scan.json /
-# report.html). Skip those three when
+# Wide blocks (dense correlation matrices) blow up the O(col²) relation and equal-pair
+# detectors in both compute time and output size (scan.json / report.html);
+# row-pair-digit-coupling is only linear in columns but is skipped with them because its
+# per-row digit work is still wasted on a correlation matrix. Skip those three when
 # a block is wider than this; the cheap column-wise detectors still run. 0 disables the skip.
 _MAX_BLOCK_COLS = int(os.environ.get("PAPERCONAN_MAX_BLOCK_COLS", "120"))
 # Output cap: each finding embeds a table-snippet as evidence, so a paper with thousands of
@@ -4427,7 +4438,8 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 rel = [] if wide else detect_relations(sheet, r0, r1, c0, c1, header)
                 ap = detect_arithmetic_progression(sheet, r0, r1, c0, c1, header)
                 eq = [] if wide else detect_equal_pairs(sheet, r0, r1, c0, c1, header)
-                rp = [] if wide else detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header)
+                rp = [] if wide else detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header,
+                                                                   coverage=coverage)
                 # Runs UNCONDITIONALLY (not gated by `wide`): row-oriented condition/measurement
                 # layouts are exactly the wide blocks the column detectors skip, and this is
                 # where a "row B = row A * k" relationship lives. Self-gates on rows/cols.

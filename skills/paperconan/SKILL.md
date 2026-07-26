@@ -74,15 +74,19 @@ Three things to hold onto while reading:
   own caps dropped before the layers saw them, and detector-level caps that still
   reach no channel. Raise `--max-locations` / `--max-findings` to reach the
   remainder; the rest are limits of the scan, not of the view.
-- **`scan:` lines name a detector that stopped early.** A line such as
-  `scan: detector finding limit in detect_short_row_reuse (limit=60)` or
-  `... candidate pool limit ... (candidates=1500, limit=400)` means that detector
-  hit its own ceiling and stopped enumerating — the block was **not** searched to
-  the end, and `scan_status` is `partial`. Treat the sheet it names as
-  under-examined rather than clean; re-run with the matching `PAPERCONAN_*`
-  environment variable raised if the location matters. A caveat that no cap is
-  reported still stands for whole-detector skips (a block too wide or too tall),
-  which reach no channel at all.
+- **`scan:` lines carry every scan-layer limitation, not just detector ones.**
+  They come in two shapes. A **file or sheet** line names what was not read at
+  all — `scan: file too large limit in big.xlsx (size_mb=250.0)`. A **detector**
+  line names a detector that stopped early —
+  `scan: detector finding limit in detect_short_row_reuse (limit=60)`, or
+  `scan: detector candidate pool limit in detect_scaled_row_reuse (candidates=1500, limit=1500)`,
+  where `candidates` is the pool before truncation and `limit` the cap. Either
+  way `scan_status` is `partial` and the search was cut short, so do not read a
+  quiet result on that input as clean. Detector lines name **no file or sheet** —
+  the whole scan is affected, not one location — so re-run with the matching
+  `PAPERCONAN_*` variable raised rather than looking for a sheet to re-check.
+  A separate caveat covers whole-detector skips (a block too wide or too tall),
+  which reach no channel at all and so are never named here.
 - **A quiet overview is not a clean paper.** It means these detectors found
   nothing at these thresholds in the data that was supplied.
 

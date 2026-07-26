@@ -36,9 +36,11 @@ SCHEMA_VERSION = 2
 # from an older policy are never silently compared against a newer one.
 WORKFLOW_POLICY_VERSION = 1
 NUMERIC_CANONICALIZATION_VERSION = 1
-# Detector *result* caps (max_findings) and the row-relation compute budget now
-# record into ScanCoverage. Many resource caps still do not. Two that anyone can
-# check from the source, both whole-detector skips rather than result caps:
+# Detector result caps, compute budgets and candidate-pool caps now record into
+# ScanCoverage. Many resource caps still do not, and no exhaustive list is
+# attempted here — it would go stale as caps get wired, which is how an earlier
+# version of this note came to name coverage the code did not have. Two anyone
+# can check from the source, both whole-detector skips:
 # scan_dir's `wide` gate drops detect_relations, detect_equal_pairs and
 # detect_row_pair_digit_coupling outright past
 # _MAX_BLOCK_COLS, and _ROW_REL_MAX_ROWS silently disables two detectors at 61
@@ -50,6 +52,19 @@ NUMERIC_CANONICALIZATION_VERSION = 1
 # version cited one that no reader could verify and that would drift silently
 # as caps get wired.
 DETECTOR_CAPS_REPORTED = False
+
+# Measured consequence of wiring these, recorded so it is a decision and not a
+# surprise: on ten real supplementary-data sets, `scan_status` went from
+# "partial" on 3 to "partial" on essentially all of them, because the
+# candidate-pool and per-block result caps genuinely truncate on ordinary
+# inputs (a 14x14 block hits detect_row_pair_digit_coupling's cap of 25 with 91
+# pairs found). Reporting it is right — those searches really were cut short —
+# but it means `partial` is now the normal state and carries little information
+# on its own. What carries information is the `limitations` list, which names
+# the detector and its limit. Two consequences worth keeping in view: anything
+# downstream that gates on `scan_status == "complete"` will now see almost
+# nothing, and the caps being this tight on ordinary data is an argument for
+# raising them — a detection change, separate PR.
 
 MAX_EXPANSION_ROUNDS = 2
 # Route steps are bounded so a context-only loop cannot spin forever; the cap is
@@ -445,10 +460,10 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
         )
 
     # Result caps, compute budgets and candidate-pool caps now record through
-    # ScanCoverage. What still reaches no channel is the whole-detector skips:
-    # a block dropped for being too wide (the `wide` gate) or too tall
-    # (_ROW_REL_MAX_ROWS, a cost bound that drops real relations at 61 rows).
-    # Until those are wired
+    # ScanCoverage. Others still reach no channel — whole-detector skips for a
+    # block too wide (the `wide` gate) or too tall (_ROW_REL_MAX_ROWS, a cost
+    # bound that drops real relations at 61 rows), and per-row truncations
+    # inside detectors that are otherwise wired. Until those are wired
     # the workflow cannot know whether a block was fully enumerated, so it must
     # not claim it was. Stating it here rather than only in a side field means
     # `coverage_complete` is false by construction and the caveat reaches the
@@ -476,10 +491,12 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
         "families_not_seeded": unseeded,
         "coverage_complete": not limitations,
         "limitations": limitations,
-        # Known blind spot, stated rather than implied. Every detector result cap
-        # and compute budget now records through ScanCoverage, as do the candidate
-        # pool caps; whole-detector skips (the `wide` gate, _ROW_REL_MAX_ROWS) do
-        # not, so `coverage_complete` means
+        # Known blind spot, stated rather than implied. Result caps, compute
+        # budgets and candidate-pool caps now record through ScanCoverage. Not
+        # all of them: whole-detector skips (the `wide` gate, _ROW_REL_MAX_ROWS,
+        # BLOCK_DUP_MAX_CELLS) reach no channel, and neither do per-row
+        # truncations like _WR_MAX_ROW_CELLS. No exhaustive list is attempted
+        # here — that is the point of the caveat. So `coverage_complete` means
         # "complete as far as the scan reported", not "every finding was seeded".
         # See the caveat assembled above for what that leaves out.
         "detector_caps_reported": DETECTOR_CAPS_REPORTED,

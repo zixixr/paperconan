@@ -114,8 +114,9 @@ def _write_csv(path, rows):
 def _grid_for_pool_cap(detector):
     """A grid with more candidate rows than the pool cap under test.
 
-    Each of these detectors builds its candidate list through its own gates, so
-    a grid that overflows one does not overflow the other.
+    Each detector builds its candidate list through its own gates, so a grid has
+    to be chosen per detector: _shared_tail_across_rows only overflows the
+    row-pair cap, while _repeated_short_rows happens to overflow both.
     """
     if detector == "detect_row_pair_shared_fraction":
         return _shared_tail_across_rows()
@@ -708,7 +709,7 @@ def test_the_html_coverage_row_distinguishes_one_capped_detector_from_another(tm
     assert "limit=60" in html, "the cap value did not reach the report"
 
 
-def test_a_truncated_candidate_pool_reports_the_pool_not_the_cap(tmp_path):
+def test_a_truncated_candidate_pool_reports_the_pool_not_the_cap(tmp_path, capsys):
     """The one number on the record has to say how much was dropped.
 
     len(cands) is read after the slice, so reporting it prints max_candidates
@@ -724,13 +725,21 @@ def test_a_truncated_candidate_pool_reports_the_pool_not_the_cap(tmp_path):
     audit.detect_scaled_row_reuse(grids, profile="review", max_candidates=3,
                                   max_findings=10**6, coverage=coverage)
 
+    assert pool > 3, "fixture no longer overflows the candidate cap"
     record = next(i for i in coverage.to_dict()["limitations"]
                   if i["reason"] == "detector_candidate_pool_limit")
-    assert pool > 3, "fixture no longer overflows the candidate cap"
     assert record["candidates"] == pool, (
         f"reported {record['candidates']} candidates for a pool of {pool}"
     )
     assert record["limit"] == 3
+
+    # The stderr line is a peer reporting channel, not a lesser one -- it had the
+    # same post-slice bug and no test, so fixing only the structured record left
+    # the human watching the run reading the cap back at themselves.
+    err = capsys.readouterr().err
+    assert f"candidates={pool}" in err, (
+        f"stderr reported the cap instead of the pool: {err.strip()!r}"
+    )
 
 
 @pytest.mark.parametrize("detector,knob,reason", [
@@ -759,4 +768,36 @@ def test_sibling_candidate_pool_caps_reach_coverage(tmp_path, monkeypatch,
         f"{detector}'s candidate pool was cut at {knob} without recording it: "
         f"{_reasons(scan)}"
     )
+    assert scan["scan_status"] != "complete"
+
+
+def test_the_row_pair_digit_coupling_block_cap_reaches_coverage(tmp_path):
+    """A result cap that truncated before _cap_block_findings ever saw it.
+
+    detect_row_pair_digit_coupling ended in `findings[:25]`. That is a result cap
+    like any other, but it ran ahead of the block-level cap, so the drop reached
+    neither findings_omitted nor scan_status -- the one category the workflow's
+    blind-spot note had been rewritten to claim was empty.
+
+    No monkeypatching: 14 rows of 14 columns whose pairwise differences are
+    multiples of 10 produce all C(14,2)=91 pairs and hit the default cap of 25,
+    so this fires on an ordinary block and loses 66 findings.
+    """
+    cols = 14
+    base = [round(12.34 + j * 7.91, 2) for j in range(cols)]
+    rows = [[f"c{j}" for j in range(cols)]]
+    for i in range(14):
+        rows.append([round(v + 10 * (i + 1), 2) for v in base])
+    _write_csv(tmp_path / "d" / "p.csv", rows)
+
+    scan = scan_dir(str(tmp_path / "d"), str(tmp_path / "out"), write_html=False)
+
+    records = [i for i in (scan.get("coverage") or {}).get("limitations") or []
+               if i.get("detector") == "detect_row_pair_digit_coupling"
+               and i.get("reason") == "detector_finding_limit"]
+    assert records, (
+        f"the per-block result cap recorded nothing under its own reason: "
+        f"{[(i.get('detector'), i.get('reason')) for i in (scan.get('coverage') or {}).get('limitations') or []]}"
+    )
+    assert records[0]["found"] > records[0]["limit"], records[0]
     assert scan["scan_status"] != "complete"

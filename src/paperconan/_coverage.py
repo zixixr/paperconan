@@ -58,8 +58,8 @@ class ScanCoverage:
         # (scope, reason, file, sheet, detector) — `detector` is in it because
         # detector records carry no file or
         # sheet, so without it every capped detector after the first collapses into
-        # it and is silently discarded — while the caveat told the reader result
-        # caps were reported.
+        # it and is silently discarded, so a scan that capped three detectors
+        # would name only one of them.
         key = (scope, reason, item.get("file"), item.get("sheet"),
                item.get("detector"))
         if key in self._limitation_keys:
