@@ -37,11 +37,15 @@ SCHEMA_VERSION = 2
 WORKFLOW_POLICY_VERSION = 1
 NUMERIC_CANONICALIZATION_VERSION = 1
 # Detector *result* caps (max_findings) and the row-relation compute budget now
-# record into ScanCoverage. Many resource caps still do not — an audit of the
-# detector layer found 17, including whole-detector skips like _MAX_BLOCK_COLS,
-# where a 130-column block loses detect_relations entirely and the scan reports
-# itself complete. So this stays False: the caveat below is over-broad, but it
-# is true, and a wrong all-clear is worse than a broad warning.
+# record into ScanCoverage. Many resource caps still do not. Two that anyone can
+# check from the source: scan_dir's `wide` gate drops detect_relations,
+# detect_equal_pairs and detect_row_pair_digit_coupling outright past
+# _MAX_BLOCK_COLS, and detect_row_relations' row ceiling loses an exact relation
+# at 61 rows -- both while the scan reports itself complete. So this stays
+# False: the caveat below is over-broad, but it is true, and a wrong all-clear
+# is worse than a broad warning. No count is given here on purpose; an earlier
+# version cited one that no reader could verify and that would drift silently
+# as caps get wired.
 DETECTOR_CAPS_REPORTED = False
 
 MAX_EXPANSION_ROUNDS = 2
@@ -409,6 +413,15 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
         )
         for entry in scan_coverage.get("limitations") or []:
             limitations.append("scan: " + _describe_scan_limitation(entry))
+        # The record list is itself capped. Reporting the retained records
+        # without the dropped count shows a short list that reads as a full one.
+        dropped = int(scan_coverage.get("limitations_omitted") or 0)
+        if dropped:
+            limitations.append(
+                f"scan: {dropped} further limitations were recorded but dropped by the "
+                f"record cap (PAPERCONAN_MAX_LIMITATIONS); the scan lines above are a "
+                f"sample, not the whole set"
+            )
 
     unseeded = {
         family: len(scan.get(family) or [])
@@ -427,20 +440,25 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
             f"{len(omitted)} lower-ranked clusters were not routed"
         )
 
-    # Several detectors stop at their own limits. Some now record through
-    # ScanCoverage; an audit found others that still reach no channel at all —
-    # whole-detector skips on wide blocks, and result caps outside the wired
-    # set. Until every one is wired
-    # (a scan-layer change, separate PR) the workflow cannot know whether a block
-    # was fully enumerated, so it must not claim it was. Stating it here rather
-    # than only in a side field means `coverage_complete` is false by
-    # construction and the caveat reaches the CLI, which prints `limitations`.
+    # Six detectors now record their result caps and compute budgets through
+    # ScanCoverage. An audit found others that still reach no channel at all:
+    # whole-detector skips on blocks that are too wide or too tall (see
+    # detect_row_relations' row cap, a cost bound that drops real relations at
+    # 61 rows) and result caps outside the wired set. Until every one is wired
+    # the workflow cannot know whether a block was fully enumerated, so it must
+    # not claim it was. Stating it here rather than only in a side field means
+    # `coverage_complete` is false by construction and the caveat reaches the
+    # CLI, which prints `limitations`.
+    #
+    # Deliberately not an enumeration: a list here goes stale the moment a cap
+    # is wired, which is how an earlier version of this text came to name
+    # coverage the code did not have.
     if not DETECTOR_CAPS_REPORTED:
         limitations.append(
             "some detector caps are still not reported: a detector that skipped a "
             "block for being too wide or too tall, or stopped at an internal "
-            "limit, may not appear above. What is reported appears in this list; "
-            "this line does not enumerate what is not."
+            "limit, may not appear above. This line does not enumerate what is "
+            "not reported."
         )
 
     return {

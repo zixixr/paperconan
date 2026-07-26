@@ -733,7 +733,6 @@ _JS = """
 
 
 _STATUS_LABELS = {
-    "complete": ("ok", "全部输入均已检测 · full coverage"),
     "partial": ("warn", "部分输入未检测(见下)· partial coverage"),
     "failed": ("warn", "没有可检测的输入 · no input analyzed"),
 }

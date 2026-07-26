@@ -978,8 +978,11 @@ def _note_detector_cap(coverage, detector: str, reason: str, **details) -> None:
     These caps bound worst-case work on genome-scale supplements, which is
     correct — but a search that was cut short must not be reportable as a
     complete one. Routing them into ScanCoverage flips scan_status to "partial"
-    and carries the reason to every consumer, instead of the stderr line (or, on
-    several paths, the silence) they used to get.
+    and carries the reason to every consumer that renders coverage — the raw
+    HTML report, the layered views, the workflow packet — instead of the stderr
+    line (or, on several paths, the silence) they used to get. The adjudicated
+    report renders no scan coverage at all, so a cap does not reach a reader
+    there; `scan_status` is the signal to check before adjudicating.
     """
     if coverage is None:
         return
@@ -1283,12 +1286,21 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=None):
     findings = []
     n_rows = r1 - r0
     n_cols = c1 - c0
-    # Not a truncation: this detector looks for relations *between rows across
-    # many columns*, so a tall narrow matrix is out of scope rather than cut
-    # short. _scaled_row_candidates gates on the same constant and calls it
-    # scope. Reporting it as a limitation fired on 61x14 — the commonest
-    # supplementary shape there is — and would have trained readers to ignore
-    # the coverage line entirely.
+    # Two different bounds share this line. The column floor is scope: with
+    # fewer than _ROW_REL_MIN_COLS columns a "relation between rows" is not
+    # evidence of anything. The row ceiling is not — it is a cost cap on the
+    # O(rows^2 * cols) pair loop, and it truncates: a 61x14 block is squarely in
+    # this detector's orientation, and an exact ratio between two of its rows is
+    # found at 60 rows and lost at 61 while scan_status stays "complete".
+    #
+    # Left unreported on purpose, for now: 61x14 is among the commonest
+    # supplementary shapes, so emitting a limitation here would fire on ordinary
+    # scans and train readers to skip the coverage line. The workflow's
+    # deliberately over-broad caveat ("too wide or too tall") is what covers it,
+    # and test_a_block_past_the_row_cap_loses_relations_and_says_nothing pins
+    # the loss so it cannot widen unnoticed. The cap is also ~15x tighter than
+    # _ROW_REL_BUDGET, which bounds the same loop and *does* report — raising it
+    # is a detection change and belongs in its own PR.
     if n_rows < 2 or n_cols < _ROW_REL_MIN_COLS or n_rows > _ROW_REL_MAX_ROWS:
         return findings
 
@@ -1304,9 +1316,14 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=None):
             if budget <= 0:
                 print(f"[paperconan] detect_row_relations: column-op budget exhausted on a "
                       f"{n_rows}x{n_cols} block — coverage bounded", file=sys.stderr)
+                # No rows/cols here on purpose: the dedup key is
+                # (scope, reason, file, sheet, detector) and this record carries
+                # no file or sheet, so every block that exhausts the budget
+                # collapses into one entry. Naming the first block's shape would
+                # let one record speak for blocks the reader never hears about.
+                # The stderr line above stays per-occurrence.
                 _note_detector_cap(
                     coverage, "detect_row_relations", "detector_compute_budget_limit",
-                    rows=n_rows, cols=n_cols,
                 )
                 return findings
             label_b = labels[rb]
