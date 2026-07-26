@@ -65,9 +65,10 @@ Three things to hold onto while reading:
   a dense block or a repeated axis is often a fair call, but an exactly duplicated
   column can be demoted merely for sharing a block with many other relations.
   Do not skip a finding because its displayed severity is low.
-- **Read `coverage` — it is printed after the table, as lines starting with `!`.**
-  `overview` and both `drill` forms carry it; `explain` describes a single
-  finding and has none. It states what was not shown and why: locations beyond
+- **Read the `!` lines — every layer has them.** `overview` and both `drill`
+  forms carry a `coverage` block; `explain` states its own limits inline (an
+  evidence window the scan trimmed, structured parameters only `--json` shows).
+  They state what was not shown and why: locations beyond
   the listed count, findings beyond a listing limit, families this layer does not
   route (digit distributions, decimal endings, image findings), findings the scan's
   own caps dropped before the layers saw them, and detector-level caps that are

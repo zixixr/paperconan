@@ -43,7 +43,10 @@ def render_overview(view: dict[str, Any]) -> str:
         more = len(loc["families"]) - len(families)
         suffix = f", … {more} more" if more > 0 else ""
         out.append(f"      {', '.join(families)}{suffix}")
-    if not view["locations"]:
+    # Branch on the scan, not on this page: with --max-locations 0 the page is
+    # empty while the scan is not, and the all-clear text would contradict both
+    # the header and the coverage line on the same screen.
+    if not cov["locations_total"]:
         out.append("  (no locations carry signal)")
         out.append("")
         out.append("  This means these detectors found nothing at these thresholds in")
@@ -95,36 +98,70 @@ def render_drill(view: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+_EVIDENCE_ROW_LIMIT = 20
+
+
 def _render_evidence(ev: dict[str, Any] | None) -> list[str]:
+    """Render the evidence window.
+
+    Values are never clipped. This table exists so a reviewer can compare exact
+    digits against the paper, and a silently shortened number is worse than a
+    missing one — clipping to a fixed width turned -1.2345678e-100 into
+    -1.234567, wrong by a hundred orders of magnitude. Columns widen to fit
+    instead, and the row/column counts the scan itself trimmed are stated.
+    """
     if not ev or not ev.get("rows"):
         return ["  (no evidence table recorded)"]
-    headers = ev.get("headers") or []
+    headers = [str(h) for h in (ev.get("headers") or [])]
     hi_cols = {int(c) for c in ev.get("highlight_cols") or []}
     hi_rows = {int(r) for r in ev.get("highlight_rows") or []}
     col_offset = int(ev.get("col_offset") or 0)
+    rows = ev["rows"]
 
     def cell(v: Any) -> str:
         if v is None:
             return ""
         if isinstance(v, float):
-            return f"{v:.8g}"
+            # repr is Python's shortest round-tripping form: it never loses a
+            # digit the value actually has. A %g format silently rounds, which
+            # is the same defect as clipping — the reviewer is comparing digits.
+            return repr(v)
         return str(v)
 
-    widths = [max(9, len(str(h))) for h in headers]
+    shown = rows[:_EVIDENCE_ROW_LIMIT]
+    # A row may carry more values than there are headers; widen rather than zip
+    # them away, or whole columns vanish with no trace.
+    n_cols = max([len(headers)] + [len(r.get("values") or []) for r in shown] or [0])
+    labels = [headers[i] if i < len(headers) else f"col {col_offset + i + 1}"
+              for i in range(n_cols)]
+    widths = [
+        max(len(labels[i]), *(len(cell((r.get("values") or [None] * n_cols)[i]))
+                              for r in shown) if shown else 0, 3)
+        if n_cols else 0
+        for i in range(n_cols)
+    ]
+
     head = "  row │ " + " ".join(
-        f"{str(h)[:w]:>{w}}" + ("*" if col_offset + i in hi_cols else " ")
-        for i, (h, w) in enumerate(zip(headers, widths))
+        f"{labels[i]:>{widths[i]}}" + ("*" if col_offset + i in hi_cols else " ")
+        for i in range(n_cols)
     )
-    out = [head, "  " + _rule(len(head))]
-    for row in ev["rows"][:20]:
+    out = [head, "  " + _rule(min(len(head), 200))]
+    for row in shown:
         idx = int(row.get("row_idx") or 0)
         mark = "▸" if idx in hi_rows else " "
+        values = row.get("values") or []
         cells = " ".join(
-            f"{cell(v)[:w]:>{w}} " for v, w in zip(row.get("values") or [], widths)
+            f"{cell(values[i]) if i < len(values) else '':>{widths[i]}} "
+            for i in range(n_cols)
         )
         out.append(f"{mark} {idx:>3} │ {cells}")
-    if len(ev["rows"]) > 20:
-        out.append(f"  … {len(ev['rows']) - 20} more rows")
+    if len(rows) > _EVIDENCE_ROW_LIMIT:
+        out.append(f"  … {len(rows) - _EVIDENCE_ROW_LIMIT} more rows in this window")
+    if ev.get("truncated"):
+        # The scan clipped the window before it ever reached here, so the table
+        # above is not the whole block.
+        out.append("  ! this evidence window was trimmed by the scan; it does not "
+                   "show the full block")
     out.append("  (* highlighted column, ▸ highlighted row)")
     return out
 

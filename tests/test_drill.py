@@ -249,6 +249,124 @@ def test_match_is_keyed_on_the_same_tuple_as_the_seed_id():
     )
 
 
+def test_explain_renders_the_actual_evidence_numbers(scan):
+    """C1: the evidence payload had no test at all.
+
+    `"evidence" in detail` is satisfied by None, and `"evidence:" in stdout` is
+    the heading, printed unconditionally. Neither notices if the table is empty,
+    truncated to one row, or never rendered — in the layer whose whole purpose is
+    letting a reviewer compare exact digits against the paper.
+    """
+    from paperconan._drill_render import render_explain
+
+    view = overview(scan)
+    detailed = None
+    for loc in view["locations"]:
+        for group in drill(scan, loc["n"])["by_kind"]:
+            for f in drill(scan, loc["n"], kind=group["kind"])["findings"]:
+                d = explain(scan, f["finding_id"])
+                if (d.get("evidence") or {}).get("rows"):
+                    detailed = d
+                    break
+            if detailed:
+                break
+        if detailed:
+            break
+    assert detailed, "fixture produced no finding with an evidence table"
+
+    rows = detailed["evidence"]["rows"]
+    text = render_explain(detailed)
+
+    rendered_rows = [ln for ln in text.splitlines() if "│" in ln]
+    assert len(rendered_rows) >= min(len(rows), 5) + 1, (
+        "evidence table rendered fewer rows than it holds"
+    )
+    # actual recorded values must appear, not just the heading
+    checked = 0
+    for row in rows[:3]:
+        for value in (row.get("values") or [])[:3]:
+            if isinstance(value, float):
+                assert f"{value:.10g}"[:8] in text or repr(value)[:8] in text, (
+                    f"recorded value {value} does not appear in the rendered table"
+                )
+                checked += 1
+    assert checked, "no numeric cells were checked; fixture is unsuitable"
+
+
+def test_evidence_values_are_never_silently_shortened():
+    """A clipped number is worse than a missing one: this table exists so exact
+    digits can be compared against the paper."""
+    from paperconan._drill_render import _render_evidence
+
+    ev = {
+        "headers": ["a", "b"],
+        "col_offset": 0,
+        "rows": [{"row_idx": 2, "values": [-1.2345678e-100, 98765432.123456]}],
+    }
+
+    text = "\n".join(_render_evidence(ev))
+
+    assert "-1.2345678e-100" in text, "a tiny magnitude was clipped"
+    assert "98765432.123456" in text, "a long value was clipped"
+
+
+def test_evidence_says_when_the_scan_itself_trimmed_the_window():
+    from paperconan._drill_render import _render_evidence
+
+    ev = {"headers": ["a"], "rows": [{"row_idx": 2, "values": [1.0]}], "truncated": True}
+
+    assert "trimmed by the scan" in "\n".join(_render_evidence(ev))
+
+
+def test_evidence_shows_columns_that_have_no_header():
+    """zip(values, headers) silently dropped the tail; whole columns vanished."""
+    from paperconan._drill_render import _render_evidence
+
+    ev = {"headers": ["a"], "rows": [{"row_idx": 2, "values": [1.0, 42.5, 7.25]}]}
+
+    text = "\n".join(_render_evidence(ev))
+
+    assert "42.5" in text and "7.25" in text
+
+
+def test_a_cross_sheet_finding_resolves_to_its_parameters(scan):
+    """The cross-sheet lookup could be disabled entirely without a test noticing."""
+    view = overview(scan)
+    cross = [loc for loc in view["locations"] if loc["scope"] == "cross_sheet"]
+    assert cross, "fixture has no cross-sheet location"
+
+    loc = cross[0]
+    kind = drill(scan, loc["n"])["by_kind"][0]["kind"]
+    fid = drill(scan, loc["n"], kind=kind)["findings"][0]["finding_id"]
+
+    detail = explain(scan, fid)
+
+    assert detail["parameters"], (
+        "cross-sheet finding resolved to nothing; explain would show an empty shell"
+    )
+
+
+def test_the_projected_severity_comes_from_the_scan_not_the_seed(scan):
+    """I4: forcing effective = raw left the suite green, though most of the
+    fixture's findings are genuinely demoted."""
+    view = overview(scan)
+    details = [
+        explain(scan, f["finding_id"])
+        for loc in view["locations"]
+        for group in drill(scan, loc["n"])["by_kind"]
+        for f in drill(scan, loc["n"], kind=group["kind"])["findings"]
+    ]
+
+    demoted = [d for d in details if d["severity"]["raw"] != d["severity"]["effective"]]
+
+    assert demoted, (
+        "no finding shows a raw/effective split; either the fixture stopped "
+        "producing demotions or the two values are being read from one source"
+    )
+    for d in demoted:
+        assert d["severity"]["context"]
+
+
 def test_explain_rejects_an_unknown_finding(scan):
     with pytest.raises(ValueError, match="no such finding"):
         explain(scan, "seed:doesnotexist")
@@ -294,7 +412,12 @@ def test_raising_the_limit_actually_reaches_the_declared_remainder(scan):
 
     assert capped["coverage"]["shown"] == 1
     assert full["coverage"]["shown"] == full["coverage"]["total"] == biggest["n"]
-    # the listing's own truncation notice is gone once nothing is held back...
+    # Positive first: a negative assertion is trivially satisfied if the notice
+    # is deleted outright, which is how this survived a passing mutation.
+    assert any("raise max_findings" in x for x in capped["coverage"]["limitations"]), (
+        "a truncated listing did not say it was truncated"
+    )
+    # gone once nothing is held back...
     assert not any("raise max_findings" in x for x in full["coverage"]["limitations"])
     # ...but scan-wide caveats are not this layer's to drop
     assert any("detector-level caps" in x for x in full["coverage"]["limitations"])
@@ -354,7 +477,23 @@ def test_a_truncated_overview_declares_what_it_left_out(scan):
     assert len(view["locations"]) == 1
     assert view["coverage"]["locations_not_shown"] > 0
     assert view["coverage"]["signals_not_shown"] > 0
-    assert view["coverage"]["limitations"]
+    # positive, not `assert limitations` — the always-present detector-caps line
+    # satisfies that on its own, so it says nothing about truncation
+    assert any("max_locations" in x for x in view["coverage"]["limitations"]), (
+        "a truncated overview did not say which locations it dropped"
+    )
+
+
+def test_an_all_locations_hidden_overview_does_not_read_as_a_clean_paper(scan):
+    """--max-locations 0 empties the page but not the scan; the all-clear text
+    would then contradict the header and the coverage line on one screen."""
+    from paperconan._drill_render import render_overview
+
+    text = render_overview(overview(scan, max_locations=0))
+
+    assert "no locations carry signal" not in text
+    assert "free of problems" not in text
+    assert "max_locations" in text
 
 
 def test_the_views_are_deterministic(scan):
