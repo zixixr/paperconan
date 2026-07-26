@@ -856,10 +856,15 @@ def test_every_scan_line_quoted_in_the_skill_is_one_the_code_can_emit():
     coverage = ScanCoverage(files_discovered=3)
     coverage.mark_file_failed("big.xlsx", "file_too_large")
     coverage.mark_file_failed("notes.xlsx", "unreadable")
+    coverage.add_limitation("file", "formula_cache_unreadable", file="m.xlsx")
+    # Field-for-field as _audit.py passes them: `count` is the population and
+    # `cells` a bounded example list. An earlier fixture passed cells=812 as an
+    # int, so the skill quoted a shape production cannot emit and the guard
+    # accepted it -- both sides supplying the same fiction.
     coverage.add_limitation("sheet", "formula_cache_missing", file="m.xlsx",
-                            sheet="Fig 3b", cells=812)
-    coverage.add_limitation("report", "report_block_limit", file="m.xlsx",
-                            sheet="Fig 3b", count=200)
+                            sheet="Fig 3b", count=812, cells=["C4", "C5", "C6"])
+    coverage.mark_blocks_skipped(3, scope="sheet", reason="report_block_limit",
+                                 file="m.xlsx", sheet="Fig 3b")
     # Read from production, not hardcoded: with both sides self-supplied, moving
     # a default left SKILL.md quoting a limit the code no longer emits while this
     # test stayed green.
@@ -898,10 +903,13 @@ _SCAN_REASONS_NOT_IN_SKILL = {
     # formula_cache_missing is NOT here: per _formula_cache.py a formula cell
     # with no cached value is invisible to the numeric audit, so it is a silent
     # under-read and the skill quotes it.
-    # Inspection itself failed, so how many cells went unread is unknown. Quoting
-    # a count would overstate what the record knows; the missing-cache line above
-    # it already teaches the agent what the class means.
-    "formula_cache_unreadable",
+    # The two bounds that stop the formula-cache inspection early. They render
+    # as "formula metadata byte limit ..." / "... sheet limit ...", both named in
+    # the skill's `formula cache unreadable` bullet as the same class -- the
+    # inspection did not complete, so whether cells went unread is unknown. A
+    # line each would repeat that with no new instruction.
+    "formula_metadata_byte_limit",
+    "formula_metadata_sheet_limit",
     # Two of detect_recurring_row_vectors' budgets. They read as
     # "detector cross figure budget limit ..." — recognisable from the quoted
     # compute-budget example, and quoting every budget variant would bloat the
@@ -928,7 +936,11 @@ def test_every_limitation_reason_is_either_quoted_in_the_skill_or_listed_as_unqu
     # loose regex picks up unrelated names like a test's "file_a".
     reason_arg = {"add_limitation": 1, "_note_detector_cap": 2,
                   "mark_file_failed": 1, "mark_sheet_skipped": 2,
-                  "mark_blocks_skipped": 2}
+                  "mark_blocks_skipped": 2,
+                  # Raised, not recorded: the exception carries the reason to
+                  # _audit's `exc.reason` forward, so its raise sites are where
+                  # those names are actually written.
+                  "OoxmlFormulaInspectionLimit": 0}
     # Reasons also arrive as keywords, and one is a non-literal (exc.reason).
     # Skipping either silently is how three reasons drifted past the first
     # version of this guard, so a non-literal is collected as a marker and has to
@@ -965,9 +977,12 @@ def test_every_limitation_reason_is_either_quoted_in_the_skill_or_listed_as_unqu
 
     # Non-literal reason arguments are accounted for rather than dropped: a
     # silent skip is how a reason reaches production without anyone deciding
-    # whether the skill should name it. These three are pass-throughs -- two
-    # helper forwards and _extract's exception, whose own reasons are literals
-    # collected at their raise sites -- so they introduce no new name.
+    # whether the skill should name it. `reason` is the parameter name on the
+    # four helpers that forward it (_coverage's three recorders and
+    # _note_detector_cap); `exc.reason` is _audit forwarding
+    # OoxmlFormulaInspectionLimit, whose own names are literals at the raise
+    # sites -- which are only collected because that constructor is in the map
+    # above. Neither introduces a name this walk has not already seen.
     expected_pass_throughs = {"reason", "exc.reason"}
     assert non_literal <= expected_pass_throughs, (
         f"a reason is built rather than written literally: "

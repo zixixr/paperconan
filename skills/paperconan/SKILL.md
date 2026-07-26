@@ -82,12 +82,20 @@ Three things to hold onto while reading:
   - `scan: file too large in big.xlsx` — a file that was not read at all.
     `scan: unreadable in notes.xlsx` is the same class: nothing in that file was
     examined.
-  - `scan: formula cache missing in m.xlsx Fig 3b (cells=812)` — that many
-    formula cells stored no cached value, so paperconan never saw the numbers
-    they compute. Those cells were **not** audited; the sheet is partly unread.
-  - `scan: report block limit in m.xlsx Fig 3b (count=200)` — block collection
-    for that sheet stopped at an output budget, so later blocks were never
-    analysed. Raise `PAPERCONAN_MAX_REPORT_BLOCKS`.
+  - `scan: formula cache missing in m.xlsx Fig 3b (cells=['C4', 'C5', 'C6'], count=812)`
+    — `count` is how many formula cells stored no cached value; `cells` is a
+    short list of examples, not the whole set. paperconan never saw the numbers
+    those cells compute, so they were **not** audited and the sheet is partly
+    unread.
+  - `scan: formula cache unreadable in m.xlsx` — the formula-cache inspection
+    itself did not complete, so paperconan cannot say whether that file has
+    unread formula cells. Absence of a `formula cache missing` line for it
+    proves nothing. `formula metadata byte limit` and `formula metadata sheet
+    limit` are the same class, naming which bound stopped the inspection.
+  - `scan: report block limit in m.xlsx Fig 3b (count=3)` — block collection for
+    that sheet stopped at an output budget, so later blocks were never analysed.
+    Two budgets emit this same line: raise `PAPERCONAN_MAX_REPORT_BLOCKS`, and if
+    that changes nothing raise `PAPERCONAN_MAX_TOTAL_FINDINGS`.
   - `scan: detector candidate pool limit in detect_short_row_reuse (limit=400)` —
     a detector stopped building candidates at its cap, so rows past it were never
     compared.
