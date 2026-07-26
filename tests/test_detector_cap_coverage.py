@@ -161,10 +161,11 @@ def _two_sheets():
 def test_each_capped_detector_reports_reaching_its_finding_limit(name):
     """Every capped detector is wired to the coverage object.
 
-    Behavioural where the fixture can drive the detector past its cap;
-    structural where it cannot. Skipping the latter would make an unwired
-    detector look the same as an un-driven one, which is the gap this whole
-    change exists to close.
+    Behavioural for all five: each gets a fixture built to its own gates and is
+    driven past its cap for real. An earlier version fell back to asserting on
+    inspect.getsource() where the shared fixture produced nothing, which made an
+    unwired detector look the same as an un-driven one -- and passed for a call
+    carrying the wrong reason string and for one made unreachable.
     """
     import paperconan._audit as audit
 
@@ -565,3 +566,100 @@ def test_a_block_past_the_row_cap_loses_relations_and_says_nothing(tmp_path):
     assert "constant_ratio_row" in under, "fixture no longer plants a detectable relation"
     assert "constant_ratio_row" not in over, "the row cap no longer drops it -- delete this test"
     assert scan_over["scan_status"] == "complete", "the gap is now reported; update this test"
+
+
+# ---------- the production wiring, not just the detector ----------
+
+_WIRED_AT_SCAN_DIR = (
+    "detect_row_relations",
+    "detect_recurring_row_vectors",
+    "detect_scaled_row_reuse",
+    "detect_short_row_reuse",
+    "detect_within_row_shared_fraction",
+    "detect_row_pair_shared_fraction",
+)
+
+
+@pytest.mark.parametrize("name", _WIRED_AT_SCAN_DIR)
+def test_scan_dir_hands_each_wired_detector_its_coverage(tmp_path, monkeypatch, name):
+    """The kwarg at the call site, not the parameter in the signature.
+
+    Every other test in this file calls the detectors directly with an explicit
+    coverage=, so all of them stayed green when `, coverage=coverage` was deleted
+    from four of the six scan_dir call sites. A detector that accepts coverage
+    and is never handed one reports nothing, which is the defect this file
+    exists to prevent -- so assert on what scan_dir actually passes.
+    """
+    import paperconan._audit as audit
+
+    seen = {}
+    original = getattr(audit, name)
+
+    def spy(*args, **kwargs):
+        seen["coverage"] = kwargs.get("coverage", "NOT PASSED")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(audit, name, spy)
+    _panel(tmp_path / "d" / "p.csv")
+    scan_dir(str(tmp_path / "d"), str(tmp_path / "out"), write_html=False)
+
+    assert seen, f"{name} was never called by scan_dir; this test cannot see its wiring"
+    assert isinstance(seen["coverage"], ScanCoverage), (
+        f"scan_dir called {name} with coverage={seen['coverage']!r}; a cap it hits "
+        f"would reach no channel"
+    )
+
+
+def test_the_packet_renders_limitations_as_sentences_not_dict_reprs(tmp_path):
+    """_describe_scan_limitation is only reachable through _coverage_for.
+
+    Tested in isolation it stays green while the packet goes back to emitting
+    `{'scope': 'detector', ...}` at the reader.
+    """
+    from paperconan._workflow import _coverage_for
+
+    coverage = ScanCoverage(files_discovered=1)
+    coverage.add_limitation("detector", "detector_finding_limit",
+                            detector="detect_short_row_reuse", limit=60)
+    scan = {"scan_status": "partial", "coverage": coverage.to_dict()}
+
+    blob = " ".join(_coverage_for(scan, [], [], [], 100)["limitations"])
+
+    assert "detect_short_row_reuse" in blob, "the detector name did not reach the packet"
+    for repr_marker in ("{", "'scope'", "'reason'"):
+        assert repr_marker not in blob, f"a Python repr reached the reader: {blob!r}"
+
+
+def test_a_tall_band_loses_scaled_row_reuse_and_says_nothing():
+    """The second site gated on _ROW_REL_MAX_ROWS, pinned like the first.
+
+    _scaled_row_candidates drops any band taller than the constant, so at 61
+    rows this detector goes silent entirely -- including identical_row_reuse,
+    verbatim row copies across sheets. A band's height says nothing about
+    whether one of its rows is a scalar multiple of a row in another sheet, so
+    this is a cost cap, not orientation. Deliberate for now and covered only by
+    the workflow's over-broad caveat; if it is ever raised or reported, this
+    test fails loudly and should be updated.
+    """
+    import paperconan._audit as audit
+    from paperconan._sheet import Sheet
+
+    vec = (13.40712, 27.91834, 8.52619, 41.06375, 19.73408, 33.28951, 22.61483,
+           9.34026, 37.15792, 14.80613, 29.47158, 6.92374, 31.08627, 17.25913)
+
+    def sheets(n_rows):
+        grids = {}
+        for idx, name in enumerate(("Figure 1a", "Figure 2b")):
+            rows = [[f"c{j}" for j in range(len(vec))]]
+            for i in range(n_rows):
+                rows.append([round(v * (1 + 0.031 * i) + 0.7 * i, 5) for v in vec])
+            if idx == 1:
+                rows[1] = [round(3.0 * v, 6) for v in rows[1]]
+            grids[(f"{name}.csv", name)] = Sheet.from_rows(rows)
+        return grids
+
+    under = audit.detect_scaled_row_reuse(sheets(60), profile="review", max_findings=10**6)
+    over = audit.detect_scaled_row_reuse(sheets(61), profile="review", max_findings=10**6)
+
+    assert under, "fixture no longer produces cross-sheet row reuse at 60 rows"
+    assert not over, "the band ceiling no longer silences this detector -- update this test"

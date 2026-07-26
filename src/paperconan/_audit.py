@@ -1298,9 +1298,19 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=None):
     # scans and train readers to skip the coverage line. The workflow's
     # deliberately over-broad caveat ("too wide or too tall") is what covers it,
     # and test_a_block_past_the_row_cap_loses_relations_and_says_nothing pins
-    # the loss so it cannot widen unnoticed. The cap is also ~15x tighter than
-    # _ROW_REL_BUDGET, which bounds the same loop and *does* report — raising it
-    # is a detection change and belongs in its own PR.
+    # the loss so it cannot widen unnoticed. Note that caveat lives in the
+    # workflow packet only — a plain `paperconan <dir>` run gets scan.json and
+    # report.html, neither of which carries it.
+    #
+    # _ROW_REL_MAX_ROWS is also the gate in _scaled_row_candidates, so the same
+    # constant drops a second detector; that site has its own note.
+    #
+    # At the 12-14 column shapes above, this ceiling is ~15x tighter than
+    # _ROW_REL_BUDGET, which bounds the same loop and *does* report. The two
+    # cross near 3,400 columns and past that the budget is the tighter one — so
+    # "redundant" holds for ordinary panels, not for the genome-scale wide
+    # blocks this detector also covers. Raising it is a detection change (recall
+    # against cost and false positives) and belongs in its own PR.
     if n_rows < 2 or n_cols < _ROW_REL_MIN_COLS or n_rows > _ROW_REL_MAX_ROWS:
         return findings
 
@@ -3298,7 +3308,14 @@ def _scaled_row_candidates(grid_sheets):
     for (fname, sname), sheet in grid_sheets.items():
         for bi, (r0, r1) in enumerate(_row_bands(sheet)):
             if (r1 - r0) < 2 or (r1 - r0) > _ROW_REL_MAX_ROWS:
-                continue                                  # tall matrices are not this orientation
+                # Second site sharing _ROW_REL_MAX_ROWS, and it is a cost cap here
+                # too, not orientation: a band's height says nothing about whether
+                # a row in it is a scalar multiple of a row in *another* band or
+                # sheet, which is what this detector compares. A 61-row band drops
+                # out entirely, taking identical_row_reuse with it. Unreported, for
+                # the same reason as detect_row_relations' ceiling — see the note
+                # there, and test_a_tall_band_loses_scaled_row_reuse_and_says_nothing.
+                continue
             for r in range(r0, r1):
                 a = sheet.numeric[r, :]
                 finite = a[~np.isnan(a)]
@@ -3392,13 +3409,18 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
                 _capped = True
                 break
         if budget <= 0 or len(findings) >= max_findings:
-            # only the result-cap arm is a finding limit; a spent compute
-            # budget is reported separately and may have found nothing
+            # This `if` fires on either arm; only the result-cap arm is a
+            # finding limit, since a spent compute budget is reported separately
+            # and may have found nothing. Belt-and-braces: the inner break
+            # already sets _capped on the result-cap path, so this re-assert is
+            # a no-op today. It is kept so a future append path that forgets the
+            # inner flag still attributes correctly rather than silently.
             _capped = _capped or len(findings) >= max_findings
             break
     if truncated or budget <= 0:
-        # Never silently cap coverage — say what was bounded (stderr only; scan.json stays
-        # deterministic). Real condition-layout papers stay far under these limits.
+        # Never silently cap coverage — say what was bounded, on stderr for a human
+        # watching the run and in scan.json for every downstream consumer. Real
+        # condition-layout papers stay far under these limits.
         print(f"[paperconan] detect_scaled_row_reuse: coverage bounded "
               f"(candidates={len(cands)}{'+truncated' if truncated else ''}, "
               f"budget_exhausted={budget <= 0})", file=sys.stderr)
@@ -3708,8 +3730,12 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
                     _capped = True
                     break
             if budget <= 0 or len(findings) >= max_findings:
-                # only the result-cap arm is a finding limit; a spent compute
-                # budget is reported separately and may have found nothing
+                # This `if` fires on either arm; only the result-cap arm is a
+                # finding limit, since a spent compute budget is reported separately
+                # and may have found nothing. Belt-and-braces: the inner break
+                # already sets _capped on the result-cap path, so this re-assert is
+                # a no-op today. It is kept so a future append path that forgets the
+                # inner flag still attributes correctly rather than silently.
                 _capped = _capped or len(findings) >= max_findings
                 break
 
@@ -3797,8 +3823,12 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
                     break
 
         if budget <= 0 or len(findings) >= max_findings:
-            # only the result-cap arm is a finding limit; a spent compute
-            # budget is reported separately and may have found nothing
+            # This `if` fires on either arm; only the result-cap arm is a
+            # finding limit, since a spent compute budget is reported separately
+            # and may have found nothing. Belt-and-braces: the inner break
+            # already sets _capped on the result-cap path, so this re-assert is
+            # a no-op today. It is kept so a future append path that forgets the
+            # inner flag still attributes correctly rather than silently.
             _capped = _capped or len(findings) >= max_findings
             break
     if budget <= 0:
@@ -3939,8 +3969,12 @@ def detect_within_row_shared_fraction(grid_sheets, profile="review", max_finding
                 _capped = True
                 break
         if budget <= 0 or len(findings) >= max_findings:
-            # only the result-cap arm is a finding limit; a spent compute
-            # budget is reported separately and may have found nothing
+            # This `if` fires on either arm; only the result-cap arm is a
+            # finding limit, since a spent compute budget is reported separately
+            # and may have found nothing. Belt-and-braces: the inner break
+            # already sets _capped on the result-cap path, so this re-assert is
+            # a no-op today. It is kept so a future append path that forgets the
+            # inner flag still attributes correctly rather than silently.
             _capped = _capped or len(findings) >= max_findings
             break
     if budget <= 0:
@@ -4057,13 +4091,21 @@ def detect_row_pair_shared_fraction(grid_sheets, profile="review", max_findings=
                     _capped = True
                     break
             if budget <= 0 or len(findings) >= max_findings:
-                # only the result-cap arm is a finding limit; a spent compute
-                # budget is reported separately and may have found nothing
+                # This `if` fires on either arm; only the result-cap arm is a
+                # finding limit, since a spent compute budget is reported separately
+                # and may have found nothing. Belt-and-braces: the inner break
+                # already sets _capped on the result-cap path, so this re-assert is
+                # a no-op today. It is kept so a future append path that forgets the
+                # inner flag still attributes correctly rather than silently.
                 _capped = _capped or len(findings) >= max_findings
                 break
         if budget <= 0 or len(findings) >= max_findings:
-            # only the result-cap arm is a finding limit; a spent compute
-            # budget is reported separately and may have found nothing
+            # This `if` fires on either arm; only the result-cap arm is a
+            # finding limit, since a spent compute budget is reported separately
+            # and may have found nothing. Belt-and-braces: the inner break
+            # already sets _capped on the result-cap path, so this re-assert is
+            # a no-op today. It is kept so a future append path that forgets the
+            # inner flag still attributes correctly rather than silently.
             _capped = _capped or len(findings) >= max_findings
             break
     if budget <= 0:
@@ -4110,7 +4152,7 @@ _MAX_CELLS = int(os.environ.get("PAPERCONAN_MAX_CELLS", "10000000"))
 _OOXML_FORMULA_INSPECT = os.environ.get(
     "PAPERCONAN_OOXML_FORMULA_INSPECT", "1") not in ("0", "false", "False", "")
 # Wide blocks (dense correlation matrices) blow up the O(col²) relation/equal-pair detectors in
-# both compute time and output size (scan.json / report.html). Skip just those two detectors when
+# both compute time and output size (scan.json / report.html). Skip those three detectors when
 # a block is wider than this; the cheap column-wise detectors still run. 0 disables the skip.
 _MAX_BLOCK_COLS = int(os.environ.get("PAPERCONAN_MAX_BLOCK_COLS", "120"))
 # Output cap: each finding embeds a table-snippet as evidence, so a paper with thousands of
@@ -4357,8 +4399,11 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 blocks_analyzed_here += 1
                 header = header_for(sheet, r0, c0, c1)
                 # On very wide blocks (dense correlation matrices) the O(col²) relation and
-                # equal-pair detectors explode in compute + output, so skip just those two; the
-                # column-wise detectors below still run. (_MAX_BLOCK_COLS=0 disables the skip.)
+                # equal-pair detectors explode in compute + output, so skip those three
+                # (relations, equal_pairs, row_pair_digit_coupling); the column-wise
+                # detectors below still run. (_MAX_BLOCK_COLS=0 disables the skip.)
+                # Unreported: this is one of the whole-detector skips the workflow's
+                # over-broad "too wide or too tall" caveat stands in for.
                 wide = _MAX_BLOCK_COLS and (c1 - c0) > _MAX_BLOCK_COLS
                 rel = [] if wide else detect_relations(sheet, r0, r1, c0, c1, header)
                 ap = detect_arithmetic_progression(sheet, r0, r1, c0, c1, header)

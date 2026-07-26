@@ -71,8 +71,8 @@ Three things to hold onto while reading:
   They state what was not shown and why: locations beyond
   the listed count, findings beyond a listing limit, families this layer does not
   route (digit distributions, decimal endings, image findings), findings the scan's
-  own caps dropped before the layers saw them, and detector-level caps that are
-  reported nowhere at all. Raise `--max-locations` / `--max-findings` to reach the
+  own caps dropped before the layers saw them, and detector-level caps that still
+  reach no channel. Raise `--max-locations` / `--max-findings` to reach the
   remainder; the rest are limits of the scan, not of the view.
 - **A quiet overview is not a clean paper.** It means these detectors found
   nothing at these thresholds in the data that was supplied.

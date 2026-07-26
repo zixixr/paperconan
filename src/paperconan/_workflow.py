@@ -40,8 +40,10 @@ NUMERIC_CANONICALIZATION_VERSION = 1
 # record into ScanCoverage. Many resource caps still do not. Two that anyone can
 # check from the source: scan_dir's `wide` gate drops detect_relations,
 # detect_equal_pairs and detect_row_pair_digit_coupling outright past
-# _MAX_BLOCK_COLS, and detect_row_relations' row ceiling loses an exact relation
-# at 61 rows -- both while the scan reports itself complete. So this stays
+# _MAX_BLOCK_COLS, and _ROW_REL_MAX_ROWS silently disables two detectors at 61
+# rows -- detect_row_relations loses an exact relation, and _scaled_row_candidates
+# drops the band entirely, taking identical_row_reuse with it. All while the scan
+# reports itself complete. So this stays
 # False: the caveat below is over-broad, but it is true, and a wrong all-clear
 # is worse than a broad warning. No count is given here on purpose; an earlier
 # version cited one that no reader could verify and that would drift silently
@@ -418,9 +420,10 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
         dropped = int(scan_coverage.get("limitations_omitted") or 0)
         if dropped:
             limitations.append(
-                f"scan: {dropped} further limitations were recorded but dropped by the "
-                f"record cap (PAPERCONAN_MAX_LIMITATIONS); the scan lines above are a "
-                f"sample, not the whole set"
+                f"scan: {dropped} further limitation records were dropped by the record "
+                f"cap (PAPERCONAN_MAX_LIMITATIONS); the scan lines above are a sample, "
+                f"not the whole set. Records, not distinct causes: repeats of one cause "
+                f"past the cap are each counted, so this bounds what was lost from above"
             )
 
     unseeded = {
@@ -472,11 +475,11 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
         "families_not_seeded": unseeded,
         "coverage_complete": not limitations,
         "limitations": limitations,
-        # Known blind spot, stated rather than implied: several detectors stop at
-        # their own `max_findings` or compute budget and report that only on
-        # stderr, so it reaches neither scan_status nor findings_omitted. Until
-        # those are wired into ScanCoverage, `coverage_complete` means "complete
-        # as far as the scan reported", not "every finding was seeded".
+        # Known blind spot, stated rather than implied. Six detectors now record
+        # their result caps and compute budgets through ScanCoverage; the rest of
+        # the resource caps still reach no channel, so `coverage_complete` means
+        # "complete as far as the scan reported", not "every finding was seeded".
+        # See the caveat assembled above for what that leaves out.
         "detector_caps_reported": DETECTOR_CAPS_REPORTED,
     }
 
