@@ -501,7 +501,9 @@ def test_the_unreported_cap_caveat_reaches_the_packet(tmp_path):
     assert any("still not reported" in x for x in packet["coverage"]["limitations"]), (
         packet["coverage"]["limitations"]
     )
-    assert packet["coverage"]["coverage_complete"] is False
+    # Not asserting coverage_complete: the blanket caveat is appended whenever
+    # DETECTOR_CAPS_REPORTED is False, which is hardcoded, so that flag is False
+    # on a wholly clean scan too and cannot discriminate.
 
 
 # ---------- the record cap itself ----------
@@ -708,6 +710,18 @@ def test_the_html_coverage_row_distinguishes_one_capped_detector_from_another(tm
     )
     assert "limit=60" in html, "the cap value did not reach the report"
 
+    # A pool record separately: `candidates` is the quantity that says how much
+    # was dropped, and rendering only `limit` shows the reader the cap back at
+    # themselves. Only detect_scaled_row_reuse emits it, so the two-record
+    # fixture above cannot cover it.
+    pool = ScanCoverage(files_discovered=1)
+    pool.add_limitation("detector", "detector_candidate_pool_limit",
+                        detector="detect_scaled_row_reuse", candidates=1800, limit=1500)
+    pool_html = _render_scan_status({"scan_status": "partial", "coverage": pool.to_dict()})
+    assert "1800" in pool_html, (
+        f"the pool size did not reach the report: {pool_html}"
+    )
+
 
 def test_a_truncated_candidate_pool_reports_the_pool_not_the_cap(tmp_path, capsys):
     """The one number on the record has to say how much was dropped.
@@ -841,4 +855,77 @@ def test_every_scan_line_quoted_in_the_skill_is_one_the_code_can_emit():
     assert not unemittable, (
         f"SKILL.md quotes {len(unemittable)} scan: line(s) the code does not emit: "
         f"{unemittable}\nemitted here: {sorted(emitted)}"
+    )
+
+
+# Reasons the skill deliberately does not quote. Listing them here rather than
+# leaving the check one-directional: an agent that meets an unfamiliar `scan:`
+# line is likelier to skim it as noise than to be misled by an invented one, so
+# omission is the more dangerous direction. Adding a reason to the code without
+# deciding which side it belongs on now fails the test below.
+_SCAN_REASONS_NOT_IN_SKILL = {
+    # Renders exactly like the quoted file line with the sheet name appended, and
+    # the bullet says so in prose.
+    "sheet_too_large",
+    # Provenance of a formula sidecar, not a bound on what was searched: no
+    # numeric coverage is lost, so it does not change how a result is read.
+    "formula_cache_missing",
+    "formula_cache_unreadable",
+    # Two of detect_recurring_row_vectors' budgets. They read as
+    # "detector cross figure budget limit ..." — recognisable from the quoted
+    # compute-budget example, and quoting every budget variant would bloat the
+    # bullet without teaching the agent anything new.
+    "detector_cross_figure_budget_limit",
+    "detector_within_row_budget_limit",
+}
+
+
+def test_every_limitation_reason_is_either_quoted_in_the_skill_or_listed_as_unquoted():
+    """The reverse direction: a reason the code can emit and nobody decided about.
+
+    The forward check stops SKILL.md inventing shapes. On its own it says nothing
+    about the ones the code emits and the skill omits -- and under a heading that
+    reads as an enumeration, an unlisted line is read as noise. This forces a
+    decision per reason rather than letting the set drift.
+    """
+    import ast
+    from pathlib import Path
+
+    # Extracted from the call sites, not by pattern-matching identifiers: the
+    # reason is a positional literal whose index depends on the helper, and a
+    # loose regex picks up unrelated names like a test's "file_a".
+    reason_arg = {"add_limitation": 1, "_note_detector_cap": 2,
+                  "mark_file_failed": 1, "mark_sheet_skipped": 2}
+    src = Path(__file__).resolve().parents[1] / "src" / "paperconan"
+    reasons = set()
+    for path in sorted(src.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+            idx = reason_arg.get(name)
+            if idx is None or len(node.args) <= idx:
+                continue
+            arg = node.args[idx]
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                reasons.add(arg.value)
+
+    assert reasons, "no limitation reasons found; did the helpers get renamed?"
+
+    skill = (Path(__file__).resolve().parents[1] / "skills" / "paperconan"
+             / "SKILL.md").read_text(encoding="utf-8")
+
+    def shown(reason):
+        # _describe_scan_limitation renders a reason by stripping the _limit
+        # suffix and swapping underscores for spaces.
+        return reason.replace("_limit", "").replace("_", " ") in skill
+
+    undecided = sorted(r for r in reasons
+                       if r not in _SCAN_REASONS_NOT_IN_SKILL and not shown(r))
+    assert not undecided, (
+        f"{len(undecided)} limitation reason(s) are neither shown in SKILL.md nor "
+        f"listed as deliberately unquoted: {undecided}. Add an example to the skill, "
+        f"or add the reason to _SCAN_REASONS_NOT_IN_SKILL with a note saying why."
     )

@@ -57,7 +57,7 @@ DETECTOR_CAPS_REPORTED = False
 # surprise: on ten real supplementary-data sets, `scan_status` went from
 # "partial" on 3 to "partial" on essentially all of them, because the
 # candidate-pool caps genuinely truncate on ordinary inputs: any sheet with
-# more than 400 candidate rows trips _SHORT_ROW_MAX_ROWS_PER_SHEET or
+# 400 or more candidate rows trips _SHORT_ROW_MAX_ROWS_PER_SHEET or
 # _ROW_PAIR_MAX_ROWS_PER_SHEET, and supplements that size are routine.
 # Reporting it is right — those searches really were cut short —
 # but it means `partial` is now the normal state and carries little information
