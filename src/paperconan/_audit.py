@@ -2975,7 +2975,7 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
         # own; wiring only that one left the cross-figure index — the higher-value
         # signal, a tuple recurring across figures — truncating in silence.
         _note_detector_cap(coverage, "detect_recurring_row_vectors",
-                           "detector_compute_budget_limit", pass_="cross_figure")
+                           "detector_cross_figure_budget_limit")
 
     cands = []
     for vec, places in (occ.items() if cross_figure_possible else ()):
@@ -3104,7 +3104,7 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
         print("[paperconan] detect_recurring_row_vectors: within-row coverage bounded",
               file=sys.stderr)
         _note_detector_cap(coverage, "detect_recurring_row_vectors",
-                           "detector_compute_budget_limit")
+                           "detector_within_row_budget_limit")
     # One physical repeat yields many overlapping windows (k=4..8) — keep the strongest (most
     # copies, then longest) per row, dropping >=50%-cell-overlap duplicates.
     wr_cands.sort(key=lambda x: (-len(x[5]), -len(x[0])))
@@ -3385,8 +3385,15 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
         print(f"[paperconan] detect_scaled_row_reuse: coverage bounded "
               f"(candidates={len(cands)}{'+truncated' if truncated else ''}, "
               f"budget_exhausted={budget <= 0})", file=sys.stderr)
-        _note_detector_cap(coverage, "detect_scaled_row_reuse",
-                           "detector_compute_budget_limit", candidates=len(cands))
+        # Two distinct causes, reported separately: a truncated candidate pool is
+        # not a spent compute budget, and naming the wrong one sends a reader to
+        # the wrong knob. The stderr line above already prints both flags.
+        if truncated:
+            _note_detector_cap(coverage, "detect_scaled_row_reuse",
+                               "detector_candidate_pool_limit", candidates=len(cands))
+        if budget <= 0:
+            _note_detector_cap(coverage, "detect_scaled_row_reuse",
+                               "detector_compute_budget_limit")
     if _capped:
         _note_detector_cap(coverage, "detect_scaled_row_reuse", "detector_finding_limit",
                            limit=max_findings)

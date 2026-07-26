@@ -427,19 +427,20 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
             f"{len(omitted)} lower-ranked clusters were not routed"
         )
 
-    # Several detectors stop at their own max_findings or compute budget and
-    # report it to no channel at all — not scan_status, not findings_omitted,
-    # and for some paths not even stderr. Until they are wired into ScanCoverage
+    # Several detectors stop at their own limits. Some now record through
+    # ScanCoverage; an audit found others that still reach no channel at all —
+    # whole-detector skips on wide blocks, and result caps outside the wired
+    # set. Until every one is wired
     # (a scan-layer change, separate PR) the workflow cannot know whether a block
     # was fully enumerated, so it must not claim it was. Stating it here rather
     # than only in a side field means `coverage_complete` is false by
     # construction and the caveat reaches the CLI, which prints `limitations`.
     if not DETECTOR_CAPS_REPORTED:
         limitations.append(
-            "some detector resource caps are still not reported: a detector that "
-            "skipped a block for being too wide or too tall, or stopped at an "
-            "internal compute budget, may not appear above. Result caps "
-            "(max_findings) and the row-relation budget are reported."
+            "some detector caps are still not reported: a detector that skipped a "
+            "block for being too wide or too tall, or stopped at an internal "
+            "limit, may not appear above. What is reported appears in this list; "
+            "this line does not enumerate what is not."
         )
 
     return {

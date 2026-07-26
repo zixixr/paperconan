@@ -90,10 +90,10 @@ def _two_sheets():
 def test_each_capped_detector_reports_reaching_its_finding_limit(name):
     """Every capped detector is wired to the coverage object.
 
-    Uses max_findings=1 against a fixture rich enough that several of these
-    detectors produce more than one finding. Detectors the fixture cannot drive
-    past one are skipped rather than asserted vacuously — a detector that never
-    reaches its cap correctly records nothing.
+    Behavioural where the fixture can drive the detector past its cap;
+    structural where it cannot. Skipping the latter would make an unwired
+    detector look the same as an un-driven one, which is the gap this whole
+    change exists to close.
     """
     import paperconan._audit as audit
 
@@ -101,16 +101,28 @@ def test_each_capped_detector_reports_reaching_its_finding_limit(name):
 
     natural = len(getattr(audit, name)(_two_sheets(), profile="review",
                                        max_findings=10**6))
-    if natural < 2:
-        pytest.skip(f"{name} yields {natural} finding(s) on this fixture; "
-                    "cannot drive it past its cap")
+    if natural >= 2:
+        getattr(audit, name)(_two_sheets(), profile="review", max_findings=1,
+                             coverage=coverage)
+        reasons = [item["reason"] for item in coverage.to_dict()["limitations"]]
+        assert "detector_finding_limit" in reasons, (
+            f"{name} was cut short without recording it: {reasons}"
+        )
+        return
 
-    getattr(audit, name)(_two_sheets(), profile="review", max_findings=1,
-                         coverage=coverage)
+    # This fixture cannot drive the detector past its cap — its own gates
+    # (band separation, value frequency, precision) reject the shapes that
+    # would. Skipping here would be indistinguishable from the wiring being
+    # absent, so assert the wiring structurally instead: an unwired detector
+    # fails this, a merely un-driven one does not.
+    import inspect
 
-    reasons = [item["reason"] for item in coverage.to_dict()["limitations"]]
-    assert "detector_finding_limit" in reasons, (
-        f"{name} was cut short without recording it: {reasons}"
+    fn = getattr(audit, name)
+    assert "coverage" in inspect.signature(fn).parameters, f"{name} takes no coverage"
+    source = inspect.getsource(fn)
+    assert "_note_detector_cap" in source, f"{name} records no cap"
+    assert "_capped = _capped or len(findings) >= max_findings" in source, (
+        f"{name} does not set its result-cap flag at a break site"
     )
 
 
@@ -286,18 +298,25 @@ def test_a_result_cap_equal_to_the_natural_output_still_reports(tmp_path):
 
 # ---------- the three claims that outran their coverage ----------
 
+# (detector, budget constant, expected reason). detect_recurring_row_vectors has
+# two budgets with distinct reasons: sharing one would collapse them in the
+# coverage dedup key and the survivor would imply the other pass ran to
+# completion.
 _BUDGETS = (
-    ("detect_recurring_row_vectors", "_RECURRING_VEC_BUDGET"),
-    ("detect_scaled_row_reuse", "_SCALED_ROW_BUDGET"),
-    ("detect_short_row_reuse", "_SHORT_ROW_BUDGET"),
-    ("detect_within_row_shared_fraction", "_WITHIN_ROW_FRAC_BUDGET"),
-    ("detect_row_pair_shared_fraction", "_ROW_PAIR_FRAC_BUDGET"),
+    ("detect_recurring_row_vectors", "_RECURRING_VEC_BUDGET",
+     "detector_cross_figure_budget_limit"),
+    ("detect_recurring_row_vectors", "_WITHIN_ROW_VEC_BUDGET",
+     "detector_within_row_budget_limit"),
+    ("detect_scaled_row_reuse", "_SCALED_ROW_BUDGET", "detector_compute_budget_limit"),
+    ("detect_short_row_reuse", "_SHORT_ROW_BUDGET", "detector_compute_budget_limit"),
+    ("detect_within_row_shared_fraction", "_WITHIN_ROW_FRAC_BUDGET", "detector_compute_budget_limit"),
+    ("detect_row_pair_shared_fraction", "_ROW_PAIR_FRAC_BUDGET", "detector_compute_budget_limit"),
 )
 
 
-@pytest.mark.parametrize("detector,budget_const", _BUDGETS)
+@pytest.mark.parametrize("detector,budget_const,reason", _BUDGETS)
 def test_a_spent_budget_is_not_reported_as_a_result_cap(detector, budget_const,
-                                                        monkeypatch):
+                                                        reason, monkeypatch):
     """C1': a scripted rewrite folded two break conditions into one flag.
 
     A detector that exhausts its compute budget and returns nothing then
@@ -313,15 +332,19 @@ def test_a_spent_budget_is_not_reported_as_a_result_cap(detector, budget_const,
                                      max_findings=10**6, coverage=coverage)
 
     reasons = [i["reason"] for i in coverage.to_dict()["limitations"]]
-    assert not found, "budget of 1 should starve the detector"
-    assert "detector_finding_limit" not in reasons, (
-        f"{detector} produced nothing but reported a result cap: {reasons}"
-    )
+    # Some detectors have more than one budget, so starving one need not empty
+    # the result list. The invariant is the same either way: a spent budget is
+    # not a result cap, and must never be reported as one.
+    assert reason in reasons, f"{detector} spent its budget without saying so: {reasons}"
+    if not found:
+        assert "detector_finding_limit" not in reasons, (
+            f"{detector} produced nothing but reported a result cap: {reasons}"
+        )
 
 
-@pytest.mark.parametrize("detector,budget_const", _BUDGETS)
+@pytest.mark.parametrize("detector,budget_const,reason", _BUDGETS)
 def test_each_detector_reports_its_own_exhausted_budget(detector, budget_const,
-                                                        monkeypatch):
+                                                        reason, monkeypatch):
     """Pins the budget wiring itself — untestable while these were literals."""
     import paperconan._audit as audit
     monkeypatch.setattr(audit, budget_const, 1)
@@ -330,7 +353,26 @@ def test_each_detector_reports_its_own_exhausted_budget(detector, budget_const,
     getattr(audit, detector)(_two_sheets(), profile="review", coverage=coverage)
 
     named = [(i.get("detector"), i["reason"]) for i in coverage.to_dict()["limitations"]]
-    assert (detector, "detector_compute_budget_limit") in named, named
+    assert (detector, reason) in named, named
+
+
+def test_a_truncated_candidate_pool_is_not_called_a_budget_limit():
+    """Two causes, two names. The stderr line prints budget_exhausted=False while
+    the structured record used to say the budget was spent — sending a reader to
+    a knob that never moved."""
+    import paperconan._audit as audit
+
+    coverage = ScanCoverage(files_discovered=1)
+    audit.detect_scaled_row_reuse(_two_sheets(), profile="review",
+                                  max_candidates=3, max_findings=1,
+                                  coverage=coverage)
+
+    reasons = [i["reason"] for i in coverage.to_dict()["limitations"]]
+    if "detector_candidate_pool_limit" not in reasons:
+        pytest.skip("fixture no longer truncates the candidate pool")
+    assert "detector_compute_budget_limit" not in reasons, (
+        f"a full compute budget was reported as spent: {reasons}"
+    )
 
 
 def test_two_detectors_capped_at_once_are_both_named():
