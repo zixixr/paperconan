@@ -953,6 +953,16 @@ _ROW_REL_RTOL = float(os.environ.get("PAPERCONAN_ROW_REL_RTOL", "1e-3"))
 # under _MAX_CELLS) would otherwise cost ~minutes. Bound total pair*cols work; a
 # starved run stops early (stderr note) rather than hanging.
 _ROW_REL_BUDGET = int(os.environ.get("PAPERCONAN_ROW_REL_BUDGET", "6000000"))
+# The remaining detector compute budgets. Module constants rather than in-function
+# literals so a truncation they cause can be reproduced in a test and tuned by an
+# operator, per the PAPERCONAN_* convention — as in-function literals they were
+# untestable, which is why their wiring went unverified.
+_RECURRING_VEC_BUDGET = int(os.environ.get("PAPERCONAN_RECURRING_VEC_BUDGET", "3000000"))
+_WITHIN_ROW_VEC_BUDGET = int(os.environ.get("PAPERCONAN_WITHIN_ROW_VEC_BUDGET", "2000000"))
+_SCALED_ROW_BUDGET = int(os.environ.get("PAPERCONAN_SCALED_ROW_BUDGET", "4000000"))
+_SHORT_ROW_BUDGET = int(os.environ.get("PAPERCONAN_SHORT_ROW_BUDGET", "4000000"))
+_WITHIN_ROW_FRAC_BUDGET = int(os.environ.get("PAPERCONAN_WITHIN_ROW_FRAC_BUDGET", "8000000"))
+_ROW_PAIR_FRAC_BUDGET = int(os.environ.get("PAPERCONAN_ROW_PAIR_FRAC_BUDGET", "40000000"))
 
 
 def _note_detector_cap(coverage, detector: str, reason: str, **details) -> None:
@@ -2935,7 +2945,7 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
     cross_figure_possible = (
         len({figure_key(s) for (_f, s) in grid_sheets if figure_key(s) is not None}) >= 2)
     occ = {}   # rounded tuple -> list of (file, sheet, figure_key, row, start_col)
-    budget = 3_000_000   # bound worst-case work on genome-scale papers (linear, but many blocks)
+    budget = _RECURRING_VEC_BUDGET   # worst-case work on genome-scale papers
     # The window index feeds ONLY the cross-figure path; skip building it entirely otherwise
     # (the within-row pass below scans rows directly).
     for (fname, sname), sheet in (grid_sheets.items() if cross_figure_possible else ()):
@@ -2960,6 +2970,12 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
                 break
         if budget <= 0:
             break
+    if cross_figure_possible and budget <= 0:
+        # The second budget in this function. The within-row pass below has its
+        # own; wiring only that one left the cross-figure index — the higher-value
+        # signal, a tuple recurring across figures — truncating in silence.
+        _note_detector_cap(coverage, "detect_recurring_row_vectors",
+                           "detector_compute_budget_limit", pass_="cross_figure")
 
     cands = []
     for vec, places in (occ.items() if cross_figure_possible else ()):
@@ -3028,7 +3044,7 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
     # sparse sub-panel (S2H sits in columns the grid segmentation never blocks) would otherwise
     # be invisible. Same gates as the cross-figure path; the repeat corroborates itself, so one
     # figure namespace is enough.
-    wr_budget = 2_000_000
+    wr_budget = _WITHIN_ROW_VEC_BUDGET
     wr_cands = []
     for (fname, sname), sheet in grid_sheets.items():
         fk = figure_key(sname)
@@ -3303,7 +3319,7 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
         cands = cands[:max_candidates]
     findings = []
     _capped = False   # set only where a loop is actually abandoned
-    budget = 4_000_000
+    budget = _SCALED_ROW_BUDGET
     for i in range(len(cands)):
         A = cands[i]
         for j in range(i + 1, len(cands)):
@@ -3359,7 +3375,9 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
                 _capped = True
                 break
         if budget <= 0 or len(findings) >= max_findings:
-            _capped = True
+            # only the result-cap arm is a finding limit; a spent compute
+            # budget is reported separately and may have found nothing
+            _capped = _capped or len(findings) >= max_findings
             break
     if truncated or budget <= 0:
         # Never silently cap coverage — say what was bounded (stderr only; scan.json stays
@@ -3562,7 +3580,7 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
         by_sheet.setdefault((c["file"], c["sheet"]), []).append(c)
     findings = []
     _capped = False   # set only where a loop is actually abandoned
-    budget = 4_000_000
+    budget = _SHORT_ROW_BUDGET
     for (fname, sname), rows in by_sheet.items():
         fig = figure_key(sname)
         # Sheet-wide frequency of each high-precision value, BUCKETED to 5 significant
@@ -3666,7 +3684,9 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
                     _capped = True
                     break
             if budget <= 0 or len(findings) >= max_findings:
-                _capped = True
+                # only the result-cap arm is a finding limit; a spent compute
+                # budget is reported separately and may have found nothing
+                _capped = _capped or len(findings) >= max_findings
                 break
 
         # Second pass — isolated low-precision divisor case: B = k * A over a PARTIAL run where
@@ -3753,7 +3773,9 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
                     break
 
         if budget <= 0 or len(findings) >= max_findings:
-            _capped = True
+            # only the result-cap arm is a finding limit; a spent compute
+            # budget is reported separately and may have found nothing
+            _capped = _capped or len(findings) >= max_findings
             break
     if budget <= 0:
         print("[paperconan] detect_short_row_reuse: coverage bounded (budget exhausted)",
@@ -3836,7 +3858,7 @@ def detect_within_row_shared_fraction(grid_sheets, profile="review", max_finding
     Signal, not verdict — confirm against the legend/Methods before drawing a conclusion."""
     findings = []
     _capped = False   # set only where a loop is actually abandoned
-    budget = 8_000_000
+    budget = _WITHIN_ROW_FRAC_BUDGET
     for (fname, sname), sheet in grid_sheets.items():
         fig = figure_key(sname)
         for r in range(sheet.nrows):
@@ -3893,7 +3915,9 @@ def detect_within_row_shared_fraction(grid_sheets, profile="review", max_finding
                 _capped = True
                 break
         if budget <= 0 or len(findings) >= max_findings:
-            _capped = True
+            # only the result-cap arm is a finding limit; a spent compute
+            # budget is reported separately and may have found nothing
+            _capped = _capped or len(findings) >= max_findings
             break
     if budget <= 0:
         print("[paperconan] detect_within_row_shared_fraction: coverage bounded "
@@ -3945,7 +3969,7 @@ def detect_row_pair_shared_fraction(grid_sheets, profile="review", max_findings=
             by_sheet[(fname, sname)] = rows
     findings = []
     _capped = False   # set only where a loop is actually abandoned
-    budget = 40_000_000                       # global compute bound across all sheets
+    budget = _ROW_PAIR_FRAC_BUDGET
     for (fname, sname), rows in by_sheet.items():
         fig = figure_key(sname)
         for i in range(len(rows)):
@@ -4009,10 +4033,14 @@ def detect_row_pair_shared_fraction(grid_sheets, profile="review", max_findings=
                     _capped = True
                     break
             if budget <= 0 or len(findings) >= max_findings:
-                _capped = True
+                # only the result-cap arm is a finding limit; a spent compute
+                # budget is reported separately and may have found nothing
+                _capped = _capped or len(findings) >= max_findings
                 break
         if budget <= 0 or len(findings) >= max_findings:
-            _capped = True
+            # only the result-cap arm is a finding limit; a spent compute
+            # budget is reported separately and may have found nothing
+            _capped = _capped or len(findings) >= max_findings
             break
     if budget <= 0:
         print("[paperconan] detect_row_pair_shared_fraction: coverage bounded "

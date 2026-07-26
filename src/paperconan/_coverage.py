@@ -55,7 +55,11 @@ class ScanCoverage:
         # Deduplicate identical (scope, reason, file, sheet) events so a repeated
         # cause records once, and cap the retained list so a pathological input
         # cannot balloon the report (GH#15-class size guard).
-        key = (scope, reason, item.get("file"), item.get("sheet"))
+        # `detector` is part of the identity: detector records carry no file or
+        # sheet, so without it every capped detector collapses into the first one
+        # and the rest are dropped while the report claims they were counted.
+        key = (scope, reason, item.get("file"), item.get("sheet"),
+               item.get("detector"))
         if key in self._limitation_keys:
             return
         if len(self.limitations) >= _limitations_cap():

@@ -67,7 +67,10 @@ def _two_sheets():
     from paperconan._sheet import Sheet
 
     grids = {}
-    for sheet in ("a", "b"):
+    # figure-shaped sheet names: the cross-figure pass is skipped entirely
+    # unless two distinct figure keys are present, which also means a fixture
+    # named "a"/"b" can only ever exercise the within-row pass.
+    for sheet in ("Figure 1a", "Figure 2b"):
         rows = [[f"c{j}" for j in range(12)]]
         base = [round(0.1234567 + j * 0.0173219, 7) for j in range(12)]
         for i in range(24):
@@ -279,3 +282,93 @@ def test_a_result_cap_equal_to_the_natural_output_still_reports(tmp_path):
         "if this stops firing the boundary was narrowed — update the docstring "
         "on _note_detector_cap"
     )
+
+
+# ---------- the three claims that outran their coverage ----------
+
+_BUDGETS = (
+    ("detect_recurring_row_vectors", "_RECURRING_VEC_BUDGET"),
+    ("detect_scaled_row_reuse", "_SCALED_ROW_BUDGET"),
+    ("detect_short_row_reuse", "_SHORT_ROW_BUDGET"),
+    ("detect_within_row_shared_fraction", "_WITHIN_ROW_FRAC_BUDGET"),
+    ("detect_row_pair_shared_fraction", "_ROW_PAIR_FRAC_BUDGET"),
+)
+
+
+@pytest.mark.parametrize("detector,budget_const", _BUDGETS)
+def test_a_spent_budget_is_not_reported_as_a_result_cap(detector, budget_const,
+                                                        monkeypatch):
+    """C1': a scripted rewrite folded two break conditions into one flag.
+
+    A detector that exhausts its compute budget and returns nothing then
+    reported "detector finding limit (limit=1000000)" — a claim about a cap it
+    never approached. Saying the wrong thing is worse than saying nothing, and
+    this was a regression: checking at function exit never did it.
+    """
+    import paperconan._audit as audit
+    monkeypatch.setattr(audit, budget_const, 1)
+
+    coverage = ScanCoverage(files_discovered=1)
+    found = getattr(audit, detector)(_two_sheets(), profile="review",
+                                     max_findings=10**6, coverage=coverage)
+
+    reasons = [i["reason"] for i in coverage.to_dict()["limitations"]]
+    assert not found, "budget of 1 should starve the detector"
+    assert "detector_finding_limit" not in reasons, (
+        f"{detector} produced nothing but reported a result cap: {reasons}"
+    )
+
+
+@pytest.mark.parametrize("detector,budget_const", _BUDGETS)
+def test_each_detector_reports_its_own_exhausted_budget(detector, budget_const,
+                                                        monkeypatch):
+    """Pins the budget wiring itself — untestable while these were literals."""
+    import paperconan._audit as audit
+    monkeypatch.setattr(audit, budget_const, 1)
+
+    coverage = ScanCoverage(files_discovered=1)
+    getattr(audit, detector)(_two_sheets(), profile="review", coverage=coverage)
+
+    named = [(i.get("detector"), i["reason"]) for i in coverage.to_dict()["limitations"]]
+    assert (detector, "detector_compute_budget_limit") in named, named
+
+
+def test_two_detectors_capped_at_once_are_both_named():
+    """C2': detector records carry no file or sheet, so a dedup key without the
+    detector name kept only the first and dropped the rest — while the caveat
+    told the reader result caps were reported."""
+    coverage = ScanCoverage(files_discovered=1)
+
+    coverage.add_limitation("detector", "detector_finding_limit",
+                            detector="detect_short_row_reuse", limit=60)
+    coverage.add_limitation("detector", "detector_finding_limit",
+                            detector="detect_row_pair_shared_fraction", limit=60)
+
+    named = {i.get("detector") for i in coverage.to_dict()["limitations"]}
+    assert named == {"detect_short_row_reuse", "detect_row_pair_shared_fraction"}, named
+
+
+def test_the_unreported_cap_caveat_reaches_the_packet(tmp_path):
+    """C3': the caveat was restored but its guard was not.
+
+    Asserting the constant is False does not keep the sentence in front of a
+    reader — deleting the block that appends it left the suite fully green,
+    which is one edit away from the gap the caveat exists to cover.
+    """
+    from paperconan._workflow import start_workflow
+
+    data = tmp_path / "data"
+    data.mkdir()
+    rows = ["a,b"] + [f"{i + 1},{(i + 1) * 2}" for i in range(12)]
+    (data / "p.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    start_workflow(str(data), str(tmp_path / "out"))
+    import json
+    packet = json.loads(
+        (tmp_path / "out" / "steps" / "t000" / "candidate_packet.json").read_text()
+    )
+
+    assert any("still not reported" in x for x in packet["coverage"]["limitations"]), (
+        packet["coverage"]["limitations"]
+    )
+    assert packet["coverage"]["coverage_complete"] is False
