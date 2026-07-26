@@ -38,8 +38,9 @@ WORKFLOW_POLICY_VERSION = 1
 NUMERIC_CANONICALIZATION_VERSION = 1
 # Detector *result* caps (max_findings) and the row-relation compute budget now
 # record into ScanCoverage. Many resource caps still do not. Two that anyone can
-# check from the source: scan_dir's `wide` gate drops detect_relations,
-# detect_equal_pairs and detect_row_pair_digit_coupling outright past
+# check from the source, both whole-detector skips rather than result caps:
+# scan_dir's `wide` gate drops detect_relations, detect_equal_pairs and
+# detect_row_pair_digit_coupling outright past
 # _MAX_BLOCK_COLS, and _ROW_REL_MAX_ROWS silently disables two detectors at 61
 # rows -- detect_row_relations loses an exact relation, and _scaled_row_candidates
 # drops the band entirely, taking identical_row_reuse with it. All while the scan
@@ -443,11 +444,11 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
             f"{len(omitted)} lower-ranked clusters were not routed"
         )
 
-    # Six detectors now record their result caps and compute budgets through
-    # ScanCoverage. An audit found others that still reach no channel at all:
-    # whole-detector skips on blocks that are too wide or too tall (see
-    # detect_row_relations' row cap, a cost bound that drops real relations at
-    # 61 rows) and result caps outside the wired set. Until every one is wired
+    # Result caps, compute budgets and candidate-pool caps now record through
+    # ScanCoverage. What still reaches no channel is the whole-detector skips:
+    # a block dropped for being too wide (the `wide` gate) or too tall
+    # (_ROW_REL_MAX_ROWS, a cost bound that drops real relations at 61 rows).
+    # Until those are wired
     # the workflow cannot know whether a block was fully enumerated, so it must
     # not claim it was. Stating it here rather than only in a side field means
     # `coverage_complete` is false by construction and the caveat reaches the
@@ -475,9 +476,10 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
         "families_not_seeded": unseeded,
         "coverage_complete": not limitations,
         "limitations": limitations,
-        # Known blind spot, stated rather than implied. Six detectors now record
-        # their result caps and compute budgets through ScanCoverage; the rest of
-        # the resource caps still reach no channel, so `coverage_complete` means
+        # Known blind spot, stated rather than implied. Every detector result cap
+        # and compute budget now records through ScanCoverage, as do the candidate
+        # pool caps; whole-detector skips (the `wide` gate, _ROW_REL_MAX_ROWS) do
+        # not, so `coverage_complete` means
         # "complete as far as the scan reported", not "every finding was seeded".
         # See the caveat assembled above for what that leaves out.
         "detector_caps_reported": DETECTOR_CAPS_REPORTED,

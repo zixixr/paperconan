@@ -955,8 +955,8 @@ _ROW_REL_RTOL = float(os.environ.get("PAPERCONAN_ROW_REL_RTOL", "1e-3"))
 _ROW_REL_BUDGET = int(os.environ.get("PAPERCONAN_ROW_REL_BUDGET", "6000000"))
 # The remaining detector compute budgets. Module constants rather than in-function
 # literals so a truncation they cause can be reproduced in a test and tuned by an
-# operator, per the PAPERCONAN_* convention — as in-function literals they were
-# untestable, which is why their wiring went unverified.
+# operator, per the PAPERCONAN_* convention — as in-function literals they could
+# only be driven by editing the source, which is why their wiring went unverified.
 _RECURRING_VEC_BUDGET = int(os.environ.get("PAPERCONAN_RECURRING_VEC_BUDGET", "3000000"))
 _WITHIN_ROW_VEC_BUDGET = int(os.environ.get("PAPERCONAN_WITHIN_ROW_VEC_BUDGET", "2000000"))
 _SCALED_ROW_BUDGET = int(os.environ.get("PAPERCONAN_SCALED_ROW_BUDGET", "4000000"))
@@ -1298,9 +1298,10 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=None):
     # scans and train readers to skip the coverage line. The workflow's
     # deliberately over-broad caveat ("too wide or too tall") is what covers it,
     # and test_a_block_past_the_row_cap_loses_relations_and_says_nothing pins
-    # the loss so it cannot widen unnoticed. Note that caveat lives in the
-    # workflow packet only — a plain `paperconan <dir>` run gets scan.json and
-    # report.html, neither of which carries it.
+    # the loss so it cannot widen unnoticed. That caveat reaches the workflow
+    # packet and the layered views (`paperconan overview` / `drill` / `explain`,
+    # which read it through _build_clusters); a plain `paperconan <dir>` run gets
+    # scan.json and report.html, neither of which carries it.
     #
     # _ROW_REL_MAX_ROWS is also the gate in _scaled_row_candidates, so the same
     # constant drops a second detector; that site has its own note.
@@ -3349,6 +3350,10 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
     """
     cands = _scaled_row_candidates(grid_sheets)
     truncated = len(cands) > max_candidates
+    # Captured before the slice: len(cands) afterwards is always max_candidates,
+    # so reporting it would print the cap back at the reader and lose the one
+    # quantity that says how much was dropped.
+    pool_size = len(cands)
     if truncated:
         cands = cands[:max_candidates]
     findings = []
@@ -3429,7 +3434,8 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
         # the wrong knob. The stderr line above already prints both flags.
         if truncated:
             _note_detector_cap(coverage, "detect_scaled_row_reuse",
-                               "detector_candidate_pool_limit", candidates=len(cands))
+                               "detector_candidate_pool_limit",
+                               candidates=pool_size, limit=max_candidates)
         if budget <= 0:
             _note_detector_cap(coverage, "detect_scaled_row_reuse",
                                "detector_compute_budget_limit")
@@ -3587,7 +3593,7 @@ def _longest_hp_offset_run(a, b):
     return c, best_len, x_run
 
 
-def _short_row_candidates(grid_sheets):
+def _short_row_candidates(grid_sheets, coverage=None):
     """Every data row carrying >=_SHORT_ROW_MIN_COLS high-precision values with >=3
     DISTINCT such values — including ISOLATED single rows that `_scaled_row_candidates`
     drops (its bands need >=2 rows of >=12 finite cells). Grouped by sheet downstream."""
@@ -3606,6 +3612,15 @@ def _short_row_candidates(grid_sheets):
                 continue
             rows.append(dict(file=fname, sheet=sname, row=r, label=label, a=a))
             if len(rows) >= _SHORT_ROW_MAX_ROWS_PER_SHEET:
+                # Same construct as detect_scaled_row_reuse's max_candidates,
+                # which is wired: a candidate pool cut short, so later rows are
+                # never compared. Was silent on every channel, including stderr.
+                print(f"[paperconan] detect_short_row_reuse: {sname} candidate rows "
+                      f"capped at {_SHORT_ROW_MAX_ROWS_PER_SHEET} — later rows not "
+                      "compared", file=sys.stderr)
+                _note_detector_cap(coverage, "detect_short_row_reuse",
+                                   "detector_candidate_pool_limit",
+                                   limit=_SHORT_ROW_MAX_ROWS_PER_SHEET)
                 break
         cands.extend(rows)
     return cands
@@ -3622,7 +3637,7 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
     A whole power-of-ten ratio is a unit restatement (benign) and is skipped. Signal, not
     verdict — confirm against the legend/Methods before drawing any conclusion."""
     by_sheet = {}
-    for c in _short_row_candidates(grid_sheets):
+    for c in _short_row_candidates(grid_sheets, coverage=coverage):
         by_sheet.setdefault((c["file"], c["sheet"]), []).append(c)
     findings = []
     _capped = False   # set only where a loop is actually abandoned
@@ -4022,6 +4037,9 @@ def detect_row_pair_shared_fraction(grid_sheets, profile="review", max_findings=
                     print(f"[paperconan] detect_row_pair_shared_fraction: {sname} candidate "
                           f"rows capped at {_ROW_PAIR_MAX_ROWS_PER_SHEET} — later rows not "
                           "compared", file=sys.stderr)
+                    _note_detector_cap(coverage, "detect_row_pair_shared_fraction",
+                                       "detector_candidate_pool_limit",
+                                       limit=_ROW_PAIR_MAX_ROWS_PER_SHEET)
                     break
         if len(rows) >= 2:
             by_sheet[(fname, sname)] = rows
@@ -4151,8 +4169,9 @@ _MAX_CELLS = int(os.environ.get("PAPERCONAN_MAX_CELLS", "10000000"))
 # to skip the extra per-workbook XML pass on throughput-sensitive corpora.
 _OOXML_FORMULA_INSPECT = os.environ.get(
     "PAPERCONAN_OOXML_FORMULA_INSPECT", "1") not in ("0", "false", "False", "")
-# Wide blocks (dense correlation matrices) blow up the O(col²) relation/equal-pair detectors in
-# both compute time and output size (scan.json / report.html). Skip those three detectors when
+# Wide blocks (dense correlation matrices) blow up the O(col²) relation, equal-pair and
+# row-pair-digit-coupling detectors in both compute time and output size (scan.json /
+# report.html). Skip those three when
 # a block is wider than this; the cheap column-wise detectors still run. 0 disables the skip.
 _MAX_BLOCK_COLS = int(os.environ.get("PAPERCONAN_MAX_BLOCK_COLS", "120"))
 # Output cap: each finding embeds a table-snippet as evidence, so a paper with thousands of

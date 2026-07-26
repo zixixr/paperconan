@@ -583,7 +583,7 @@ def test_the_profile_is_part_of_the_run_configuration(tmp_path):
             == _packet(tmp_path / "b")["clusters"])
 
 
-def test_a_detector_cap_reaches_the_packet(tmp_path, monkeypatch):
+def test_an_incomplete_scan_makes_the_packet_declare_itself_incomplete(tmp_path, monkeypatch):
     """Detector caps used to reach no channel, so the packet carried a blanket
     caveat instead. Now that they record into ScanCoverage, the packet must
     carry the real one — and only when a cap actually bit.
@@ -604,8 +604,6 @@ def test_a_detector_cap_reaches_the_packet(tmp_path, monkeypatch):
     assert coverage["scan_incomplete"] is True
     assert coverage["coverage_complete"] is False
     assert any("scan was not complete" in x for x in coverage["limitations"])
-
-
 
 
 def test_an_index_from_an_unsupported_schema_is_refused(tmp_path):

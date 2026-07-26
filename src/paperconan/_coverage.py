@@ -57,8 +57,9 @@ class ScanCoverage:
         # (GH#15-class size guard). The identity is
         # (scope, reason, file, sheet, detector) — `detector` is in it because
         # detector records carry no file or
-        # sheet, so without it every capped detector collapses into the first one
-        # and the rest are dropped while the report claims they were counted.
+        # sheet, so without it every capped detector after the first collapses into
+        # it and is silently discarded — while the caveat told the reader result
+        # caps were reported.
         key = (scope, reason, item.get("file"), item.get("sheet"),
                item.get("detector"))
         if key in self._limitation_keys:

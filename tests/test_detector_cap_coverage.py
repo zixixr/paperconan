@@ -104,6 +104,24 @@ def _grids_for(name):
     return {(f"{s}.csv", s): Sheet.from_rows(build()) for s in ("Figure 1a", "Figure 2b")}
 
 
+def _write_csv(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(",".join("" if v is None else str(v) for v in r) for r in rows) + "\n",
+        encoding="utf-8")
+
+
+def _grid_for_pool_cap(detector):
+    """A grid with more candidate rows than the pool cap under test.
+
+    Each of these detectors builds its candidate list through its own gates, so
+    a grid that overflows one does not overflow the other.
+    """
+    if detector == "detect_row_pair_shared_fraction":
+        return _shared_tail_across_rows()
+    return _repeated_short_rows()
+
+
 def _reasons(scan):
     return [item.get("reason") for item in (scan.get("coverage") or {}).get("limitations") or []]
 
@@ -663,3 +681,82 @@ def test_a_tall_band_loses_scaled_row_reuse_and_says_nothing():
 
     assert under, "fixture no longer produces cross-sheet row reuse at 60 rows"
     assert not over, "the band ceiling no longer silences this detector -- update this test"
+
+
+def test_the_html_coverage_row_distinguishes_one_capped_detector_from_another(tmp_path):
+    """Detector records carry no file or sheet, so the name is all there is.
+
+    The dedup key was widened to keep each capped detector as its own record;
+    the renderer then dropped the field that made them distinguishable, so three
+    capped detectors rendered as three identical rows that read as a display
+    bug. Asserted on the rendered markup because the scan.json side was already
+    green while this was broken.
+    """
+    from paperconan._html import _render_scan_status
+
+    coverage = ScanCoverage(files_discovered=1)
+    coverage.add_limitation("detector", "detector_finding_limit",
+                            detector="detect_short_row_reuse", limit=60)
+    coverage.add_limitation("detector", "detector_finding_limit",
+                            detector="detect_scaled_row_reuse", limit=60)
+
+    html = _render_scan_status({"scan_status": "partial", "coverage": coverage.to_dict()})
+
+    assert "detect_short_row_reuse" in html and "detect_scaled_row_reuse" in html, (
+        "the reader cannot tell which detector was capped"
+    )
+    assert "limit=60" in html, "the cap value did not reach the report"
+
+
+def test_a_truncated_candidate_pool_reports_the_pool_not_the_cap(tmp_path):
+    """The one number on the record has to say how much was dropped.
+
+    len(cands) is read after the slice, so reporting it prints max_candidates
+    back at the reader -- the same value in every scan, and no way to recover
+    how large the pool actually was.
+    """
+    import paperconan._audit as audit
+
+    coverage = ScanCoverage(files_discovered=1)
+    grids = _grids_for("detect_scaled_row_reuse")
+    pool = len(audit._scaled_row_candidates(grids))
+
+    audit.detect_scaled_row_reuse(grids, profile="review", max_candidates=3,
+                                  max_findings=10**6, coverage=coverage)
+
+    record = next(i for i in coverage.to_dict()["limitations"]
+                  if i["reason"] == "detector_candidate_pool_limit")
+    assert pool > 3, "fixture no longer overflows the candidate cap"
+    assert record["candidates"] == pool, (
+        f"reported {record['candidates']} candidates for a pool of {pool}"
+    )
+    assert record["limit"] == 3
+
+
+@pytest.mark.parametrize("detector,knob,reason", [
+    ("detect_short_row_reuse", "_SHORT_ROW_MAX_ROWS_PER_SHEET",
+     "detector_candidate_pool_limit"),
+    ("detect_row_pair_shared_fraction", "_ROW_PAIR_MAX_ROWS_PER_SHEET",
+     "detector_candidate_pool_limit"),
+])
+def test_sibling_candidate_pool_caps_reach_coverage(tmp_path, monkeypatch,
+                                                    detector, knob, reason):
+    """The same construct as max_candidates, in the detectors that also have it.
+
+    One of these reported on stderr only and the other was silent everywhere,
+    so an identical event flipped scan_status in one detector and vanished in
+    two others.
+    """
+    import paperconan._audit as audit
+    monkeypatch.setattr(audit, knob, 2)
+
+    _write_csv(tmp_path / "d" / "p.csv", _grid_for_pool_cap(detector))
+    scan = scan_dir(str(tmp_path / "d"), str(tmp_path / "out"), write_html=False)
+
+    records = [i for i in (scan.get("coverage") or {}).get("limitations") or []
+               if i.get("detector") == detector and i.get("reason") == reason]
+    assert records, (
+        f"{detector}'s candidate pool was cut at {knob} without recording it: "
+        f"{_reasons(scan)}"
+    )
+    assert scan["scan_status"] != "complete"
