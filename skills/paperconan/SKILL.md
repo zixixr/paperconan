@@ -79,7 +79,15 @@ Three things to hold onto while reading:
   emits others in the same form (a sheet-scoped line appends the sheet name after
   the file). Whole-detector skips are the exception — they reach no channel and
   are never named here at all.
-  - `scan: file too large in big.xlsx` — a file or sheet that was not read at all.
+  - `scan: file too large in big.xlsx` — a file that was not read at all.
+    `scan: unreadable in notes.xlsx` is the same class: nothing in that file was
+    examined.
+  - `scan: formula cache missing in m.xlsx Fig 3b (cells=812)` — that many
+    formula cells stored no cached value, so paperconan never saw the numbers
+    they compute. Those cells were **not** audited; the sheet is partly unread.
+  - `scan: report block limit in m.xlsx Fig 3b (count=200)` — block collection
+    for that sheet stopped at an output budget, so later blocks were never
+    analysed. Raise `PAPERCONAN_MAX_REPORT_BLOCKS`.
   - `scan: detector candidate pool limit in detect_short_row_reuse (limit=400)` —
     a detector stopped building candidates at its cap, so rows past it were never
     compared.

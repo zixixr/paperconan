@@ -60,7 +60,8 @@ class ScanCoverage:
         # key every capped detector after the first matches the first and is
         # silently discarded, so a scan that capped three detectors would name
         # only one. Detector records still collapse across blocks and sheets --
-        # one entry per detector per scan -- which is why they carry no counts.
+        # one entry per (detector, reason) per scan, since `reason` is in the key
+        # too -- which is why they carry no counts.
         key = (scope, reason, item.get("file"), item.get("sheet"),
                item.get("detector"))
         if key in self._limitation_keys:

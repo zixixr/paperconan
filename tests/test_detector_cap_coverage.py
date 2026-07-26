@@ -853,8 +853,13 @@ def test_every_scan_line_quoted_in_the_skill_is_one_the_code_can_emit():
     import paperconan._audit as audit
     from paperconan._workflow import _coverage_for
 
-    coverage = ScanCoverage(files_discovered=2)
+    coverage = ScanCoverage(files_discovered=3)
     coverage.mark_file_failed("big.xlsx", "file_too_large")
+    coverage.mark_file_failed("notes.xlsx", "unreadable")
+    coverage.add_limitation("sheet", "formula_cache_missing", file="m.xlsx",
+                            sheet="Fig 3b", cells=812)
+    coverage.add_limitation("report", "report_block_limit", file="m.xlsx",
+                            sheet="Fig 3b", count=200)
     # Read from production, not hardcoded: with both sides self-supplied, moving
     # a default left SKILL.md quoting a limit the code no longer emits while this
     # test stayed green.
@@ -890,9 +895,12 @@ _SCAN_REASONS_NOT_IN_SKILL = {
     # Renders exactly like the quoted file line with the sheet name appended, and
     # the bullet says so in prose.
     "sheet_too_large",
-    # Provenance of a formula sidecar, not a bound on what was searched: no
-    # numeric coverage is lost, so it does not change how a result is read.
-    "formula_cache_missing",
+    # formula_cache_missing is NOT here: per _formula_cache.py a formula cell
+    # with no cached value is invisible to the numeric audit, so it is a silent
+    # under-read and the skill quotes it.
+    # Inspection itself failed, so how many cells went unread is unknown. Quoting
+    # a count would overstate what the record knows; the missing-cache line above
+    # it already teaches the agent what the class means.
     "formula_cache_unreadable",
     # Two of detect_recurring_row_vectors' budgets. They read as
     # "detector cross figure budget limit ..." — recognisable from the quoted
@@ -912,13 +920,20 @@ def test_every_limitation_reason_is_either_quoted_in_the_skill_or_listed_as_unqu
     decision per reason rather than letting the set drift.
     """
     import ast
+    import re
     from pathlib import Path
 
     # Extracted from the call sites, not by pattern-matching identifiers: the
     # reason is a positional literal whose index depends on the helper, and a
     # loose regex picks up unrelated names like a test's "file_a".
     reason_arg = {"add_limitation": 1, "_note_detector_cap": 2,
-                  "mark_file_failed": 1, "mark_sheet_skipped": 2}
+                  "mark_file_failed": 1, "mark_sheet_skipped": 2,
+                  "mark_blocks_skipped": 2}
+    # Reasons also arrive as keywords, and one is a non-literal (exc.reason).
+    # Skipping either silently is how three reasons drifted past the first
+    # version of this guard, so a non-literal is collected as a marker and has to
+    # be accounted for explicitly rather than vanishing.
+    non_literal = set()
     src = Path(__file__).resolve().parents[1] / "src" / "paperconan"
     reasons = set()
     for path in sorted(src.glob("*.py")):
@@ -929,21 +944,48 @@ def test_every_limitation_reason_is_either_quoted_in_the_skill_or_listed_as_unqu
             fn = node.func
             name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
             idx = reason_arg.get(name)
-            if idx is None or len(node.args) <= idx:
+            if idx is None:
                 continue
-            arg = node.args[idx]
+            arg = None
+            if len(node.args) > idx:
+                arg = node.args[idx]
+            else:
+                for kw in node.keywords:
+                    if kw.arg == "reason":
+                        arg = kw.value
+                        break
+            if arg is None:
+                continue
             if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                 reasons.add(arg.value)
+            else:
+                non_literal.add(ast.unparse(arg))
 
     assert reasons, "no limitation reasons found; did the helpers get renamed?"
 
+    # Non-literal reason arguments are accounted for rather than dropped: a
+    # silent skip is how a reason reaches production without anyone deciding
+    # whether the skill should name it. These three are pass-throughs -- two
+    # helper forwards and _extract's exception, whose own reasons are literals
+    # collected at their raise sites -- so they introduce no new name.
+    expected_pass_throughs = {"reason", "exc.reason"}
+    assert non_literal <= expected_pass_throughs, (
+        f"a reason is built rather than written literally: "
+        f"{sorted(non_literal - expected_pass_throughs)}. This guard cannot see "
+        f"its value, so decide explicitly: give it a literal, or account for it "
+        f"here."
+    )
+
     skill = (Path(__file__).resolve().parents[1] / "skills" / "paperconan"
              / "SKILL.md").read_text(encoding="utf-8")
+    quoted_lines = re.findall(r"`(scan: [^`]+)`", skill)
 
     def shown(reason):
-        # _describe_scan_limitation renders a reason by stripping the _limit
-        # suffix and swapping underscores for spaces.
-        return reason.replace("_limit", "").replace("_", " ") in skill
+        # Matched inside a quoted `scan: ...` line, not as a bare substring:
+        # "unreadable" passed on an unrelated `unreadable_asset_ids` field
+        # elsewhere in the skill, so a whole unread file counted as documented.
+        phrase = reason.replace("_limit", "").replace("_", " ")
+        return any(phrase in line for line in quoted_lines)
 
     undecided = sorted(r for r in reasons
                        if r not in _SCAN_REASONS_NOT_IN_SKILL and not shown(r))
