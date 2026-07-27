@@ -43,9 +43,30 @@ paperconan overview audit/scan.json                    # which locations carry s
 paperconan drill    audit/scan.json 2                  # that location, grouped by kind
 paperconan drill    audit/scan.json 2 --kind identical_column
 paperconan explain  audit/scan.json seed:17942ad206854a66
+paperconan explain  audit/scan.json seed:17942ad206854a66 --full
 ```
 
 Add `--json` to any of them when you need the structure rather than the text.
+
+**Evidence windows are bounded, and say so.** The scan stores a window around
+the highlighted cells, not the whole block — on a dense supplement the windows
+are most of the file's bytes. A trimmed window carries its own scale, e.g.
+`! this window is 20x30 of a 300x200 block, trimmed by the scan.` Read that as
+"the anomaly is here, and there is more of this block than you are seeing" — not
+as the block. When the exact cells matter (checking a value against the paper,
+or judging whether a pattern runs the whole column), `explain --full` re-reads
+the block from the source data.
+
+`--full` refuses rather than guesses. The scan records each input's size and
+timestamp, so a source that has moved, been edited, or lost the rows or columns
+the finding covers returns the reason and no rows — reading it blind would hand
+you a different table under this finding's heading. Two limits worth knowing:
+a source rewritten to the same byte count with the timestamp restored is
+undetectable (the check compares size, not content), and a
+scan produced before this check existed falls back to comparing extents, which
+catches a shrunk source but not an in-place edit. It also stays inside a cell
+budget (`PAPERCONAN_MAX_FULL_EVIDENCE_CELLS`); a window bounded by it says so
+and names that variable rather than telling you to re-run `--full`.
 
 Work down, and stop at the shallowest layer that answers the question:
 

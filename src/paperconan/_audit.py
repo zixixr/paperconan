@@ -470,64 +470,80 @@ def _cell_value(v):
     return str(v)
 
 
-def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_rows=None):
+def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_rows=None,
+                    max_rows=None, max_cols=None, trimmed_by="scan"):
     """Slice a numeric block (with 1 row of context above/below if available) into a
     JSON-friendly evidence dict that the HTML renderer can show as a table.
 
-    The emitted snippet is bounded to a contiguous _MAX_EV_ROWS × _MAX_EV_COLS
+    max_rows/max_cols override the stored bounds for one call. They are
+    parameters rather than a save-and-restore of the module globals because
+    `explain --full` needs a wider window than the scan stores, and this module
+    is imported by a library API another thread may be scanning through -- a
+    global raised for the duration of one call would widen every window written
+    in that window of time, which is the OOM the caps exist to prevent.
+
+    The emitted snippet is bounded to a contiguous max_rows × max_cols
     sub-rectangle inside the block, always covering the highlighted columns (and rows
     when given). This stops a dense block from being copied whole into every finding
     (which balloons the scan dict / scan.json to GBs). Small blocks are emitted whole
     and stay byte-identical (no `truncated` key)."""
     truncated = False
+    max_rows = _MAX_EV_ROWS if max_rows is None else max_rows
+    max_cols = _MAX_EV_COLS if max_cols is None else max_cols
 
     # --- column window -------------------------------------------------------
     ec0, ec1 = c0, c1
-    if (c1 - c0) > _MAX_EV_COLS:
+    if (c1 - c0) > max_cols:
         truncated = True
         if highlight_cols:
             lo = min(highlight_cols)
             hi = max(highlight_cols)
         else:
             lo = hi = c0
-        if hi - lo + 1 > _MAX_EV_COLS:
+        if hi - lo + 1 > max_cols:
             ec0 = lo
-            ec1 = lo + _MAX_EV_COLS
+            ec1 = lo + max_cols
         else:
-            # Center a _MAX_EV_COLS-wide window on [lo, hi], then clamp into [c0, c1).
-            pad = (_MAX_EV_COLS - (hi - lo + 1)) // 2
+            # Center a max_cols-wide window on [lo, hi], then clamp into [c0, c1).
+            pad = (max_cols - (hi - lo + 1)) // 2
             ec0 = lo - pad
-            ec1 = ec0 + _MAX_EV_COLS
+            ec1 = ec0 + max_cols
             if ec0 < c0:
-                ec0, ec1 = c0, c0 + _MAX_EV_COLS
+                ec0, ec1 = c0, c0 + max_cols
             if ec1 > c1:
                 ec1 = c1
-                ec0 = ec1 - _MAX_EV_COLS
+                ec0 = ec1 - max_cols
             if ec0 < c0:
                 ec0 = c0
 
     # --- row window ----------------------------------------------------------
+    # Captured before windowing: a reader who is shown 12 of 5000 rows and a
+    # reader shown 12 of 13 are in very different positions, and a bare
+    # `truncated: True` cannot tell them apart.
+    full_rows = min(sheet.nrows, r1 + 1) - max(0, r0 - 1)
+    full_cols = c1 - c0
+
     r_start = max(0, r0 - 1)
     r_end = min(sheet.nrows, r1 + 1)
-    if (r_end - r_start) > _MAX_EV_ROWS:
+    if (r_end - r_start) > max_rows:
         truncated = True
         if highlight_rows:
             # highlight_rows are 1-based row numbers; center the window on them.
             rlo = min(highlight_rows) - 1
             rhi = max(highlight_rows) - 1
-            if rhi - rlo + 1 >= _MAX_EV_ROWS:
+            if rhi - rlo + 1 >= max_rows:
                 wr0 = rlo
             else:
-                pad = (_MAX_EV_ROWS - (rhi - rlo + 1)) // 2
+                pad = (max_rows - (rhi - rlo + 1)) // 2
                 wr0 = rlo - pad
         else:
             wr0 = r_start
         if wr0 < r_start:
             wr0 = r_start
-        wr1 = wr0 + _MAX_EV_ROWS
+        wr1 = wr0 + max_rows
         if wr1 > r_end:
             wr1 = r_end
-            wr0 = max(r_start, wr1 - _MAX_EV_ROWS)
+            wr0 = max(r_start, wr1 - max_rows)
         r_start, r_end = wr0, wr1
 
     data_rows = []
@@ -546,7 +562,19 @@ def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_row
         "rows": data_rows,
     }
     if truncated:
-        out["truncated"] = True
+        # Dict rather than True: still truthy for the `if ev.get("truncated")`
+        # consumers, and it says how much of the block the window covers. An
+        # evidence table that does not state its own scale is the same defect as
+        # a scan that reports itself complete after stopping early.
+        out["truncated"] = {
+            # Both row figures include the +-1 context rows, so the ratio is
+            # self-consistent. `by` names who trimmed it: a window the scan
+            # bounded and one `--full` bounded to its cell budget need different
+            # remedies, and telling a --full reader to run --full is a loop.
+            "by": trimmed_by,
+            "rows_shown": len(data_rows), "rows_total": full_rows,
+            "cols_shown": ec1 - ec0, "cols_total": full_cols,
+        }
     return out
 
 
@@ -4201,8 +4229,26 @@ _MAX_REPORT_BLOCKS = int(os.environ.get("PAPERCONAN_MAX_REPORT_BLOCKS", "2000"))
 # across thousands of findings — ballooning the scan dict / scan.json to many GB and OOMing the
 # worker. Bound each evidence snippet to a contiguous window of this many rows × cols (always
 # including the highlighted cells). Small blocks are emitted whole and stay byte-identical.
-_MAX_EV_ROWS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_ROWS", "50"))
+# 20, not 50, and tied to _drill_render's _EVIDENCE_ROW_LIMIT: the layered views
+# never display more than that, so storing more is bytes no reader sees. Measured
+# over ten real supplementary sets the evidence windows were the bulk of a 36 MB
+# scan corpus -- one finding reached 18 KB, 96% of it the window -- and this
+# takes the largest of them from 37 MB to 18 MB with no change in what is found.
+#
+# 12 would save another 6 MB there, and was rejected: it trims blocks barely over
+# the bound (the demo has a 13-row one) so a reader gets a truncation notice
+# where nothing worth reading was dropped, which teaches them to discount the
+# notice everywhere. What the window is for is the shape of the anomaly and rows
+# to check against the paper; the rest is re-derivable, and `explain --full`
+# re-reads it. The window always covers the highlighted cells.
+_MAX_EV_ROWS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_ROWS", "20"))
 _MAX_EV_COLS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_COLS", "30"))
+# Ceiling on a single `explain --full` window. --full lifts the stored
+# bound, not to remove it: a genomics block is millions of cells and CLAUDE.md
+# requires new code paths to respect the memory caps. Generous enough that an
+# ordinary panel comes back whole, finite enough that a pathological one does
+# not materialise as JSON.
+_FULL_EV_CELLS = int(os.environ.get("PAPERCONAN_MAX_FULL_EVIDENCE_CELLS", "200000"))
 # Per-block finding cap: the pairwise detectors are O(col²), so a single dense, highly
 # correlated block (a correlation matrix, an expression panel with many proportional columns)
 # can emit thousands of findings. Each carries its own embedded evidence snippet, so the count —
@@ -4364,6 +4410,20 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     for f in table_files:
         file_start = time.perf_counter() if runtime_metadata else None
         file_stat = {"file": os.path.basename(f), "path": f}
+        # Identity of the input as scanned. `explain --full` re-reads these files
+        # to widen an evidence window, and without something to compare against
+        # it cannot tell the file it opens from the file that was scanned -- so a
+        # source edited afterwards comes back as this finding's block. Size and
+        # mtime are a few bytes each. They compare size, not content, so an
+        # edit that preserves both the byte count and the timestamp is not
+        # detectable this way. SKILL.md states that limit; the extent checks
+        # below are the backstop for a scan that carries no identity at all.
+        try:
+            st = os.stat(f)
+            file_stat["size"] = st.st_size
+            file_stat["mtime_ns"] = st.st_mtime_ns
+        except OSError:
+            pass
         # Memory guard: a large workbook expands to many GB of Python objects when fully
         # loaded, so cap file size BEFORE loading. Oversized files are recorded (never
         # silently treated as clean) and skipped. Raise PAPERCONAN_MAX_FILE_MB on big-RAM hosts.
@@ -4635,7 +4695,10 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                    datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
                    if runtime_metadata else None),
                profile=profile,
-               input_dir=in_dir,
+               # Absolute: a relative input_dir resolves against whatever tree
+               # the reader happens to be in, so `explain --full` would read a
+               # different file of the same name and present it as this block.
+               input_dir=os.path.abspath(in_dir),
                paper=_load_provenance(in_dir, paper),
                n_files=len(table_files),
                n_image_source_files=len(local_images),
@@ -4919,7 +4982,7 @@ def _run_drill_command(args: argparse.Namespace) -> None:
             view = drill(scan, location, kind=args.kind, max_findings=args.max_findings)
             text = render_drill(view)
         else:
-            view = explain(scan, args.finding_id)
+            view = explain(scan, args.finding_id, full=args.full)
             text = render_explain(view)
     except ValueError as exc:
         sys.exit(str(exc))
@@ -5004,6 +5067,9 @@ def _build_parser() -> argparse.ArgumentParser:
     ex = sub.add_parser("explain", help="one finding in full, with its evidence table")
     ex.add_argument("scan_json", help="Path to paperconan scan.json")
     ex.add_argument("finding_id", help="Finding id from `drill --kind`")
+    ex.add_argument("--full", action="store_true",
+                    help="Re-read the evidence window from the source data "
+                         "instead of the bounded copy stored in the scan")
 
     for parser in (ov, dr, ex):
         parser.add_argument("--json", action="store_true",

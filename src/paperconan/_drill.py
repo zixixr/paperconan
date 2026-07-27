@@ -21,6 +21,7 @@ These functions are pure reads — they never write, and never mutate the scan.
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from ._workflow import (_SEVERITY_RANK, _block_seed, _build_clusters,
@@ -384,12 +385,130 @@ def _demotion_reasons(raw: dict[str, Any]) -> list[str]:
     return reasons
 
 
-def explain(scan: dict[str, Any], finding_id: str) -> dict[str, Any]:
+def _reread_evidence(scan: dict[str, Any], seed: dict[str, Any],
+                     raw: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild a finding's evidence window from the source data.
+
+    The scan stores a bounded window so a dense block is not copied whole into
+    every finding. That is the right default -- the stored windows were most of
+    a scan corpus's bytes -- but it must not be the only way to see the cells,
+    or a trimmed window becomes a permanent loss. `input_dir` is recorded in the
+    scan, so the block can be read again on request.
+
+    Returns a dict carrying either the full window or, when the source cannot be
+    reached, the reason. Never silently returns the trimmed view as if it were
+    complete: a reader who asked for everything and got a subset would take the
+    subset for the block.
+    """
+    from ._audit import (_FULL_EV_CELLS, _block_evidence, header_for,
+                         load_table)
+
+    in_dir = scan.get("input_dir")
+    if not in_dir:
+        return {"unavailable": "this scan records no input_dir, so the source "
+                               "data cannot be located"}
+    path = os.path.join(in_dir, seed.get("file") or "")
+    if not os.path.isfile(path):
+        return {"unavailable": f"source file not found at {path}; it moved or the "
+                               f"scan was copied away from its inputs"}
+    try:
+        sheets = load_table(path)
+    except Exception as exc:                       # noqa: BLE001 - reported, not raised
+        return {"unavailable": f"{type(exc).__name__} reading {path}: {exc}"}
+
+    sheet = sheets.get(seed.get("sheet"))
+    if sheet is None:
+        return {"unavailable": f"sheet {seed.get('sheet')!r} is not in {path} now"}
+
+    rows = _span(seed.get("block_rows"))
+    cols = _span(seed.get("block_cols"))
+    if rows is None or cols is None:
+        return {"unavailable": "this finding records no block span to re-read"}
+
+    r0, r1 = rows
+    c0, c1 = cols
+
+    # Unconditional, and measured against the sheet rather than against
+    # scan.json. The previous version ran these only when the scan had trimmed
+    # the finding -- so every finding whose block fits the stored window, which
+    # is most of them and all of the demo's, was re-read with no check at all.
+    # It also compared the finding's column span with the span the same scan
+    # wrote, which is the same number by construction and could never fire.
+    #
+    # Identity first: size and mtime catch an edit that preserves the block's
+    # shape, which no extent check can see.
+    for rec in (scan.get("scan_stats") or {}).get("files") or []:
+        if rec.get("file") != os.path.basename(path):
+            continue
+        if "size" not in rec:
+            break
+        try:
+            st = os.stat(path)
+        except OSError:
+            break
+        if st.st_size != rec["size"] or st.st_mtime_ns != rec.get("mtime_ns"):
+            return {"unavailable": f"{os.path.basename(path)} has changed since the "
+                                   f"scan (size or timestamp differs); its cells no "
+                                   f"longer correspond to this finding"}
+        break
+
+    if sheet.nrows < r1:
+        return {"unavailable": f"{seed.get('sheet')!r} in {path} now has "
+                               f"{sheet.nrows} rows, fewer than the {r1} this "
+                               f"finding covers -- the source changed since the scan"}
+    if sheet.ncols < c1:
+        return {"unavailable": f"{seed.get('sheet')!r} in {path} now has "
+                               f"{sheet.ncols} columns, fewer than the {c1} this "
+                               f"finding covers -- the source changed since the scan"}
+
+    header = header_for(sheet, r0, c0, c1)
+    stored_ev = raw.get("evidence") or {}
+    highlight_cols = stored_ev.get("highlight_cols") or []
+    highlight_rows = stored_ev.get("highlight_rows") or []
+    if not highlight_cols and not highlight_rows:
+        # Without the markers the reader cannot see which cells the finding is
+        # about, and a wide window of unmarked numbers is worse than the trimmed
+        # one it replaces.
+        return {"unavailable": "this finding's highlighted cells could not be "
+                               "recovered, so a full window would not show what "
+                               "the finding is about"}
+
+    # Widened for this call, not unbounded: CLAUDE.md requires the evidence caps
+    # be respected in new code paths, and a genomics block is millions of cells.
+    # Passed as arguments rather than by raising the module globals, so a
+    # concurrent scan is unaffected.
+    span_rows, span_cols = r1 - r0 + 2, c1 - c0
+    if span_rows * max(1, span_cols) > _FULL_EV_CELLS:
+        allowed = max(1, _FULL_EV_CELLS // max(1, span_cols))
+        return _block_evidence(sheet, r0, r1, c0, c1, header,
+                               highlight_cols, highlight_rows,
+                               max_rows=allowed, max_cols=span_cols,
+                               trimmed_by="full_budget")
+    return _block_evidence(sheet, r0, r1, c0, c1, header,
+                           highlight_cols, highlight_rows,
+                           max_rows=span_rows, max_cols=span_cols)
+
+
+def _span(text: Any) -> tuple[int, int] | None:
+    """'3-120' -> (2, 120): scan spans are 1-based inclusive, slices are 0-based."""
+    if not isinstance(text, str) or "-" not in text:
+        return None
+    lo, _, hi = text.partition("-")
+    try:
+        return int(lo) - 1, int(hi)
+    except ValueError:
+        return None
+
+
+def explain(scan: dict[str, Any], finding_id: str, *, full: bool = False) -> dict[str, Any]:
     """One finding in full: parameters, evidence, and how a profile treated it."""
     for cluster, seed in _iter_findings_with_seeds(scan):
         if seed["seed_id"] != finding_id:
             continue
         raw = _match_raw_finding(scan, seed) or {}
+        # Once: --full re-reads the source file, so asking twice doubles the IO
+        # and, on a large supplement, the peak memory.
+        evidence = _reread_evidence(scan, seed, raw) if full else raw.get("evidence")
         return {
             "finding_id": finding_id,
             "kind": seed["kind"],
@@ -409,6 +528,20 @@ def explain(scan: dict[str, Any], finding_id: str) -> dict[str, Any]:
             "parameters": {
                 k: v for k, v in raw.items() if k not in _NON_PARAMETER_KEYS
             },
-            "evidence": raw.get("evidence"),
+            "evidence": evidence,
+            # Two separate facts, and conflating them cost a round: this one
+            # is a claim about the evidence, which a --json consumer reads as
+            # "the whole block is here". A --full that refused, or that came
+            # back bounded by its own budget, is not that.
+            "evidence_is_full": bool(
+                full and isinstance(evidence, dict)
+                and "unavailable" not in evidence
+                and "truncated" not in evidence
+            ),
+            # And this one is what the reader asked for. The renderer needs it
+            # to lift its page cap: keying that off evidence_is_full re-trimmed
+            # a budget-bounded window to twenty rows and told a reader who had
+            # just run --full to add --full.
+            "evidence_requested_full": bool(full),
         }
     raise ValueError(f"no such finding: {finding_id!r}; run drill() to list them")
