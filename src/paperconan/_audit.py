@@ -470,39 +470,49 @@ def _cell_value(v):
     return str(v)
 
 
-def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_rows=None):
+def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_rows=None,
+                    max_rows=None, max_cols=None):
     """Slice a numeric block (with 1 row of context above/below if available) into a
     JSON-friendly evidence dict that the HTML renderer can show as a table.
 
-    The emitted snippet is bounded to a contiguous _MAX_EV_ROWS × _MAX_EV_COLS
+    max_rows/max_cols override the stored bounds for one call. They are
+    parameters rather than a save-and-restore of the module globals because
+    `explain --full` needs a wider window than the scan stores, and this module
+    is imported by a library API another thread may be scanning through -- a
+    global raised for the duration of one call would widen every window written
+    in that window of time, which is the OOM the caps exist to prevent.
+
+    The emitted snippet is bounded to a contiguous max_rows × max_cols
     sub-rectangle inside the block, always covering the highlighted columns (and rows
     when given). This stops a dense block from being copied whole into every finding
     (which balloons the scan dict / scan.json to GBs). Small blocks are emitted whole
     and stay byte-identical (no `truncated` key)."""
     truncated = False
+    max_rows = _MAX_EV_ROWS if max_rows is None else max_rows
+    max_cols = _MAX_EV_COLS if max_cols is None else max_cols
 
     # --- column window -------------------------------------------------------
     ec0, ec1 = c0, c1
-    if (c1 - c0) > _MAX_EV_COLS:
+    if (c1 - c0) > max_cols:
         truncated = True
         if highlight_cols:
             lo = min(highlight_cols)
             hi = max(highlight_cols)
         else:
             lo = hi = c0
-        if hi - lo + 1 > _MAX_EV_COLS:
+        if hi - lo + 1 > max_cols:
             ec0 = lo
-            ec1 = lo + _MAX_EV_COLS
+            ec1 = lo + max_cols
         else:
-            # Center a _MAX_EV_COLS-wide window on [lo, hi], then clamp into [c0, c1).
-            pad = (_MAX_EV_COLS - (hi - lo + 1)) // 2
+            # Center a max_cols-wide window on [lo, hi], then clamp into [c0, c1).
+            pad = (max_cols - (hi - lo + 1)) // 2
             ec0 = lo - pad
-            ec1 = ec0 + _MAX_EV_COLS
+            ec1 = ec0 + max_cols
             if ec0 < c0:
-                ec0, ec1 = c0, c0 + _MAX_EV_COLS
+                ec0, ec1 = c0, c0 + max_cols
             if ec1 > c1:
                 ec1 = c1
-                ec0 = ec1 - _MAX_EV_COLS
+                ec0 = ec1 - max_cols
             if ec0 < c0:
                 ec0 = c0
 
@@ -515,25 +525,25 @@ def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_row
 
     r_start = max(0, r0 - 1)
     r_end = min(sheet.nrows, r1 + 1)
-    if (r_end - r_start) > _MAX_EV_ROWS:
+    if (r_end - r_start) > max_rows:
         truncated = True
         if highlight_rows:
             # highlight_rows are 1-based row numbers; center the window on them.
             rlo = min(highlight_rows) - 1
             rhi = max(highlight_rows) - 1
-            if rhi - rlo + 1 >= _MAX_EV_ROWS:
+            if rhi - rlo + 1 >= max_rows:
                 wr0 = rlo
             else:
-                pad = (_MAX_EV_ROWS - (rhi - rlo + 1)) // 2
+                pad = (max_rows - (rhi - rlo + 1)) // 2
                 wr0 = rlo - pad
         else:
             wr0 = r_start
         if wr0 < r_start:
             wr0 = r_start
-        wr1 = wr0 + _MAX_EV_ROWS
+        wr1 = wr0 + max_rows
         if wr1 > r_end:
             wr1 = r_end
-            wr0 = max(r_start, wr1 - _MAX_EV_ROWS)
+            wr0 = max(r_start, wr1 - max_rows)
         r_start, r_end = wr0, wr1
 
     data_rows = []
@@ -557,6 +567,9 @@ def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_row
         # evidence table that does not state its own scale is the same defect as
         # a scan that reports itself complete after stopping early.
         out["truncated"] = {
+            # Both row figures include the +-1 context rows, so the ratio is
+            # self-consistent; `window_rows_total` rather than `block` because
+            # the column figures are the block's exact width.
             "rows_shown": len(data_rows), "rows_total": full_rows,
             "cols_shown": ec1 - ec0, "cols_total": full_cols,
         }
@@ -4228,6 +4241,12 @@ _MAX_REPORT_BLOCKS = int(os.environ.get("PAPERCONAN_MAX_REPORT_BLOCKS", "2000"))
 # re-reads it. The window always covers the highlighted cells.
 _MAX_EV_ROWS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_ROWS", "20"))
 _MAX_EV_COLS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_COLS", "30"))
+# Ceiling on a single `explain --full` window. --full lifts the stored
+# bound, not to remove it: a genomics block is millions of cells and CLAUDE.md
+# requires new code paths to respect the memory caps. Generous enough that an
+# ordinary panel comes back whole, finite enough that a pathological one does
+# not materialise as JSON.
+_FULL_EV_CELLS = int(os.environ.get("PAPERCONAN_MAX_FULL_EVIDENCE_CELLS", "200000"))
 # Per-block finding cap: the pairwise detectors are O(col²), so a single dense, highly
 # correlated block (a correlation matrix, an expression panel with many proportional columns)
 # can emit thousands of findings. Each carries its own embedded evidence snippet, so the count —
@@ -4660,7 +4679,10 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                    datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
                    if runtime_metadata else None),
                profile=profile,
-               input_dir=in_dir,
+               # Absolute: a relative input_dir resolves against whatever tree
+               # the reader happens to be in, so `explain --full` would read a
+               # different file of the same name and present it as this block.
+               input_dir=os.path.abspath(in_dir),
                paper=_load_provenance(in_dir, paper),
                n_files=len(table_files),
                n_image_source_files=len(local_images),

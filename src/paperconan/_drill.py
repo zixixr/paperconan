@@ -400,7 +400,8 @@ def _reread_evidence(scan: dict[str, Any], seed: dict[str, Any],
     complete: a reader who asked for everything and got a subset would take the
     subset for the block.
     """
-    from ._audit import _block_evidence, header_for, load_table
+    from ._audit import (_FULL_EV_CELLS, _block_evidence, header_for,
+                         load_table)
 
     in_dir = scan.get("input_dir")
     if not in_dir:
@@ -426,20 +427,54 @@ def _reread_evidence(scan: dict[str, Any], seed: dict[str, Any],
 
     r0, r1 = rows
     c0, c1 = cols
+
+    # The scan holds no identity for its inputs -- no hash, no mtime -- and
+    # input_dir may be relative, so the same scan.json read from another
+    # directory resolves against whatever tree is there. Re-reading blind turns
+    # "you are seeing part of the block" into "you are seeing a different
+    # block", which is worse than the trimming this exists to undo. The stored
+    # window records the block's true extent, so a shape that no longer matches
+    # is proof the source moved on, and the only honest answer is to refuse.
+    stored = (raw.get("evidence") or {}).get("truncated")
+    if isinstance(stored, dict):
+        want_cols = stored.get("cols_total")
+        if want_cols is not None and (c1 - c0) != want_cols:
+            return {"unavailable": "the finding's column span does not match what "
+                                   "the scan recorded; the scan or the finding is "
+                                   "from a different run"}
+        if sheet.nrows < r1:
+            return {"unavailable": f"{seed.get('sheet')!r} in {path} now has "
+                                   f"{sheet.nrows} rows, fewer than the {r1} this "
+                                   f"finding covers -- the source changed since "
+                                   f"the scan"}
     # Rebuilt from the sheet, not taken from the stored evidence: those headers
     # were already sliced to the stored window, so reusing them left the widened
     # window with a short header row and the columns effectively un-widened.
     header = header_for(sheet, r0, c0, c1)
-    # Raised for this call only: the point of --full is to lift the stored bound.
-    import paperconan._audit as audit
-    keep_rows, keep_cols = audit._MAX_EV_ROWS, audit._MAX_EV_COLS
-    audit._MAX_EV_ROWS, audit._MAX_EV_COLS = 10 ** 9, 10 ** 9
-    try:
+    stored_ev = raw.get("evidence") or {}
+    highlight_cols = stored_ev.get("highlight_cols") or []
+    highlight_rows = stored_ev.get("highlight_rows") or []
+    if not highlight_cols and not highlight_rows:
+        # Without the markers the reader cannot see which cells the finding is
+        # about, and a wide window of unmarked numbers is worse than the trimmed
+        # one it replaces.
+        return {"unavailable": "this finding's highlighted cells could not be "
+                               "recovered, so a full window would not show what "
+                               "the finding is about"}
+
+    # Widened for this call, not unbounded: CLAUDE.md requires the evidence caps
+    # be respected in new code paths, and a genomics block is millions of cells.
+    # Passed as arguments rather than by raising the module globals, so a
+    # concurrent scan is unaffected.
+    span_rows, span_cols = r1 - r0 + 2, c1 - c0
+    if span_rows * max(1, span_cols) > _FULL_EV_CELLS:
+        allowed = max(1, _FULL_EV_CELLS // max(1, span_cols))
         return _block_evidence(sheet, r0, r1, c0, c1, header,
-                               (raw.get("evidence") or {}).get("highlight_cols") or [],
-                               (raw.get("evidence") or {}).get("highlight_rows") or [])
-    finally:
-        audit._MAX_EV_ROWS, audit._MAX_EV_COLS = keep_rows, keep_cols
+                               highlight_cols, highlight_rows,
+                               max_rows=allowed, max_cols=span_cols)
+    return _block_evidence(sheet, r0, r1, c0, c1, header,
+                           highlight_cols, highlight_rows,
+                           max_rows=span_rows, max_cols=span_cols)
 
 
 def _span(text: Any) -> tuple[int, int] | None:
@@ -478,7 +513,11 @@ def explain(scan: dict[str, Any], finding_id: str, *, full: bool = False) -> dic
             "parameters": {
                 k: v for k, v in raw.items() if k not in _NON_PARAMETER_KEYS
             },
-"evidence": (_reread_evidence(scan, seed, raw) if full
+            "evidence": (_reread_evidence(scan, seed, raw) if full
                          else raw.get("evidence")),
+            # The renderer caps rows at a page's worth. Under --full that cap
+            # would silently undo the re-read: the reader asked for the block,
+            # got it, and still saw one page of it.
+            "evidence_is_full": bool(full),
         }
     raise ValueError(f"no such finding: {finding_id!r}; run drill() to list them")

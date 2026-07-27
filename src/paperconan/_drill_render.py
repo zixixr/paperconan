@@ -9,6 +9,7 @@ inconsistencies awaiting an author's clarification, never accusations.
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
 
@@ -99,9 +100,13 @@ def render_drill(view: dict[str, Any]) -> str:
 
 
 _EVIDENCE_ROW_LIMIT = 20
+# Under --full the reader has explicitly asked for the whole block, so the page
+# cap would defeat the re-read. Still finite: a terminal is not a spreadsheet.
+_FULL_EVIDENCE_ROW_LIMIT = int(os.environ.get(
+    "PAPERCONAN_FULL_EVIDENCE_ROW_LIMIT", "500"))
 
 
-def _render_evidence(ev: dict[str, Any] | None) -> list[str]:
+def _render_evidence(ev: dict[str, Any] | None, *, full: bool = False) -> list[str]:
     """Render the evidence window.
 
     Values are never clipped. This table exists so a reviewer can compare exact
@@ -110,6 +115,12 @@ def _render_evidence(ev: dict[str, Any] | None) -> list[str]:
     -1.234567, wrong by a hundred orders of magnitude. Columns widen to fit
     instead, and the row/column counts the scan itself trimmed are stated.
     """
+
+    if isinstance(ev, dict) and ev.get("unavailable"):
+        # --full could not reach the source. Saying so is the whole point: the
+        # alternative is an empty table that reads as a block with nothing in it.
+        return ["  evidence:", f"  ! full evidence unavailable — {ev['unavailable']}"]
+
     if not ev or not ev.get("rows"):
         return ["  (no evidence table recorded)"]
     headers = [str(h) for h in (ev.get("headers") or [])]
@@ -128,7 +139,8 @@ def _render_evidence(ev: dict[str, Any] | None) -> list[str]:
             return repr(v)
         return str(v)
 
-    shown = rows[:_EVIDENCE_ROW_LIMIT]
+    limit = _FULL_EVIDENCE_ROW_LIMIT if full else _EVIDENCE_ROW_LIMIT
+    shown = rows[:limit]
     # A row may carry more values than there are headers; widen rather than zip
     # them away, or whole columns vanish with no trace.
     n_cols = max([len(headers)] + [len(r.get("values") or []) for r in shown])
@@ -161,8 +173,9 @@ def _render_evidence(ev: dict[str, Any] | None) -> list[str]:
             for i in range(n_cols)
         )
         out.append(f"{mark} {idx:>3} │ {cells}")
-    if len(rows) > _EVIDENCE_ROW_LIMIT:
-        out.append(f"  … {len(rows) - _EVIDENCE_ROW_LIMIT} more rows in this window")
+    if len(rows) > limit:
+        out.append(f"  … {len(rows) - limit} more rows in this window"
+                   + ("" if full else "; add --full to read the block"))
     cut = ev.get("truncated")
     if cut:
         # The scan clipped the window before it ever reached here, so the table
@@ -215,7 +228,8 @@ def render_explain(view: dict[str, Any]) -> str:
                    f"({', '.join(structured)}); use --json")
     out.append("")
     out.append("  evidence:")
-    out += _render_evidence(view.get("evidence"))
+    out += _render_evidence(view.get("evidence"),
+                            full=bool(view.get("evidence_is_full")))
     out.append("")
     out.append("This is a statistical signal, not a conclusion. Confirm against the "
                "original records,")

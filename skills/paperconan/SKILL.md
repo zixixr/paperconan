@@ -55,8 +55,14 @@ are most of the file's bytes. A trimmed window carries its own scale, e.g.
 "the anomaly is here, and there is more of this block than you are seeing" — not
 as the block. When the exact cells matter (checking a value against the paper,
 or judging whether a pattern runs the whole column), `explain --full` re-reads
-the block from the source data. It needs the source files still in place: if
-they have moved, it says so rather than handing back the trimmed window.
+the block from the source data.
+
+`--full` refuses rather than guesses. The scan keeps no hash of its inputs, so
+if the source file has moved, been edited, or no longer has the shape the scan
+recorded, it returns the reason and no rows — reading it blind would hand you a
+different table under this finding's heading. It also stays inside a cell budget
+(`PAPERCONAN_MAX_FULL_EVIDENCE_CELLS`), so a genomics-scale block comes back
+bounded and still says so.
 
 Work down, and stop at the shallowest layer that answers the question:
 

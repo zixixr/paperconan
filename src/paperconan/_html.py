@@ -154,9 +154,26 @@ def _render_evidence_table(ev: dict | None) -> str:
             cells.append(f'<td class="{cls}">{_fmt_cell(v)}</td>')
         body_rows.append(f'<tr class="{tr_cls}">{"".join(cells)}</tr>')
 
+    # A trimmed window with no notice reads as the whole block. This table is
+    # what a reader checks against the paper, and it reaches them through the
+    # adjudicated report too, so the scale has to travel with it.
+    cut = ev.get("truncated")
+    caption = ""
+    if isinstance(cut, dict):
+        caption = (
+            f'<caption class="ev-cut">'
+            f'{_esc(cut.get("rows_shown"))}×{_esc(cut.get("cols_shown"))} / '
+            f'{_esc(cut.get("rows_total"))}×{_esc(cut.get("cols_total"))} '
+            f'· 此表为窗口,非整块 · window, not the whole block</caption>'
+        )
+    elif cut:
+        caption = ('<caption class="ev-cut">窗口已被扫描裁剪 · '
+                   'this window was trimmed by the scan</caption>')
+
     return (
         '<div class="ev-wrap"><table class="ev">'
-        f'<thead><tr>{"".join(head_cells)}</tr></thead>'
+        + caption
+        + f'<thead><tr>{"".join(head_cells)}</tr></thead>'
         f'<tbody>{"".join(body_rows)}</tbody>'
         '</table></div>'
     )
@@ -639,6 +656,7 @@ p.benign { margin:6px 14px; padding:6px 12px; font-size:13px; color:var(--low);
   color:var(--muted); font-size:11px; }
 .show-noisy { margin:10px 0 2px; padding:6px 8px; border:1px solid var(--border);
   border-radius:4px; background:var(--panel-2); }
+.ev-cut { caption-side:top; text-align:left; padding:5px 8px; font-size:11.5px; color:var(--muted); }
 .ev-wrap { overflow-x:auto; border:1px solid var(--border); border-radius:4px; background:var(--panel-2); }
 table.ev { width:100%; border-collapse:collapse; }
 table.ev th, table.ev td { padding:5px 9px; border-bottom:1px solid var(--border);

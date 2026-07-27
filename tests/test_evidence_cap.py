@@ -148,3 +148,98 @@ def test_explain_full_says_why_when_the_source_is_gone(tmp_path):
         f"--full returned a window with the source deleted: {list(full)}"
     )
     assert "rows" not in full, "a partial window must not ride alongside the reason"
+
+
+def test_explain_full_refuses_when_the_source_no_longer_matches(tmp_path):
+    """Wrong cells are worse than missing ones.
+
+    The scan keeps no hash or mtime for its inputs, so a source edited or
+    replaced since the scan re-reads clean and is presented as this finding's
+    block -- a reader checking values against the paper would be comparing a
+    different table. The stored window records the block's true extent, so a
+    shape that no longer matches is proof the source moved on.
+    """
+    from paperconan._drill import explain
+
+    _panel(tmp_path / "d" / "p.csv", rows=80, cols=40)
+    scan = scan_dir(str(tmp_path / "d"), str(tmp_path / "out"), write_html=False)
+    fid, cut = _a_trimmed_finding(scan)
+    assert fid and cut["rows_total"] > 3
+
+    _panel(tmp_path / "d" / "p.csv", rows=3, cols=40)      # same name, different data
+    full = explain(scan, fid, full=True)["evidence"]
+
+    assert "unavailable" in full, (
+        f"--full returned a window from a source that no longer matches: {list(full)}"
+    )
+    assert "rows" not in full
+
+
+def test_explain_full_stays_inside_a_finite_cell_budget(tmp_path, monkeypatch):
+    """--full lifts the stored bound; it does not remove it.
+
+    CLAUDE.md requires new code paths to respect the memory caps -- a genomics
+    block is millions of cells, and materialising one as JSON is the OOM the
+    caps exist to prevent.
+    """
+    import paperconan._audit as audit
+    from paperconan._drill import explain
+
+    monkeypatch.setattr(audit, "_FULL_EV_CELLS", 200)
+
+    _panel(tmp_path / "d" / "p.csv", rows=80, cols=40)
+    scan = scan_dir(str(tmp_path / "d"), str(tmp_path / "out"), write_html=False)
+    fid, cut = _a_trimmed_finding(scan)
+    assert fid
+
+    full = explain(scan, fid, full=True)["evidence"]
+    assert "unavailable" not in full, full
+    cells = len(full["rows"]) * len(full["rows"][0]["values"])
+    assert cells <= 200 * 2, f"--full materialised {cells} cells against a 200 budget"
+    assert full.get("truncated"), "a budget-bounded window must still say it is one"
+
+
+def test_the_html_evidence_table_discloses_a_trimmed_window():
+    """The adjudicated report is the deliverable, and it renders this table.
+
+    A trimmed window with no notice reads as the whole block to whoever the
+    report reaches -- who may not be the person who ran the scan.
+    """
+    from paperconan._html import _render_evidence_table
+
+    ev = {"headers": ["a", "b"], "col_offset": 0, "highlight_cols": [0],
+          "highlight_rows": [], "rows": [{"row_idx": 1, "is_context": False,
+                                          "values": [1.0, 2.0]}],
+          "truncated": {"rows_shown": 20, "rows_total": 300,
+                        "cols_shown": 30, "cols_total": 200}}
+
+    html = _render_evidence_table(ev)
+    assert "300" in html and "200" in html, f"the block's true size is absent: {html}"
+
+    whole = dict(ev)
+    whole.pop("truncated")
+    assert "<caption" not in _render_evidence_table(whole), (
+        "an untrimmed table must not claim to be a window"
+    )
+
+
+def test_the_text_view_does_not_re_trim_a_full_window(tmp_path):
+    """--full reads the block, then the page cap would show one page of it.
+
+    SKILL.md tells an agent to use --full when judging whether a pattern runs
+    the whole column. A renderer that caps at a page silently undoes the
+    re-read the agent just paid for.
+    """
+    from paperconan._drill import explain
+    from paperconan._drill_render import render_explain
+
+    _panel(tmp_path / "d" / "p.csv", rows=80, cols=40)
+    scan = scan_dir(str(tmp_path / "d"), str(tmp_path / "out"), write_html=False)
+    fid, cut = _a_trimmed_finding(scan)
+    assert fid and cut["rows_total"] > 25
+
+    text = render_explain(explain(scan, fid, full=True))
+    body = [ln for ln in text.splitlines() if "│" in ln]
+    assert len(body) > 25, (
+        f"--full rendered {len(body)} rows of a {cut['rows_total']}-row block"
+    )
