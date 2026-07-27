@@ -261,8 +261,11 @@ def _block_seed(blk: dict[str, Any], group: str, f: dict[str, Any]) -> dict[str,
         "block_cols": block.get("cols"),
     }
     return {
-        # Derived from content, never from enumeration order: adding an unrelated
-        # file must not renumber the seeds a routing request already cites.
+        # Derived from content, not from enumeration order: adding an unrelated
+        # file must not renumber the seeds a routing request already cites. One
+        # exception, and it is declared in coverage: the `#N` suffix a collision
+        # gets IS positional, so a suffixed id identifies a finding only within
+        # one scan of one input and must not be persisted across scans.
         "seed_id": _stable_id("seed", [locator, group, f.get("kind"), f.get("rule")]),
         "kind": f.get("kind"),
         "group": group,
@@ -322,18 +325,22 @@ def _build_clusters(scan: dict[str, Any], max_clusters: int) -> tuple[list[dict]
     seeds = [_block_seed(blk, group, f) for blk, group, f in _iter_raw_findings(scan)]
     seeds += [_cross_sheet_seed(f) for f in scan.get("cross_sheet_findings", []) or []]
 
-    # A routing request cites seeds by id, so a content-derived id is only an
-    # identifier if the hashed tuple is a key. Two findings sharing an id would
-    # make a routing decision ambiguous and inflate seeds_total; catch it here
-    # rather than letting the packet ship indistinguishable entries.
-    ids = [s["seed_id"] for s in seeds]
-    if len(set(ids)) != len(ids):
-        from collections import Counter
-        dupes = sorted(i for i, n in Counter(ids).items() if n > 1)
-        raise WorkflowError(
-            f"seed ids are not unique ({len(ids) - len(set(ids))} collisions, "
-            f"first: {dupes[0]}); the seed locator does not distinguish these findings"
-        )
+    # Disambiguate rather than refuse. Raising here was the wrong call: real
+    # supplements do collide — a locator that cannot separate two findings is a
+    # gap in the locator, not a reason to deny the reader every other finding in
+    # the paper. An ordinal keeps ids unique and stable within a packet; the
+    # collision itself is recorded so it is visible rather than papered over.
+    seen: dict[str, int] = {}
+    collisions = 0
+    for seed in seeds:
+        base = seed["seed_id"]
+        if base in seen:
+            seen[base] += 1
+            collisions += 1
+            seed["seed_id"] = f"{base}#{seen[base]}"
+            seed["id_disambiguated"] = True
+        else:
+            seen[base] = 0
 
     grouped: dict[tuple, list[dict]] = {}
     for seed in seeds:
@@ -369,6 +376,14 @@ def _build_clusters(scan: dict[str, Any], max_clusters: int) -> tuple[list[dict]
 
     kept, omitted = clusters[:max_clusters], clusters[max_clusters:]
     coverage = _coverage_for(scan, seeds, clusters, omitted, max_clusters)
+    if collisions:
+        coverage["seed_ids_disambiguated"] = collisions
+        coverage["coverage_complete"] = False
+        coverage["limitations"].append(
+            f"{collisions} findings shared a locator with another and were given "
+            "an ordinal suffix; their ids are unique within this packet but do "
+            "not identify the finding on their own"
+        )
     return kept, coverage
 
 
