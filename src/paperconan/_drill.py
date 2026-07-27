@@ -23,7 +23,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._finding_groups import BLOCK_FINDING_GROUPS
 from ._workflow import (_SEVERITY_RANK, _block_seed, _build_clusters,
                         _cross_sheet_seed, _iter_raw_findings)
 
@@ -39,12 +38,17 @@ def _location_label(cluster: dict[str, Any]) -> str:
     where = f'{cluster["file"]} :: {cluster["sheet"]}'
     if cluster.get("block_rows"):
         where += f' rows {cluster["block_rows"]}'
-    spans = [c for c in (cluster.get("block_cols_merged") or []) if c]
-    if len(spans) > 1:
+    merged_spans = cluster.get("block_cols_merged") or []
+    spans = [c for c in merged_spans if c]
+    if len(merged_spans) > 1:
         # A merged panel spans several column groups. Naming the first would send
         # the reader to a third of the evidence; naming none loses the location
         # entirely, which is what setting block_cols=None used to do.
-        where += f' cols {spans[0]} +{len(spans) - 1} more'
+        # Counted from members, not from non-empty spans: a member whose span
+        # is missing still holds evidence, and dropping it from the count told
+        # the reader a three-group panel had two.
+        first = spans[0] if spans else "?"
+        where += f' cols {first} +{len(merged_spans) - 1} more'
     elif cluster.get("block_cols"):
         where += f' cols {cluster["block_cols"]}'
     return where
@@ -143,7 +147,12 @@ def _interleave_by_family(clusters: list[dict[str, Any]]) -> list[dict[str, Any]
 
 
 def _ranked_panels(scan: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """The one list every layer indexes.
+    """The list `overview` and `drill` share, so an ordinal means one thing.
+
+    Not `explain`: L4 answers about one finding and reports the member cluster's
+    exact column span, which is the span the reader needs to find the cells --
+    deliberately narrower than the panel label above it. _resolve accepts a
+    member id, so that id still opens the panel.
 
     overview used to merge and interleave while drill resolved against the raw
     cluster list, so `overview` printed a number and `drill <that number>` opened

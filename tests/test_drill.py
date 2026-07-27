@@ -920,9 +920,12 @@ def test_every_overview_number_opens_that_location_on_a_saturated_scan():
 
     overview merges panels and interleaves families; drill used to resolve
     against the raw cluster list, so the number printed by one layer opened a
-    different location in the next -- silently, on any scan large enough for the
-    reordering to matter. The small fixtures elsewhere in this file are below
-    that size, so they agreed by accident.
+    different location in the next.
+
+    Not a large-scan effect: _merge_panels set block_cols=None on every panel
+    including single-member ones, so the labels diverged at every fixture size
+    in this file. What was missing was any test that compared the two layers at
+    all. This one does it on a scan big enough that the reordering also bites.
     """
     scan = _saturated_scan()
     view = overview(scan, max_locations=20)
@@ -1084,4 +1087,30 @@ def test_explain_serves_the_right_finding_for_a_disambiguated_id():
     )
     assert "shared axis" in str(got["severity"]["context"]), (
         f"the demotion reason did not reach the reader: {got['severity']}"
+    )
+
+
+def test_a_member_cluster_id_opens_the_panel_that_absorbed_it():
+    """Ids outlive the merge that hid them.
+
+    explain reports the member cluster's own id, and the workflow packet cites
+    raw cluster ids -- neither of which appears in overview's listing once the
+    panel absorbs them. If _resolve did not accept a member id, those ids would
+    reference nothing. Deleting that branch left the whole suite green.
+    """
+    scan = _saturated_scan()
+    view = overview(scan, max_locations=20)
+    panel = next(loc for loc in view["locations"] if "more" in loc["location"])
+
+    from paperconan._drill import _clusters_of, _merge_panels
+
+    raw, _seeding = _clusters_of(scan)
+    merged = next(p for p in _merge_panels(raw) if p["cluster_id"] == panel["cluster_id"])
+    members = [m for m in merged["member_ids"] if m != merged["cluster_id"]]
+    assert members, "fixture no longer produces a panel with absorbed members"
+
+    opened = drill(scan, members[0])
+    assert opened["cluster_id"] == panel["cluster_id"], (
+        f"a member id opened {opened['cluster_id']} instead of its panel "
+        f"{panel['cluster_id']}"
     )

@@ -325,11 +325,6 @@ def _build_clusters(scan: dict[str, Any], max_clusters: int) -> tuple[list[dict]
     seeds = [_block_seed(blk, group, f) for blk, group, f in _iter_raw_findings(scan)]
     seeds += [_cross_sheet_seed(f) for f in scan.get("cross_sheet_findings", []) or []]
 
-    # A routing request cites seeds by id, so two findings sharing one make a
-    # routing decision ambiguous. This used to raise. On real supplements ids
-    # collide routinely, and refusing the packet denied the reader every other
-    # finding in the file over a gap in one locator -- so collisions are
-    # disambiguated and declared instead.
     # Disambiguate rather than refuse. Raising here was the wrong call: real
     # supplements do collide — a locator that cannot separate two findings is a
     # gap in the locator, not a reason to deny the reader every other finding in
