@@ -4416,7 +4416,8 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         # source edited afterwards comes back as this finding's block. Size and
         # mtime are a few bytes each. They compare size, not content, so an
         # edit that preserves both the byte count and the timestamp is not
-        # detectable this way -- the extent checks and SKILL.md say so.
+        # detectable this way. SKILL.md states that limit; the extent checks
+        # below are the backstop for a scan that carries no identity at all.
         try:
             st = os.stat(f)
             file_stat["size"] = st.st_size

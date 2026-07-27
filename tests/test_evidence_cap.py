@@ -238,7 +238,11 @@ def test_the_text_view_does_not_re_trim_a_full_window(tmp_path):
     fid, cut = _a_trimmed_finding(scan)
     assert fid and cut["rows_total"] > 25
 
-    text = render_explain(explain(scan, fid, full=True))
+    view = explain(scan, fid, full=True)
+    assert view["evidence_is_full"] is True, (
+        "a whole re-read window did not report itself whole"
+    )
+    text = render_explain(view)
     body = [ln for ln in text.splitlines() if "│" in ln]
     assert len(body) > 25, (
         f"--full rendered {len(body)} rows of a {cut['rows_total']}-row block"
@@ -367,6 +371,12 @@ def test_a_budget_bounded_window_does_not_send_the_reader_back_to_full(tmp_path,
 
     view = explain(scan, fid, full=True)
     assert view["evidence"]["truncated"]["by"] == "full_budget"
+    # The --json half of the same distinction: a window the budget bounded is
+    # not the whole block, and this field is what a consumer reads as the claim.
+    assert view["evidence_is_full"] is False, (
+        "a budget-bounded window claimed to be the whole block"
+    )
+    assert view["evidence_requested_full"] is True
 
     text = render_explain(view)
     assert "PAPERCONAN_MAX_FULL_EVIDENCE_CELLS" in text, text
@@ -442,4 +452,37 @@ def test_a_same_size_edit_is_caught_by_the_timestamp(tmp_path):
 
     assert "unavailable" in explain(scan, fid, full=True)["evidence"], (
         "a same-size edit was served as this finding's block"
+    )
+
+
+def test_a_resized_edit_is_caught_by_the_size(tmp_path):
+    """The other half of the identity pair.
+
+    Comparing mtime alone survived the suite: an edit that changes the byte
+    count but restores the timestamp -- which a build step or a sync tool can do
+    -- would be served as this finding's block.
+    """
+    import os
+
+    from paperconan._drill import explain
+
+    _small_panel(tmp_path / "d" / "p.csv", rows=8, cols=4)
+    scan = scan_dir(str(tmp_path / "d"), str(tmp_path / "out"), write_html=False)
+    fid = _any_finding(scan)
+    assert fid
+
+    rec = scan["scan_stats"]["files"][0]
+    path = tmp_path / "d" / "p.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    # Same shape, more bytes per cell, timestamp put back.
+    body = [lines[0]] + [",".join(f"{float(v):.9f}" for v in r.split(","))
+                         for r in lines[1:]]
+    path.write_text("\n".join(body) + "\n", encoding="utf-8")
+    os.utime(path, ns=(rec["mtime_ns"], rec["mtime_ns"]))
+
+    assert os.path.getsize(path) != rec["size"], "fixture no longer changes size"
+    assert os.stat(path).st_mtime_ns == rec["mtime_ns"], "fixture failed to restore mtime"
+
+    assert "unavailable" in explain(scan, fid, full=True)["evidence"], (
+        "a resized edit with the timestamp restored was served as the block"
     )
