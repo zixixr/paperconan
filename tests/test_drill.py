@@ -823,3 +823,91 @@ def test_cli_rejects_a_scan_that_is_not_json(tmp_path):
     assert res.returncode != 0
     assert "Traceback" not in res.stderr
     assert "not valid JSON" in (res.stderr + res.stdout)
+
+
+# ---------- collisions and ordering, both found by running on real papers ----------
+
+def _saturated_scan(noisy_blocks=30, per_block=150, real_blocks=6):
+    """Shaped like a real supplement.
+
+    `noisy_blocks` blocks where one family saturates the per-block cap, and a few
+    carrying a single strong signal. Deliberately more noisy blocks than the
+    default page holds — with fewer, a diversity assertion passes for free.
+    """
+    blocks = []
+    for b in range(noisy_blocks):
+        blocks.append({
+            "file": "big.xlsx", "sheet": f"Supplementary Figure {b}",
+            "block": {"rows": "3-53", "cols": f"{30 + b}-53", "header": []},
+            "row_pairs": [
+                {"kind": "integer_diff_shared_fraction", "severity": "high",
+                 "raw_severity": "high", "n": 20,
+                 "rule": f"col[{i}] and col[{i + 1}] share the same decimal fraction"}
+                for i in range(per_block)
+            ],
+        })
+    for b in range(real_blocks):
+        blocks.append({
+            "file": "big.xlsx", "sheet": "Supplementary Figure 8e",
+            "block": {"rows": "4-9", "cols": f"{15 + b * 22}-{21 + b * 22}", "header": []},
+            "relations": [
+                {"kind": "identical_column", "severity": "high", "raw_severity": "high",
+                 "n": 6, "rule": f"col[{16 + b * 22}] == col[{18 + b * 22}]"}
+            ],
+        })
+    return {"tool": "paperconan", "schema_version": 1, "n_files": 1,
+            "relations_blocks": blocks, "cross_sheet_findings": []}
+
+
+def test_a_saturating_family_cannot_fill_the_default_page():
+    """Measured on a real paper: the duplicated columns the report was about
+    landed at rank 25-47, past the default page, because three blocks where one
+    family hit the per-block cap outranked them on high-count.
+
+    A family saturating one block is evidence about that family, not about the
+    paper. Thirty such blocks must not take all twenty slots.
+    """
+    view = overview(_saturated_scan(), max_locations=20)
+    first_families = [loc["families"][0] for loc in view["locations"]]
+
+    assert "identical_column" in first_families, (
+        "a 6-row exactly-duplicated column never reached the default page; "
+        f"it was filled with {set(first_families)}"
+    )
+
+
+def test_the_default_page_shows_more_than_one_family():
+    view = overview(_saturated_scan(), max_locations=20)
+
+    shown = {loc["families"][0] for loc in view["locations"]}
+    assert len(shown) >= 2, f"the whole page is one family: {shown}"
+
+
+def test_ordering_stays_deterministic_under_diversity():
+    scan = _saturated_scan()
+    assert overview(scan) == overview(scan)
+
+
+def test_colliding_seed_ids_are_disambiguated_not_refused():
+    """Real supplements collide. Refusing the packet denies the reader every
+    other finding in the paper over a gap in one locator — measured: a real
+    Nature Metabolism supplement produced 10 collisions and no output at all.
+    """
+    from paperconan._workflow import _build_clusters
+
+    dup = {"kind": "identical_column", "severity": "high", "raw_severity": "high",
+           "n": 6, "rule": "col[2] == col[5]"}
+    scan = {"relations_blocks": [{
+        "file": "f.xlsx", "sheet": "S", "block": {"rows": "2-9", "cols": "1-9", "header": []},
+        "relations": [dict(dup), dict(dup), dict(dup)],
+    }], "cross_sheet_findings": []}
+
+    clusters, coverage = _build_clusters(scan, max_clusters=10)
+
+    seeds = [s for c in clusters for s in c["seeds"]]
+    ids = [s["seed_id"] for s in seeds]
+    assert len(ids) == 3, "findings were dropped instead of disambiguated"
+    assert len(set(ids)) == 3, f"ids still collide: {ids}"
+    assert coverage["seed_ids_disambiguated"] == 2
+    assert coverage["coverage_complete"] is False
+    assert any("shared a locator" in x for x in coverage["limitations"])

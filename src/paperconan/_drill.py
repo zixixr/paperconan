@@ -24,7 +24,8 @@ from __future__ import annotations
 from typing import Any
 
 from ._finding_groups import BLOCK_FINDING_GROUPS
-from ._workflow import _block_seed, _build_clusters, _cross_sheet_seed
+from ._workflow import (_SEVERITY_RANK, _block_seed, _build_clusters,
+                        _cross_sheet_seed)
 
 # Kept generous: these are read straight into a reviewer's context, and the
 # limit exists to bound a pathological scan, not to curate.
@@ -65,11 +66,80 @@ def _families(cluster: dict[str, Any]) -> list[str]:
 
 # ---------- L1 ----------
 
+
+def _merge_panels(clusters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group the ranked clusters by panel for the overview.
+
+    Clusters key on the column span, which is right for routing — two panels
+    side by side are independent evidence. But one panel's findings often sit in
+    several column groups, and listing each separately makes a single finding
+    compete with itself for space: on a real paper, six exactly-duplicated
+    column pairs from one panel occupied six ranks instead of one, and none
+    reached the first page. The column span is what `drill` is for.
+    """
+    merged: dict[tuple, dict[str, Any]] = {}
+    for cluster in clusters:
+        key = (cluster["scope"], cluster["file"], cluster["sheet"],
+               cluster.get("block_rows"))
+        panel = merged.get(key)
+        if panel is None:
+            merged[key] = dict(cluster, block_cols=None, member_ids=[cluster["cluster_id"]])
+            continue
+        panel["seeds"] = panel["seeds"] + cluster["seeds"]
+        panel["n_high_seeds"] += cluster["n_high_seeds"]
+        panel["member_ids"].append(cluster["cluster_id"])
+        if _SEVERITY_RANK.get(cluster["strongest_raw_severity"], 3) < \
+           _SEVERITY_RANK.get(panel["strongest_raw_severity"], 3):
+            panel["strongest_raw_severity"] = cluster["strongest_raw_severity"]
+
+    # Re-rank: merging changed the counts the ranking is built on. Skipping this
+    # left a panel with seven high findings behind one with six, purely because
+    # its evidence had arrived split across six column groups.
+    panels = list(merged.values())
+    panels.sort(key=lambda c: (
+        _SEVERITY_RANK.get(c["strongest_raw_severity"], 3),
+        -c["n_high_seeds"],
+        -len(c["seeds"]),
+        c["cluster_id"],
+    ))
+    return panels
+
+
+def _interleave_by_family(clusters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Round-robin the ranked list across finding families.
+
+    Ranking on severity then high-count alone lets one family own the page: a
+    block where a single kind hits the per-block cap contributes 150 high
+    findings, which outranks a six-row exactly-duplicated column. Measured on a
+    real paper, that pushed the duplicated columns the report was about to rank
+    25-47, past the default page.
+
+    A family saturating one block is evidence about that family, not about the
+    paper. Taking one block from each family in turn keeps the strongest of every
+    kind on the first page while preserving the existing order within a family.
+    Deterministic: families are visited in the order they first appear in the
+    already-deterministic ranking.
+    """
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for cluster in clusters:
+        families = _families(cluster)
+        buckets.setdefault(families[0] if families else "?", []).append(cluster)
+
+    out: list[dict[str, Any]] = []
+    while any(buckets.values()):
+        for queue in buckets.values():
+            if queue:
+                out.append(queue.pop(0))
+    return out
+
+
+
 def overview(scan: dict[str, Any], *,
              max_locations: int = DEFAULT_MAX_LOCATIONS) -> dict[str, Any]:
     """Which locations carry signal, how strong, and of what kinds."""
     clusters, seeding = _clusters_of(scan)
     max_locations = max(0, max_locations)
+    clusters = _interleave_by_family(_merge_panels(clusters))
     shown, hidden = clusters[:max_locations], clusters[max_locations:]
 
     locations = []

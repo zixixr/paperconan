@@ -221,8 +221,13 @@ def test_cross_sheet_seeds_differing_only_in_row_get_different_ids():
     )
 
 
-def test_the_packet_refuses_to_ship_colliding_seed_ids(tmp_path, monkeypatch):
-    """The invariant fires even if a future locator change loses information."""
+def test_colliding_seed_ids_are_disambiguated_and_declared(tmp_path, monkeypatch):
+    """Refusing the packet was the wrong call, and a real paper proved it.
+
+    A Nature Metabolism supplement produced ten collisions, and raising meant the
+    reader saw nothing at all — every other finding in the paper denied over a
+    gap in one locator. Collisions get an ordinal instead, and are declared.
+    """
     from paperconan import _workflow
 
     monkeypatch.setattr(_workflow, "_stable_id", lambda prefix, parts: f"{prefix}:same")
@@ -230,8 +235,15 @@ def test_the_packet_refuses_to_ship_colliding_seed_ids(tmp_path, monkeypatch):
     data = tmp_path / "data"
     _panel(data / "p.csv")
 
-    with pytest.raises(WorkflowError, match="seed ids are not unique"):
-        start_workflow(str(data), str(tmp_path / "out"))
+    start_workflow(str(data), str(tmp_path / "out"))
+    packet = _packet(tmp_path / "out")
+
+    seeds = [s for c in packet["clusters"] for s in c["seeds"]]
+    ids = [s["seed_id"] for s in seeds]
+    assert len(set(ids)) == len(ids), f"ids still collide: {ids}"
+    assert packet["coverage"]["seed_ids_disambiguated"] > 0
+    assert packet["coverage"]["coverage_complete"] is False
+    assert any("shared a locator" in x for x in packet["coverage"]["limitations"])
 
 
 def test_seed_ids_are_unique_within_a_packet(tmp_path):
@@ -514,22 +526,19 @@ def test_a_v1_workflow_directory_is_refused(tmp_path):
     assert "--force" in str(exc.value), "the error must name the way out"
 
 
-def test_force_does_not_destroy_the_directory_when_seeding_fails(tmp_path,
-                                                                 monkeypatch):
-    """The cleanup window closed on a failing scan, but seeding can raise too.
+def test_force_does_not_destroy_the_directory_when_the_scan_fails(tmp_path):
+    """Cleanup runs only after everything that can fail has succeeded.
 
-    `_build_clusters` gained a raise of its own, so clearing anywhere before the
-    writes reopens the same door: index present, states gone.
+    Previously exercised through a seeding raise; seeding no longer refuses a
+    collision, so this drives the failure through the scan instead.
     """
-    from paperconan import _workflow
-
     data = tmp_path / "data"
     _panel(data / "p.csv")
     out = tmp_path / "out"
     start_workflow(str(data), str(out))
 
-    monkeypatch.setattr(_workflow, "_stable_id", lambda prefix, parts: f"{prefix}:collide")
-    with pytest.raises(WorkflowError, match="not unique"):
+    (data / "p.csv").unlink()
+    with pytest.raises(Exception):
         start_workflow(str(data), str(out), force=True)
 
     workflow_status(str(out))  # previous run must still be readable
