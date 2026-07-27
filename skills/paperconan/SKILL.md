@@ -61,7 +61,8 @@ the block from the source data.
 timestamp, so a source that has moved, been edited, or lost the rows or columns
 the finding covers returns the reason and no rows — reading it blind would hand
 you a different table under this finding's heading. Two limits worth knowing:
-a source rewritten with identical bytes and timestamp is undetectable, and a
+a source rewritten to the same byte count with the timestamp restored is
+undetectable (the check compares size, not content), and a
 scan produced before this check existed falls back to comparing extents, which
 catches a shrunk source but not an in-place edit. It also stays inside a cell
 budget (`PAPERCONAN_MAX_FULL_EVIDENCE_CELLS`); a window bounded by it says so

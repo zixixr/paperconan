@@ -1,8 +1,14 @@
 """Runtime metadata (wall-clock timestamp + elapsed times) is opt-in.
 
-By default paperconan omits every non-deterministic timing value so that
-``scan.json`` is byte-reproducible for identical input; ``--runtime-metadata``
-(``scan_dir(runtime_metadata=True)``) records them explicitly.
+By default paperconan omits every timing value produced by the run, so
+``scan.json`` is byte-reproducible for a given set of input files;
+``--runtime-metadata`` (``scan_dir(runtime_metadata=True)``) records them
+explicitly.
+
+One value that is not a run timing does survive: each input's mtime, recorded in
+``scan_stats["files"]`` so ``explain --full`` can tell the file it opens from
+the file that was scanned. It makes the same content in two checkouts produce
+different bytes -- deliberate, and the alternative was re-reading sources blind.
 """
 
 import json

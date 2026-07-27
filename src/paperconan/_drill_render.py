@@ -236,7 +236,8 @@ def render_explain(view: dict[str, Any]) -> str:
     out.append("")
     out.append("  evidence:")
     out += _render_evidence(view.get("evidence"),
-                            full=bool(view.get("evidence_is_full")))
+                            full=bool(view.get("evidence_requested_full")
+                                      or view.get("evidence_is_full")))
     out.append("")
     out.append("This is a statistical signal, not a conclusion. Confirm against the "
                "original records,")

@@ -243,6 +243,7 @@ def test_the_text_view_does_not_re_trim_a_full_window(tmp_path):
     assert len(body) > 25, (
         f"--full rendered {len(body)} rows of a {cut['rows_total']}-row block"
     )
+    assert "add --full" not in text, "a --full reader was told to add --full"
 
 
 def _small_panel(path, rows=8, cols=4):
@@ -319,7 +320,6 @@ def test_explain_full_detects_an_edit_that_keeps_the_same_shape(tmp_path):
     body = [rows[0]] + [",".join(str(float(v) + 500) for v in r.split(","))
                         for r in rows[1:]]
     path.write_text("\n".join(body) + "\n", encoding="utf-8")
-    assert os.path.getsize(path) != scan["scan_stats"]["files"][0]["size"] or True
 
     full = explain(scan, fid, full=True)["evidence"]
     assert "unavailable" in full, (
@@ -357,7 +357,9 @@ def test_a_budget_bounded_window_does_not_send_the_reader_back_to_full(tmp_path,
     from paperconan._drill import explain
     from paperconan._drill_render import render_explain
 
-    monkeypatch.setattr(audit, "_FULL_EV_CELLS", 200)
+    # 2000/40 = 50 rows: above the renderer's 20-row page cap and below the
+    # block's 80, so the budget binds and the renderer must not bind again.
+    monkeypatch.setattr(audit, "_FULL_EV_CELLS", 2000)
     _panel(tmp_path / "d" / "p.csv", rows=80, cols=40)
     scan = scan_dir(str(tmp_path / "d"), str(tmp_path / "out"), write_html=False)
     fid, _cut = _a_trimmed_finding(scan)
@@ -370,6 +372,16 @@ def test_a_budget_bounded_window_does_not_send_the_reader_back_to_full(tmp_path,
     assert "PAPERCONAN_MAX_FULL_EVIDENCE_CELLS" in text, text
     assert "Re-run explain with --full" not in text, (
         "a --full reader was told to run --full again"
+    )
+    # The same loop, relocated: the page cap keyed off "is this whole?" instead
+    # of "did the reader ask?", so a budget-bounded window was re-trimmed to a
+    # page and the hint reappeared on the row-count line.
+    assert "add --full" not in text, (
+        f"a --full reader was told to add --full: {text}"
+    )
+    body = [ln for ln in text.splitlines() if "│" in ln]
+    assert len(body) > 25, (
+        f"a budget-bounded --full window was re-trimmed to {len(body)} rows"
     )
 
 
@@ -400,4 +412,34 @@ def test_extent_checks_hold_when_a_scan_records_no_source_identity(tmp_path):
     _small_panel(tmp_path / "d" / "p.csv", rows=8, cols=2)
     assert "unavailable" in explain(scan, fid, full=True)["evidence"], (
         "with no identity records, a narrowed source was served as the block"
+    )
+
+
+def test_a_same_size_edit_is_caught_by_the_timestamp(tmp_path):
+    """Size alone is not identity.
+
+    An edit that keeps the byte count -- swapping digits, reordering rows --
+    passes a size check and re-reads clean. Only the timestamp separates it, and
+    nothing pinned that half of the comparison.
+    """
+    import os
+    import time
+
+    from paperconan._drill import explain
+
+    _small_panel(tmp_path / "d" / "p.csv", rows=8, cols=4)
+    scan = scan_dir(str(tmp_path / "d"), str(tmp_path / "out"), write_html=False)
+    fid = _any_finding(scan)
+    assert fid
+
+    path = tmp_path / "d" / "p.csv"
+    before = path.read_bytes()
+    time.sleep(0.01)
+    # Byte count preserved: reverse the data rows.
+    lines = before.decode().splitlines()
+    path.write_bytes(("\n".join([lines[0]] + lines[1:][::-1]) + "\n").encode())
+    assert os.path.getsize(path) == len(before), "fixture no longer preserves size"
+
+    assert "unavailable" in explain(scan, fid, full=True)["evidence"], (
+        "a same-size edit was served as this finding's block"
     )

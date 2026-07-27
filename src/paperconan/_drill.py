@@ -529,15 +529,19 @@ def explain(scan: dict[str, Any], finding_id: str, *, full: bool = False) -> dic
                 k: v for k, v in raw.items() if k not in _NON_PARAMETER_KEYS
             },
             "evidence": evidence,
-            # Computed, not the caller's flag: a --full that refused, or that
-            # came back bounded by its own budget, is not a whole window -- and
-            # a --json consumer reads this name as a claim about the evidence,
-            # not about what was requested. The renderer also uses it to lift
-            # its page cap, which would otherwise undo the re-read.
+            # Two separate facts, and conflating them cost a round: this one
+            # is a claim about the evidence, which a --json consumer reads as
+            # "the whole block is here". A --full that refused, or that came
+            # back bounded by its own budget, is not that.
             "evidence_is_full": bool(
                 full and isinstance(evidence, dict)
                 and "unavailable" not in evidence
                 and "truncated" not in evidence
             ),
+            # And this one is what the reader asked for. The renderer needs it
+            # to lift its page cap: keying that off evidence_is_full re-trimmed
+            # a budget-bounded window to twenty rows and told a reader who had
+            # just run --full to add --full.
+            "evidence_requested_full": bool(full),
         }
     raise ValueError(f"no such finding: {finding_id!r}; run drill() to list them")
