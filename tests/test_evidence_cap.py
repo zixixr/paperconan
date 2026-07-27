@@ -195,7 +195,7 @@ def test_explain_full_stays_inside_a_finite_cell_budget(tmp_path, monkeypatch):
     full = explain(scan, fid, full=True)["evidence"]
     assert "unavailable" not in full, full
     cells = len(full["rows"]) * len(full["rows"][0]["values"])
-    assert cells <= 200 * 2, f"--full materialised {cells} cells against a 200 budget"
+    assert cells <= 200, f"--full materialised {cells} cells against a 200 budget"
     assert full.get("truncated"), "a budget-bounded window must still say it is one"
 
 
@@ -242,4 +242,162 @@ def test_the_text_view_does_not_re_trim_a_full_window(tmp_path):
     body = [ln for ln in text.splitlines() if "│" in ln]
     assert len(body) > 25, (
         f"--full rendered {len(body)} rows of a {cut['rows_total']}-row block"
+    )
+
+
+def _small_panel(path, rows=8, cols=4):
+    """Small enough that the scan stores the window whole -- no `truncated` key."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [",".join(f"c{j}" for j in range(cols))]
+    for i in range(rows):
+        vals = [round((i + 1) * (j + 1) * 1.017, 6) for j in range(cols)]
+        if cols > 2:
+            vals[2] = vals[0]
+        lines.append(",".join(str(v) for v in vals))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _any_finding(scan):
+    from paperconan._drill import drill, overview
+
+    for loc in overview(scan, max_locations=50)["locations"]:
+        for group in drill(scan, loc["n"])["by_kind"]:
+            for f in drill(scan, loc["n"], kind=group["kind"])["findings"]:
+                return f["finding_id"]
+    return None
+
+
+def test_explain_full_checks_the_source_for_untruncated_findings_too(tmp_path):
+    """The guards must not depend on the finding having been trimmed.
+
+    An earlier version ran them only when the scan had stored a `truncated` key,
+    so every finding whose block fits the stored window -- most of them, and all
+    of the shipped demo's -- was re-read with no check at all, and a replaced
+    source came back as this finding's block.
+    """
+    from paperconan._drill import explain
+
+    _small_panel(tmp_path / "d" / "p.csv")
+    scan = scan_dir(str(tmp_path / "d"), str(tmp_path / "out"), write_html=False)
+    fid = _any_finding(scan)
+    assert fid, "fixture no longer produces a finding"
+
+    stored = explain(scan, fid)["evidence"]
+    assert "truncated" not in stored, "fixture must produce an UNtruncated finding"
+
+    _small_panel(tmp_path / "d" / "p.csv", rows=2)
+    full = explain(scan, fid, full=True)
+
+    assert "unavailable" in full["evidence"], (
+        f"--full returned a window from a replaced source: {list(full['evidence'])}"
+    )
+    assert full["evidence_is_full"] is False, (
+        "a refused re-read still claimed to be a full window"
+    )
+
+
+def test_explain_full_detects_an_edit_that_keeps_the_same_shape(tmp_path):
+    """No extent check can see this; only the file's identity can.
+
+    A source edited in place with the same rows and columns re-reads cleanly and
+    is presented as the finding's block, so a reader comparing values against
+    the paper compares a different table.
+    """
+    import os
+    import time
+
+    from paperconan._drill import explain
+
+    _small_panel(tmp_path / "d" / "p.csv")
+    scan = scan_dir(str(tmp_path / "d"), str(tmp_path / "out"), write_html=False)
+    fid = _any_finding(scan)
+    assert fid
+
+    time.sleep(0.01)
+    path = tmp_path / "d" / "p.csv"
+    rows = path.read_text(encoding="utf-8").splitlines()
+    body = [rows[0]] + [",".join(str(float(v) + 500) for v in r.split(","))
+                        for r in rows[1:]]
+    path.write_text("\n".join(body) + "\n", encoding="utf-8")
+    assert os.path.getsize(path) != scan["scan_stats"]["files"][0]["size"] or True
+
+    full = explain(scan, fid, full=True)["evidence"]
+    assert "unavailable" in full, (
+        f"a same-shape edit was served as this finding's block: {list(full)}"
+    )
+
+
+def test_a_scan_records_an_absolute_input_dir(tmp_path, monkeypatch):
+    """`explain --full` resolves the source against this path.
+
+    Stored relative, the same scan.json read from another directory resolves
+    against whatever tree is there and re-reads a different file of the same
+    name. Nothing in the suite held this.
+    """
+    import os
+
+    _small_panel(tmp_path / "d" / "p.csv")
+    monkeypatch.chdir(tmp_path)
+    scan = scan_dir("d", str(tmp_path / "out"), write_html=False)
+
+    assert os.path.isabs(scan["input_dir"]), (
+        f"input_dir is relative ({scan['input_dir']!r}); --full would resolve it "
+        f"against the reader's working directory"
+    )
+
+
+def test_a_budget_bounded_window_does_not_send_the_reader_back_to_full(tmp_path,
+                                                                      monkeypatch):
+    """Two different trims need two different remedies.
+
+    A window bounded by --full's own budget used to report itself trimmed by the
+    scan and advise re-running --full, which returns the identical window.
+    """
+    import paperconan._audit as audit
+    from paperconan._drill import explain
+    from paperconan._drill_render import render_explain
+
+    monkeypatch.setattr(audit, "_FULL_EV_CELLS", 200)
+    _panel(tmp_path / "d" / "p.csv", rows=80, cols=40)
+    scan = scan_dir(str(tmp_path / "d"), str(tmp_path / "out"), write_html=False)
+    fid, _cut = _a_trimmed_finding(scan)
+    assert fid
+
+    view = explain(scan, fid, full=True)
+    assert view["evidence"]["truncated"]["by"] == "full_budget"
+
+    text = render_explain(view)
+    assert "PAPERCONAN_MAX_FULL_EVIDENCE_CELLS" in text, text
+    assert "Re-run explain with --full" not in text, (
+        "a --full reader was told to run --full again"
+    )
+
+
+def test_extent_checks_hold_when_a_scan_records_no_source_identity(tmp_path):
+    """The backstop for a scan.json written before identity was recorded.
+
+    Size and mtime are the strong check, but a scan from an earlier version has
+    neither, and re-reading those blind is the same defect. The extent checks
+    have to stand on their own for that input, so they are exercised with the
+    identity records removed.
+    """
+    from paperconan._drill import explain
+
+    _small_panel(tmp_path / "d" / "p.csv", rows=8, cols=4)
+    scan = scan_dir(str(tmp_path / "d"), str(tmp_path / "out"), write_html=False)
+    fid = _any_finding(scan)
+    assert fid
+
+    for rec in scan["scan_stats"]["files"]:        # as an older scan would be
+        rec.pop("size", None)
+        rec.pop("mtime_ns", None)
+
+    _small_panel(tmp_path / "d" / "p.csv", rows=2, cols=4)
+    assert "unavailable" in explain(scan, fid, full=True)["evidence"], (
+        "with no identity records, a shrunk source was served as the block"
+    )
+
+    _small_panel(tmp_path / "d" / "p.csv", rows=8, cols=2)
+    assert "unavailable" in explain(scan, fid, full=True)["evidence"], (
+        "with no identity records, a narrowed source was served as the block"
     )

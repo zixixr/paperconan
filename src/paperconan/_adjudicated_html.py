@@ -681,6 +681,7 @@ body { margin:0; background:var(--bg); color:var(--ink);
   font:15px/1.62 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,
        "PingFang SC","Microsoft YaHei",sans-serif; }
 code, table.ev td, table.ev th { font-family:"SF Mono",Menlo,Consolas,monospace; }
+.ev-cut { caption-side:top; text-align:left; padding:5px 8px; font-size:11.5px; color:#6b7280; }
 .page { max-width:1180px; margin:0 auto; padding:28px 22px 48px; }
 .hero { background:var(--paper); border:1px solid var(--line); border-radius:8px;
   padding:24px 28px; box-shadow:0 12px 30px rgba(16,24,40,.06); }

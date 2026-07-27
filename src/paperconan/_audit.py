@@ -471,7 +471,7 @@ def _cell_value(v):
 
 
 def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_rows=None,
-                    max_rows=None, max_cols=None):
+                    max_rows=None, max_cols=None, trimmed_by="scan"):
     """Slice a numeric block (with 1 row of context above/below if available) into a
     JSON-friendly evidence dict that the HTML renderer can show as a table.
 
@@ -568,8 +568,10 @@ def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_row
         # a scan that reports itself complete after stopping early.
         out["truncated"] = {
             # Both row figures include the +-1 context rows, so the ratio is
-            # self-consistent; `window_rows_total` rather than `block` because
-            # the column figures are the block's exact width.
+            # self-consistent. `by` names who trimmed it: a window the scan
+            # bounded and one `--full` bounded to its cell budget need different
+            # remedies, and telling a --full reader to run --full is a loop.
+            "by": trimmed_by,
             "rows_shown": len(data_rows), "rows_total": full_rows,
             "cols_shown": ec1 - ec0, "cols_total": full_cols,
         }
@@ -4408,6 +4410,17 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     for f in table_files:
         file_start = time.perf_counter() if runtime_metadata else None
         file_stat = {"file": os.path.basename(f), "path": f}
+        # Identity of the input as scanned. `explain --full` re-reads these files
+        # to widen an evidence window, and without something to compare against
+        # it cannot tell the file it opens from the file that was scanned -- so a
+        # source edited afterwards comes back as this finding's block. Size and
+        # mtime are a few bytes each and catch every edit that touches the file.
+        try:
+            st = os.stat(f)
+            file_stat["size"] = st.st_size
+            file_stat["mtime_ns"] = st.st_mtime_ns
+        except OSError:
+            pass
         # Memory guard: a large workbook expands to many GB of Python objects when fully
         # loaded, so cap file size BEFORE loading. Oversized files are recorded (never
         # silently treated as clean) and skipped. Raise PAPERCONAN_MAX_FILE_MB on big-RAM hosts.

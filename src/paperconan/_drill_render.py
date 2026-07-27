@@ -119,7 +119,7 @@ def _render_evidence(ev: dict[str, Any] | None, *, full: bool = False) -> list[s
     if isinstance(ev, dict) and ev.get("unavailable"):
         # --full could not reach the source. Saying so is the whole point: the
         # alternative is an empty table that reads as a block with nothing in it.
-        return ["  evidence:", f"  ! full evidence unavailable — {ev['unavailable']}"]
+        return [f"  ! full evidence unavailable — {ev['unavailable']}"]
 
     if not ev or not ev.get("rows"):
         return ["  (no evidence table recorded)"]
@@ -183,12 +183,19 @@ def _render_evidence(ev: dict[str, Any] | None, *, full: bool = False) -> list[s
         # only "trimmed" cannot tell 12-of-13 from 12-of-5000, and will read the
         # window as representative either way.
         if isinstance(cut, dict):
-            out.append(
-                f"  ! this window is {cut.get('rows_shown')}x{cut.get('cols_shown')} "
-                f"of a {cut.get('rows_total')}x{cut.get('cols_total')} block, trimmed "
-                f"by the scan. Re-run explain with --full to read it from the "
-                f"source data."
-            )
+            where = (f"{cut.get('rows_shown')}x{cut.get('cols_shown')} of a "
+                     f"{cut.get('rows_total')}x{cut.get('cols_total')} block")
+            if cut.get("by") == "full_budget":
+                # Saying "trimmed by the scan" here, and suggesting --full, sent
+                # a reader who had just run --full back to run it again for the
+                # identical window.
+                out.append(f"  ! this window is {where}, bounded by --full's cell "
+                           f"budget. Raise PAPERCONAN_MAX_FULL_EVIDENCE_CELLS to "
+                           f"widen it.")
+            else:
+                out.append(f"  ! this window is {where}, trimmed by the scan. "
+                           f"Re-run explain with --full to read it from the "
+                           f"source data.")
         else:
             out.append("  ! this evidence window was trimmed by the scan; it does not "
                        "show the full block")

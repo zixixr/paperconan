@@ -428,28 +428,39 @@ def _reread_evidence(scan: dict[str, Any], seed: dict[str, Any],
     r0, r1 = rows
     c0, c1 = cols
 
-    # The scan holds no identity for its inputs -- no hash, no mtime -- and
-    # input_dir may be relative, so the same scan.json read from another
-    # directory resolves against whatever tree is there. Re-reading blind turns
-    # "you are seeing part of the block" into "you are seeing a different
-    # block", which is worse than the trimming this exists to undo. The stored
-    # window records the block's true extent, so a shape that no longer matches
-    # is proof the source moved on, and the only honest answer is to refuse.
-    stored = (raw.get("evidence") or {}).get("truncated")
-    if isinstance(stored, dict):
-        want_cols = stored.get("cols_total")
-        if want_cols is not None and (c1 - c0) != want_cols:
-            return {"unavailable": "the finding's column span does not match what "
-                                   "the scan recorded; the scan or the finding is "
-                                   "from a different run"}
-        if sheet.nrows < r1:
-            return {"unavailable": f"{seed.get('sheet')!r} in {path} now has "
-                                   f"{sheet.nrows} rows, fewer than the {r1} this "
-                                   f"finding covers -- the source changed since "
-                                   f"the scan"}
-    # Rebuilt from the sheet, not taken from the stored evidence: those headers
-    # were already sliced to the stored window, so reusing them left the widened
-    # window with a short header row and the columns effectively un-widened.
+    # Unconditional, and measured against the sheet rather than against
+    # scan.json. The previous version ran these only when the scan had trimmed
+    # the finding -- so every finding whose block fits the stored window, which
+    # is most of them and all of the demo's, was re-read with no check at all.
+    # It also compared the finding's column span with the span the same scan
+    # wrote, which is the same number by construction and could never fire.
+    #
+    # Identity first: size and mtime catch an edit that preserves the block's
+    # shape, which no extent check can see.
+    for rec in (scan.get("scan_stats") or {}).get("files") or []:
+        if rec.get("file") != os.path.basename(path):
+            continue
+        if "size" not in rec:
+            break
+        try:
+            st = os.stat(path)
+        except OSError:
+            break
+        if st.st_size != rec["size"] or st.st_mtime_ns != rec.get("mtime_ns"):
+            return {"unavailable": f"{os.path.basename(path)} has changed since the "
+                                   f"scan (size or timestamp differs); its cells no "
+                                   f"longer correspond to this finding"}
+        break
+
+    if sheet.nrows < r1:
+        return {"unavailable": f"{seed.get('sheet')!r} in {path} now has "
+                               f"{sheet.nrows} rows, fewer than the {r1} this "
+                               f"finding covers -- the source changed since the scan"}
+    if sheet.ncols < c1:
+        return {"unavailable": f"{seed.get('sheet')!r} in {path} now has "
+                               f"{sheet.ncols} columns, fewer than the {c1} this "
+                               f"finding covers -- the source changed since the scan"}
+
     header = header_for(sheet, r0, c0, c1)
     stored_ev = raw.get("evidence") or {}
     highlight_cols = stored_ev.get("highlight_cols") or []
@@ -471,7 +482,8 @@ def _reread_evidence(scan: dict[str, Any], seed: dict[str, Any],
         allowed = max(1, _FULL_EV_CELLS // max(1, span_cols))
         return _block_evidence(sheet, r0, r1, c0, c1, header,
                                highlight_cols, highlight_rows,
-                               max_rows=allowed, max_cols=span_cols)
+                               max_rows=allowed, max_cols=span_cols,
+                               trimmed_by="full_budget")
     return _block_evidence(sheet, r0, r1, c0, c1, header,
                            highlight_cols, highlight_rows,
                            max_rows=span_rows, max_cols=span_cols)
@@ -494,6 +506,9 @@ def explain(scan: dict[str, Any], finding_id: str, *, full: bool = False) -> dic
         if seed["seed_id"] != finding_id:
             continue
         raw = _match_raw_finding(scan, seed) or {}
+        # Once: --full re-reads the source file, so asking twice doubles the IO
+        # and, on a large supplement, the peak memory.
+        evidence = _reread_evidence(scan, seed, raw) if full else raw.get("evidence")
         return {
             "finding_id": finding_id,
             "kind": seed["kind"],
@@ -513,11 +528,16 @@ def explain(scan: dict[str, Any], finding_id: str, *, full: bool = False) -> dic
             "parameters": {
                 k: v for k, v in raw.items() if k not in _NON_PARAMETER_KEYS
             },
-            "evidence": (_reread_evidence(scan, seed, raw) if full
-                         else raw.get("evidence")),
-            # The renderer caps rows at a page's worth. Under --full that cap
-            # would silently undo the re-read: the reader asked for the block,
-            # got it, and still saw one page of it.
-            "evidence_is_full": bool(full),
+            "evidence": evidence,
+            # Computed, not the caller's flag: a --full that refused, or that
+            # came back bounded by its own budget, is not a whole window -- and
+            # a --json consumer reads this name as a claim about the evidence,
+            # not about what was requested. The renderer also uses it to lift
+            # its page cap, which would otherwise undo the re-read.
+            "evidence_is_full": bool(
+                full and isinstance(evidence, dict)
+                and "unavailable" not in evidence
+                and "truncated" not in evidence
+            ),
         }
     raise ValueError(f"no such finding: {finding_id!r}; run drill() to list them")
