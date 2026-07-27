@@ -25,7 +25,7 @@ from typing import Any
 
 from ._finding_groups import BLOCK_FINDING_GROUPS
 from ._workflow import (_SEVERITY_RANK, _block_seed, _build_clusters,
-                        _cross_sheet_seed)
+                        _cross_sheet_seed, _iter_raw_findings)
 
 # Kept generous: these are read straight into a reviewer's context, and the
 # limit exists to bound a pathological scan, not to curate.
@@ -39,7 +39,13 @@ def _location_label(cluster: dict[str, Any]) -> str:
     where = f'{cluster["file"]} :: {cluster["sheet"]}'
     if cluster.get("block_rows"):
         where += f' rows {cluster["block_rows"]}'
-    if cluster.get("block_cols"):
+    spans = [c for c in (cluster.get("block_cols_merged") or []) if c]
+    if len(spans) > 1:
+        # A merged panel spans several column groups. Naming the first would send
+        # the reader to a third of the evidence; naming none loses the location
+        # entirely, which is what setting block_cols=None used to do.
+        where += f' cols {spans[0]} +{len(spans) - 1} more'
+    elif cluster.get("block_cols"):
         where += f' cols {cluster["block_cols"]}'
     return where
 
@@ -83,9 +89,11 @@ def _merge_panels(clusters: list[dict[str, Any]]) -> list[dict[str, Any]]:
                cluster.get("block_rows"))
         panel = merged.get(key)
         if panel is None:
-            merged[key] = dict(cluster, block_cols=None, member_ids=[cluster["cluster_id"]])
+            merged[key] = dict(cluster, member_ids=[cluster["cluster_id"]],
+                               block_cols_merged=[cluster.get("block_cols")])
             continue
         panel["seeds"] = panel["seeds"] + cluster["seeds"]
+        panel["block_cols_merged"].append(cluster.get("block_cols"))
         panel["n_high_seeds"] += cluster["n_high_seeds"]
         panel["member_ids"].append(cluster["cluster_id"])
         if _SEVERITY_RANK.get(cluster["strongest_raw_severity"], 3) < \
@@ -134,12 +142,24 @@ def _interleave_by_family(clusters: list[dict[str, Any]]) -> list[dict[str, Any]
 
 
 
+def _ranked_panels(scan: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """The one list every layer indexes.
+
+    overview used to merge and interleave while drill resolved against the raw
+    cluster list, so `overview` printed a number and `drill <that number>` opened
+    a different location -- and a merged panel opened to only its first member,
+    dropping the rest while its own coverage reported the location complete.
+    Both layers now walk the same ordering, so an ordinal means one thing.
+    """
+    clusters, seeding = _clusters_of(scan)
+    return _interleave_by_family(_merge_panels(clusters)), seeding
+
+
 def overview(scan: dict[str, Any], *,
              max_locations: int = DEFAULT_MAX_LOCATIONS) -> dict[str, Any]:
     """Which locations carry signal, how strong, and of what kinds."""
-    clusters, seeding = _clusters_of(scan)
+    clusters, seeding = _ranked_panels(scan)
     max_locations = max(0, max_locations)
-    clusters = _interleave_by_family(_merge_panels(clusters))
     shown, hidden = clusters[:max_locations], clusters[max_locations:]
 
     locations = []
@@ -192,7 +212,11 @@ def _resolve(clusters: list[dict[str, Any]], location: int | str) -> dict[str, A
             return clusters[location - 1]
     else:
         for cluster in clusters:
-            if cluster["cluster_id"] == location:
+            # member_ids too: merging keeps the first member's cluster_id, so an
+            # id taken from an earlier run or from a member cluster still has to
+            # open the panel that now carries its seeds.
+            if cluster["cluster_id"] == location or location in (
+                    cluster.get("member_ids") or ()):
                 return cluster
     raise ValueError(
         f"no such location: {location!r}; run overview() to list them"
@@ -202,7 +226,7 @@ def _resolve(clusters: list[dict[str, Any]], location: int | str) -> dict[str, A
 def drill(scan: dict[str, Any], location: int | str, *, kind: str | None = None,
           max_findings: int = DEFAULT_MAX_FINDINGS) -> dict[str, Any]:
     """One location — grouped by kind, or listing the findings of a single kind."""
-    clusters, _seeding = _clusters_of(scan)
+    clusters, _seeding = _ranked_panels(scan)
     cluster = _resolve(clusters, location)
     label = _location_label(cluster)
 
@@ -285,27 +309,34 @@ def _iter_findings_with_seeds(scan: dict[str, Any]):
 def _match_raw_finding(scan: dict[str, Any], seed: dict[str, Any]) -> dict[str, Any] | None:
     """Recover the scan finding a seed came from, to show its evidence.
 
-    Matched on the same tuple `seed_id` is hashed from — anything weaker is not
-    injective where the id is, so `explain` would serve one finding's evidence
-    under another's heading. `rule` alone repeats readily: several detectors
-    build it from labels or omit the column index, so two side-by-side panels
-    produce byte-identical strings.
+    Replays the seeding enumeration rather than recomputing one hash. Two
+    reasons. Matching on the hashed tuple alone is not injective once ids
+    collide -- which they do on real supplements -- so `explain` would serve one
+    finding's evidence under another's heading. And a disambiguated id carries a
+    `#N` suffix assigned over the whole seed list, so no per-finding hash can
+    reproduce it: matching on the bare hash returned nothing at all, and
+    `explain` reported the profile defaults for a finding the profile had
+    demoted. Walking the same order and applying the same suffix rule makes the
+    id mean here exactly what it means in the packet.
     """
-    if seed["scope"] == "cross_sheet":
-        for f in scan.get("cross_sheet_findings") or []:
-            if _cross_sheet_seed(f)["seed_id"] == seed["seed_id"]:
-                return f
-        return None
-    for blk in scan.get("relations_blocks") or []:
-        if blk.get("file") != seed["file"] or blk.get("sheet") != seed["sheet"]:
-            continue
-        block = blk.get("block") or {}
-        if block.get("rows") != seed["block_rows"] or block.get("cols") != seed["block_cols"]:
-            continue
-        for group in BLOCK_FINDING_GROUPS:
-            for f in blk.get(group) or []:
-                if _block_seed(blk, group, f)["seed_id"] == seed["seed_id"]:
-                    return f
+    want = seed["seed_id"]
+    seen: dict[str, int] = {}
+
+    def disambiguated(base: str) -> str:
+        # Same rule as _build_clusters, and the counter spans both passes because
+        # that is one list there.
+        if base in seen:
+            seen[base] += 1
+            return f"{base}#{seen[base]}"
+        seen[base] = 0
+        return base
+
+    for blk, group, f in _iter_raw_findings(scan):
+        if disambiguated(_block_seed(blk, group, f)["seed_id"]) == want:
+            return f
+    for f in scan.get("cross_sheet_findings") or []:
+        if disambiguated(_cross_sheet_seed(f)["seed_id"]) == want:
+            return f
     return None
 
 

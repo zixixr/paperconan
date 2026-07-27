@@ -261,8 +261,11 @@ def _block_seed(blk: dict[str, Any], group: str, f: dict[str, Any]) -> dict[str,
         "block_cols": block.get("cols"),
     }
     return {
-        # Derived from content, never from enumeration order: adding an unrelated
-        # file must not renumber the seeds a routing request already cites.
+        # Derived from content, not from enumeration order: adding an unrelated
+        # file must not renumber the seeds a routing request already cites. One
+        # exception, and it is declared in coverage: the `#N` suffix a collision
+        # gets IS positional, so a suffixed id identifies a finding only within
+        # one scan of one input and must not be persisted across scans.
         "seed_id": _stable_id("seed", [locator, group, f.get("kind"), f.get("rule")]),
         "kind": f.get("kind"),
         "group": group,
@@ -322,10 +325,11 @@ def _build_clusters(scan: dict[str, Any], max_clusters: int) -> tuple[list[dict]
     seeds = [_block_seed(blk, group, f) for blk, group, f in _iter_raw_findings(scan)]
     seeds += [_cross_sheet_seed(f) for f in scan.get("cross_sheet_findings", []) or []]
 
-    # A routing request cites seeds by id, so a content-derived id is only an
-    # identifier if the hashed tuple is a key. Two findings sharing an id would
-    # make a routing decision ambiguous and inflate seeds_total; catch it here
-    # rather than letting the packet ship indistinguishable entries.
+    # A routing request cites seeds by id, so two findings sharing one make a
+    # routing decision ambiguous. This used to raise. On real supplements ids
+    # collide routinely, and refusing the packet denied the reader every other
+    # finding in the file over a gap in one locator -- so collisions are
+    # disambiguated and declared instead.
     # Disambiguate rather than refuse. Raising here was the wrong call: real
     # supplements do collide — a locator that cannot separate two findings is a
     # gap in the locator, not a reason to deny the reader every other finding in

@@ -526,18 +526,26 @@ def test_a_v1_workflow_directory_is_refused(tmp_path):
     assert "--force" in str(exc.value), "the error must name the way out"
 
 
-def test_force_does_not_destroy_the_directory_when_the_scan_fails(tmp_path):
-    """Cleanup runs only after everything that can fail has succeeded.
+def test_force_does_not_destroy_the_directory_when_a_later_step_fails(tmp_path,
+                                                                     monkeypatch):
+    """Cleanup runs after everything that can fail, not just after the scan.
 
-    Previously exercised through a seeding raise; seeding no longer refuses a
-    collision, so this drives the failure through the scan instead.
+    The scan is the first fallible step, and the neighbouring test already
+    covers it -- so driving the failure there passes even with cleanup moved to
+    immediately after scan_dir, which is exactly the window this guards. Fail in
+    a step after clustering instead.
     """
+    import paperconan._workflow as wf
+
     data = tmp_path / "data"
     _panel(data / "p.csv")
     out = tmp_path / "out"
     start_workflow(str(data), str(out))
 
-    (data / "p.csv").unlink()
+    def boom(*a, **k):
+        raise RuntimeError("artifact write failed")
+
+    monkeypatch.setattr(wf, "_envelope", boom)
     with pytest.raises(Exception):
         start_workflow(str(data), str(out), force=True)
 

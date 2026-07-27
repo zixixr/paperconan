@@ -911,3 +911,177 @@ def test_colliding_seed_ids_are_disambiguated_not_refused():
     assert coverage["seed_ids_disambiguated"] == 2
     assert coverage["coverage_complete"] is False
     assert any("shared a locator" in x for x in coverage["limitations"])
+
+
+# ---------- the invariants, run against a scan big enough to merge and interleave ----------
+
+def test_every_overview_number_opens_that_location_on_a_saturated_scan():
+    """L1's ordinal is the only handle the reader is given.
+
+    overview merges panels and interleaves families; drill used to resolve
+    against the raw cluster list, so the number printed by one layer opened a
+    different location in the next -- silently, on any scan large enough for the
+    reordering to matter. The small fixtures elsewhere in this file are below
+    that size, so they agreed by accident.
+    """
+    scan = _saturated_scan()
+    view = overview(scan, max_locations=20)
+
+    assert len(view["locations"]) == 20, "fixture no longer fills a page"
+    mismatched = [
+        (loc["n"], loc["location"], drill(scan, loc["n"])["location"])
+        for loc in view["locations"]
+        if drill(scan, loc["n"])["location"] != loc["location"]
+    ]
+    assert not mismatched, (
+        f"{len(mismatched)} overview numbers open a different location: {mismatched[:3]}"
+    )
+
+
+def test_a_merged_panel_opens_with_every_finding_it_was_counted_for():
+    """The count on L1 and the findings on L2 have to be the same set.
+
+    _merge_panels folds several column spans into one panel and kept only the
+    first member's cluster_id, so drilling it reached one span and reported
+    `kinds_total == kinds_shown` -- a truncated view declaring itself complete,
+    which is this tool's worst failure.
+    """
+    scan = _saturated_scan()
+    view = overview(scan, max_locations=20)
+
+    # Compared against the unmerged clusters, not against drill: both layers read
+    # one list now, so a panel that dropped its members' seeds would report the
+    # same reduced count at every layer and any consistency check would hold.
+    # The property that matters is that merging loses nothing.
+    from paperconan._drill import _clusters_of, _merge_panels
+
+    raw, _seeding = _clusters_of(scan)
+    before = sum(len(c["seeds"]) for c in raw)
+    after = sum(len(p["seeds"]) for p in _merge_panels(raw))
+    assert after == before, (
+        f"merging panels dropped {before - after} of {before} findings"
+    )
+
+    merged = [loc for loc in view["locations"] if loc["signals"] > 1]
+    assert merged, "fixture no longer produces a location with several findings"
+    for loc in merged[:6]:
+        opened = drill(scan, loc["n"])
+        shown = sum(group["n"] for group in opened["by_kind"])
+        assert shown == loc["signals"], (
+            f"location #{loc['n']} was counted for {loc['signals']} findings and "
+            f"opens with {shown}"
+        )
+
+
+def test_a_merged_panel_still_names_where_its_evidence_is():
+    """Merging must not cost the reader the column span.
+
+    The panel used to set block_cols=None so the label dropped the span
+    entirely, leaving a row range and no way to find the cells.
+    """
+    scan = _saturated_scan()
+    view = overview(scan, max_locations=20)
+
+    spanned = [loc for loc in view["locations"] if "rows" in loc["location"]]
+    assert spanned, "fixture no longer produces a block-scoped location"
+    assert all("cols" in loc["location"] for loc in spanned), (
+        f"a block location names no column span: "
+        f"{[loc['location'] for loc in spanned if 'cols' not in loc['location']][:3]}"
+    )
+    # A panel built from several column groups has to say so, or the reader is
+    # sent to one group's cells for evidence that is spread across four.
+    multi = [loc for loc in view["locations"] if loc["signals"] > 1
+             and "more" in loc["location"]]
+    assert multi, (
+        f"no merged panel discloses its extra column groups: "
+        f"{[l['location'] for l in view['locations'][:5]]}"
+    )
+
+
+def test_merging_re_ranks_so_the_strongest_panel_leads():
+    """Merging changes the counts the ranking is built on.
+
+    Without a re-rank a panel whose evidence arrived split across several column
+    groups sorts on its first fragment's count, so a panel with more high
+    findings ends up behind one with fewer.
+    """
+    def block(sheet, cols, n_high):
+        return {
+            "file": "split.xlsx", "sheet": sheet,
+            "block": {"rows": "3-40", "cols": cols, "header": []},
+            "relations": [
+                {"kind": "identical_column", "severity": "high",
+                 "raw_severity": "high", "n": 6,
+                 "rule": f"col[{cols}] == col[{i}]"}
+                for i in range(n_high)
+            ],
+        }
+
+    # One panel, seven high findings arriving split across four column groups,
+    # none of which alone beats the rival.
+    blocks = [block("Fig 1a", "0-2", 2), block("Fig 1a", "3-5", 2),
+              block("Fig 1a", "6-8", 2), block("Fig 1a", "9-11", 1)]
+    # A rival that arrives whole with six.
+    blocks.append(block("Fig 2b", "0-9", 6))
+    scan = {"relations_blocks": blocks, "cross_sheet_findings": []}
+
+    leader = overview(scan, max_locations=10)["locations"][0]
+
+    assert leader["high"] == 7, (
+        f"the merged seven-high panel did not lead; got {leader['location']} "
+        f"with {leader['high']} high"
+    )
+
+
+def test_explain_serves_the_right_finding_for_a_disambiguated_id():
+    """L4 has to answer for the finding the id names, not the first one like it.
+
+    Colliding seed ids get a `#N` suffix. _match_raw_finding recomputed the bare
+    hash and compared it to the suffixed id, so it never matched: explain
+    returned an empty evidence table and the profile defaults -- reporting a
+    finding as kept when the profile had demoted it. The suffix is assigned over
+    the whole seed list, so recovering the finding means replaying that
+    enumeration, not parsing the suffix as an index into one block.
+    """
+    twin = {
+        "kind": "identical_column", "severity": "high", "raw_severity": "high",
+        "n": 6, "rule": "col[1] == col[3]",
+    }
+    first = dict(twin, profile_action="kept",
+                 evidence={"rows": ["r1"], "cols": ["c1"], "cells": [[1.5]]})
+    second = dict(twin, profile_action="demoted",
+                  false_positive_context=["shared axis"],
+                  evidence={"rows": ["r9"], "cols": ["c9"], "cells": [[9.5]]})
+    scan = {
+        "relations_blocks": [{
+            "file": "t.xlsx", "sheet": "Fig 1a",
+            "block": {"rows": "3-9", "cols": "1-4", "header": []},
+            "relations": [first, second],
+        }],
+        "cross_sheet_findings": [],
+    }
+
+    from paperconan._drill import _clusters_of
+
+    clusters, _seeding = _clusters_of(scan)
+    ids = [s["seed_id"] for c in clusters for s in c["seeds"]]
+    assert any("#" in i for i in ids), (
+        f"fixture no longer produces colliding ids: {ids}"
+    )
+
+    bare = next(i for i in ids if "#" not in i)
+    suffixed = next(i for i in ids if "#" in i)
+
+    assert explain(scan, bare)["evidence"] == first["evidence"]
+    got = explain(scan, suffixed)
+    assert got["evidence"] == second["evidence"], (
+        f"the suffixed id served the wrong finding's evidence: {got['evidence']}"
+    )
+    # The falsehood this fixes: with no raw match, profile_action fell back to
+    # its "kept" default, so a demoted finding was reported as kept.
+    assert got["severity"]["profile_action"] == "demoted", (
+        f"explain reported {got['severity']['profile_action']!r} for a demoted finding"
+    )
+    assert "shared axis" in str(got["severity"]["context"]), (
+        f"the demotion reason did not reach the reader: {got['severity']}"
+    )
