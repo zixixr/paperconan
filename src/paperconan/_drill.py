@@ -21,6 +21,7 @@ These functions are pure reads — they never write, and never mutate the scan.
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from ._workflow import (_SEVERITY_RANK, _block_seed, _build_clusters,
@@ -384,7 +385,75 @@ def _demotion_reasons(raw: dict[str, Any]) -> list[str]:
     return reasons
 
 
-def explain(scan: dict[str, Any], finding_id: str) -> dict[str, Any]:
+def _reread_evidence(scan: dict[str, Any], seed: dict[str, Any],
+                     raw: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild a finding's evidence window from the source data.
+
+    The scan stores a bounded window so a dense block is not copied whole into
+    every finding. That is the right default -- the stored windows were most of
+    a scan corpus's bytes -- but it must not be the only way to see the cells,
+    or a trimmed window becomes a permanent loss. `input_dir` is recorded in the
+    scan, so the block can be read again on request.
+
+    Returns a dict carrying either the full window or, when the source cannot be
+    reached, the reason. Never silently returns the trimmed view as if it were
+    complete: a reader who asked for everything and got a subset would take the
+    subset for the block.
+    """
+    from ._audit import _block_evidence, header_for, load_table
+
+    in_dir = scan.get("input_dir")
+    if not in_dir:
+        return {"unavailable": "this scan records no input_dir, so the source "
+                               "data cannot be located"}
+    path = os.path.join(in_dir, seed.get("file") or "")
+    if not os.path.isfile(path):
+        return {"unavailable": f"source file not found at {path}; it moved or the "
+                               f"scan was copied away from its inputs"}
+    try:
+        sheets = load_table(path)
+    except Exception as exc:                       # noqa: BLE001 - reported, not raised
+        return {"unavailable": f"{type(exc).__name__} reading {path}: {exc}"}
+
+    sheet = sheets.get(seed.get("sheet"))
+    if sheet is None:
+        return {"unavailable": f"sheet {seed.get('sheet')!r} is not in {path} now"}
+
+    rows = _span(seed.get("block_rows"))
+    cols = _span(seed.get("block_cols"))
+    if rows is None or cols is None:
+        return {"unavailable": "this finding records no block span to re-read"}
+
+    r0, r1 = rows
+    c0, c1 = cols
+    # Rebuilt from the sheet, not taken from the stored evidence: those headers
+    # were already sliced to the stored window, so reusing them left the widened
+    # window with a short header row and the columns effectively un-widened.
+    header = header_for(sheet, r0, c0, c1)
+    # Raised for this call only: the point of --full is to lift the stored bound.
+    import paperconan._audit as audit
+    keep_rows, keep_cols = audit._MAX_EV_ROWS, audit._MAX_EV_COLS
+    audit._MAX_EV_ROWS, audit._MAX_EV_COLS = 10 ** 9, 10 ** 9
+    try:
+        return _block_evidence(sheet, r0, r1, c0, c1, header,
+                               (raw.get("evidence") or {}).get("highlight_cols") or [],
+                               (raw.get("evidence") or {}).get("highlight_rows") or [])
+    finally:
+        audit._MAX_EV_ROWS, audit._MAX_EV_COLS = keep_rows, keep_cols
+
+
+def _span(text: Any) -> tuple[int, int] | None:
+    """'3-120' -> (2, 120): scan spans are 1-based inclusive, slices are 0-based."""
+    if not isinstance(text, str) or "-" not in text:
+        return None
+    lo, _, hi = text.partition("-")
+    try:
+        return int(lo) - 1, int(hi)
+    except ValueError:
+        return None
+
+
+def explain(scan: dict[str, Any], finding_id: str, *, full: bool = False) -> dict[str, Any]:
     """One finding in full: parameters, evidence, and how a profile treated it."""
     for cluster, seed in _iter_findings_with_seeds(scan):
         if seed["seed_id"] != finding_id:
@@ -409,6 +478,7 @@ def explain(scan: dict[str, Any], finding_id: str) -> dict[str, Any]:
             "parameters": {
                 k: v for k, v in raw.items() if k not in _NON_PARAMETER_KEYS
             },
-            "evidence": raw.get("evidence"),
+"evidence": (_reread_evidence(scan, seed, raw) if full
+                         else raw.get("evidence")),
         }
     raise ValueError(f"no such finding: {finding_id!r}; run drill() to list them")

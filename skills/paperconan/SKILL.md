@@ -43,9 +43,20 @@ paperconan overview audit/scan.json                    # which locations carry s
 paperconan drill    audit/scan.json 2                  # that location, grouped by kind
 paperconan drill    audit/scan.json 2 --kind identical_column
 paperconan explain  audit/scan.json seed:17942ad206854a66
+paperconan explain  audit/scan.json seed:17942ad206854a66 --full
 ```
 
 Add `--json` to any of them when you need the structure rather than the text.
+
+**Evidence windows are bounded, and say so.** The scan stores a window around
+the highlighted cells, not the whole block — on a dense supplement the windows
+are most of the file's bytes. A trimmed window carries its own scale, e.g.
+`! this window is 20x30 of a 300x200 block, trimmed by the scan.` Read that as
+"the anomaly is here, and there is more of this block than you are seeing" — not
+as the block. When the exact cells matter (checking a value against the paper,
+or judging whether a pattern runs the whole column), `explain --full` re-reads
+the block from the source data. It needs the source files still in place: if
+they have moved, it says so rather than handing back the trimmed window.
 
 Work down, and stop at the shallowest layer that answers the question:
 

@@ -507,6 +507,12 @@ def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_row
                 ec0 = c0
 
     # --- row window ----------------------------------------------------------
+    # Captured before windowing: a reader who is shown 12 of 5000 rows and a
+    # reader shown 12 of 13 are in very different positions, and a bare
+    # `truncated: True` cannot tell them apart.
+    full_rows = min(sheet.nrows, r1 + 1) - max(0, r0 - 1)
+    full_cols = c1 - c0
+
     r_start = max(0, r0 - 1)
     r_end = min(sheet.nrows, r1 + 1)
     if (r_end - r_start) > _MAX_EV_ROWS:
@@ -546,7 +552,14 @@ def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_row
         "rows": data_rows,
     }
     if truncated:
-        out["truncated"] = True
+        # Dict rather than True: still truthy for the `if ev.get("truncated")`
+        # consumers, and it says how much of the block the window covers. An
+        # evidence table that does not state its own scale is the same defect as
+        # a scan that reports itself complete after stopping early.
+        out["truncated"] = {
+            "rows_shown": len(data_rows), "rows_total": full_rows,
+            "cols_shown": ec1 - ec0, "cols_total": full_cols,
+        }
     return out
 
 
@@ -4201,7 +4214,19 @@ _MAX_REPORT_BLOCKS = int(os.environ.get("PAPERCONAN_MAX_REPORT_BLOCKS", "2000"))
 # across thousands of findings — ballooning the scan dict / scan.json to many GB and OOMing the
 # worker. Bound each evidence snippet to a contiguous window of this many rows × cols (always
 # including the highlighted cells). Small blocks are emitted whole and stay byte-identical.
-_MAX_EV_ROWS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_ROWS", "50"))
+# 20, not 50, and tied to _drill_render's _EVIDENCE_ROW_LIMIT: the layered views
+# never display more than that, so storing more is bytes no reader sees. Measured
+# over ten real supplementary sets the evidence windows were the bulk of a 36 MB
+# scan corpus -- one finding reached 18 KB, 96% of it the window -- and this
+# takes the largest of them from 37 MB to 18 MB with no change in what is found.
+#
+# 12 would save another 6 MB there, and was rejected: it trims blocks barely over
+# the bound (the demo has a 13-row one) so a reader gets a truncation notice
+# where nothing worth reading was dropped, which teaches them to discount the
+# notice everywhere. What the window is for is the shape of the anomaly and rows
+# to check against the paper; the rest is re-derivable, and `explain --full`
+# re-reads it. The window always covers the highlighted cells.
+_MAX_EV_ROWS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_ROWS", "20"))
 _MAX_EV_COLS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_COLS", "30"))
 # Per-block finding cap: the pairwise detectors are O(col²), so a single dense, highly
 # correlated block (a correlation matrix, an expression panel with many proportional columns)
@@ -4919,7 +4944,7 @@ def _run_drill_command(args: argparse.Namespace) -> None:
             view = drill(scan, location, kind=args.kind, max_findings=args.max_findings)
             text = render_drill(view)
         else:
-            view = explain(scan, args.finding_id)
+            view = explain(scan, args.finding_id, full=args.full)
             text = render_explain(view)
     except ValueError as exc:
         sys.exit(str(exc))
@@ -5004,6 +5029,9 @@ def _build_parser() -> argparse.ArgumentParser:
     ex = sub.add_parser("explain", help="one finding in full, with its evidence table")
     ex.add_argument("scan_json", help="Path to paperconan scan.json")
     ex.add_argument("finding_id", help="Finding id from `drill --kind`")
+    ex.add_argument("--full", action="store_true",
+                    help="Re-read the evidence window from the source data "
+                         "instead of the bounded copy stored in the scan")
 
     for parser in (ov, dr, ex):
         parser.add_argument("--json", action="store_true",

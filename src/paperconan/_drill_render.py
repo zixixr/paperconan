@@ -163,11 +163,22 @@ def _render_evidence(ev: dict[str, Any] | None) -> list[str]:
         out.append(f"{mark} {idx:>3} │ {cells}")
     if len(rows) > _EVIDENCE_ROW_LIMIT:
         out.append(f"  … {len(rows) - _EVIDENCE_ROW_LIMIT} more rows in this window")
-    if ev.get("truncated"):
+    cut = ev.get("truncated")
+    if cut:
         # The scan clipped the window before it ever reached here, so the table
-        # above is not the whole block.
-        out.append("  ! this evidence window was trimmed by the scan; it does not "
-                   "show the full block")
+        # above is not the whole block. Naming the scale matters: a reader told
+        # only "trimmed" cannot tell 12-of-13 from 12-of-5000, and will read the
+        # window as representative either way.
+        if isinstance(cut, dict):
+            out.append(
+                f"  ! this window is {cut.get('rows_shown')}x{cut.get('cols_shown')} "
+                f"of a {cut.get('rows_total')}x{cut.get('cols_total')} block, trimmed "
+                f"by the scan. Re-run explain with --full to read it from the "
+                f"source data."
+            )
+        else:
+            out.append("  ! this evidence window was trimmed by the scan; it does not "
+                       "show the full block")
     out.append("  (* highlighted column, ▸ highlighted row)")
     return out
 
