@@ -1117,3 +1117,70 @@ def test_the_compute_budget_matches_the_row_ceiling_it_serves():
         "the compute budget is exhausted by sheets that all sit inside the row "
         "ceiling; the budget and _ROW_REL_MAX_ROWS are out of step"
     )
+
+
+def _duplicated_rectangle(n_rows=60, shared_cols=14):
+    """Two sheets sharing a leading run of columns over their whole height.
+
+    The shape a shared control cohort makes: every row of one block matches the
+    positionally corresponding row of the other, so the detector sees n_rows
+    matches for a single duplicated rectangle.
+    """
+    from paperconan._sheet import Sheet
+
+    vec = [13.40712, 27.91834, 8.52619, 41.06375, 19.73408, 33.28951, 22.61483,
+           9.34026, 37.15792, 14.80613, 29.47158, 6.92374, 31.08627, 17.25913]
+    grids = {}
+    for name in ("Figure 7a", "Figure 7b"):
+        rows = [[f"c{j}" for j in range(shared_cols)]]
+        for i in range(n_rows):
+            rows.append([round(v * (1 + 0.017 * i) + 0.7 * i, 5) for v in vec])
+        grids[(f"{name}.csv", name)] = Sheet.from_rows(rows)
+    return grids
+
+
+def test_a_duplicated_rectangle_is_one_finding_not_one_per_row():
+    """A shared rectangle is one event however many rows it spans.
+
+    Two blocks sharing a leading run of columns match row-for-row down their
+    whole height. Emitting a finding per row produced 117 restatements of a
+    single shared control cohort on a real supplement, which then filled the
+    result cap and evicted unrelated findings elsewhere in the scan.
+    """
+    import paperconan._audit as audit
+
+    found = audit.detect_scaled_row_reuse(_duplicated_rectangle(60),
+                                          profile="review", max_findings=10**6)
+    reuse = [f for f in found if f["kind"] == "identical_row_reuse"]
+
+    assert len(reuse) == 1, (
+        f"one duplicated rectangle produced {len(reuse)} findings; rows are not "
+        f"folding into their rectangle"
+    )
+    assert reuse[0]["rows_matched"] == 60, reuse[0]["rows_matched"]
+    assert reuse[0]["row_pairs"], "the folded finding names none of its rows"
+    assert len(reuse[0]["row_pairs"]) <= 5, "the examples are not bounded"
+    assert "60 rows" in reuse[0]["rule"], (
+        f"the rule still describes one row: {reuse[0]['rule']}"
+    )
+
+
+def test_restatements_of_one_rectangle_do_not_consume_the_result_cap():
+    """The cap bounds findings; it must not be spent on one event's rows.
+
+    The break abandons both loops, so restatements filling the cap stopped the
+    search before it reached other sheets -- on real data that cost three
+    cross-file findings in a different workbook.
+    """
+    import paperconan._audit as audit
+
+    coverage = ScanCoverage(files_discovered=2)
+    found = audit.detect_scaled_row_reuse(_duplicated_rectangle(60),
+                                          profile="review", max_findings=3,
+                                          coverage=coverage)
+
+    assert found, "the fixture produced nothing"
+    reasons = [i["reason"] for i in coverage.to_dict()["limitations"]]
+    assert "detector_finding_limit" not in reasons, (
+        f"a 60-row rectangle exhausted a 3-finding cap: {reasons}"
+    )
