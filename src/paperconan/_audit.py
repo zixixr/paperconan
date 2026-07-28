@@ -944,7 +944,23 @@ _ROW_PAIR_MAX_FINDINGS_PER_BLOCK = 25
 # row count keeps the O(rows^2) pair loop cheap on tall entity-in-rows tables (which
 # are not this orientation anyway); the column floor keeps a proportional pair from
 # firing on too few cells to be distinctive.
-_ROW_REL_MAX_ROWS = int(os.environ.get("PAPERCONAN_ROW_REL_MAX_ROWS", "60"))
+# 200, and it may not be raised without raising the two budgets below with it.
+# At 60 a band of 61 rows dropped out of both detectors that gate on this --
+# detect_row_relations and, through _scaled_row_candidates, detect_scaled_row_reuse,
+# taking identical_row_reuse with it. Measured over seven real supplementary sets,
+# moving to 200 takes one paper's row-relation family from 31 findings to 68 and
+# costs nothing anywhere; 400 and 1000 add nothing further, so this is where the
+# recall is.
+#
+# Moving it alone is worse than not moving it. detect_scaled_row_reuse pools
+# candidates across every sheet and compares them pairwise, so a taller ceiling
+# multiplies the pairs and the O(rows^2) loop spends _SCALED_ROW_BUDGET before
+# reaching the rows that matter; the break then drops what was never compared.
+# Measured: at 200 rows on the old 4M budget one paper fell from 21 findings to
+# 1. That budget is raised in the same step. _ROW_REL_BUDGET is not -- it bounds
+# a single block, where the arithmetic shows the existing value still covers the
+# new ceiling.
+_ROW_REL_MAX_ROWS = int(os.environ.get("PAPERCONAN_ROW_REL_MAX_ROWS", "200"))
 _ROW_REL_MIN_COLS = int(os.environ.get("PAPERCONAN_ROW_REL_MIN_COLS", "12"))
 # Short-run row reuse (detect_short_row_reuse): the long-run detectors above miss the
 # JCI "Supporting Data Values" layout, where each sub-panel is its own 1-4 row block and
@@ -980,6 +996,10 @@ _ROW_REL_RTOL = float(os.environ.get("PAPERCONAN_ROW_REL_RTOL", "1e-3"))
 # pair runs a pure-Python O(cols) scan, so a very wide block (e.g. 60x160000, still
 # under _MAX_CELLS) would otherwise cost ~minutes. Bound total pair*cols work; a
 # starved run stops early (stderr note) rather than hanging.
+# Unchanged by the row-ceiling raise, and measured rather than assumed: this
+# budget bounds one block's pair loop, and at the new ceiling of 200 rows even a
+# 160-column block is 3.2M column-ops, inside this. It is _SCALED_ROW_BUDGET
+# that had to move, because that one accumulates candidates across every sheet.
 _ROW_REL_BUDGET = int(os.environ.get("PAPERCONAN_ROW_REL_BUDGET", "6000000"))
 # The remaining detector compute budgets. Module constants rather than in-function
 # literals so a truncation they cause can be reproduced in a test and tuned by an
@@ -987,7 +1007,9 @@ _ROW_REL_BUDGET = int(os.environ.get("PAPERCONAN_ROW_REL_BUDGET", "6000000"))
 # only be driven by editing the source, which is why their wiring went unverified.
 _RECURRING_VEC_BUDGET = int(os.environ.get("PAPERCONAN_RECURRING_VEC_BUDGET", "3000000"))
 _WITHIN_ROW_VEC_BUDGET = int(os.environ.get("PAPERCONAN_WITHIN_ROW_VEC_BUDGET", "2000000"))
-_SCALED_ROW_BUDGET = int(os.environ.get("PAPERCONAN_SCALED_ROW_BUDGET", "4000000"))
+# Raised with _ROW_REL_MAX_ROWS, and this is the one that bit: the paper that
+# fell from 21 findings to 1 fell here, not in detect_row_relations.
+_SCALED_ROW_BUDGET = int(os.environ.get("PAPERCONAN_SCALED_ROW_BUDGET", "20000000"))
 _SHORT_ROW_BUDGET = int(os.environ.get("PAPERCONAN_SHORT_ROW_BUDGET", "4000000"))
 _WITHIN_ROW_FRAC_BUDGET = int(os.environ.get("PAPERCONAN_WITHIN_ROW_FRAC_BUDGET", "8000000"))
 _ROW_PAIR_FRAC_BUDGET = int(os.environ.get("PAPERCONAN_ROW_PAIR_FRAC_BUDGET", "40000000"))

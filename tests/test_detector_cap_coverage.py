@@ -573,17 +573,17 @@ def test_the_caveat_makes_no_claim_the_list_is_exhaustive():
 
 # ---------- a known gap, held honestly ----------
 
-def test_a_block_past_the_row_cap_loses_relations_and_says_nothing(tmp_path):
-    """Pins a real blind spot so it cannot widen unnoticed.
+def test_an_ordinary_tall_block_keeps_its_relations(tmp_path):
+    """The gap this replaced: at a ceiling of 60, a 61-row band lost them.
 
-    detect_row_relations returns early above _ROW_REL_MAX_ROWS. That bound is a
-    cost cap, not a scope rule: a 61x14 block is well inside the detector's
-    orientation (14 >= _ROW_REL_MIN_COLS), and an exact relation there is lost
-    while scan_status stays "complete". The behaviour is deliberate for now --
-    the shape is common enough that reporting it would train readers to skip
-    the coverage line -- but it is a gap, and the workflow's caveat is what
-    currently covers it. If this test starts failing because the relation is
-    found, the cap was raised: delete the test.
+    A 61x14 block is squarely in detect_row_relations' orientation, and an exact
+    ratio between two of its rows was dropped while scan_status stayed
+    "complete" -- the shortened search that reads clean. The ceiling is 200 now.
+
+    A bound still exists, so this asserts the shape that was failing rather than
+    that no bound remains; test_skips_block_with_too_many_rows covers the skip
+    above it. If this fails, the ceiling came back down and the row-relation
+    family lost recall with it.
     """
     import csv
 
@@ -596,14 +596,14 @@ def test_a_block_past_the_row_cap_loses_relations_and_says_nothing(tmp_path):
             csv.writer(fh).writerows(grid)
         scan = scan_dir(str(d), str(d / "out"), write_html=False)
         return {f.get("kind") for b in scan["relations_blocks"]
-                for f in (b.get("row_relations") or [])}, scan
+                for f in (b.get("row_relations") or [])}
 
-    under, _ = kinds_at(60)
-    over, scan_over = kinds_at(61)
-
-    assert "constant_ratio_row" in under, "fixture no longer plants a detectable relation"
-    assert "constant_ratio_row" not in over, "the row cap no longer drops it -- delete this test"
-    assert scan_over["scan_status"] == "complete", "the gap is now reported; update this test"
+    assert "constant_ratio_row" in kinds_at(61), (
+        "a 61-row block lost its planted ratio; the row ceiling dropped back"
+    )
+    assert "constant_ratio_row" in kinds_at(150), (
+        "a 150-row block lost its planted ratio"
+    )
 
 
 # ---------- the production wiring, not just the detector ----------
@@ -668,16 +668,18 @@ def test_the_packet_renders_limitations_as_sentences_not_dict_reprs(tmp_path):
         assert repr_marker not in blob, f"a Python repr reached the reader: {blob!r}"
 
 
-def test_a_tall_band_loses_scaled_row_reuse_and_says_nothing():
-    """The second site gated on _ROW_REL_MAX_ROWS, pinned like the first.
+def test_a_tall_band_keeps_its_cross_sheet_row_reuse():
+    """The second detector the same constant gated, and the one that bit hardest.
 
-    _scaled_row_candidates drops any band taller than the constant, so at 61
-    rows this detector goes silent entirely -- including identical_row_reuse,
-    verbatim row copies across sheets. A band's height says nothing about
-    whether one of its rows is a scalar multiple of a row in another sheet, so
-    this is a cost cap, not orientation. Deliberate for now and covered only by
-    the workflow's over-broad caveat; if it is ever raised or reported, this
-    test fails loudly and should be updated.
+    _scaled_row_candidates drops any band taller than _ROW_REL_MAX_ROWS, so at 60
+    a 61-row band silenced this detector entirely -- including identical_row_reuse,
+    verbatim row copies across sheets, the family carrying the strongest real
+    findings in this corpus.
+
+    Raising the ceiling alone would not have fixed it: the pair loop is O(rows^2)
+    and spends _SCALED_ROW_BUDGET before reaching the rows that matter, which on
+    real data took one paper from 21 findings to 1. The budget moved with it, and
+    this asserts the outcome of both.
     """
     import paperconan._audit as audit
     from paperconan._sheet import Sheet
@@ -696,11 +698,12 @@ def test_a_tall_band_loses_scaled_row_reuse_and_says_nothing():
             grids[(f"{name}.csv", name)] = Sheet.from_rows(rows)
         return grids
 
-    under = audit.detect_scaled_row_reuse(sheets(60), profile="review", max_findings=10**6)
-    over = audit.detect_scaled_row_reuse(sheets(61), profile="review", max_findings=10**6)
-
-    assert under, "fixture no longer produces cross-sheet row reuse at 60 rows"
-    assert not over, "the band ceiling no longer silences this detector -- update this test"
+    for n in (61, 150):
+        assert audit.detect_scaled_row_reuse(sheets(n), profile="review",
+                                             max_findings=10**6), (
+            f"a {n}-row band produced no cross-sheet row reuse; either the "
+            f"ceiling dropped back or the budget did"
+        )
 
 
 def test_the_html_coverage_row_distinguishes_one_capped_detector_from_another(tmp_path):
@@ -1063,4 +1066,54 @@ def test_two_budgets_in_one_detector_survive_a_real_scan(tmp_path, monkeypatch):
     assert len(reasons) >= 2, (
         f"both starved budgets collapsed to {reasons}; a reader is told one pass "
         f"was bounded and cannot learn the other was too"
+    )
+
+
+def _many_sheets(n_sheets=10, n_rows=150):
+    """An ordinary corpus shape: several figure sheets, each inside the row cap.
+
+    detect_scaled_row_reuse compares candidates across every sheet, so the pair
+    count is quadratic in the total, not in one sheet's height. Ten sheets of
+    150 rows fills the candidate pool exactly.
+    """
+    import numpy as np
+
+    from paperconan._sheet import Sheet
+
+    vec = [13.40712, 27.91834, 8.52619, 41.06375, 19.73408, 33.28951, 22.61483,
+           9.34026, 37.15792, 14.80613, 29.47158, 6.92374, 31.08627, 17.25913]
+    grids = {}
+    for s in range(n_sheets):
+        rows = [[f"c{j}" for j in range(14)]]
+        for i in range(n_rows):
+            rows.append([round(v * (1 + 0.017 * i) + 0.31 * s + 0.7 * i, 5)
+                         for v in vec])
+        if s == n_sheets - 1:
+            rows[1] = [round(3.0 * v, 6) for v in rows[1]]
+        grids[(f"Figure {s}a.csv", f"Figure {s}a")] = Sheet.from_rows(rows)
+    return grids
+
+
+def test_the_compute_budget_matches_the_row_ceiling_it_serves():
+    """The two constants have to move together, and nothing else pins that.
+
+    Raising _ROW_REL_MAX_ROWS admits taller bands, and the pair loop is
+    O(rows^2), so on the old budget the scan spent it before reaching the rows
+    that mattered and the break dropped what was never compared. Measured on
+    real data, a paper went from 21 findings to 1 when the ceiling moved alone.
+
+    Asserted as consistency between the constants rather than as a finding
+    count: on an ordinary corpus shape whose bands are all inside the ceiling,
+    the budget must not be the thing that stops the search.
+    """
+    import paperconan._audit as audit
+
+    coverage = ScanCoverage(files_discovered=10)
+    audit.detect_scaled_row_reuse(_many_sheets(), profile="review",
+                                  max_findings=10**6, coverage=coverage)
+
+    reasons = [i["reason"] for i in coverage.to_dict()["limitations"]]
+    assert "detector_compute_budget_limit" not in reasons, (
+        "the compute budget is exhausted by sheets that all sit inside the row "
+        "ceiling; the budget and _ROW_REL_MAX_ROWS are out of step"
     )
