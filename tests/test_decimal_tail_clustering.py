@@ -45,7 +45,7 @@ def test_no_false_positive_on_diffuse_tails():
 def test_a_partial_cluster_below_the_share_gate_does_not_fire():
     """~30% of 200 values on two tails — improbable, but still not reported.
 
-    Measured, this is 870 collision pairs against 19.9 expected. The Poisson gate
+    Measured, this is 870 collision pairs against 22.1 expected (C(200,2)/900). The Poisson gate
     passes it easily. The share gate does not, and that gate is deliberately kept:
     it is the only thing separating a copied tail from data on a coarse grid, and
     the margin is thin — benign quantised shapes reach 24% (a constant
@@ -66,7 +66,7 @@ def test_low_precision_values_are_ignored():
 
 
 def test_a_small_panel_with_the_same_concentration_is_reported():
-    """40 values on 6 tails — 114 collision pairs against 0.78 expected, 146x.
+    """40 values on 6 tails — 114 collision pairs against 0.87 expected (C(40,2)/900), 132x.
 
     This is the shape the hard-threshold audit records as a real miss: the old
     count floor of 100 made it invisible, and the previous version of this test
@@ -111,7 +111,12 @@ def test_below_the_validity_floor_nothing_is_reported():
     from paperconan._audit import _TAIL_CLUSTER_MIN_VALUES
 
     assert _TAIL_CLUSTER_MIN_VALUES == 12, "update the literals below deliberately"
-    tails = ["714", "286"]
+    # Not sevenths. 714/286 and the rest of this file's tails are the decimal
+    # residues of k/7, so values carrying them are indistinguishable from data
+    # divided by 7 -- which the averaging guard now correctly calls benign. The
+    # boundary this test pins is the validity floor, so it needs tails that are
+    # not a d-fold artifact for any d the guard scans.
+    tails = ["137", "409"]
     assert detect_decimal_tail_clustering(_clustered(11, tails), "Fig B") is None
     assert detect_decimal_tail_clustering(_clustered(12, tails), "Fig B") is not None
 

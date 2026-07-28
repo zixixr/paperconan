@@ -2056,7 +2056,7 @@ def detect_decimal_tail_clustering(values, label, top_k=6):
     Distinct from detect_last_digit (a single last digit), detect_repeated_decimals
     (2-digit endings, no concentration test) and within_col_value_duplication (repeated
     whole VALUES, not shared tails). Gated hard: only values with >=3 fractional digits
-    (at read precision) count; needs >=_TAIL_CLUSTER_MIN_N of them; the top-`top_k`
+    (at read precision) count; needs >=_TAIL_CLUSTER_MIN_VALUES of them; the top-`top_k`
     3-digit tails must cover >=_TAIL_CLUSTER_SHARE of them; AND the full fractional parts
     must be MOSTLY DISTINCT — otherwise a quantized / common-denominator column (values
     like k/7 or eighths) trivially shares tails and would false-positive. Large-magnitude
@@ -2086,19 +2086,27 @@ def detect_decimal_tail_clustering(values, label, top_k=6):
     # collide on a few tails, so require the full fractional parts to be mostly
     # distinct. Scaled to n: a fixed floor of 50 was itself unreachable below 50
     # values, a third hidden count gate.
-    if len(set(full)) < max(_TAIL_CLUSTER_MIN_VALUES, (2 * n) // 3):
+    # Ratio stays n//2. Lowering the floor was the point; raising the ratio to
+    # 2n/3 rode along unannounced and is stricter above n=75 -- a panel of 200
+    # with 131 distinct fractions fired before this branch and would not after,
+    # which is the loss the branch exists to stop.
+    if len(set(full)) < max(_TAIL_CLUSTER_MIN_VALUES, n // 2):
         return None
     counts = Counter(tails)
     top = counts.most_common(top_k)
     top_sum = sum(c for _, c in top)
     share = top_sum / n
 
-    # Concentration still has to be high. Removing this alongside the count floor
-    # was a mistake: it is the only thing separating a copied tail from data that
-    # merely lives on a coarse grid. Measured, the gap is wide — an instrument
-    # readout step gives top-6 shares of 4-7%, a constant denominator 14-24%,
-    # while the reuse this detector exists for sits at 87-92%. What made the old
-    # gate unusable was pairing this with a 100-value floor, not the share itself.
+    # Concentration still has to be high, and removing it alongside the count
+    # floor was a mistake -- but not for the reason first given here. Measured:
+    # a fine instrument step (14-16 bit) gives top-6 shares of 4-8%, and this
+    # gate holds it. A coarse one (10 bit) reaches 62%, and division by a small
+    # constant reaches 100% -- both sail past 40%. So this gate is not what
+    # separates a copied tail from a coarse grid; the terminating-decimal guard
+    # below is, and it has to be, since genuine reuse also sits at ~100%.
+    # What this gate does is hold ordinary diffuse data quiet at scale, where
+    # the Poisson test would otherwise gain enough power to fire. What made the
+    # old arrangement unusable was pairing it with a 100-value floor.
     if share < _TAIL_CLUSTER_SHARE:
         return None
 
@@ -2127,18 +2135,32 @@ def detect_decimal_tail_clustering(values, label, top_k=6):
     carriers = [av for av, t in zip(hp_vals, tails) if t in set(top_tails)]
     if carriers:
         for d in range(2, 13):
+            # Tolerance scales with d because the error does: a d-fold mean of
+            # values recorded at a few decimals, stored at 6dp, carries up to
+            # d * 5e-7 of rounding error, so av*d misses a short decimal by that
+            # much. The fixed 1e-6 only ever covered d=2, which is why ordinary
+            # replicate means at d>=3 were not recognised as averaging artifacts
+            # -- invisible while a count floor of 100 hid them, and severity=high
+            # on a 30-row panel once that floor came off.
             terminating = sum(1 for av in carriers
-                              if abs(av * d - round(av * d, 4)) < 1e-6)
+                              if abs(av * d - round(av * d, 4)) < d * 5e-7 + 1e-9)
             if terminating >= 0.9 * len(carriers):
                 return None
     # complementary pairs (t + t' = 1000) among the dominant tails — a stronger sub-signal
     comp = sum(1 for t in top_tails if int(t) < 500 and f"{1000 - int(t):03d}" in top_tails)
     return dict(label=label, n=n, n_unique=len(counts), n_distinct_fraction=len(set(full)),
                 top=[[t, c] for t, c in top], top_share=round(share, 4),
+                # Below about twenty values the top-k share is arithmetically
+                # forced -- six tails out of at most nineteen distinct ones are
+                # always most of them -- so the share carries no information and
+                # the Poisson result is the entire case. A reader who cannot see
+                # it cannot weigh the finding.
+                collision_pairs=pairs_obs, expected_pairs=round(lam, 3),
+                p_value=float(f"{p_value:.3g}"),
                 complementary_pairs=comp, severity="high",
                 rule=(f"the {top_k} most common 3-digit fractional tails cover "
                       f"{top_sum}/{n} ({share:.0%}) of the high-precision values "
-                      f"(uniform expectation ~{100 * top_k / 1000:.1f}%), which have "
+                      f"(uniform expectation ~{100 * top_k / _TAIL_SPACE:.1f}%), which have "
                       f"{len(set(full))} distinct fractional parts"))
 
 

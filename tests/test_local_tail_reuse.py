@@ -129,17 +129,15 @@ def test_independent_values_stay_quiet_across_sizes(n):
 
 @pytest.mark.parametrize("n", [1000, 3000, 10000])
 def test_large_sheets_of_pure_noise_stay_quiet(n):
-    """The size where a wrong null shows up — and where real supplements live.
+    """Noise stays quiet at the sizes real supplements reach.
 
-    The tail is read off a `rstrip("0")` string, so its last digit is never 0
-    and the space is 900, not 1000. Assuming 1000 understates the expectation by
-    1.111x; the Poisson test gains power with n, so that fixed bias eventually
-    crosses the alpha on data with nothing wrong with it. It did: three of four
-    sheets of synthetic noise reported severity=high, with an evidence line
-    reading "2% of values".
-
-    A grid that stops at 200 cannot see this. This case is the reason the grid
-    goes to 10000.
+    What holds it quiet here is the concentration gate, not the null: on noise
+    the top-6 share is 1-4% at these sizes, so the Poisson test is never
+    reached. Setting _TAIL_SPACE back to the wrong 1000 leaves this test green,
+    so it does not pin the null -- test_the_tail_space_matches_what_the_extraction_can_produce
+    does that, by measuring the reachable space. Stated because an earlier
+    version of this docstring claimed the opposite, and a reviewer reading it
+    would take the wrong-null regime for covered.
     """
     rng = np.random.default_rng(2024)
     for _ in range(3):
@@ -158,8 +156,14 @@ def test_the_tail_space_matches_what_the_extraction_can_produce():
         if len(frac) >= 3:
             seen.add(frac[-3:])
 
+    # The measurement above has to reach the assertion, or this test passes for
+    # a space of 810 or 729 just as happily. The trailing-zero check alone is
+    # true by construction of rstrip, and comparing the constant with a literal
+    # compares two literals.
+    assert len(seen) == _TAIL_SPACE, (
+        f"the extraction reaches {len(seen)} distinct tails, not {_TAIL_SPACE}"
+    )
     assert not any(t.endswith("0") for t in seen), "a trailing zero survived rstrip"
-    assert _TAIL_SPACE == 900, "the null must match the reachable tail space"
 
 
 def _benign_shapes():
@@ -190,3 +194,64 @@ def test_ordinary_derived_data_stays_quiet(name):
     all. Each has to stay silent, or the notice stops meaning anything.
     """
     assert detect_decimal_tail_clustering(_benign_shapes()[name], "x") is None
+
+
+@pytest.mark.parametrize("d,dec,n", [(3, 2, 30), (3, 3, 30), (6, 2, 60), (3, 3, 150)])
+def test_a_mean_of_limited_precision_replicates_stays_quiet(d, dec, n):
+    """The shape the count floor was accidentally hiding.
+
+    A mean of d readings recorded at a few decimals, stored at 6dp, is an
+    ordinary supplement. Its tails concentrate on the residues of 1/d, which is
+    what the terminating-decimal guard exists to recognise -- but that guard
+    compared against a fixed 1e-6 while a d-fold mean carries up to d * 5e-7 of
+    storage error, so it admitted every d >= 3. Below 100 values the count floor
+    hid it; removing the floor turned this into severity=high on a 30-row panel.
+
+    None of the other benign fixtures reaches that guard -- four stop at the
+    share gate, two at the distinct-fraction gate, one yields no high-precision
+    values -- so without this the guard has no coverage at all.
+    """
+    rng = np.random.default_rng(20260728 + d * 100 + dec * 10 + n)
+    vals = [round(float(np.mean(np.round(rng.uniform(1, 100, d), dec))), 6)
+            for _ in range(n)]
+
+    assert detect_decimal_tail_clustering(vals, "Fig 1a") is None, (
+        f"a mean of {d} replicates at {dec}dp was reported as a tail signal"
+    )
+
+
+def test_the_distinct_fraction_ratio_did_not_tighten():
+    """Lowering a floor must not raise a ratio on the way past.
+
+    The gate is max(validity_floor, n//2). Raising the ratio to 2n/3 is stricter
+    above n=75, so a panel with just over half its fractions distinct stops
+    firing -- a recall loss inside a change whose whole purpose is recall.
+    """
+    import paperconan._audit as audit
+
+    n, distinct = 200, 131
+    assert distinct >= n // 2, "fixture must sit above the n//2 gate"
+    assert distinct < (2 * n) // 3, "fixture must sit below the 2n/3 gate"
+
+    rng = np.random.default_rng(31)
+    tails = ["137", "409", "163", "829", "371", "508"]
+    vals = []
+    for i in range(n):
+        if i < distinct:
+            # `distinct` different fractional parts, each carrying one of six
+            # tails so the concentration clears the share gate.
+            vals.append(float(f"{round(float(rng.uniform(1, 1000)), 3):.3f}"
+                              f"{tails[i % len(tails)]}"))
+        else:
+            # One repeated value, not six: cycling the tails here would add six
+            # distinct fractions and lift the count past both gates, which is
+            # how the first version of this fixture passed under either ratio.
+            vals.append(float(f"{12.345:.3f}{tails[0]}"))
+
+    n_distinct = len({f"{abs(v):.10f}".rstrip("0").split(".")[-1] for v in vals})
+    assert n // 2 <= n_distinct < (2 * n) // 3, (
+        f"fixture must sit between the two ratios; it has {n_distinct} distinct"
+    )
+    assert detect_decimal_tail_clustering(vals, "Fig 2b") is not None, (
+        "a panel above the n//2 gate went silent; the ratio tightened"
+    )
