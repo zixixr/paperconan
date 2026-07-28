@@ -3567,9 +3567,14 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
     _capped = False   # set only where a loop is actually abandoned
     budget = _SCALED_ROW_BUDGET
     for i in range(len(cands)):
-        A = cands[i]
         for j in range(i + 1, len(cands)):
-            B = cands[j]
+            # Both rebound every inner pass. Binding A once outside this loop and
+            # then swapping it left the swapped-in candidate in place for every
+            # remaining j: the band guard below tested the wrong candidate and
+            # skipped genuine cross-band pairs, so only the first partner per i
+            # was ever examined. Measured, a six-row duplicated rectangle came
+            # back as one row, and a reuse at a mismatched index vanished.
+            A, B = cands[i], cands[j]
             if A["band"] == B["band"]:
                 continue                                  # same block → detect_row_relations
             # Canonical order for the PAIR, before anything is computed from it.
@@ -3610,8 +3615,12 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
             same_file = fa == fb
             same_sheet = same_file and sa_name == sb_name
             scope = "blocks" if same_sheet else ("sheets" if same_file else "files")
+            # k is mean(b/a), so B = k x A. The sentence used to read
+            # "A = B * k", which inverts it -- and canonicalizing the pair turned
+            # that from an arrival-order coin flip into a fixed wrong direction.
+            # This is the claim a reader checks against the spreadsheet.
             rel = (f"== row '{B['label']}'" if kind == "identical_row_reuse"
-                   else f"= row '{B['label']}' ({sb_name}) * {k:.6g}")
+                   else f"-> row '{B['label']}' ({sb_name}) = this row * {k:.6g}")
             # One duplicated rectangle is one event, not one event per row.
             # Two blocks that share a leading run of columns match row-for-row
             # down their whole height, so the loop emitted a finding per row --
@@ -3735,17 +3744,25 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
         if f["rows_matched"] > 1:
             scope = ("blocks" if f["same_sheet"]
                      else ("sheets" if f["same_file"] else "files"))
-            verb = ("are identical to" if f["kind"] == "identical_row_reuse"
-                    else f"are {f['ratio']:.6g} x")
-            # Not "positionally matching": the loop pairs any row with any row,
-            # and on real data two of three matches were off-diagonal. Naming
-            # the pair count separately keeps both numbers honest.
+            # Stated in the direction the ratio was measured: k is mean(b/a),
+            # so sheet_b is k x sheet_a. The old wording put sheet_a first and
+            # read "A are k x B", inverting it -- and canonicalizing the pair
+            # turned that from an arrival-order coin flip into a fixed wrong
+            # direction. This is the claim a reader checks against the sheet.
+            #
+            # Not "positionally matching" either: the loop pairs any row with
+            # any row, and on real data two of three matches were off-diagonal.
             noun = "row" if f["distinct_rows_matched"] == 1 else "rows"
-            f["rule"] = (f"{f['distinct_rows_matched']} {noun} of {f['sheet_a']} "
-                         f"({f['block_a']}) {verb} rows of {f['sheet_b']} "
-                         f"({f['block_b']}) over a run of {f['run_length']} "
-                         f"columns across 2 {scope} "
-                         f"({f['rows_matched']} row pairs)")
+            if f["kind"] == "identical_row_reuse":
+                body = (f"{f['distinct_rows_matched']} {noun} of {f['sheet_a']} "
+                        f"({f['block_a']}) are identical to rows of "
+                        f"{f['sheet_b']} ({f['block_b']})")
+            else:
+                body = (f"{f['distinct_rows_matched']} {noun} of {f['sheet_b']} "
+                        f"({f['block_b']}) are {f['ratio']:.6g} x rows of "
+                        f"{f['sheet_a']} ({f['block_a']})")
+            f["rule"] = (f"{body} over a run of {f['run_length']} columns "
+                         f"across 2 {scope} ({f['rows_matched']} row pairs)")
 
     # Attached here rather than only at the call site, so the detector's own
     # output is complete for anyone calling it directly. benign_reason reads the

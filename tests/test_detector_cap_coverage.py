@@ -1483,11 +1483,15 @@ def test_a_permuted_rectangle_does_not_split_when_the_pool_truncates():
                 f"{kind} reported k={f['ratio']} for a x{k} rectangle; the pair "
                 f"was not put in canonical order before k was computed"
             )
-            if cap > 10 ** 5:
-                assert f["distinct_rows_matched"] == 12, (
-                    f"{kind} counted {f['distinct_rows_matched']} of 12 rows; "
-                    f"the row sets mixed the two sheets"
-                )
+            # Asserted at both caps. Guarding it to the untruncated one left
+            # the count unchecked at exactly the cap where the reversal occurs,
+            # so the row-set cross-contamination passed the whole suite.
+            expected = 12 if cap > 10 ** 5 else 8
+            assert f["distinct_rows_matched"] == expected, (
+                f"{kind} at max_candidates={cap} counted "
+                f"{f['distinct_rows_matched']} of {expected} rows; the row sets "
+                f"mixed the two sheets"
+            )
 
 
 def test_a_small_unnamed_rectangle_keeps_no_shared_control_excuse():
@@ -1550,4 +1554,80 @@ def test_a_fold_that_overflows_its_label_cap_is_kept_not_demoted(monkeypatch):
     assert found[0]["row_labels_complete"] is False, "fixture must overflow the cap"
     assert found[0].get("profile_action") != "demoted", (
         "a fold whose labels were not all kept was demoted anyway"
+    )
+
+
+def test_a_rectangle_is_found_whole_when_tab_order_is_not_alphabetical():
+    """The canonical swap must not survive into the next inner iteration.
+
+    A is bound once per outer pass. Swapping it in place left the swapped-in
+    candidate there for every remaining j, so the band guard tested the wrong
+    candidate and skipped genuine cross-band pairs -- only the first partner per
+    outer pass was examined. A six-row duplicated rectangle came back as one row,
+    and a reuse at a mismatched index vanished.
+
+    Sheet insertion order is workbook tab order, which nothing sorts, so this
+    needs no truncation to fire: the permuted-rectangle test cannot reach it,
+    since Figure 9a sorts before Figure 9b in both arrival and canonical order.
+    """
+    import numpy as np
+
+    import paperconan._audit as audit
+    from paperconan._sheet import Sheet
+
+    rng = np.random.default_rng(11)
+    rows = [[round(float(rng.uniform(5, 500)), 5) for _ in range(14)]
+            for _ in range(6)]
+
+    grids = {}
+    # Tab order deliberately the reverse of lexicographic order.
+    for name in ("Source Data Fig 2", "Extended Data Fig 2"):
+        grids[("wb.xlsx", name)] = Sheet.from_rows(
+            [[f"c{j}" for j in range(14)]] + [list(r) for r in rows])
+
+    found = [f for f in audit.detect_scaled_row_reuse(grids, profile="review",
+                                                      max_findings=10 ** 6)
+             if f["kind"] == "identical_row_reuse"]
+
+    assert len(found) == 1, f"expected one rectangle, got {len(found)}"
+    assert found[0]["distinct_rows_matched"] == 6, (
+        f"the rectangle reported {found[0]['distinct_rows_matched']} of 6 rows; "
+        f"the swap leaked into the next inner iteration"
+    )
+    assert found[0]["rows_matched"] == 6, found[0]["rows_matched"]
+
+
+def test_the_rule_states_the_ratio_in_the_direction_it_was_measured():
+    """The sentence a reader takes to the spreadsheet has to be the right way round.
+
+    k is mean(b/a), so sheet_b is k x sheet_a. The rule read "A are k x B",
+    inverting it -- and canonicalizing the pair turned an arrival-order coin flip
+    into a fixed wrong direction. An inverted claim either burns the check or
+    reads as a false positive.
+    """
+    import numpy as np
+
+    import paperconan._audit as audit
+    from paperconan._sheet import Sheet
+
+    rng = np.random.default_rng(3)
+    base = [[round(float(rng.uniform(5, 500)), 5) for _ in range(14)]
+            for _ in range(3)]
+    grids = {}
+    for name, k in (("Figure 9a", 1.0), ("Figure 9b", 2.0)):   # 9b = 2 x 9a
+        grids[(f"{name}.csv", name)] = Sheet.from_rows(
+            [[f"c{j}" for j in range(14)]]
+            + [[round(v * k, 6) for v in r] for r in base])
+
+    found = [f for f in audit.detect_scaled_row_reuse(grids, profile="review",
+                                                      max_findings=10 ** 6)
+             if f["kind"] == "scaled_row_reuse"]
+    assert found, "fixture no longer produces a scaled reuse"
+    rule = found[0]["rule"]
+
+    assert "of Figure 9b" in rule.split(" are ")[0], (
+        f"the multiple is attributed to the wrong sheet: {rule}"
+    )
+    assert "are 2 x rows of Figure 9a" in rule, (
+        f"the ratio direction is inverted: {rule}"
     )
