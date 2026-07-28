@@ -1010,6 +1010,9 @@ _WITHIN_ROW_VEC_BUDGET = int(os.environ.get("PAPERCONAN_WITHIN_ROW_VEC_BUDGET", 
 # Raised with _ROW_REL_MAX_ROWS, and this is the one that bit: the paper that
 # fell from 21 findings to 1 fell here, not in detect_row_relations.
 _SCALED_ROW_BUDGET = int(os.environ.get("PAPERCONAN_SCALED_ROW_BUDGET", "20000000"))
+# How many row pairs a folded rectangle names. The reader needs the shape of the
+# match and a few rows to check against the paper; the count carries the rest.
+_ROW_REUSE_EXAMPLE_ROWS = int(os.environ.get("PAPERCONAN_ROW_REUSE_EXAMPLE_ROWS", "5"))
 _SHORT_ROW_BUDGET = int(os.environ.get("PAPERCONAN_SHORT_ROW_BUDGET", "4000000"))
 _WITHIN_ROW_FRAC_BUDGET = int(os.environ.get("PAPERCONAN_WITHIN_ROW_FRAC_BUDGET", "8000000"))
 _ROW_PAIR_FRAC_BUDGET = int(os.environ.get("PAPERCONAN_ROW_PAIR_FRAC_BUDGET", "40000000"))
@@ -3501,6 +3504,7 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
     if truncated:
         cands = cands[:max_candidates]
     findings = []
+    by_rect: dict[tuple, dict] = {}
     _capped = False   # set only where a loop is actually abandoned
     budget = _SCALED_ROW_BUDGET
     for i in range(len(cands)):
@@ -3534,7 +3538,24 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
             scope = "blocks" if same_sheet else ("sheets" if same_file else "files")
             rel = (f"== row '{B['label']}'" if kind == "identical_row_reuse"
                    else f"= row '{B['label']}' ({sb_name}) * {k:.6g}")
-            findings.append(dict(
+            # One duplicated rectangle is one event, not one event per row.
+            # Two blocks that share a leading run of columns match row-for-row
+            # down their whole height, so the loop emitted a finding per row --
+            # measured, 117 for a single shared control cohort, truncated by
+            # max_findings to 40, which then evicted three unrelated cross-file
+            # findings and put the rectangle at the top of the report. Rows fold
+            # into the finding for their rectangle; only distinct rectangles
+            # count against the cap.
+            rect = (fa, sa_name, A["rows"], fb, sb_name, B["rows"], kind,
+                    round(k, 9), run_len)
+            prior = by_rect.get(rect)
+            if prior is not None:
+                prior["rows_matched"] += 1
+                if len(prior["row_pairs"]) < _ROW_REUSE_EXAMPLE_ROWS:
+                    prior["row_pairs"].append([A["label"], B["label"]])
+                continue
+
+            finding = dict(
                 kind=kind,
                 file=fa if same_file else f"{fa} + {fb}",
                 file_a=fa, file_b=fb, same_file=same_file, same_sheet=same_sheet,
@@ -3552,8 +3573,12 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
                 examples=[{"row": A["label"], "col": None, "value": float(v)}
                           for v in x_run[:5]],
                 severity="high",
+                rows_matched=1,
+                row_pairs=[[A["label"], B["label"]]],
                 rule=(f"row '{A['label']}' ({sa_name}) {rel} over a run of {run_len} "
-                      f"positionally-aligned columns across 2 {scope}")))
+                      f"positionally-aligned columns across 2 {scope}"))
+            by_rect[rect] = finding
+            findings.append(finding)
             if len(findings) >= max_findings:
                 _capped = True
                 break
@@ -3583,6 +3608,19 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
         if budget <= 0:
             _note_detector_cap(coverage, "detect_scaled_row_reuse",
                                "detector_compute_budget_limit")
+    # Restated after folding: a finding that turned out to cover 40 rows must not
+    # keep the wording of the first row it was built from.
+    for f in findings:
+        if f["rows_matched"] > 1:
+            scope = ("blocks" if f["same_sheet"]
+                     else ("sheets" if f["same_file"] else "files"))
+            verb = ("are identical to" if f["kind"] == "identical_row_reuse"
+                    else f"are {f['ratio']:.6g} x")
+            f["rule"] = (f"{f['rows_matched']} rows of {f['sheet_a']} "
+                         f"({f['block_a']}) {verb} the positionally matching rows "
+                         f"of {f['sheet_b']} ({f['block_b']}) over a run of "
+                         f"{f['run_length']} columns across 2 {scope}")
+
     if _capped:
         _note_detector_cap(coverage, "detect_scaled_row_reuse", "detector_finding_limit",
                            limit=max_findings)
