@@ -44,7 +44,7 @@ NUMERIC_CANONICALIZATION_VERSION = 1
 # scan_dir's `wide` gate drops detect_relations, detect_equal_pairs and
 # detect_row_pair_digit_coupling outright past
 # _MAX_BLOCK_COLS, and _ROW_REL_MAX_ROWS still disables both row-relation
-# detectors on a block past its ceiling, now 200 rather than 60, while the scan
+# detectors on a block past its 60-row ceiling, while the scan
 # reports itself complete. So this stays
 # False: the caveat below is over-broad, but it is true, and a wrong all-clear
 # is worse than a broad warning. No count is given here on purpose; an earlier

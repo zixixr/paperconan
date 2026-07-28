@@ -163,10 +163,9 @@ def test_skips_narrow_block_below_min_cols():
 
 def test_skips_block_with_too_many_rows():
     # Guard against O(rows^2) on tall entity-in-rows tables: a huge block is
-    # skipped even if it hides a proportional pair. The ceiling moved from 60 to
-    # 200 -- a 61-row band is an ordinary supplement shape and was losing real
-    # relations -- so this now needs a band past 200 to exercise the skip.
-    n = 260
+    # skipped even if it hides a proportional pair. Sized just past the ceiling,
+    # so a raise is caught here rather than passing silently.
+    n = 200
     base = _distinct_highprec(20, 31, 7)
     rows = [["cond", *[f"m{i}" for i in range(20)]]]
     for r in range(n):

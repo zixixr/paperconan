@@ -1065,56 +1065,6 @@ def test_two_budgets_in_one_detector_survive_a_real_scan(tmp_path, monkeypatch):
     )
 
 
-def _many_sheets(n_sheets=10, n_rows=150):
-    """An ordinary corpus shape: several figure sheets, each inside the row cap.
-
-    detect_scaled_row_reuse compares candidates across every sheet, so the pair
-    count is quadratic in the total, not in one sheet's height. Ten sheets of
-    150 rows fills the candidate pool exactly.
-    """
-    import numpy as np
-
-    from paperconan._sheet import Sheet
-
-    vec = [13.40712, 27.91834, 8.52619, 41.06375, 19.73408, 33.28951, 22.61483,
-           9.34026, 37.15792, 14.80613, 29.47158, 6.92374, 31.08627, 17.25913]
-    grids = {}
-    for s in range(n_sheets):
-        rows = [[f"c{j}" for j in range(14)]]
-        for i in range(n_rows):
-            rows.append([round(v * (1 + 0.017 * i) + 0.31 * s + 0.7 * i, 5)
-                         for v in vec])
-        if s == n_sheets - 1:
-            rows[1] = [round(3.0 * v, 6) for v in rows[1]]
-        grids[(f"Figure {s}a.csv", f"Figure {s}a")] = Sheet.from_rows(rows)
-    return grids
-
-
-def test_the_compute_budget_matches_the_row_ceiling_it_serves():
-    """The two constants have to move together, and nothing else pins that.
-
-    Raising _ROW_REL_MAX_ROWS admits taller bands, and the pair loop is
-    O(rows^2), so on the old budget the scan spent it before reaching the rows
-    that mattered and the break dropped what was never compared. Measured on
-    real data, a paper went from 21 findings to 1 when the ceiling moved alone.
-
-    Asserted as consistency between the constants rather than as a finding
-    count: on an ordinary corpus shape whose bands are all inside the ceiling,
-    the budget must not be the thing that stops the search.
-    """
-    import paperconan._audit as audit
-
-    coverage = ScanCoverage(files_discovered=10)
-    audit.detect_scaled_row_reuse(_many_sheets(), profile="review",
-                                  max_findings=10**6, coverage=coverage)
-
-    reasons = [i["reason"] for i in coverage.to_dict()["limitations"]]
-    assert "detector_compute_budget_limit" not in reasons, (
-        "the compute budget is exhausted by sheets that all sit inside the row "
-        "ceiling; the budget and _ROW_REL_MAX_ROWS are out of step"
-    )
-
-
 def _duplicated_rectangle(n_rows=60, shared_cols=14):
     """Two sheets sharing a leading run of columns over their whole height.
 
@@ -1482,4 +1432,106 @@ def test_one_derived_looking_label_does_not_demote_the_rectangle():
     assert f.get("profile_action") != "demoted", (
         f"one derived-looking label demoted the whole rectangle; rows: "
         f"{f['matched_row_pairs']}"
+    )
+
+
+def test_a_permuted_rectangle_does_not_split_when_the_pool_truncates():
+    """The rotation is what activates the fold key's direction sensitivity.
+
+    Grouped by sheet, the earlier sheet is always the A side and the key is
+    stable. _stratified_head interleaves them, so an off-diagonal pair whose
+    rows sit at different depths arrives reversed, and the rectangle split into
+    two mirror findings -- each understating its row count and each taking a
+    result-cap slot. Truncation is the normal case on the corpora that motivated
+    both changes.
+    """
+    import numpy as np
+
+    import paperconan._audit as audit
+    from paperconan._sheet import Sheet
+
+    rng = np.random.default_rng(5)
+    base = [[round(float(rng.uniform(5, 500)), 5) for _ in range(14)]
+            for _ in range(12)]
+
+    def sheets():
+        grids = {}
+        for name, rows in (("Figure 9a", base), ("Figure 9b", list(reversed(base)))):
+            out = [[f"c{j}" for j in range(14)]] + [list(r) for r in rows]
+            grids[(f"{name}.csv", name)] = Sheet.from_rows(out)
+        return grids
+
+    for cap in (10 ** 6, 20):
+        found = [f for f in audit.detect_scaled_row_reuse(
+            sheets(), profile="review", max_candidates=cap, max_findings=10 ** 6)
+            if f["kind"] == "identical_row_reuse"]
+        assert len(found) == 1, (
+            f"at max_candidates={cap} the rectangle split into {len(found)} "
+            f"findings: {[(f['sheet_a'], f['sheet_b']) for f in found]}"
+        )
+        assert found[0]["sheet_a"] == "Figure 9a", (
+            f"orientation flipped at max_candidates={cap}"
+        )
+
+
+def test_a_small_unnamed_rectangle_keeps_no_shared_control_excuse():
+    """The floor is pinned from above but not from below.
+
+    _ROW_REUSE_BENIGN_ROWS says it is "kept above a handful so a genuine two- or
+    three-row reuse is not explained away" -- lowering it to 2 left the suite
+    green, and below is the direction where a real small reuse acquires an
+    excuse.
+    """
+    import paperconan._audit as audit
+
+    found = [f for f in audit.detect_scaled_row_reuse(_panels(None, None, n=3),
+                                                      profile="review",
+                                                      max_findings=10 ** 6)
+             if f["kind"] == "identical_row_reuse"]
+    assert found, "fixture no longer produces a reuse"
+    assert found[0]["distinct_rows_matched"] <= 3, "fixture must stay small"
+    assert found[0].get("likely_benign") is None, (
+        f"a {found[0]['distinct_rows_matched']}-row reuse was explained away: "
+        f"{found[0]['likely_benign']}"
+    )
+
+
+def test_a_fully_derived_rectangle_demotes_and_an_overflowed_one_does_not():
+    """The demote arm had no coverage: nothing showed it can fire at all.
+
+    Both mutations survived -- never demoting a folded rectangle, and forcing
+    every fold to abstain -- so the tests could not tell deliberate abstention
+    from a dead branch.
+    """
+    import paperconan._audit as audit
+
+    derived_a = [f"Mean of {i} (ng/mL)" for i in range(12)]
+    derived_b = [f"Normalized {i} (%)" for i in range(12)]
+
+    found = [f for f in audit.detect_scaled_row_reuse(
+        _panels(derived_a, derived_b, ratio=2.0), profile="review",
+        max_findings=10 ** 6) if f["kind"] == "scaled_row_reuse"]
+    assert found, "fixture no longer produces a scaled reuse"
+    assert found[0]["rows_matched"] > 1, "fixture must fold"
+    assert found[0].get("profile_action") == "demoted", (
+        f"a rectangle whose every label is derived-looking was not demoted: "
+        f"{found[0].get('profile_action')}"
+    )
+
+
+def test_a_fold_that_overflows_its_label_cap_is_kept_not_demoted(monkeypatch):
+    """Abstention on overflow, asserted rather than inferred."""
+    import paperconan._audit as audit
+
+    monkeypatch.setattr(audit, "_ROW_REUSE_LABEL_CAP", 2)
+    derived_a = [f"Mean of {i} (ng/mL)" for i in range(12)]
+    derived_b = [f"Normalized {i} (%)" for i in range(12)]
+
+    found = [f for f in audit.detect_scaled_row_reuse(
+        _panels(derived_a, derived_b, ratio=2.0), profile="review",
+        max_findings=10 ** 6) if f["kind"] == "scaled_row_reuse"]
+    assert found, "fixture no longer produces a scaled reuse"
+    assert found[0]["row_labels_complete"] is False, "fixture must overflow the cap"
+    assert found[0].get("profile_action") != "demoted", (
+        "a fold whose labels were not all kept was demoted anyway"
     )

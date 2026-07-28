@@ -1015,10 +1015,11 @@ _ROW_REL_RTOL = float(os.environ.get("PAPERCONAN_ROW_REL_RTOL", "1e-3"))
 # pair runs a pure-Python O(cols) scan, so a very wide block (e.g. 60x160000, still
 # under _MAX_CELLS) would otherwise cost ~minutes. Bound total pair*cols work; a
 # starved run stops early (stderr note) rather than hanging.
-# Unchanged by the row-ceiling raise, and measured rather than assumed: this
-# budget bounds one block's pair loop, and at the new ceiling of 200 rows even a
-# 160-column block is 3.2M column-ops, inside this. It is _SCALED_ROW_BUDGET
-# that had to move, because that one accumulates candidates across every sheet.
+# Bounds one block's pair loop, unlike _SCALED_ROW_BUDGET below, which
+# accumulates candidates across every sheet. That difference matters to anyone
+# raising _ROW_REL_MAX_ROWS: measured, the pooled budget is the one that has to
+# move with it, and moving the ceiling without it took one paper from 21
+# findings to 1. Neither is raised here.
 _ROW_REL_BUDGET = int(os.environ.get("PAPERCONAN_ROW_REL_BUDGET", "6000000"))
 # The remaining detector compute budgets. Module constants rather than in-function
 # literals so a truncation they cause can be reproduced in a test and tuned by an
@@ -1384,8 +1385,9 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=None):
     # fewer than _ROW_REL_MIN_COLS columns a "relation between rows" is not
     # evidence of anything. The row ceiling is a cost cap on the O(rows^2) pair
     # loop, and it truncates -- at 60 an exact ratio between two rows of a 61-row
-    # block was lost while scan_status stayed "complete". It is 200 now, which
-    # measurement showed is where the recall is; 400 and 1000 add nothing.
+    # block is lost while scan_status stays "complete". Raising it is a
+    # detection change under separate evaluation, and it cannot be raised alone
+    # -- see the note on _SCALED_ROW_BUDGET.
     #
     # A ceiling still exists, so a tall enough block still loses relations and
     # still says nothing about it. That residue is covered by the workflow's
@@ -3483,10 +3485,10 @@ def _scaled_row_candidates(grid_sheets):
                 # Second site sharing _ROW_REL_MAX_ROWS, and a cost cap here
                 # too, not orientation: a band's height says nothing about
                 # whether a row in it is a scalar multiple of a row in another
-                # band or sheet. At 60 a 61-row band dropped out entirely,
-                # taking identical_row_reuse with it; the ceiling is 200 now,
-                # and _SCALED_ROW_BUDGET moved with it because this detector
-                # pools candidates across every sheet.
+                # band or sheet. A 61-row band drops out entirely, taking
+                # identical_row_reuse with it. Raising the ceiling needs
+                # _SCALED_ROW_BUDGET raised with it, since this detector pools
+                # candidates across every sheet.
                 continue
             for r in range(r0, r1):
                 a = sheet.numeric[r, :]
@@ -3603,8 +3605,20 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
             # findings and put the rectangle at the top of the report. Rows fold
             # into the finding for their rectangle; only distinct rectangles
             # count against the cap.
-            rect = (fa, sa_name, A["rows"], fb, sb_name, B["rows"], kind,
-                    round(k, 9), run_len)
+            # Canonically ordered. The key has two sides and nothing said which
+            # was which: without truncation the pool is grouped by sheet so A is
+            # always the earlier one, but _stratified_head interleaves sheets, so
+            # an off-diagonal pair whose rows sit at different depths can arrive
+            # reversed. The rectangle then split into two mirror findings, each
+            # understating its row count and each taking a result-cap slot --
+            # the restatement problem this fold exists to remove, reintroduced by
+            # the rotation added alongside it, on exactly the truncating corpora
+            # that motivated both.
+            side_a = (fa, sa_name, A["rows"])
+            side_b = (fb, sb_name, B["rows"])
+            if side_b < side_a:
+                side_a, side_b = side_b, side_a
+            rect = (side_a, side_b, kind, round(k, 9), run_len)
             prior = by_rect.get(rect)
             if prior is not None:
                 prior["rows_matched"] += 1
