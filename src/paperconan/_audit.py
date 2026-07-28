@@ -2101,12 +2101,17 @@ def detect_decimal_tail_clustering(values, label, top_k=6):
     # floor was a mistake -- but not for the reason first given here. Measured:
     # a fine instrument step (14-16 bit) gives top-6 shares of 4-8%, and this
     # gate holds it. A coarse one (10 bit) reaches 62%, and division by a small
-    # constant reaches 100% -- both sail past 40%. So this gate is not what
-    # separates a copied tail from a coarse grid; the terminating-decimal guard
-    # below is, and it has to be, since genuine reuse also sits at ~100%.
-    # What this gate does is hold ordinary diffuse data quiet at scale, where
-    # the Poisson test would otherwise gain enough power to fire. What made the
-    # old arrangement unusable was pairing it with a 100-value floor.
+    # constant reaches 100%. Neither actually arrives here -- both are stopped
+    # one gate earlier, by the distinct-fraction test, which over 210 coarse-grid
+    # configurations is what rejects 125 of them to this gate's 60. So the
+    # coarse-grid separator is the gate above, not this one.
+    #
+    # What this gate demonstrably does is suppress a concentration diluted across
+    # a whole sheet: remove it and the only test that breaks is the one
+    # documenting that miss. Not, as an earlier version of this comment said,
+    # holding diffuse data quiet against a Poisson test gaining power -- with the
+    # null corrected to 900 that test stays at p in [0.07, 0.75] out to n=200000
+    # and never fires on diffuse data at all.
     if share < _TAIL_CLUSTER_SHARE:
         return None
 
@@ -2142,9 +2147,26 @@ def detect_decimal_tail_clustering(values, label, top_k=6):
             # replicate means at d>=3 were not recognised as averaging artifacts
             # -- invisible while a count floor of 100 hid them, and severity=high
             # on a 30-row panel once that floor came off.
-            terminating = sum(1 for av in carriers
-                              if abs(av * d - round(av * d, 4)) < d * 5e-7 + 1e-9)
-            if terminating >= 0.9 * len(carriers):
+            hits = [av for av in carriers
+                    if abs(av * d - round(av * d, 4)) < d * 5e-7 + 1e-9]
+            if len(hits) < 0.9 * len(carriers):
+                continue
+            # The tolerance alone is too generous to stand on. Acceptance depends
+            # only on the 3-digit tail (d*F mod 100 == d*T mod 100), so widening
+            # it from 1e-6 took the unconditionally-explainable tails from 20 of
+            # 900 to 400 of 900 -- any panel dominated by one of those went
+            # silent however improbable its concentration, a 43% loss on partial
+            # single-tail reuse.
+            #
+            # So require the hypothesis to be consistent, not just arithmetically
+            # possible: if these values are means of d readings, the implied sums
+            # are readings added together, and readings are recorded to about
+            # three decimals. A sum off that grid means the coincidence is with
+            # the tail, not with an averaging process.
+            sums = [round(av * d, 4) for av in hits]
+            on_grid = sum(1 for x in sums
+                          if abs(x * 1000 - round(x * 1000)) < 1e-6)
+            if on_grid >= 0.9 * len(sums):
                 return None
     # complementary pairs (t + t' = 1000) among the dominant tails — a stronger sub-signal
     comp = sum(1 for t in top_tails if int(t) < 500 and f"{1000 - int(t):03d}" in top_tails)

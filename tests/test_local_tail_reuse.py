@@ -255,3 +255,34 @@ def test_the_distinct_fraction_ratio_did_not_tighten():
     assert detect_decimal_tail_clustering(vals, "Fig 2b") is not None, (
         "a panel above the n//2 gate went silent; the ratio tightened"
     )
+
+
+def test_widening_the_averaging_tolerance_did_not_cost_partial_reuse():
+    """The tolerance alone would explain away 400 of 900 tails.
+
+    Acceptance by the averaging guard depends only on the 3-digit tail, so
+    widening the tolerance from 1e-6 took the unconditionally-explainable tails
+    from 20 of 900 to 400 -- and a panel dominated by one of those went silent
+    however improbable its concentration. The guard also requires the implied
+    sums to sit on the grid a recorded reading lives on, which is what keeps the
+    false-positive fix from being a recall regression.
+    """
+    def partial(tail, seed):
+        rng = np.random.default_rng(seed)
+        out = []
+        for i in range(200):
+            if i < 120:                      # 60% carrying one copied tail
+                out.append(float(f"{round(float(rng.uniform(1, 1000)), 3):.3f}{tail}"))
+            else:
+                out.append(round(float(rng.uniform(1, 1000)), 6))
+        return out
+
+    tails = [f"{t:03d}" for t in range(100, 400)]
+    found = sum(1 for t in tails if detect_decimal_tail_clustering(partial(t, int(t)), "p"))
+
+    # Measured 172/300 on main and 285/300 here; the floor is set below that with
+    # room for fixture drift but far above what the tolerance alone would leave.
+    assert found >= 260, (
+        f"only {found}/300 single-tail panels were reported; the averaging guard "
+        f"is explaining away tails it should not"
+    )

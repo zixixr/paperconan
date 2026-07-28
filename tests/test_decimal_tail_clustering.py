@@ -47,8 +47,9 @@ def test_a_partial_cluster_below_the_share_gate_does_not_fire():
 
     Measured, this is 870 collision pairs against 22.1 expected (C(200,2)/900). The Poisson gate
     passes it easily. The share gate does not, and that gate is deliberately kept:
-    it is the only thing separating a copied tail from data on a coarse grid, and
-    the margin is thin — benign quantised shapes reach 24% (a constant
+    it suppresses a concentration diluted across a whole sheet (the coarse-grid
+    separator is the distinct-fraction gate above it), and
+    measured, a constant denominator reaches 100% here (a constant
     denominator) against this case's 32%.
 
     So this is a known miss, held conservatively rather than bought with an
