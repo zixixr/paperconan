@@ -1158,8 +1158,9 @@ def test_a_duplicated_rectangle_is_one_finding_not_one_per_row():
         f"folding into their rectangle"
     )
     assert reuse[0]["rows_matched"] == 60, reuse[0]["rows_matched"]
-    assert reuse[0]["row_pairs"], "the folded finding names none of its rows"
-    assert len(reuse[0]["row_pairs"]) <= 5, "the examples are not bounded"
+    assert reuse[0]["distinct_rows_matched"] == 60
+    assert reuse[0]["matched_row_pairs"], "the folded finding names none of its rows"
+    assert len(reuse[0]["matched_row_pairs"]) <= 5, "the examples are not bounded"
     assert "60 rows" in reuse[0]["rule"], (
         f"the rule still describes one row: {reuse[0]['rule']}"
     )
@@ -1239,4 +1240,120 @@ def test_the_detector_cuts_its_pool_through_the_stratified_head():
     assert ("Figure 10a", "Figure 11a") in pairs, (
         f"the match on the last two sheets was not found; the pool cut dropped "
         f"them. found: {sorted(pairs)}"
+    )
+
+
+def _panels(rows_a, rows_b, *, ratio=1.0, label=None, n=12, cols=14):
+    """Two panels of one figure, the second a copy (or scalar multiple) of the first."""
+    from paperconan._sheet import Sheet
+
+    import numpy as np
+
+    rng = np.random.default_rng(20260728)
+    # Irregular per row: a smooth progression makes _vector_is_patterned drop
+    # most candidates, which left an earlier version of this fixture with two
+    # matched rows -- under the benign threshold, so it could not discriminate.
+    base = [[round(float(rng.uniform(5, 500)), 5) for _ in range(cols)]
+            for _ in range(n)]
+    grids = {}
+    for name, labels, k in (("Figure 3a", rows_a, 1.0), ("Figure 3b", rows_b, ratio)):
+        out = [[f"c{j}" for j in range(cols + 1)]]
+        for i in range(n):
+            out.append([labels[i] if labels else None,
+                        *[round(v * k, 6) for v in base[i]]])
+        grids[(f"{name}.csv", name)] = Sheet.from_rows(out)
+    return grids
+
+
+def test_a_scaled_rectangle_is_not_explained_as_a_shared_control():
+    """A shared control replot is k == 1; a shared axis cannot be rescaled.
+
+    An arbitrary constant between two panels is this detector's strongest
+    signal. The unnamed-rectangle branch fired for any ratio, so a 10-row block
+    at x1.14 across two panels came back as "usually a shared control".
+    """
+    import paperconan._audit as audit
+
+    found = audit.detect_scaled_row_reuse(_panels(None, None, ratio=1.14),
+                                          profile="review", max_findings=10**6)
+    scaled = [f for f in found if f["kind"] == "scaled_row_reuse"]
+    assert scaled, "fixture no longer produces a scaled reuse"
+    assert all(f.get("likely_benign") is None for f in scaled), (
+        f"a scaled rectangle was explained away: {scaled[0]['likely_benign']}"
+    )
+
+
+def test_named_arms_copying_each_other_stay_unexplained():
+    """Rows that carry names state what they are.
+
+    Two differently-named treatment arms matching is what the branch above the
+    fold deliberately leaves unexplained, and the shipped skill says so. The
+    unnamed-rectangle branch overrode that for any block of 8 rows or more.
+    """
+    import paperconan._audit as audit
+
+    a = [f"Vehicle mouse {i}" for i in range(12)]
+    b = [f"Drug-treated mouse {i}" for i in range(12)]
+    found = audit.detect_scaled_row_reuse(_panels(a, b), profile="review",
+                                          max_findings=10**6)
+    reuse = [f for f in found if f["kind"] == "identical_row_reuse"]
+    assert reuse, "fixture no longer produces a reuse"
+    assert all(f.get("likely_benign") is None for f in reuse), (
+        f"differently-named arms were explained away: {reuse[0]['likely_benign']}"
+    )
+
+
+def test_an_unnamed_rectangle_across_two_panels_carries_its_context():
+    """The case that motivated the branch: positional rows, one figure.
+
+    Measured on a real supplement as 117 aligned rows disclosed in that figure's
+    own legend as a shared control, reported high with no context.
+    """
+    import paperconan._audit as audit
+
+    found = audit.detect_scaled_row_reuse(_panels(None, None), profile="review",
+                                          max_findings=10**6)
+    reuse = [f for f in found if f["kind"] == "identical_row_reuse"]
+    assert reuse, "fixture no longer produces a reuse"
+    assert any("shared control" in (f.get("likely_benign") or "") for f in reuse), (
+        f"the unnamed rectangle carries no context: {reuse[0].get('likely_benign')}"
+    )
+
+
+def test_one_row_repeated_many_times_is_one_row_not_many():
+    """`rows_matched` counts pairs; the rule and the benign gate speak of rows.
+
+    A single row of a small block reappearing nine times in the other panel is
+    nine pairs and one row. Counted as rows it both contradicts itself -- a
+    four-row block described as nine rows -- and crosses the benign threshold,
+    handing "usually a shared control" to one donor's values reappearing as nine
+    replicates, which is the opposite of benign.
+    """
+    import paperconan._audit as audit
+    from paperconan._sheet import Sheet
+
+    vec = [13.40712, 27.91834, 8.52619, 41.06375, 19.73408, 33.28951, 22.61483,
+           9.34026, 37.15792, 14.80613, 29.47158, 6.92374, 31.08627, 17.25913]
+    a = [[f"c{j}" for j in range(14)]]
+    for i in range(4):
+        a.append([round(v * (1 + 0.05 * i), 6) for v in vec])
+    b = [[f"c{j}" for j in range(14)]]
+    for _ in range(9):                      # row 0 of A, nine times over
+        b.append([round(v, 6) for v in vec])
+    grids = {("Figure 4a.csv", "Figure 4a"): Sheet.from_rows(a),
+             ("Figure 4b.csv", "Figure 4b"): Sheet.from_rows(b)}
+
+    found = [f for f in audit.detect_scaled_row_reuse(grids, profile="review",
+                                                      max_findings=10**6)
+             if f["kind"] == "identical_row_reuse"]
+    assert found, "fixture no longer produces a reuse"
+    f = found[0]
+
+    assert f["distinct_rows_matched"] == 1, (
+        f"one repeated row counted as {f['distinct_rows_matched']} rows"
+    )
+    assert f["rows_matched"] > f["distinct_rows_matched"], "fixture is not discriminating"
+    assert f.get("likely_benign") is None, (
+        f"one row reappearing {f['rows_matched']} times was explained away: "
+        f"{f['likely_benign']}"
     )
