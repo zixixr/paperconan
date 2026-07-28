@@ -975,29 +975,11 @@ _ROW_PAIR_MAX_FINDINGS_PER_BLOCK = 25
 # row count keeps the O(rows^2) pair loop cheap on tall entity-in-rows tables (which
 # are not this orientation anyway); the column floor keeps a proportional pair from
 # firing on too few cells to be distinctive.
-# 200, and it may not be raised without raising the two budgets below with it.
-# At 60 a band of 61 rows dropped out of both detectors that gate on this --
-# detect_row_relations and, through _scaled_row_candidates, detect_scaled_row_reuse,
-# taking identical_row_reuse with it. Measured over seven real supplementary sets,
-# moving to 200 is where the available recall is: 400 and 1000 add nothing
-# further on any of them.
-#
-# The counts this was first justified with (one paper 31 -> 68) no longer
-# describe the output. Rectangle folding, added in the same branch, collapses a
-# duplicated block into one finding, so the gain that remains is the rectangles
-# that were previously invisible plus the blocks that stopped being skipped
-# outright -- not a larger count. It is not free either: measured +15% to +48%
-# runtime on four of seven corpora, the pair loop being 11x larger per block.
-#
-# Moving it alone is worse than not moving it. detect_scaled_row_reuse pools
-# candidates across every sheet and compares them pairwise, so a taller ceiling
-# multiplies the pairs and the O(rows^2) loop spends _SCALED_ROW_BUDGET before
-# reaching the rows that matter; the break then drops what was never compared.
-# Measured: at 200 rows on the old 4M budget one paper fell from 21 findings to
-# 1. That budget is raised in the same step. _ROW_REL_BUDGET is not -- it bounds
-# a single block, where the arithmetic shows the existing value still covers the
-# new ceiling.
-_ROW_REL_MAX_ROWS = int(os.environ.get("PAPERCONAN_ROW_REL_MAX_ROWS", "200"))
+# A cost cap on the O(rows^2) pair loop, shared with _scaled_row_candidates.
+# Raising it is a detection change and is being evaluated separately; folding
+# applies at this ceiling too, where the row-per-line output was already the
+# shape it is here, just smaller.
+_ROW_REL_MAX_ROWS = int(os.environ.get("PAPERCONAN_ROW_REL_MAX_ROWS", "60"))
 _ROW_REL_MIN_COLS = int(os.environ.get("PAPERCONAN_ROW_REL_MIN_COLS", "12"))
 # Short-run row reuse (detect_short_row_reuse): the long-run detectors above miss the
 # JCI "Supporting Data Values" layout, where each sub-panel is its own 1-4 row block and
@@ -1044,9 +1026,7 @@ _ROW_REL_BUDGET = int(os.environ.get("PAPERCONAN_ROW_REL_BUDGET", "6000000"))
 # only be driven by editing the source, which is why their wiring went unverified.
 _RECURRING_VEC_BUDGET = int(os.environ.get("PAPERCONAN_RECURRING_VEC_BUDGET", "3000000"))
 _WITHIN_ROW_VEC_BUDGET = int(os.environ.get("PAPERCONAN_WITHIN_ROW_VEC_BUDGET", "2000000"))
-# Raised with _ROW_REL_MAX_ROWS, and this is the one that bit: the paper that
-# fell from 21 findings to 1 fell here, not in detect_row_relations.
-_SCALED_ROW_BUDGET = int(os.environ.get("PAPERCONAN_SCALED_ROW_BUDGET", "20000000"))
+_SCALED_ROW_BUDGET = int(os.environ.get("PAPERCONAN_SCALED_ROW_BUDGET", "4000000"))
 # How many row pairs a folded rectangle names. The reader needs the shape of the
 # match and a few rows to check against the paper; the count carries the rest.
 _ROW_REUSE_EXAMPLE_ROWS = int(os.environ.get("PAPERCONAN_ROW_REUSE_EXAMPLE_ROWS", "5"))
@@ -3995,6 +3975,15 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
                 rel = "row '{}' = row '{}' * {:.6g}".format(b_label, a_label, k)
             findings.append(dict(
                 kind=kind, short_run=True,
+                # The same kinds detect_scaled_row_reuse emits, so they carry the
+                # same fold fields. A short-run match is one row pair by nature,
+                # and a consumer reading a missing key as "unnamed" or "all the
+                # same name" would grant an excuse this finding never earned.
+                rows_matched=1, distinct_rows_matched=1,
+                all_rows_unnamed=not (_norm_label(a_label) or _norm_label(b_label)),
+                all_rows_same_named=bool(
+                    _norm_label(a_label)
+                    and _norm_label(a_label) == _norm_label(b_label)),
                 file=fname, file_a=fname, file_b=fname,
                 same_file=True, same_sheet=True,
                 sheet_a=sname, sheet_b=sname,
