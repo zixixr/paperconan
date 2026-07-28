@@ -626,9 +626,16 @@ def benign_reason(f):
         # figure number) is the classic shared control/baseline replot — benign. A
         # same-sheet cross-block pair (e.g. a DMSO vs MMS arm) or a DIFFERENT-named row
         # is NOT a shared control and stays unexplained.
+        # Read off the fold, not off row_a/row_b -- those are the labels of
+        # whichever pair built the rectangle first, so one same-named pair
+        # excused eleven Vehicle-vs-Drug-treated pairs folded in behind it. A
+        # finding that never folded carries all_rows_same_named from its only
+        # pair, so this is the same test it always was for those.
         if (f.get("same_figure") and not f.get("same_sheet")
-                and _norm_label(f.get("row_a")) == _norm_label(f.get("row_b"))
-                and _norm_label(f.get("row_a"))):
+                and (f.get("all_rows_same_named")
+                     if "all_rows_same_named" in f else
+                     (_norm_label(f.get("row_a")) == _norm_label(f.get("row_b"))
+                      and _norm_label(f.get("row_a"))))):
             return ("the same-named row reused across two panels of one figure is usually "
                     "a shared control/baseline replot — confirm the legend discloses the reuse")
         if kind != "identical_row_reuse":
@@ -1047,6 +1054,9 @@ _ROW_REUSE_EXAMPLE_ROWS = int(os.environ.get("PAPERCONAN_ROW_REUSE_EXAMPLE_ROWS"
 # replotted cohort rather than a copied row. Kept above a handful so a genuine
 # two- or three-row reuse is not explained away.
 _ROW_REUSE_BENIGN_ROWS = int(os.environ.get("PAPERCONAN_ROW_REUSE_BENIGN_ROWS", "8"))
+# How many label pairs a fold retains for consumers that must decide about the
+# whole rectangle. Past this the finding says so and those consumers abstain.
+_ROW_REUSE_LABEL_CAP = int(os.environ.get("PAPERCONAN_ROW_REUSE_LABEL_CAP", "200"))
 _SHORT_ROW_BUDGET = int(os.environ.get("PAPERCONAN_SHORT_ROW_BUDGET", "4000000"))
 _WITHIN_ROW_FRAC_BUDGET = int(os.environ.get("PAPERCONAN_WITHIN_ROW_FRAC_BUDGET", "8000000"))
 _ROW_PAIR_FRAC_BUDGET = int(os.environ.get("PAPERCONAN_ROW_PAIR_FRAC_BUDGET", "40000000"))
@@ -3628,6 +3638,13 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
                 prior["_rows_b"].add(B["row"])
                 prior["_any_named"] = prior["_any_named"] or bool(
                     _norm_label(A["label"]) or _norm_label(B["label"]))
+                prior["_all_same_named"] = prior["_all_same_named"] and bool(
+                    _norm_label(A["label"])
+                    and _norm_label(A["label"]) == _norm_label(B["label"]))
+                if len(prior["_label_pairs"]) < _ROW_REUSE_LABEL_CAP:
+                    prior["_label_pairs"].append((A["label"], B["label"]))
+                else:
+                    prior["_labels_complete"] = False
                 prior["distinct_rows_matched"] = min(len(prior["_rows_a"]),
                                                      len(prior["_rows_b"]))
                 if len(prior["matched_row_pairs"]) < _ROW_REUSE_EXAMPLE_ROWS:
@@ -3666,6 +3683,15 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
             # treatment arms answer "unnamed".
             finding["_any_named"] = bool(_norm_label(A["label"])
                                          or _norm_label(B["label"]))
+            finding["_all_same_named"] = bool(
+                _norm_label(A["label"])
+                and _norm_label(A["label"]) == _norm_label(B["label"]))
+            # Every label pair the fold saw, so a consumer deciding about the
+            # rectangle is not left reading whichever pair happened to build it.
+            # Capped, with a flag when it overflows: a consumer that needs all of
+            # them must treat an incomplete list as "cannot conclude".
+            finding["_label_pairs"] = [(A["label"], B["label"])]
+            finding["_labels_complete"] = True
             by_rect[rect] = finding
             findings.append(finding)
             if len(findings) >= max_findings:
@@ -3700,7 +3726,12 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
     # Restated after folding: a finding that turned out to cover 40 rows must not
     # keep the wording of the first row it was built from.
     for f in findings:
-        f["all_rows_unnamed"] = not f.pop("_any_named", False)
+        # Fail closed: an emit path that skipped the accumulators must not read
+        # as "unnamed" or "all the same name", both of which grant an excuse.
+        f["all_rows_unnamed"] = not f.pop("_any_named", True)
+        f["all_rows_same_named"] = f.pop("_all_same_named", False)
+        f["row_labels"] = [list(x) for x in f.pop("_label_pairs", [])]
+        f["row_labels_complete"] = f.pop("_labels_complete", False)
         f.pop("_rows_a", None)
         f.pop("_rows_b", None)
         if f["rows_matched"] > 1:

@@ -1160,6 +1160,10 @@ def test_a_duplicated_rectangle_is_one_finding_not_one_per_row():
     assert reuse[0]["rows_matched"] == 60, reuse[0]["rows_matched"]
     assert reuse[0]["distinct_rows_matched"] == 60
     assert reuse[0]["matched_row_pairs"], "the folded finding names none of its rows"
+    # json.dump(..., default=str) stringifies a leaked set instead of raising, so
+    # internal accumulator state reaches scan.json with nothing failing.
+    leaked = [k for f in reuse for k in f if k.startswith("_")]
+    assert not leaked, f"internal keys reached the finding: {sorted(set(leaked))}"
     assert len(reuse[0]["matched_row_pairs"]) <= 5, "the examples are not bounded"
     assert "60 rows" in reuse[0]["rule"], (
         f"the rule still describes one row: {reuse[0]['rule']}"
@@ -1282,6 +1286,12 @@ def test_a_scaled_rectangle_is_not_explained_as_a_shared_control():
                                           profile="review", max_findings=10**6)
     scaled = [f for f in found if f["kind"] == "scaled_row_reuse"]
     assert scaled, "fixture no longer produces a scaled reuse"
+    # The missing assertion is what made this unfalsifiable at ratio 1.14: the
+    # rectangle fragmented below the gate, so the branch under test was never
+    # reached and the test passed on the code it was written to catch.
+    assert max(f["distinct_rows_matched"] for f in scaled) >= 8, (
+        "fixture no longer reaches the benign gate; this test cannot fail"
+    )
     assert all(f.get("likely_benign") is None for f in scaled), (
         f"a scaled rectangle was explained away: {scaled[0]['likely_benign']}"
     )
@@ -1424,4 +1434,56 @@ def test_a_blank_first_row_does_not_make_a_named_rectangle_unnamed():
     assert f.get("likely_benign") is None, (
         f"a rectangle of named arms with one blank row was explained away: "
         f"{f['likely_benign']}\nrows: {f['matched_row_pairs']}"
+    )
+
+
+def test_one_same_named_pair_does_not_excuse_the_rectangle_behind_it():
+    """The sibling of the branch fixed last round, with the identical defect.
+
+    row_a/row_b are the labels of whichever pair built the rectangle first, so a
+    single Control-vs-Control pair explained away eleven Vehicle-vs-Drug-treated
+    pairs folded in behind it. That branch has no row-count floor and sits above
+    the scaled early return, so it reached further than the one below it.
+    """
+    import paperconan._audit as audit
+
+    a = ["Control"] + [f"Vehicle mouse {i}" for i in range(1, 12)]
+    b = ["Control"] + [f"Drug-treated mouse {i}" for i in range(1, 12)]
+    found = [f for f in audit.detect_scaled_row_reuse(_panels(a, b),
+                                                      profile="review",
+                                                      max_findings=10**6)
+             if f["kind"] == "identical_row_reuse"]
+    assert found, "fixture no longer produces a reuse"
+    f = found[0]
+    assert f["rows_matched"] > 1, "fixture must fold"
+    assert f.get("likely_benign") is None, (
+        f"one same-named pair excused the rectangle: {f['likely_benign']}\n"
+        f"rows: {f['matched_row_pairs']}"
+    )
+
+
+def test_one_derived_looking_label_does_not_demote_the_rectangle():
+    """The same defect on the path that changes severity rather than context.
+
+    _is_derived_relation read row_a/row_b too. One incidental "Mean baseline
+    (ng)" in the pair that built the rectangle demoted every other pair in it --
+    to low under review, hidden under triage.
+    """
+    import paperconan._audit as audit
+
+    # Different labels on the two sides: an identical pair short-circuits to
+    # "not derived" before _DERIVED_RE is consulted, so a same-label fixture
+    # cannot exercise this path at all.
+    a = ["Mean baseline (ng)"] + [f"Arm A {i}" for i in range(1, 12)]
+    b = ["Normalized signal (%)"] + [f"Arm B {i}" for i in range(1, 12)]
+    found = [f for f in audit.detect_scaled_row_reuse(_panels(a, b, ratio=2.0),
+                                                      profile="review",
+                                                      max_findings=10**6)
+             if f["kind"] == "scaled_row_reuse"]
+    assert found, "fixture no longer produces a scaled reuse"
+    f = found[0]
+    assert f["rows_matched"] > 1, "fixture must fold"
+    assert f.get("profile_action") != "demoted", (
+        f"one derived-looking label demoted the whole rectangle; rows: "
+        f"{f['matched_row_pairs']}"
     )
