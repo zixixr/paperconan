@@ -1438,12 +1438,14 @@ def test_one_derived_looking_label_does_not_demote_the_rectangle():
 def test_a_permuted_rectangle_does_not_split_when_the_pool_truncates():
     """The rotation is what activates the fold key's direction sensitivity.
 
-    Grouped by sheet, the earlier sheet is always the A side and the key is
-    stable. _stratified_head interleaves them, so an off-diagonal pair whose
-    rows sit at different depths arrives reversed, and the rectangle split into
-    two mirror findings -- each understating its row count and each taking a
-    result-cap slot. Truncation is the normal case on the corpora that motivated
-    both changes.
+    Grouped by sheet, the earlier sheet is always the A side and arrival order is
+    stable. _stratified_head interleaves them, so an off-diagonal pair whose rows
+    sit at different depths arrives reversed. Ordering only the key was not
+    enough: a reversed scaled pair computes k on swapped operands, keys on 1/k
+    and never merges, and the row sets took the arriving pair's A-side index,
+    which then belonged to the other sheet. Both kinds are asserted, and the
+    counts as well as the split, because a fold that merges but miscounts passes
+    a count-free test.
     """
     import numpy as np
 
@@ -1454,24 +1456,38 @@ def test_a_permuted_rectangle_does_not_split_when_the_pool_truncates():
     base = [[round(float(rng.uniform(5, 500)), 5) for _ in range(14)]
             for _ in range(12)]
 
-    def sheets():
+    def sheets(k):
         grids = {}
         for name, rows in (("Figure 9a", base), ("Figure 9b", list(reversed(base)))):
-            out = [[f"c{j}" for j in range(14)]] + [list(r) for r in rows]
+            scale = k if name.endswith("b") else 1.0
+            out = [[f"c{j}" for j in range(14)]]
+            out += [[round(v * scale, 6) for v in r] for r in rows]
             grids[(f"{name}.csv", name)] = Sheet.from_rows(out)
         return grids
 
-    for cap in (10 ** 6, 20):
-        found = [f for f in audit.detect_scaled_row_reuse(
-            sheets(), profile="review", max_candidates=cap, max_findings=10 ** 6)
-            if f["kind"] == "identical_row_reuse"]
-        assert len(found) == 1, (
-            f"at max_candidates={cap} the rectangle split into {len(found)} "
-            f"findings: {[(f['sheet_a'], f['sheet_b']) for f in found]}"
-        )
-        assert found[0]["sheet_a"] == "Figure 9a", (
-            f"orientation flipped at max_candidates={cap}"
-        )
+    # cap=20 is where a reversed arrival actually occurs for this fixture:
+    # without pair canonicalization the scaled case splits into k=2 and k=0.5
+    # there. A larger cap merges by luck, which is how an earlier version of this
+    # test passed on the unfixed code.
+    for k, kind in ((1.0, "identical_row_reuse"), (2.0, "scaled_row_reuse")):
+        for cap in (10 ** 6, 20):
+            found = [f for f in audit.detect_scaled_row_reuse(
+                sheets(k), profile="review", max_candidates=cap,
+                max_findings=10 ** 6) if f["kind"] == kind]
+            assert len(found) == 1, (
+                f"{kind} at max_candidates={cap} split into {len(found)}: "
+                f"{[(f['sheet_a'], f['sheet_b'], f['ratio']) for f in found]}"
+            )
+            f = found[0]
+            assert f["ratio"] == k, (
+                f"{kind} reported k={f['ratio']} for a x{k} rectangle; the pair "
+                f"was not put in canonical order before k was computed"
+            )
+            if cap > 10 ** 5:
+                assert f["distinct_rows_matched"] == 12, (
+                    f"{kind} counted {f['distinct_rows_matched']} of 12 rows; "
+                    f"the row sets mixed the two sheets"
+                )
 
 
 def test_a_small_unnamed_rectangle_keeps_no_shared_control_excuse():

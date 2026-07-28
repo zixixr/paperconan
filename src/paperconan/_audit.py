@@ -1387,7 +1387,7 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=None):
     # loop, and it truncates -- at 60 an exact ratio between two rows of a 61-row
     # block is lost while scan_status stays "complete". Raising it is a
     # detection change under separate evaluation, and it cannot be raised alone
-    # -- see the note on _SCALED_ROW_BUDGET.
+    # -- see the note above _ROW_REL_BUDGET on which budget has to move with it.
     #
     # A ceiling still exists, so a tall enough block still loses relations and
     # still says nothing about it. That residue is covered by the workflow's
@@ -3572,6 +3572,21 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
             B = cands[j]
             if A["band"] == B["band"]:
                 continue                                  # same block → detect_row_relations
+            # Canonical order for the PAIR, before anything is computed from it.
+            # Ordering only the fold key was not enough: a reversed arrival
+            # computes k on swapped operands, so a mirrored scaled pair keys on
+            # 1/k and never merges -- only k == 1 is self-inverse. And the row
+            # sets took the arriving pair's A-side index, which for a reversed
+            # pair belongs to the other sheet, so the counts mixed two sheets:
+            # a permuted rectangle under-reported its height, and one row
+            # replicated across a panel over-reported it past the benign gate.
+            # Both are reachable once _stratified_head interleaves sheets, which
+            # is the ordinary case on the corpora this fold is for.
+            #
+            # Fixing the direction here also makes which row is the denominator
+            # deterministic, rather than depending on which arrived first.
+            if (B["file"], B["sheet"], B["rows"]) < (A["file"], A["sheet"], A["rows"]):
+                A, B = B, A
             a, b = A["a"], B["a"]
             m = min(len(a), len(b))
             budget -= m
@@ -3605,20 +3620,9 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
             # findings and put the rectangle at the top of the report. Rows fold
             # into the finding for their rectangle; only distinct rectangles
             # count against the cap.
-            # Canonically ordered. The key has two sides and nothing said which
-            # was which: without truncation the pool is grouped by sheet so A is
-            # always the earlier one, but _stratified_head interleaves sheets, so
-            # an off-diagonal pair whose rows sit at different depths can arrive
-            # reversed. The rectangle then split into two mirror findings, each
-            # understating its row count and each taking a result-cap slot --
-            # the restatement problem this fold exists to remove, reintroduced by
-            # the rotation added alongside it, on exactly the truncating corpora
-            # that motivated both.
-            side_a = (fa, sa_name, A["rows"])
-            side_b = (fb, sb_name, B["rows"])
-            if side_b < side_a:
-                side_a, side_b = side_b, side_a
-            rect = (side_a, side_b, kind, round(k, 9), run_len)
+            # A and B are already in canonical order, so the key is too.
+            rect = ((fa, sa_name, A["rows"]), (fb, sb_name, B["rows"]),
+                    kind, round(k, 9), run_len)
             prior = by_rect.get(rect)
             if prior is not None:
                 prior["rows_matched"] += 1
