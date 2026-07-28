@@ -36,9 +36,36 @@ SCHEMA_VERSION = 2
 # from an older policy are never silently compared against a newer one.
 WORKFLOW_POLICY_VERSION = 1
 NUMERIC_CANONICALIZATION_VERSION = 1
-# Flip to True in the PR that wires detector max_findings / compute budgets into
-# ScanCoverage. Until then coverage_complete is false by construction.
+# Detector result caps, compute budgets and candidate-pool caps now record into
+# ScanCoverage. Many resource caps still do not, and no exhaustive list is
+# attempted here — it would go stale as caps get wired, which is how an earlier
+# version of this note came to name coverage the code did not have. Two anyone
+# can check from the source, both whole-detector skips:
+# scan_dir's `wide` gate drops detect_relations, detect_equal_pairs and
+# detect_row_pair_digit_coupling outright past
+# _MAX_BLOCK_COLS, and _ROW_REL_MAX_ROWS silently disables two detectors at 61
+# rows -- detect_row_relations loses an exact relation, and _scaled_row_candidates
+# drops the band entirely, taking identical_row_reuse with it. All while the scan
+# reports itself complete. So this stays
+# False: the caveat below is over-broad, but it is true, and a wrong all-clear
+# is worse than a broad warning. No count is given here on purpose; an earlier
+# version cited one that no reader could verify and that would drift silently
+# as caps get wired.
 DETECTOR_CAPS_REPORTED = False
+
+# Measured consequence of wiring these, recorded so it is a decision and not a
+# surprise: on ten real supplementary-data sets, `scan_status` went from
+# "partial" on 3 to "partial" on essentially all of them, because the
+# candidate-pool caps genuinely truncate on ordinary inputs: any sheet with
+# 400 or more candidate rows trips _SHORT_ROW_MAX_ROWS_PER_SHEET or
+# _ROW_PAIR_MAX_ROWS_PER_SHEET, and supplements that size are routine.
+# Reporting it is right — those searches really were cut short —
+# but it means `partial` is now the normal state and carries little information
+# on its own. What carries information is the `limitations` list, which names
+# the detector and its limit. Two consequences worth keeping in view: anything
+# downstream that gates on `scan_status == "complete"` will now see almost
+# nothing, and the caps being this tight on ordinary data is an argument for
+# raising them — a detection change, separate PR.
 
 MAX_EXPANSION_ROUNDS = 2
 # Route steps are bounded so a context-only loop cannot spin forever; the cap is
@@ -234,8 +261,11 @@ def _block_seed(blk: dict[str, Any], group: str, f: dict[str, Any]) -> dict[str,
         "block_cols": block.get("cols"),
     }
     return {
-        # Derived from content, never from enumeration order: adding an unrelated
-        # file must not renumber the seeds a routing request already cites.
+        # Derived from content, not from enumeration order: adding an unrelated
+        # file must not renumber the seeds a routing request already cites. One
+        # exception, and it is declared in coverage: the `#N` suffix a collision
+        # gets IS positional, so a suffixed id identifies a finding only within
+        # one scan of one input and must not be persisted across scans.
         "seed_id": _stable_id("seed", [locator, group, f.get("kind"), f.get("rule")]),
         "kind": f.get("kind"),
         "group": group,
@@ -295,18 +325,22 @@ def _build_clusters(scan: dict[str, Any], max_clusters: int) -> tuple[list[dict]
     seeds = [_block_seed(blk, group, f) for blk, group, f in _iter_raw_findings(scan)]
     seeds += [_cross_sheet_seed(f) for f in scan.get("cross_sheet_findings", []) or []]
 
-    # A routing request cites seeds by id, so a content-derived id is only an
-    # identifier if the hashed tuple is a key. Two findings sharing an id would
-    # make a routing decision ambiguous and inflate seeds_total; catch it here
-    # rather than letting the packet ship indistinguishable entries.
-    ids = [s["seed_id"] for s in seeds]
-    if len(set(ids)) != len(ids):
-        from collections import Counter
-        dupes = sorted(i for i, n in Counter(ids).items() if n > 1)
-        raise WorkflowError(
-            f"seed ids are not unique ({len(ids) - len(set(ids))} collisions, "
-            f"first: {dupes[0]}); the seed locator does not distinguish these findings"
-        )
+    # Disambiguate rather than refuse. Raising here was the wrong call: real
+    # supplements do collide — a locator that cannot separate two findings is a
+    # gap in the locator, not a reason to deny the reader every other finding in
+    # the paper. An ordinal keeps ids unique and stable within a packet; the
+    # collision itself is recorded so it is visible rather than papered over.
+    seen: dict[str, int] = {}
+    collisions = 0
+    for seed in seeds:
+        base = seed["seed_id"]
+        if base in seen:
+            seen[base] += 1
+            collisions += 1
+            seed["seed_id"] = f"{base}#{seen[base]}"
+            seed["id_disambiguated"] = True
+        else:
+            seen[base] = 0
 
     grouped: dict[tuple, list[dict]] = {}
     for seed in seeds:
@@ -342,6 +376,14 @@ def _build_clusters(scan: dict[str, Any], max_clusters: int) -> tuple[list[dict]
 
     kept, omitted = clusters[:max_clusters], clusters[max_clusters:]
     coverage = _coverage_for(scan, seeds, clusters, omitted, max_clusters)
+    if collisions:
+        coverage["seed_ids_disambiguated"] = collisions
+        coverage["coverage_complete"] = False
+        coverage["limitations"].append(
+            f"{collisions} findings shared a locator with another and were given "
+            "an ordinal suffix; their ids are unique within this packet but do "
+            "not identify the finding on their own"
+        )
     return kept, coverage
 
 
@@ -354,6 +396,28 @@ _UNSEEDED_FAMILIES = (
     "decimal_endings",
     "decimal_tail_clusters",
 )
+
+
+def _describe_scan_limitation(entry: Any) -> str:
+    """A sentence, not a Python repr — these reach a reader's terminal."""
+    if isinstance(entry, str):
+        return entry
+    if not isinstance(entry, dict):
+        return str(entry)
+    reason = str(entry.get("reason") or "unspecified").replace("_", " ")
+    where = " ".join(
+        str(entry[k]) for k in ("detector", "file", "sheet") if entry.get(k)
+    )
+    extra = ", ".join(
+        f"{k}={entry[k]}" for k in sorted(entry)
+        if k not in ("scope", "reason", "detector", "file", "sheet")
+    )
+    text = reason
+    if where:
+        text += f" in {where}"
+    if extra:
+        text += f" ({extra})"
+    return text
 
 
 def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any]:
@@ -382,7 +446,17 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
             "seeds cover only what it analysed"
         )
         for entry in scan_coverage.get("limitations") or []:
-            limitations.append(f"scan: {entry}" if isinstance(entry, str) else f"scan: {entry!r}")
+            limitations.append("scan: " + _describe_scan_limitation(entry))
+        # The record list is itself capped. Reporting the retained records
+        # without the dropped count shows a short list that reads as a full one.
+        dropped = int(scan_coverage.get("limitations_omitted") or 0)
+        if dropped:
+            limitations.append(
+                f"scan: {dropped} further limitation records were dropped by the record "
+                f"cap (PAPERCONAN_MAX_LIMITATIONS); the scan lines above are a sample, "
+                f"not the whole set. Records, not distinct causes: repeats of one cause "
+                f"past the cap are each counted, so this bounds what was lost from above"
+            )
 
     unseeded = {
         family: len(scan.get(family) or [])
@@ -401,18 +475,25 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
             f"{len(omitted)} lower-ranked clusters were not routed"
         )
 
-    # Several detectors stop at their own max_findings or compute budget and
-    # report it to no channel at all — not scan_status, not findings_omitted,
-    # and for some paths not even stderr. Until they are wired into ScanCoverage
-    # (a scan-layer change, separate PR) the workflow cannot know whether a block
-    # was fully enumerated, so it must not claim it was. Stating it here rather
-    # than only in a side field means `coverage_complete` is false by
-    # construction and the caveat reaches the CLI, which prints `limitations`.
+    # Result caps, compute budgets and candidate-pool caps now record through
+    # ScanCoverage. Others still reach no channel — whole-detector skips for a
+    # block too wide (the `wide` gate) or too tall (_ROW_REL_MAX_ROWS, a cost
+    # bound that drops real relations at 61 rows), and per-row truncations
+    # inside detectors that are otherwise wired. Until those are wired
+    # the workflow cannot know whether a block was fully enumerated, so it must
+    # not claim it was. Stating it here rather than only in a side field means
+    # `coverage_complete` is false by construction and the caveat reaches the
+    # CLI, which prints `limitations`.
+    #
+    # Deliberately not an enumeration: a list here goes stale the moment a cap
+    # is wired, which is how an earlier version of this text came to name
+    # coverage the code did not have.
     if not DETECTOR_CAPS_REPORTED:
         limitations.append(
-            "detector-level caps are not reported to the scan layer, so a detector "
-            "that stopped at its own max_findings or compute budget is not counted "
-            "here (see coverage.detector_caps_reported)"
+            "some detector caps are still not reported: a detector that skipped a "
+            "block for being too wide or too tall, or stopped at an internal "
+            "limit, may not appear above. This line does not enumerate what is "
+            "not reported."
         )
 
     return {
@@ -426,11 +507,14 @@ def _coverage_for(scan, seeds, clusters, omitted, max_clusters) -> dict[str, Any
         "families_not_seeded": unseeded,
         "coverage_complete": not limitations,
         "limitations": limitations,
-        # Known blind spot, stated rather than implied: several detectors stop at
-        # their own `max_findings` or compute budget and report that only on
-        # stderr, so it reaches neither scan_status nor findings_omitted. Until
-        # those are wired into ScanCoverage, `coverage_complete` means "complete
-        # as far as the scan reported", not "every finding was seeded".
+        # Known blind spot, stated rather than implied. Result caps, compute
+        # budgets and candidate-pool caps now record through ScanCoverage. Not
+        # all of them: whole-detector skips (the `wide` gate, _ROW_REL_MAX_ROWS,
+        # BLOCK_DUP_MAX_CELLS) reach no channel, and neither do per-row
+        # truncations like _WR_MAX_ROW_CELLS. No exhaustive list is attempted
+        # here — that is the point of the caveat. So `coverage_complete` means
+        # "complete as far as the scan reported", not "every finding was seeded".
+        # See the caveat assembled above for what that leaves out.
         "detector_caps_reported": DETECTOR_CAPS_REPORTED,
     }
 

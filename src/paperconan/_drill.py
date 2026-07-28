@@ -21,10 +21,11 @@ These functions are pure reads — they never write, and never mutate the scan.
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
-from ._finding_groups import BLOCK_FINDING_GROUPS
-from ._workflow import _block_seed, _build_clusters, _cross_sheet_seed
+from ._workflow import (_SEVERITY_RANK, _block_seed, _build_clusters,
+                        _cross_sheet_seed, _iter_raw_findings)
 
 # Kept generous: these are read straight into a reviewer's context, and the
 # limit exists to bound a pathological scan, not to curate.
@@ -38,7 +39,18 @@ def _location_label(cluster: dict[str, Any]) -> str:
     where = f'{cluster["file"]} :: {cluster["sheet"]}'
     if cluster.get("block_rows"):
         where += f' rows {cluster["block_rows"]}'
-    if cluster.get("block_cols"):
+    merged_spans = cluster.get("block_cols_merged") or []
+    spans = [c for c in merged_spans if c]
+    if len(merged_spans) > 1:
+        # A merged panel spans several column groups. Naming the first would send
+        # the reader to a third of the evidence; naming none loses the location
+        # entirely, which is what setting block_cols=None used to do.
+        # Counted from members, not from non-empty spans: a member whose span
+        # is missing still holds evidence, and dropping it from the count told
+        # the reader a three-group panel had two.
+        first = spans[0] if spans else "?"
+        where += f' cols {first} +{len(merged_spans) - 1} more'
+    elif cluster.get("block_cols"):
         where += f' cols {cluster["block_cols"]}'
     return where
 
@@ -48,7 +60,7 @@ def _clusters_of(scan: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, 
 
     That second value is not optional bookkeeping. It carries the upstream
     finding caps, an incomplete scan, the families this layer does not route, and
-    the detector-level caps nothing reports — i.e. most of the ways a real signal
+    the detector-level caps still reaching no channel — i.e. most of the ways a real signal
     fails to reach the reader. Discarding it here made `overview` print an empty
     `limitations` list on a scan where thousands of findings had been dropped.
     """
@@ -65,10 +77,98 @@ def _families(cluster: dict[str, Any]) -> list[str]:
 
 # ---------- L1 ----------
 
+
+def _merge_panels(clusters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group the ranked clusters by panel for the overview.
+
+    Clusters key on the column span, which is right for routing — two panels
+    side by side are independent evidence. But one panel's findings often sit in
+    several column groups, and listing each separately makes a single finding
+    compete with itself for space: on a real paper, six exactly-duplicated
+    column pairs from one panel occupied six ranks instead of one, and none
+    reached the first page. The column span is what `drill` is for.
+    """
+    merged: dict[tuple, dict[str, Any]] = {}
+    for cluster in clusters:
+        key = (cluster["scope"], cluster["file"], cluster["sheet"],
+               cluster.get("block_rows"))
+        panel = merged.get(key)
+        if panel is None:
+            merged[key] = dict(cluster, member_ids=[cluster["cluster_id"]],
+                               block_cols_merged=[cluster.get("block_cols")])
+            continue
+        panel["seeds"] = panel["seeds"] + cluster["seeds"]
+        panel["block_cols_merged"].append(cluster.get("block_cols"))
+        panel["n_high_seeds"] += cluster["n_high_seeds"]
+        panel["member_ids"].append(cluster["cluster_id"])
+        if _SEVERITY_RANK.get(cluster["strongest_raw_severity"], 3) < \
+           _SEVERITY_RANK.get(panel["strongest_raw_severity"], 3):
+            panel["strongest_raw_severity"] = cluster["strongest_raw_severity"]
+
+    # Re-rank: merging changed the counts the ranking is built on. Skipping this
+    # left a panel with seven high findings behind one with six, purely because
+    # its evidence had arrived split across six column groups.
+    panels = list(merged.values())
+    panels.sort(key=lambda c: (
+        _SEVERITY_RANK.get(c["strongest_raw_severity"], 3),
+        -c["n_high_seeds"],
+        -len(c["seeds"]),
+        c["cluster_id"],
+    ))
+    return panels
+
+
+def _interleave_by_family(clusters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Round-robin the ranked list across finding families.
+
+    Ranking on severity then high-count alone lets one family own the page: a
+    block where a single kind hits the per-block cap contributes 150 high
+    findings, which outranks a six-row exactly-duplicated column. Measured on a
+    real paper, that pushed the duplicated columns the report was about to rank
+    25-47, past the default page.
+
+    A family saturating one block is evidence about that family, not about the
+    paper. Taking one block from each family in turn keeps the strongest of every
+    kind on the first page while preserving the existing order within a family.
+    Deterministic: families are visited in the order they first appear in the
+    already-deterministic ranking.
+    """
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for cluster in clusters:
+        families = _families(cluster)
+        buckets.setdefault(families[0] if families else "?", []).append(cluster)
+
+    out: list[dict[str, Any]] = []
+    while any(buckets.values()):
+        for queue in buckets.values():
+            if queue:
+                out.append(queue.pop(0))
+    return out
+
+
+
+def _ranked_panels(scan: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """The list `overview` and `drill` share, so an ordinal means one thing.
+
+    Not `explain`: L4 answers about one finding and reports the member cluster's
+    exact column span, which is the span the reader needs to find the cells --
+    deliberately narrower than the panel label above it. _resolve accepts a
+    member id, so that id still opens the panel.
+
+    overview used to merge and interleave while drill resolved against the raw
+    cluster list, so `overview` printed a number and `drill <that number>` opened
+    a different location -- and a merged panel opened to only its first member,
+    dropping the rest while its own coverage reported the location complete.
+    Both layers now walk the same ordering, so an ordinal means one thing.
+    """
+    clusters, seeding = _clusters_of(scan)
+    return _interleave_by_family(_merge_panels(clusters)), seeding
+
+
 def overview(scan: dict[str, Any], *,
              max_locations: int = DEFAULT_MAX_LOCATIONS) -> dict[str, Any]:
     """Which locations carry signal, how strong, and of what kinds."""
-    clusters, seeding = _clusters_of(scan)
+    clusters, seeding = _ranked_panels(scan)
     max_locations = max(0, max_locations)
     shown, hidden = clusters[:max_locations], clusters[max_locations:]
 
@@ -122,7 +222,11 @@ def _resolve(clusters: list[dict[str, Any]], location: int | str) -> dict[str, A
             return clusters[location - 1]
     else:
         for cluster in clusters:
-            if cluster["cluster_id"] == location:
+            # member_ids too: merging keeps the first member's cluster_id, so an
+            # id taken from an earlier run or from a member cluster still has to
+            # open the panel that now carries its seeds.
+            if cluster["cluster_id"] == location or location in (
+                    cluster.get("member_ids") or ()):
                 return cluster
     raise ValueError(
         f"no such location: {location!r}; run overview() to list them"
@@ -132,7 +236,7 @@ def _resolve(clusters: list[dict[str, Any]], location: int | str) -> dict[str, A
 def drill(scan: dict[str, Any], location: int | str, *, kind: str | None = None,
           max_findings: int = DEFAULT_MAX_FINDINGS) -> dict[str, Any]:
     """One location — grouped by kind, or listing the findings of a single kind."""
-    clusters, _seeding = _clusters_of(scan)
+    clusters, _seeding = _ranked_panels(scan)
     cluster = _resolve(clusters, location)
     label = _location_label(cluster)
 
@@ -215,27 +319,34 @@ def _iter_findings_with_seeds(scan: dict[str, Any]):
 def _match_raw_finding(scan: dict[str, Any], seed: dict[str, Any]) -> dict[str, Any] | None:
     """Recover the scan finding a seed came from, to show its evidence.
 
-    Matched on the same tuple `seed_id` is hashed from — anything weaker is not
-    injective where the id is, so `explain` would serve one finding's evidence
-    under another's heading. `rule` alone repeats readily: several detectors
-    build it from labels or omit the column index, so two side-by-side panels
-    produce byte-identical strings.
+    Replays the seeding enumeration rather than recomputing one hash. Two
+    reasons. Matching on the hashed tuple alone is not injective once ids
+    collide -- which they do on real supplements -- so `explain` would serve one
+    finding's evidence under another's heading. And a disambiguated id carries a
+    `#N` suffix assigned over the whole seed list, so no per-finding hash can
+    reproduce it: matching on the bare hash returned nothing at all, and
+    `explain` reported the profile defaults for a finding the profile had
+    demoted. Walking the same order and applying the same suffix rule makes the
+    id mean here exactly what it means in the packet.
     """
-    if seed["scope"] == "cross_sheet":
-        for f in scan.get("cross_sheet_findings") or []:
-            if _cross_sheet_seed(f)["seed_id"] == seed["seed_id"]:
-                return f
-        return None
-    for blk in scan.get("relations_blocks") or []:
-        if blk.get("file") != seed["file"] or blk.get("sheet") != seed["sheet"]:
-            continue
-        block = blk.get("block") or {}
-        if block.get("rows") != seed["block_rows"] or block.get("cols") != seed["block_cols"]:
-            continue
-        for group in BLOCK_FINDING_GROUPS:
-            for f in blk.get(group) or []:
-                if _block_seed(blk, group, f)["seed_id"] == seed["seed_id"]:
-                    return f
+    want = seed["seed_id"]
+    seen: dict[str, int] = {}
+
+    def disambiguated(base: str) -> str:
+        # Same rule as _build_clusters, and the counter spans both passes because
+        # that is one list there.
+        if base in seen:
+            seen[base] += 1
+            return f"{base}#{seen[base]}"
+        seen[base] = 0
+        return base
+
+    for blk, group, f in _iter_raw_findings(scan):
+        if disambiguated(_block_seed(blk, group, f)["seed_id"]) == want:
+            return f
+    for f in scan.get("cross_sheet_findings") or []:
+        if disambiguated(_cross_sheet_seed(f)["seed_id"]) == want:
+            return f
     return None
 
 
@@ -274,12 +385,130 @@ def _demotion_reasons(raw: dict[str, Any]) -> list[str]:
     return reasons
 
 
-def explain(scan: dict[str, Any], finding_id: str) -> dict[str, Any]:
+def _reread_evidence(scan: dict[str, Any], seed: dict[str, Any],
+                     raw: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild a finding's evidence window from the source data.
+
+    The scan stores a bounded window so a dense block is not copied whole into
+    every finding. That is the right default -- the stored windows were most of
+    a scan corpus's bytes -- but it must not be the only way to see the cells,
+    or a trimmed window becomes a permanent loss. `input_dir` is recorded in the
+    scan, so the block can be read again on request.
+
+    Returns a dict carrying either the full window or, when the source cannot be
+    reached, the reason. Never silently returns the trimmed view as if it were
+    complete: a reader who asked for everything and got a subset would take the
+    subset for the block.
+    """
+    from ._audit import (_FULL_EV_CELLS, _block_evidence, header_for,
+                         load_table)
+
+    in_dir = scan.get("input_dir")
+    if not in_dir:
+        return {"unavailable": "this scan records no input_dir, so the source "
+                               "data cannot be located"}
+    path = os.path.join(in_dir, seed.get("file") or "")
+    if not os.path.isfile(path):
+        return {"unavailable": f"source file not found at {path}; it moved or the "
+                               f"scan was copied away from its inputs"}
+    try:
+        sheets = load_table(path)
+    except Exception as exc:                       # noqa: BLE001 - reported, not raised
+        return {"unavailable": f"{type(exc).__name__} reading {path}: {exc}"}
+
+    sheet = sheets.get(seed.get("sheet"))
+    if sheet is None:
+        return {"unavailable": f"sheet {seed.get('sheet')!r} is not in {path} now"}
+
+    rows = _span(seed.get("block_rows"))
+    cols = _span(seed.get("block_cols"))
+    if rows is None or cols is None:
+        return {"unavailable": "this finding records no block span to re-read"}
+
+    r0, r1 = rows
+    c0, c1 = cols
+
+    # Unconditional, and measured against the sheet rather than against
+    # scan.json. The previous version ran these only when the scan had trimmed
+    # the finding -- so every finding whose block fits the stored window, which
+    # is most of them and all of the demo's, was re-read with no check at all.
+    # It also compared the finding's column span with the span the same scan
+    # wrote, which is the same number by construction and could never fire.
+    #
+    # Identity first: size and mtime catch an edit that preserves the block's
+    # shape, which no extent check can see.
+    for rec in (scan.get("scan_stats") or {}).get("files") or []:
+        if rec.get("file") != os.path.basename(path):
+            continue
+        if "size" not in rec:
+            break
+        try:
+            st = os.stat(path)
+        except OSError:
+            break
+        if st.st_size != rec["size"] or st.st_mtime_ns != rec.get("mtime_ns"):
+            return {"unavailable": f"{os.path.basename(path)} has changed since the "
+                                   f"scan (size or timestamp differs); its cells no "
+                                   f"longer correspond to this finding"}
+        break
+
+    if sheet.nrows < r1:
+        return {"unavailable": f"{seed.get('sheet')!r} in {path} now has "
+                               f"{sheet.nrows} rows, fewer than the {r1} this "
+                               f"finding covers -- the source changed since the scan"}
+    if sheet.ncols < c1:
+        return {"unavailable": f"{seed.get('sheet')!r} in {path} now has "
+                               f"{sheet.ncols} columns, fewer than the {c1} this "
+                               f"finding covers -- the source changed since the scan"}
+
+    header = header_for(sheet, r0, c0, c1)
+    stored_ev = raw.get("evidence") or {}
+    highlight_cols = stored_ev.get("highlight_cols") or []
+    highlight_rows = stored_ev.get("highlight_rows") or []
+    if not highlight_cols and not highlight_rows:
+        # Without the markers the reader cannot see which cells the finding is
+        # about, and a wide window of unmarked numbers is worse than the trimmed
+        # one it replaces.
+        return {"unavailable": "this finding's highlighted cells could not be "
+                               "recovered, so a full window would not show what "
+                               "the finding is about"}
+
+    # Widened for this call, not unbounded: CLAUDE.md requires the evidence caps
+    # be respected in new code paths, and a genomics block is millions of cells.
+    # Passed as arguments rather than by raising the module globals, so a
+    # concurrent scan is unaffected.
+    span_rows, span_cols = r1 - r0 + 2, c1 - c0
+    if span_rows * max(1, span_cols) > _FULL_EV_CELLS:
+        allowed = max(1, _FULL_EV_CELLS // max(1, span_cols))
+        return _block_evidence(sheet, r0, r1, c0, c1, header,
+                               highlight_cols, highlight_rows,
+                               max_rows=allowed, max_cols=span_cols,
+                               trimmed_by="full_budget")
+    return _block_evidence(sheet, r0, r1, c0, c1, header,
+                           highlight_cols, highlight_rows,
+                           max_rows=span_rows, max_cols=span_cols)
+
+
+def _span(text: Any) -> tuple[int, int] | None:
+    """'3-120' -> (2, 120): scan spans are 1-based inclusive, slices are 0-based."""
+    if not isinstance(text, str) or "-" not in text:
+        return None
+    lo, _, hi = text.partition("-")
+    try:
+        return int(lo) - 1, int(hi)
+    except ValueError:
+        return None
+
+
+def explain(scan: dict[str, Any], finding_id: str, *, full: bool = False) -> dict[str, Any]:
     """One finding in full: parameters, evidence, and how a profile treated it."""
     for cluster, seed in _iter_findings_with_seeds(scan):
         if seed["seed_id"] != finding_id:
             continue
         raw = _match_raw_finding(scan, seed) or {}
+        # Once: --full re-reads the source file, so asking twice doubles the IO
+        # and, on a large supplement, the peak memory.
+        evidence = _reread_evidence(scan, seed, raw) if full else raw.get("evidence")
         return {
             "finding_id": finding_id,
             "kind": seed["kind"],
@@ -299,6 +528,20 @@ def explain(scan: dict[str, Any], finding_id: str) -> dict[str, Any]:
             "parameters": {
                 k: v for k, v in raw.items() if k not in _NON_PARAMETER_KEYS
             },
-            "evidence": raw.get("evidence"),
+            "evidence": evidence,
+            # Two separate facts, and conflating them cost a round: this one
+            # is a claim about the evidence, which a --json consumer reads as
+            # "the whole block is here". A --full that refused, or that came
+            # back bounded by its own budget, is not that.
+            "evidence_is_full": bool(
+                full and isinstance(evidence, dict)
+                and "unavailable" not in evidence
+                and "truncated" not in evidence
+            ),
+            # And this one is what the reader asked for. The renderer needs it
+            # to lift its page cap: keying that off evidence_is_full re-trimmed
+            # a budget-bounded window to twenty rows and told a reader who had
+            # just run --full to add --full.
+            "evidence_requested_full": bool(full),
         }
     raise ValueError(f"no such finding: {finding_id!r}; run drill() to list them")

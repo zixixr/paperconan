@@ -470,64 +470,80 @@ def _cell_value(v):
     return str(v)
 
 
-def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_rows=None):
+def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_rows=None,
+                    max_rows=None, max_cols=None, trimmed_by="scan"):
     """Slice a numeric block (with 1 row of context above/below if available) into a
     JSON-friendly evidence dict that the HTML renderer can show as a table.
 
-    The emitted snippet is bounded to a contiguous _MAX_EV_ROWS × _MAX_EV_COLS
+    max_rows/max_cols override the stored bounds for one call. They are
+    parameters rather than a save-and-restore of the module globals because
+    `explain --full` needs a wider window than the scan stores, and this module
+    is imported by a library API another thread may be scanning through -- a
+    global raised for the duration of one call would widen every window written
+    in that window of time, which is the OOM the caps exist to prevent.
+
+    The emitted snippet is bounded to a contiguous max_rows × max_cols
     sub-rectangle inside the block, always covering the highlighted columns (and rows
     when given). This stops a dense block from being copied whole into every finding
     (which balloons the scan dict / scan.json to GBs). Small blocks are emitted whole
     and stay byte-identical (no `truncated` key)."""
     truncated = False
+    max_rows = _MAX_EV_ROWS if max_rows is None else max_rows
+    max_cols = _MAX_EV_COLS if max_cols is None else max_cols
 
     # --- column window -------------------------------------------------------
     ec0, ec1 = c0, c1
-    if (c1 - c0) > _MAX_EV_COLS:
+    if (c1 - c0) > max_cols:
         truncated = True
         if highlight_cols:
             lo = min(highlight_cols)
             hi = max(highlight_cols)
         else:
             lo = hi = c0
-        if hi - lo + 1 > _MAX_EV_COLS:
+        if hi - lo + 1 > max_cols:
             ec0 = lo
-            ec1 = lo + _MAX_EV_COLS
+            ec1 = lo + max_cols
         else:
-            # Center a _MAX_EV_COLS-wide window on [lo, hi], then clamp into [c0, c1).
-            pad = (_MAX_EV_COLS - (hi - lo + 1)) // 2
+            # Center a max_cols-wide window on [lo, hi], then clamp into [c0, c1).
+            pad = (max_cols - (hi - lo + 1)) // 2
             ec0 = lo - pad
-            ec1 = ec0 + _MAX_EV_COLS
+            ec1 = ec0 + max_cols
             if ec0 < c0:
-                ec0, ec1 = c0, c0 + _MAX_EV_COLS
+                ec0, ec1 = c0, c0 + max_cols
             if ec1 > c1:
                 ec1 = c1
-                ec0 = ec1 - _MAX_EV_COLS
+                ec0 = ec1 - max_cols
             if ec0 < c0:
                 ec0 = c0
 
     # --- row window ----------------------------------------------------------
+    # Captured before windowing: a reader who is shown 12 of 5000 rows and a
+    # reader shown 12 of 13 are in very different positions, and a bare
+    # `truncated: True` cannot tell them apart.
+    full_rows = min(sheet.nrows, r1 + 1) - max(0, r0 - 1)
+    full_cols = c1 - c0
+
     r_start = max(0, r0 - 1)
     r_end = min(sheet.nrows, r1 + 1)
-    if (r_end - r_start) > _MAX_EV_ROWS:
+    if (r_end - r_start) > max_rows:
         truncated = True
         if highlight_rows:
             # highlight_rows are 1-based row numbers; center the window on them.
             rlo = min(highlight_rows) - 1
             rhi = max(highlight_rows) - 1
-            if rhi - rlo + 1 >= _MAX_EV_ROWS:
+            if rhi - rlo + 1 >= max_rows:
                 wr0 = rlo
             else:
-                pad = (_MAX_EV_ROWS - (rhi - rlo + 1)) // 2
+                pad = (max_rows - (rhi - rlo + 1)) // 2
                 wr0 = rlo - pad
         else:
             wr0 = r_start
         if wr0 < r_start:
             wr0 = r_start
-        wr1 = wr0 + _MAX_EV_ROWS
+        wr1 = wr0 + max_rows
         if wr1 > r_end:
             wr1 = r_end
-            wr0 = max(r_start, wr1 - _MAX_EV_ROWS)
+            wr0 = max(r_start, wr1 - max_rows)
         r_start, r_end = wr0, wr1
 
     data_rows = []
@@ -546,7 +562,19 @@ def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_row
         "rows": data_rows,
     }
     if truncated:
-        out["truncated"] = True
+        # Dict rather than True: still truthy for the `if ev.get("truncated")`
+        # consumers, and it says how much of the block the window covers. An
+        # evidence table that does not state its own scale is the same defect as
+        # a scan that reports itself complete after stopping early.
+        out["truncated"] = {
+            # Both row figures include the +-1 context rows, so the ratio is
+            # self-consistent. `by` names who trimmed it: a window the scan
+            # bounded and one `--full` bounded to its cell budget need different
+            # remedies, and telling a --full reader to run --full is a loop.
+            "by": trimmed_by,
+            "rows_shown": len(data_rows), "rows_total": full_rows,
+            "cols_shown": ec1 - ec0, "cols_total": full_cols,
+        }
     return out
 
 
@@ -953,6 +981,40 @@ _ROW_REL_RTOL = float(os.environ.get("PAPERCONAN_ROW_REL_RTOL", "1e-3"))
 # under _MAX_CELLS) would otherwise cost ~minutes. Bound total pair*cols work; a
 # starved run stops early (stderr note) rather than hanging.
 _ROW_REL_BUDGET = int(os.environ.get("PAPERCONAN_ROW_REL_BUDGET", "6000000"))
+# The remaining detector compute budgets. Module constants rather than in-function
+# literals so a truncation they cause can be reproduced in a test and tuned by an
+# operator, per the PAPERCONAN_* convention — as in-function literals they could
+# only be driven by editing the source, which is why their wiring went unverified.
+_RECURRING_VEC_BUDGET = int(os.environ.get("PAPERCONAN_RECURRING_VEC_BUDGET", "3000000"))
+_WITHIN_ROW_VEC_BUDGET = int(os.environ.get("PAPERCONAN_WITHIN_ROW_VEC_BUDGET", "2000000"))
+_SCALED_ROW_BUDGET = int(os.environ.get("PAPERCONAN_SCALED_ROW_BUDGET", "4000000"))
+_SHORT_ROW_BUDGET = int(os.environ.get("PAPERCONAN_SHORT_ROW_BUDGET", "4000000"))
+_WITHIN_ROW_FRAC_BUDGET = int(os.environ.get("PAPERCONAN_WITHIN_ROW_FRAC_BUDGET", "8000000"))
+_ROW_PAIR_FRAC_BUDGET = int(os.environ.get("PAPERCONAN_ROW_PAIR_FRAC_BUDGET", "40000000"))
+
+
+def _note_detector_cap(coverage, detector: str, reason: str, **details) -> None:
+    """Record that a detector stopped at one of its own limits.
+
+    Known boundary: `detector_finding_limit` fires whenever a result cap was
+    reached, including the case where the detector had nothing further to find
+    anyway (natural output == the cap). That errs toward saying "there may be
+    more" rather than toward a false all-clear, which is the safe direction for
+    this tool; distinguishing the two needs per-break-site knowledge of what
+    remained unexamined.
+
+    These caps bound worst-case work on genome-scale supplements, which is
+    correct — but a search that was cut short must not be reportable as a
+    complete one. Routing them into ScanCoverage flips scan_status to "partial"
+    and carries the reason to every consumer that renders coverage — the raw
+    HTML report, the layered views, the workflow packet — instead of the stderr
+    line (or, on several paths, the silence) they used to get. The adjudicated
+    report renders no scan coverage at all, so a cap does not reach a reader
+    there; `scan_status` is the signal to check before adjudicating.
+    """
+    if coverage is None:
+        return
+    coverage.add_limitation("detector", reason, detector=detector, **details)
 
 
 def _row_label(sheet, r, c0):
@@ -1007,7 +1069,8 @@ def _row_pair_low_cardinality_integer_like(x, y):
     return bool(near_integer >= 0.9 and max_abs <= 20 and distinct <= max(5, len(finite) // 4))
 
 
-def detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header, min_n=10):
+def detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header, min_n=10,
+                                   coverage=None):
     """Detect suspicious paired rows that preserve low-order digits across many cells.
 
     This targets source-data layouts where replicate/condition rows are aligned by
@@ -1141,6 +1204,22 @@ def detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header, min_n=10):
         -f["coarse_10_diff_frac"],
         -f["n"],
     ))
+    if len(findings) > _ROW_PAIR_MAX_FINDINGS_PER_BLOCK:
+        # A result cap like any other, and it truncates before _cap_block_findings
+        # runs, so without this the drop reaches neither findings_omitted nor
+        # scan_status.
+        #
+        # No per-block count: this goes through _note_detector_cap, so the record
+        # carries no file or sheet and the dedup key collapses every overflowing
+        # block in the scan into one entry. A `found` here would be the first
+        # such block's count while reading as the total — the same trap that cost
+        # detect_row_relations its rows/cols. The limit alone is honest; the
+        # stderr line below stays per-block.
+        print(f"[paperconan] detect_row_pair_digit_coupling: {len(findings)} findings "
+              f"capped at {_ROW_PAIR_MAX_FINDINGS_PER_BLOCK} in one block", file=sys.stderr)
+        _note_detector_cap(coverage, "detect_row_pair_digit_coupling",
+                           "detector_finding_limit",
+                           limit=_ROW_PAIR_MAX_FINDINGS_PER_BLOCK)
     return findings[:_ROW_PAIR_MAX_FINDINGS_PER_BLOCK]
 
 
@@ -1233,7 +1312,7 @@ def _demote_reused_progressions(report_blocks):
     return report_blocks
 
 
-def detect_row_relations(sheet, r0, r1, c0, c1, header):
+def detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=None):
     """Row-oriented mirror of `detect_relations`: flag two ROWS that hold an exact
     relationship across many columns.
 
@@ -1252,6 +1331,33 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header):
     findings = []
     n_rows = r1 - r0
     n_cols = c1 - c0
+    # Two different bounds share this line. The column floor is scope: with
+    # fewer than _ROW_REL_MIN_COLS columns a "relation between rows" is not
+    # evidence of anything. The row ceiling is not — it is a cost cap on the
+    # O(rows^2 * cols) pair loop, and it truncates: a 61x14 block is squarely in
+    # this detector's orientation, and an exact ratio between two of its rows is
+    # found at 60 rows and lost at 61 while scan_status stays "complete".
+    #
+    # Left unreported on purpose, for now: 61x14 is among the commonest
+    # supplementary shapes, so emitting a limitation here would fire on ordinary
+    # scans and train readers to skip the coverage line. The workflow's
+    # deliberately over-broad caveat ("too wide or too tall") is what covers it,
+    # and test_a_block_past_the_row_cap_loses_relations_and_says_nothing pins
+    # the loss so it cannot widen unnoticed. That caveat reaches the workflow
+    # packet and the layered views that render a coverage block — `paperconan
+    # overview` and both `drill` forms, via _build_clusters. `explain` renders no
+    # coverage block, and a plain `paperconan <dir>` run gets scan.json and
+    # report.html, neither of which carries it either.
+    #
+    # _ROW_REL_MAX_ROWS is also the gate in _scaled_row_candidates, so the same
+    # constant drops a second detector; that site has its own note.
+    #
+    # At the 12-14 column shapes above, this ceiling is ~15x tighter than
+    # _ROW_REL_BUDGET, which bounds the same loop and *does* report. The two
+    # cross near 3,400 columns and past that the budget is the tighter one — so
+    # "redundant" holds for ordinary panels, not for the genome-scale wide
+    # blocks this detector also covers. Raising it is a detection change (recall
+    # against cost and false positives) and belongs in its own PR.
     if n_rows < 2 or n_cols < _ROW_REL_MIN_COLS or n_rows > _ROW_REL_MAX_ROWS:
         return findings
 
@@ -1267,6 +1373,15 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header):
             if budget <= 0:
                 print(f"[paperconan] detect_row_relations: column-op budget exhausted on a "
                       f"{n_rows}x{n_cols} block — coverage bounded", file=sys.stderr)
+                # No rows/cols here on purpose: the dedup key is
+                # (scope, reason, file, sheet, detector) and this record carries
+                # no file or sheet, so every block that exhausts the budget
+                # collapses into one entry. Naming the first block's shape would
+                # let one record speak for blocks the reader never hears about.
+                # The stderr line above stays per-occurrence.
+                _note_detector_cap(
+                    coverage, "detect_row_relations", "detector_compute_budget_limit",
+                )
                 return findings
             label_b = labels[rb]
             if _AXIS_CONTEXT_LABEL_RE.search(label_b):
@@ -2924,7 +3039,8 @@ _WR_MAX_ROW_CELLS = int(os.environ.get("PAPERCONAN_WR_MAX_ROW_CELLS", "20000"))
 
 
 def detect_recurring_row_vectors(grid_sheets, profile="review",
-                                 min_k=4, max_k=8, max_rows=300, max_findings=20):
+                                 min_k=4, max_k=8, max_rows=300, max_findings=20,
+                                 coverage=None):
     """B2 — a fixed ordered numeric tuple recurring as a contiguous row-slice across >=3 places
     spanning >=2 figure namespaces. Six independent mice cannot yield the identical six-value
     vector in several arms; a specific high-information tuple reappearing across unrelated figures
@@ -2938,7 +3054,7 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
     cross_figure_possible = (
         len({figure_key(s) for (_f, s) in grid_sheets if figure_key(s) is not None}) >= 2)
     occ = {}   # rounded tuple -> list of (file, sheet, figure_key, row, start_col)
-    budget = 3_000_000   # bound worst-case work on genome-scale papers (linear, but many blocks)
+    budget = _RECURRING_VEC_BUDGET   # worst-case work on genome-scale papers
     # The window index feeds ONLY the cross-figure path; skip building it entirely otherwise
     # (the within-row pass below scans rows directly).
     for (fname, sname), sheet in (grid_sheets.items() if cross_figure_possible else ()):
@@ -2963,6 +3079,12 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
                 break
         if budget <= 0:
             break
+    if cross_figure_possible and budget <= 0:
+        # The second budget in this function. The within-row pass below has its
+        # own; wiring only that one left the cross-figure index — the higher-value
+        # signal, a tuple recurring across figures — truncating in silence.
+        _note_detector_cap(coverage, "detect_recurring_row_vectors",
+                           "detector_cross_figure_budget_limit")
 
     cands = []
     for vec, places in (occ.items() if cross_figure_possible else ()):
@@ -2997,6 +3119,7 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
         kept.append(c)
 
     findings = []
+    _capped = False   # set only where a loop is actually abandoned
     for vec, places, namespaces, sites, _cells in kept:
         sheets_hit = sorted({p[1] for p in places})
         loc = "; ".join(sheets_hit[:6])
@@ -3021,6 +3144,7 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
             rule=(f"the {len(vec)}-value vector {list(vec)} recurs at {len(sites)} places across "
                   f"{len(namespaces)} figures ({loc})")))
         if len(findings) >= max_findings:
+            _capped = True
             break
 
     # Within-ROW member of the same family: the identical high-precision segment appearing at
@@ -3029,7 +3153,7 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
     # sparse sub-panel (S2H sits in columns the grid segmentation never blocks) would otherwise
     # be invisible. Same gates as the cross-figure path; the repeat corroborates itself, so one
     # figure namespace is enough.
-    wr_budget = 2_000_000
+    wr_budget = _WITHIN_ROW_VEC_BUDGET
     wr_cands = []
     for (fname, sname), sheet in grid_sheets.items():
         fk = figure_key(sname)
@@ -3088,6 +3212,8 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
     if wr_budget <= 0:
         print("[paperconan] detect_recurring_row_vectors: within-row coverage bounded",
               file=sys.stderr)
+        _note_detector_cap(coverage, "detect_recurring_row_vectors",
+                           "detector_within_row_budget_limit")
     # One physical repeat yields many overlapping windows (k=4..8) — keep the strongest (most
     # copies, then longest) per row, dropping >=50%-cell-overlap duplicates.
     wr_cands.sort(key=lambda x: (-len(x[5]), -len(x[0])))
@@ -3133,8 +3259,12 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
                   f"{len(chosen)} non-overlapping positions within row {r + 1} of {sn} "
                   f"({coordinate_text})")))
         if len(findings) >= max_findings:
+            _capped = True
             break
 
+    if _capped:
+        _note_detector_cap(coverage, "detect_recurring_row_vectors", "detector_finding_limit",
+                           limit=max_findings)
     apply_profile_to_findings(findings, profile)
     return findings
 
@@ -3260,7 +3390,14 @@ def _scaled_row_candidates(grid_sheets):
     for (fname, sname), sheet in grid_sheets.items():
         for bi, (r0, r1) in enumerate(_row_bands(sheet)):
             if (r1 - r0) < 2 or (r1 - r0) > _ROW_REL_MAX_ROWS:
-                continue                                  # tall matrices are not this orientation
+                # Second site sharing _ROW_REL_MAX_ROWS, and it is a cost cap here
+                # too, not orientation: a band's height says nothing about whether
+                # a row in it is a scalar multiple of a row in *another* band or
+                # sheet, which is what this detector compares. A 61-row band drops
+                # out entirely, taking identical_row_reuse with it. Unreported, for
+                # the same reason as detect_row_relations' ceiling — see the note
+                # there, and test_a_tall_band_loses_scaled_row_reuse_and_says_nothing.
+                continue
             for r in range(r0, r1):
                 a = sheet.numeric[r, :]
                 finite = a[~np.isnan(a)]
@@ -3277,7 +3414,7 @@ def _scaled_row_candidates(grid_sheets):
 
 
 def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
-                            max_findings=40):
+                            max_findings=40, coverage=None):
     """Two DATA ROWS in DIFFERENT blocks (cross-block within a sheet) or different
     sheets that hold `row_B == row_A * k` over a long contiguous run of positionally-
     aligned columns — the scalar-multiple case (k != 1, `scaled_row_reuse`) and its
@@ -3294,10 +3431,15 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
     """
     cands = _scaled_row_candidates(grid_sheets)
     truncated = len(cands) > max_candidates
+    # Captured before the slice: len(cands) afterwards is always max_candidates,
+    # so reporting it would print the cap back at the reader and lose the one
+    # quantity that says how much was dropped.
+    pool_size = len(cands)
     if truncated:
         cands = cands[:max_candidates]
     findings = []
-    budget = 4_000_000
+    _capped = False   # set only where a loop is actually abandoned
+    budget = _SCALED_ROW_BUDGET
     for i in range(len(cands)):
         A = cands[i]
         for j in range(i + 1, len(cands)):
@@ -3350,15 +3492,37 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
                 rule=(f"row '{A['label']}' ({sa_name}) {rel} over a run of {run_len} "
                       f"positionally-aligned columns across 2 {scope}")))
             if len(findings) >= max_findings:
+                _capped = True
                 break
         if budget <= 0 or len(findings) >= max_findings:
+            # This `if` fires on either arm; only the result-cap arm is a
+            # finding limit, since a spent compute budget is reported separately
+            # and may have found nothing. Belt-and-braces: the inner break
+            # already sets _capped on the result-cap path, so this re-assert is
+            # a no-op today. It is kept so a future append path that forgets the
+            # inner flag still attributes correctly rather than silently.
+            _capped = _capped or len(findings) >= max_findings
             break
     if truncated or budget <= 0:
-        # Never silently cap coverage — say what was bounded (stderr only; scan.json stays
-        # deterministic). Real condition-layout papers stay far under these limits.
+        # Never silently cap coverage — say what was bounded, on stderr for a human
+        # watching the run and in scan.json for every downstream consumer. Real
+        # condition-layout papers stay far under these limits.
         print(f"[paperconan] detect_scaled_row_reuse: coverage bounded "
-              f"(candidates={len(cands)}{'+truncated' if truncated else ''}, "
+              f"(candidates={pool_size}{'+truncated' if truncated else ''}, "
               f"budget_exhausted={budget <= 0})", file=sys.stderr)
+        # Two distinct causes, reported separately: a truncated candidate pool is
+        # not a spent compute budget, and naming the wrong one sends a reader to
+        # the wrong knob. The stderr line above already prints both flags.
+        if truncated:
+            _note_detector_cap(coverage, "detect_scaled_row_reuse",
+                               "detector_candidate_pool_limit",
+                               candidates=pool_size, limit=max_candidates)
+        if budget <= 0:
+            _note_detector_cap(coverage, "detect_scaled_row_reuse",
+                               "detector_compute_budget_limit")
+    if _capped:
+        _note_detector_cap(coverage, "detect_scaled_row_reuse", "detector_finding_limit",
+                           limit=max_findings)
     apply_profile_to_findings(findings, profile)
     return findings
 
@@ -3510,7 +3674,7 @@ def _longest_hp_offset_run(a, b):
     return c, best_len, x_run
 
 
-def _short_row_candidates(grid_sheets):
+def _short_row_candidates(grid_sheets, coverage=None):
     """Every data row carrying >=_SHORT_ROW_MIN_COLS high-precision values with >=3
     DISTINCT such values — including ISOLATED single rows that `_scaled_row_candidates`
     drops (its bands need >=2 rows of >=12 finite cells). Grouped by sheet downstream."""
@@ -3529,12 +3693,22 @@ def _short_row_candidates(grid_sheets):
                 continue
             rows.append(dict(file=fname, sheet=sname, row=r, label=label, a=a))
             if len(rows) >= _SHORT_ROW_MAX_ROWS_PER_SHEET:
+                # Same construct as detect_scaled_row_reuse's max_candidates,
+                # which is wired: a candidate pool cut short, so later rows are
+                # never compared. Was silent on every channel, including stderr.
+                print(f"[paperconan] detect_short_row_reuse: {sname} candidate rows "
+                      f"capped at {_SHORT_ROW_MAX_ROWS_PER_SHEET} — later rows not "
+                      "compared", file=sys.stderr)
+                _note_detector_cap(coverage, "detect_short_row_reuse",
+                                   "detector_candidate_pool_limit",
+                                   limit=_SHORT_ROW_MAX_ROWS_PER_SHEET)
                 break
         cands.extend(rows)
     return cands
 
 
-def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60):
+def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
+                           coverage=None):
     """SHORT high-precision identical or constant-ratio runs (3..11 columns) between two
     data rows of one sheet — the JCI "Supporting Data Values" fingerprint that the >=12
     column `detect_scaled_row_reuse` and `detect_row_relations` cannot see: a control
@@ -3544,10 +3718,11 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60):
     A whole power-of-ten ratio is a unit restatement (benign) and is skipped. Signal, not
     verdict — confirm against the legend/Methods before drawing any conclusion."""
     by_sheet = {}
-    for c in _short_row_candidates(grid_sheets):
+    for c in _short_row_candidates(grid_sheets, coverage=coverage):
         by_sheet.setdefault((c["file"], c["sheet"]), []).append(c)
     findings = []
-    budget = 4_000_000
+    _capped = False   # set only where a loop is actually abandoned
+    budget = _SHORT_ROW_BUDGET
     for (fname, sname), rows in by_sheet.items():
         fig = figure_key(sname)
         # Sheet-wide frequency of each high-precision value, BUCKETED to 5 significant
@@ -3648,8 +3823,16 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60):
                 _add_finding(A["label"], B["label"], A["row"], B["row"],
                              kind, k, run_len, x_run)
                 if len(findings) >= max_findings:
+                    _capped = True
                     break
             if budget <= 0 or len(findings) >= max_findings:
+                # This `if` fires on either arm; only the result-cap arm is a
+                # finding limit, since a spent compute budget is reported separately
+                # and may have found nothing. Belt-and-braces: the inner break
+                # already sets _capped on the result-cap path, so this re-assert is
+                # a no-op today. It is kept so a future append path that forgets the
+                # inner flag still attributes correctly rather than silently.
+                _capped = _capped or len(findings) >= max_findings
                 break
 
         # Second pass — isolated low-precision divisor case: B = k * A over a PARTIAL run where
@@ -3729,15 +3912,29 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60):
                     _add_finding(nlbl, B["label"], nbr, B["row"],
                                  "scaled_row_reuse", k, run_len, dv_run)
                     if len(findings) >= max_findings:
+                        _capped = True
                         break
                 if len(findings) >= max_findings:
+                    _capped = True
                     break
 
         if budget <= 0 or len(findings) >= max_findings:
+            # This `if` fires on either arm; only the result-cap arm is a
+            # finding limit, since a spent compute budget is reported separately
+            # and may have found nothing. Belt-and-braces: the inner break
+            # already sets _capped on the result-cap path, so this re-assert is
+            # a no-op today. It is kept so a future append path that forgets the
+            # inner flag still attributes correctly rather than silently.
+            _capped = _capped or len(findings) >= max_findings
             break
     if budget <= 0:
         print("[paperconan] detect_short_row_reuse: coverage bounded (budget exhausted)",
               file=sys.stderr)
+        _note_detector_cap(coverage, "detect_short_row_reuse",
+                           "detector_compute_budget_limit")
+    if _capped:
+        _note_detector_cap(coverage, "detect_short_row_reuse", "detector_finding_limit",
+                           limit=max_findings)
     apply_profile_to_findings(findings, profile)
     return findings
 
@@ -3799,7 +3996,8 @@ def _shared_frac_is_small_denominator(frac, max_q=128):
     return False
 
 
-def detect_within_row_shared_fraction(grid_sheets, profile="review", max_findings=60):
+def detect_within_row_shared_fraction(grid_sheets, profile="review", max_findings=60,
+                                      coverage=None):
     """Two cells of ONE row that share a long high-precision fractional tail while their
     integer parts differ (e.g. 20.316768 and 102.316768) — a copy-then-shift: a value or a
     whole row-slice reused with the integer part rewritten but the decimals left intact.
@@ -3809,7 +4007,8 @@ def detect_within_row_shared_fraction(grid_sheets, profile="review", max_finding
     different integers is ~1e-6 by chance, so requiring that tail length is the FP control.
     Signal, not verdict — confirm against the legend/Methods before drawing a conclusion."""
     findings = []
-    budget = 8_000_000
+    _capped = False   # set only where a loop is actually abandoned
+    budget = _WITHIN_ROW_FRAC_BUDGET
     for (fname, sname), sheet in grid_sheets.items():
         fig = figure_key(sname)
         for r in range(sheet.nrows):
@@ -3863,17 +4062,31 @@ def detect_within_row_shared_fraction(grid_sheets, profile="review", max_finding
                       f"the integer part (e.g. {sample}) — a copy-then-integer-shift pattern "
                       f"in {sname}")))
             if len(findings) >= max_findings:
+                _capped = True
                 break
         if budget <= 0 or len(findings) >= max_findings:
+            # This `if` fires on either arm; only the result-cap arm is a
+            # finding limit, since a spent compute budget is reported separately
+            # and may have found nothing. Belt-and-braces: the inner break
+            # already sets _capped on the result-cap path, so this re-assert is
+            # a no-op today. It is kept so a future append path that forgets the
+            # inner flag still attributes correctly rather than silently.
+            _capped = _capped or len(findings) >= max_findings
             break
     if budget <= 0:
         print("[paperconan] detect_within_row_shared_fraction: coverage bounded "
               "(budget exhausted)", file=sys.stderr)
+        _note_detector_cap(coverage, "detect_within_row_shared_fraction",
+                           "detector_compute_budget_limit")
+    if _capped:
+        _note_detector_cap(coverage, "detect_within_row_shared_fraction", "detector_finding_limit",
+                           limit=max_findings)
     apply_profile_to_findings(findings, profile)
     return findings
 
 
-def detect_row_pair_shared_fraction(grid_sheets, profile="review", max_findings=60):
+def detect_row_pair_shared_fraction(grid_sheets, profile="review", max_findings=60,
+                                    coverage=None):
     """Two ROWS that share the same high-precision decimal fraction at a contiguous run of
     aligned columns while their integer parts differ — the row-oriented twin of
     `integer_diff_shared_fraction` (which only compares two COLUMNS). A concentration row
@@ -3905,11 +4118,15 @@ def detect_row_pair_shared_fraction(grid_sheets, profile="review", max_findings=
                     print(f"[paperconan] detect_row_pair_shared_fraction: {sname} candidate "
                           f"rows capped at {_ROW_PAIR_MAX_ROWS_PER_SHEET} — later rows not "
                           "compared", file=sys.stderr)
+                    _note_detector_cap(coverage, "detect_row_pair_shared_fraction",
+                                       "detector_candidate_pool_limit",
+                                       limit=_ROW_PAIR_MAX_ROWS_PER_SHEET)
                     break
         if len(rows) >= 2:
             by_sheet[(fname, sname)] = rows
     findings = []
-    budget = 40_000_000                       # global compute bound across all sheets
+    _capped = False   # set only where a loop is actually abandoned
+    budget = _ROW_PAIR_FRAC_BUDGET
     for (fname, sname), rows in by_sheet.items():
         fig = figure_key(sname)
         for i in range(len(rows)):
@@ -3970,14 +4187,34 @@ def detect_row_pair_shared_fraction(grid_sheets, profile="review", max_findings=
                           f"(e.g. {sample}) — a copy-then-integer-shift across two rows "
                           f"in {sname}")))
                 if len(findings) >= max_findings:
+                    _capped = True
                     break
             if budget <= 0 or len(findings) >= max_findings:
+                # This `if` fires on either arm; only the result-cap arm is a
+                # finding limit, since a spent compute budget is reported separately
+                # and may have found nothing. Belt-and-braces: the inner break
+                # already sets _capped on the result-cap path, so this re-assert is
+                # a no-op today. It is kept so a future append path that forgets the
+                # inner flag still attributes correctly rather than silently.
+                _capped = _capped or len(findings) >= max_findings
                 break
         if budget <= 0 or len(findings) >= max_findings:
+            # This `if` fires on either arm; only the result-cap arm is a
+            # finding limit, since a spent compute budget is reported separately
+            # and may have found nothing. Belt-and-braces: the inner break
+            # already sets _capped on the result-cap path, so this re-assert is
+            # a no-op today. It is kept so a future append path that forgets the
+            # inner flag still attributes correctly rather than silently.
+            _capped = _capped or len(findings) >= max_findings
             break
     if budget <= 0:
         print("[paperconan] detect_row_pair_shared_fraction: coverage bounded "
               "(global budget exhausted)", file=sys.stderr)
+        _note_detector_cap(coverage, "detect_row_pair_shared_fraction",
+                           "detector_compute_budget_limit")
+    if _capped:
+        _note_detector_cap(coverage, "detect_row_pair_shared_fraction", "detector_finding_limit",
+                           limit=max_findings)
     apply_profile_to_findings(findings, profile)
     return findings
 
@@ -4013,8 +4250,10 @@ _MAX_CELLS = int(os.environ.get("PAPERCONAN_MAX_CELLS", "10000000"))
 # to skip the extra per-workbook XML pass on throughput-sensitive corpora.
 _OOXML_FORMULA_INSPECT = os.environ.get(
     "PAPERCONAN_OOXML_FORMULA_INSPECT", "1") not in ("0", "false", "False", "")
-# Wide blocks (dense correlation matrices) blow up the O(col²) relation/equal-pair detectors in
-# both compute time and output size (scan.json / report.html). Skip just those two detectors when
+# Wide blocks (dense correlation matrices) blow up the O(col²) relation and equal-pair
+# detectors in both compute time and output size (scan.json / report.html);
+# row-pair-digit-coupling is only linear in columns but is skipped with them because its
+# per-row digit work is still wasted on a correlation matrix. Skip those three when
 # a block is wider than this; the cheap column-wise detectors still run. 0 disables the skip.
 _MAX_BLOCK_COLS = int(os.environ.get("PAPERCONAN_MAX_BLOCK_COLS", "120"))
 # Output cap: each finding embeds a table-snippet as evidence, so a paper with thousands of
@@ -4025,8 +4264,26 @@ _MAX_REPORT_BLOCKS = int(os.environ.get("PAPERCONAN_MAX_REPORT_BLOCKS", "2000"))
 # across thousands of findings — ballooning the scan dict / scan.json to many GB and OOMing the
 # worker. Bound each evidence snippet to a contiguous window of this many rows × cols (always
 # including the highlighted cells). Small blocks are emitted whole and stay byte-identical.
-_MAX_EV_ROWS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_ROWS", "50"))
+# 20, not 50, and tied to _drill_render's _EVIDENCE_ROW_LIMIT: the layered views
+# never display more than that, so storing more is bytes no reader sees. Measured
+# over ten real supplementary sets the evidence windows were the bulk of a 36 MB
+# scan corpus -- one finding reached 18 KB, 96% of it the window -- and this
+# takes the largest of them from 37 MB to 18 MB with no change in what is found.
+#
+# 12 would save another 6 MB there, and was rejected: it trims blocks barely over
+# the bound (the demo has a 13-row one) so a reader gets a truncation notice
+# where nothing worth reading was dropped, which teaches them to discount the
+# notice everywhere. What the window is for is the shape of the anomaly and rows
+# to check against the paper; the rest is re-derivable, and `explain --full`
+# re-reads it. The window always covers the highlighted cells.
+_MAX_EV_ROWS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_ROWS", "20"))
 _MAX_EV_COLS = int(os.environ.get("PAPERCONAN_MAX_EVIDENCE_COLS", "30"))
+# Ceiling on a single `explain --full` window. --full lifts the stored
+# bound, not to remove it: a genomics block is millions of cells and CLAUDE.md
+# requires new code paths to respect the memory caps. Generous enough that an
+# ordinary panel comes back whole, finite enough that a pathological one does
+# not materialise as JSON.
+_FULL_EV_CELLS = int(os.environ.get("PAPERCONAN_MAX_FULL_EVIDENCE_CELLS", "200000"))
 # Per-block finding cap: the pairwise detectors are O(col²), so a single dense, highly
 # correlated block (a correlation matrix, an expression panel with many proportional columns)
 # can emit thousands of findings. Each carries its own embedded evidence snippet, so the count —
@@ -4188,6 +4445,20 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     for f in table_files:
         file_start = time.perf_counter() if runtime_metadata else None
         file_stat = {"file": os.path.basename(f), "path": f}
+        # Identity of the input as scanned. `explain --full` re-reads these files
+        # to widen an evidence window, and without something to compare against
+        # it cannot tell the file it opens from the file that was scanned -- so a
+        # source edited afterwards comes back as this finding's block. Size and
+        # mtime are a few bytes each. They compare size, not content, so an
+        # edit that preserves both the byte count and the timestamp is not
+        # detectable this way. SKILL.md states that limit; the extent checks
+        # below are the backstop for a scan that carries no identity at all.
+        try:
+            st = os.stat(f)
+            file_stat["size"] = st.st_size
+            file_stat["mtime_ns"] = st.st_mtime_ns
+        except OSError:
+            pass
         # Memory guard: a large workbook expands to many GB of Python objects when fully
         # loaded, so cap file size BEFORE loading. Oversized files are recorded (never
         # silently treated as clean) and skipped. Raise PAPERCONAN_MAX_FILE_MB on big-RAM hosts.
@@ -4261,17 +4532,21 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 blocks_analyzed_here += 1
                 header = header_for(sheet, r0, c0, c1)
                 # On very wide blocks (dense correlation matrices) the O(col²) relation and
-                # equal-pair detectors explode in compute + output, so skip just those two; the
-                # column-wise detectors below still run. (_MAX_BLOCK_COLS=0 disables the skip.)
+                # equal-pair detectors explode in compute + output, so skip those three
+                # (relations, equal_pairs, row_pair_digit_coupling); the column-wise
+                # detectors below still run. (_MAX_BLOCK_COLS=0 disables the skip.)
+                # Unreported: this is one of the whole-detector skips the workflow's
+                # over-broad "too wide or too tall" caveat stands in for.
                 wide = _MAX_BLOCK_COLS and (c1 - c0) > _MAX_BLOCK_COLS
                 rel = [] if wide else detect_relations(sheet, r0, r1, c0, c1, header)
                 ap = detect_arithmetic_progression(sheet, r0, r1, c0, c1, header)
                 eq = [] if wide else detect_equal_pairs(sheet, r0, r1, c0, c1, header)
-                rp = [] if wide else detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header)
+                rp = [] if wide else detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header,
+                                                                   coverage=coverage)
                 # Runs UNCONDITIONALLY (not gated by `wide`): row-oriented condition/measurement
                 # layouts are exactly the wide blocks the column detectors skip, and this is
                 # where a "row B = row A * k" relationship lives. Self-gates on rows/cols.
-                rr = detect_row_relations(sheet, r0, r1, c0, c1, header)
+                rr = detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=coverage)
                 wc = detect_within_column_patterns(sheet, r0, r1, c0, c1, header)
                 wc = wc + detect_dispersed_repeats(sheet, r0, r1, c0, c1, header)
                 # Block-scoped (not column-scoped): its own group so the packet
@@ -4349,22 +4624,22 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     # B3: matrix-to-matrix decimal-fraction reuse between two blocks of the same sheet.
     cross_sheet_findings += detect_within_sheet_fraction_reuse(grid_sheets, profile=profile)
     # B2: a fixed high-information row-vector recurring across >=2 figures.
-    cross_sheet_findings += detect_recurring_row_vectors(grid_sheets, profile=profile)
+    cross_sheet_findings += detect_recurring_row_vectors(grid_sheets, profile=profile, coverage=coverage)
     # B6: a condition ROW that is an exact scalar multiple of a row in another block /
     # sheet (cross-block sibling of detect_row_relations; the Extended Data Fig. 5B case).
-    cross_sheet_findings += detect_scaled_row_reuse(grid_sheets, profile=profile)
+    cross_sheet_findings += detect_scaled_row_reuse(grid_sheets, profile=profile, coverage=coverage)
     # B6b: the SHORT high-precision variant — a 3-11 column identical/scaled run between two
     # rows (incl. isolated single-row panels) that the >=12 column detectors above miss. No
     # dedup against the long-run detector is needed: it only emits runs >=12 columns and this
     # one only runs <12, so the two never report the same relation on the same pair.
-    cross_sheet_findings += detect_short_row_reuse(grid_sheets, profile=profile)
+    cross_sheet_findings += detect_short_row_reuse(grid_sheets, profile=profile, coverage=coverage)
     # B6c: copy-then-integer-shift WITHIN a row — two cells sharing a long fractional tail
     # with different integer parts (the column- and block-pair shared-fraction detectors
     # never look across the columns of a single row).
-    cross_sheet_findings += detect_within_row_shared_fraction(grid_sheets, profile=profile)
+    cross_sheet_findings += detect_within_row_shared_fraction(grid_sheets, profile=profile, coverage=coverage)
     # B6d: the row-PAIR twin of integer_diff_shared_fraction — two rows sharing a decimal
     # fraction at aligned columns with different integer parts (copy-then-shift across rows).
-    cross_sheet_findings += detect_row_pair_shared_fraction(grid_sheets, profile=profile)
+    cross_sheet_findings += detect_row_pair_shared_fraction(grid_sheets, profile=profile, coverage=coverage)
     _attach_benign(cross_sheet_findings)
 
     digit_reports, decimal_reports, tail_cluster_reports = [], [], []
@@ -4455,7 +4730,10 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                    datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
                    if runtime_metadata else None),
                profile=profile,
-               input_dir=in_dir,
+               # Absolute: a relative input_dir resolves against whatever tree
+               # the reader happens to be in, so `explain --full` would read a
+               # different file of the same name and present it as this block.
+               input_dir=os.path.abspath(in_dir),
                paper=_load_provenance(in_dir, paper),
                n_files=len(table_files),
                n_image_source_files=len(local_images),
@@ -4739,7 +5017,7 @@ def _run_drill_command(args: argparse.Namespace) -> None:
             view = drill(scan, location, kind=args.kind, max_findings=args.max_findings)
             text = render_drill(view)
         else:
-            view = explain(scan, args.finding_id)
+            view = explain(scan, args.finding_id, full=args.full)
             text = render_explain(view)
     except ValueError as exc:
         sys.exit(str(exc))
@@ -4824,6 +5102,9 @@ def _build_parser() -> argparse.ArgumentParser:
     ex = sub.add_parser("explain", help="one finding in full, with its evidence table")
     ex.add_argument("scan_json", help="Path to paperconan scan.json")
     ex.add_argument("finding_id", help="Finding id from `drill --kind`")
+    ex.add_argument("--full", action="store_true",
+                    help="Re-read the evidence window from the source data "
+                         "instead of the bounded copy stored in the scan")
 
     for parser in (ov, dr, ex):
         parser.add_argument("--json", action="store_true",

@@ -221,8 +221,13 @@ def test_cross_sheet_seeds_differing_only_in_row_get_different_ids():
     )
 
 
-def test_the_packet_refuses_to_ship_colliding_seed_ids(tmp_path, monkeypatch):
-    """The invariant fires even if a future locator change loses information."""
+def test_colliding_seed_ids_are_disambiguated_and_declared(tmp_path, monkeypatch):
+    """Refusing the packet was the wrong call, and a real paper proved it.
+
+    A Nature Metabolism supplement produced ten collisions, and raising meant the
+    reader saw nothing at all — every other finding in the paper denied over a
+    gap in one locator. Collisions get an ordinal instead, and are declared.
+    """
     from paperconan import _workflow
 
     monkeypatch.setattr(_workflow, "_stable_id", lambda prefix, parts: f"{prefix}:same")
@@ -230,8 +235,15 @@ def test_the_packet_refuses_to_ship_colliding_seed_ids(tmp_path, monkeypatch):
     data = tmp_path / "data"
     _panel(data / "p.csv")
 
-    with pytest.raises(WorkflowError, match="seed ids are not unique"):
-        start_workflow(str(data), str(tmp_path / "out"))
+    start_workflow(str(data), str(tmp_path / "out"))
+    packet = _packet(tmp_path / "out")
+
+    seeds = [s for c in packet["clusters"] for s in c["seeds"]]
+    ids = [s["seed_id"] for s in seeds]
+    assert len(set(ids)) == len(ids), f"ids still collide: {ids}"
+    assert packet["coverage"]["seed_ids_disambiguated"] > 0
+    assert packet["coverage"]["coverage_complete"] is False
+    assert any("shared a locator" in x for x in packet["coverage"]["limitations"])
 
 
 def test_seed_ids_are_unique_within_a_packet(tmp_path):
@@ -514,22 +526,27 @@ def test_a_v1_workflow_directory_is_refused(tmp_path):
     assert "--force" in str(exc.value), "the error must name the way out"
 
 
-def test_force_does_not_destroy_the_directory_when_seeding_fails(tmp_path,
-                                                                 monkeypatch):
-    """The cleanup window closed on a failing scan, but seeding can raise too.
+def test_force_does_not_destroy_the_directory_when_a_later_step_fails(tmp_path,
+                                                                     monkeypatch):
+    """Cleanup runs after everything that can fail, not just after the scan.
 
-    `_build_clusters` gained a raise of its own, so clearing anywhere before the
-    writes reopens the same door: index present, states gone.
+    The scan is the first fallible step, and the neighbouring test already
+    covers it -- so driving the failure there passes even with cleanup moved to
+    immediately after scan_dir, which is exactly the window this guards. Fail in
+    a step after clustering instead.
     """
-    from paperconan import _workflow
+    import paperconan._workflow as wf
 
     data = tmp_path / "data"
     _panel(data / "p.csv")
     out = tmp_path / "out"
     start_workflow(str(data), str(out))
 
-    monkeypatch.setattr(_workflow, "_stable_id", lambda prefix, parts: f"{prefix}:collide")
-    with pytest.raises(WorkflowError, match="not unique"):
+    def boom(*a, **k):
+        raise RuntimeError("artifact write failed")
+
+    monkeypatch.setattr(wf, "_envelope", boom)
+    with pytest.raises(Exception):
         start_workflow(str(data), str(out), force=True)
 
     workflow_status(str(out))  # previous run must still be readable
@@ -583,28 +600,35 @@ def test_the_profile_is_part_of_the_run_configuration(tmp_path):
             == _packet(tmp_path / "b")["clusters"])
 
 
-def test_coverage_cannot_claim_completeness_while_detector_caps_go_unreported(tmp_path):
-    """Several detectors stop at their own max_findings or compute budget and
-    report it to no channel at all — for some paths not even stderr.
-
-    A side field saying so is not enough: the CLI prints `limitations`, and a
-    reader who sees `coverage_complete: true` has no reason to look further. So
-    the caveat has to be a limitation, which makes `coverage_complete` false by
-    construction until the detector-layer PR flips the flag.
+def test_an_incomplete_scan_makes_the_packet_declare_itself_incomplete(tmp_path, monkeypatch):
+    """Detector caps used to reach no channel, so the packet carried a blanket
+    caveat instead. Now that they record into ScanCoverage, the packet must
+    carry the real one — and only when a cap actually bit.
     """
+    import paperconan._audit as audit
+    monkeypatch.setattr(audit, "_ROW_REL_BUDGET", 1)
+
     data = tmp_path / "data"
-    _panel(data / "p.csv")
+    rows = ["," .join(f"c{j}" for j in range(14))]
+    for i in range(40):
+        rows.append(",".join(str(round((i + 1) * (j + 1) * 1.017, 6)) for j in range(14)))
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "p.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
 
     start_workflow(str(data), str(tmp_path / "out"))
     coverage = _packet(tmp_path / "out")["coverage"]
 
-    assert coverage["detector_caps_reported"] is False
-    assert coverage["coverage_complete"] is False, (
-        "the packet claims complete coverage while detector caps are unreported"
+    assert coverage["scan_incomplete"] is True
+    # Not `coverage_complete is False`: DETECTOR_CAPS_REPORTED is a hardcoded
+    # False, so the blanket caveat is always appended and that flag is always
+    # False -- it cannot discriminate. Assert the specific cap instead, which
+    # makes the monkeypatch above load-bearing: without it the budget is never
+    # exhausted and this line does not appear.
+    blob = " ".join(coverage["limitations"])
+    assert "detect_row_relations" in blob, (
+        f"the exhausted budget did not reach the packet by name: {coverage['limitations']}"
     )
-    assert any("detector-level caps" in x for x in coverage["limitations"]), (
-        "the caveat must reach the channel the CLI actually prints"
-    )
+    assert any("scan was not complete" in x for x in coverage["limitations"])
 
 
 def test_an_index_from_an_unsupported_schema_is_refused(tmp_path):

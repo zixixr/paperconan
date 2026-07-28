@@ -507,8 +507,11 @@ def test_raising_the_limit_actually_reaches_the_declared_remainder(scan):
     )
     # gone once nothing is held back...
     assert not any("raise max_findings" in x for x in full["coverage"]["limitations"])
-    # ...but scan-wide caveats are not this layer's to drop
-    assert any("detector-level caps" in x for x in full["coverage"]["limitations"])
+    # ...but scan-wide caveats are not this layer's to drop. The fixture always
+    # carries unrouted families, so that is the standing representative here.
+    assert any("does not route" in x for x in full["coverage"]["limitations"]), (
+        f"L3 dropped the scan-wide caveats: {full['coverage']['limitations']}"
+    )
 
 
 def test_a_family_present_but_unreachable_is_named_in_coverage(scan):
@@ -820,3 +823,294 @@ def test_cli_rejects_a_scan_that_is_not_json(tmp_path):
     assert res.returncode != 0
     assert "Traceback" not in res.stderr
     assert "not valid JSON" in (res.stderr + res.stdout)
+
+
+# ---------- collisions and ordering, both found by running on real papers ----------
+
+def _saturated_scan(noisy_blocks=30, per_block=150, real_blocks=6):
+    """Shaped like a real supplement.
+
+    `noisy_blocks` blocks where one family saturates the per-block cap, and a few
+    carrying a single strong signal. Deliberately more noisy blocks than the
+    default page holds — with fewer, a diversity assertion passes for free.
+    """
+    blocks = []
+    for b in range(noisy_blocks):
+        blocks.append({
+            "file": "big.xlsx", "sheet": f"Supplementary Figure {b}",
+            "block": {"rows": "3-53", "cols": f"{30 + b}-53", "header": []},
+            "row_pairs": [
+                {"kind": "integer_diff_shared_fraction", "severity": "high",
+                 "raw_severity": "high", "n": 20,
+                 "rule": f"col[{i}] and col[{i + 1}] share the same decimal fraction"}
+                for i in range(per_block)
+            ],
+        })
+    for b in range(real_blocks):
+        blocks.append({
+            "file": "big.xlsx", "sheet": "Supplementary Figure 8e",
+            "block": {"rows": "4-9", "cols": f"{15 + b * 22}-{21 + b * 22}", "header": []},
+            "relations": [
+                {"kind": "identical_column", "severity": "high", "raw_severity": "high",
+                 "n": 6, "rule": f"col[{16 + b * 22}] == col[{18 + b * 22}]"}
+            ],
+        })
+    return {"tool": "paperconan", "schema_version": 1, "n_files": 1,
+            "relations_blocks": blocks, "cross_sheet_findings": []}
+
+
+def test_a_saturating_family_cannot_fill_the_default_page():
+    """Measured on a real paper: the duplicated columns the report was about
+    landed at rank 25-47, past the default page, because three blocks where one
+    family hit the per-block cap outranked them on high-count.
+
+    A family saturating one block is evidence about that family, not about the
+    paper. Thirty such blocks must not take all twenty slots.
+    """
+    view = overview(_saturated_scan(), max_locations=20)
+    first_families = [loc["families"][0] for loc in view["locations"]]
+
+    assert "identical_column" in first_families, (
+        "a 6-row exactly-duplicated column never reached the default page; "
+        f"it was filled with {set(first_families)}"
+    )
+
+
+def test_the_default_page_shows_more_than_one_family():
+    view = overview(_saturated_scan(), max_locations=20)
+
+    shown = {loc["families"][0] for loc in view["locations"]}
+    assert len(shown) >= 2, f"the whole page is one family: {shown}"
+
+
+def test_ordering_stays_deterministic_under_diversity():
+    scan = _saturated_scan()
+    assert overview(scan) == overview(scan)
+
+
+def test_colliding_seed_ids_are_disambiguated_not_refused():
+    """Real supplements collide. Refusing the packet denies the reader every
+    other finding in the paper over a gap in one locator — measured: a real
+    Nature Metabolism supplement produced 10 collisions and no output at all.
+    """
+    from paperconan._workflow import _build_clusters
+
+    dup = {"kind": "identical_column", "severity": "high", "raw_severity": "high",
+           "n": 6, "rule": "col[2] == col[5]"}
+    scan = {"relations_blocks": [{
+        "file": "f.xlsx", "sheet": "S", "block": {"rows": "2-9", "cols": "1-9", "header": []},
+        "relations": [dict(dup), dict(dup), dict(dup)],
+    }], "cross_sheet_findings": []}
+
+    clusters, coverage = _build_clusters(scan, max_clusters=10)
+
+    seeds = [s for c in clusters for s in c["seeds"]]
+    ids = [s["seed_id"] for s in seeds]
+    assert len(ids) == 3, "findings were dropped instead of disambiguated"
+    assert len(set(ids)) == 3, f"ids still collide: {ids}"
+    assert coverage["seed_ids_disambiguated"] == 2
+    assert coverage["coverage_complete"] is False
+    assert any("shared a locator" in x for x in coverage["limitations"])
+
+
+# ---------- the invariants, run against a scan big enough to merge and interleave ----------
+
+def test_every_overview_number_opens_that_location_on_a_saturated_scan():
+    """L1's ordinal is the only handle the reader is given.
+
+    overview merges panels and interleaves families; drill used to resolve
+    against the raw cluster list, so the number printed by one layer opened a
+    different location in the next.
+
+    Not a large-scan effect: _merge_panels set block_cols=None on every panel
+    including single-member ones, so the labels diverged at every fixture size
+    in this file. What was missing was any test that compared the two layers at
+    all. This one does it on a scan big enough that the reordering also bites.
+    """
+    scan = _saturated_scan()
+    view = overview(scan, max_locations=20)
+
+    assert len(view["locations"]) == 20, "fixture no longer fills a page"
+    mismatched = [
+        (loc["n"], loc["location"], drill(scan, loc["n"])["location"])
+        for loc in view["locations"]
+        if drill(scan, loc["n"])["location"] != loc["location"]
+    ]
+    assert not mismatched, (
+        f"{len(mismatched)} overview numbers open a different location: {mismatched[:3]}"
+    )
+
+
+def test_a_merged_panel_opens_with_every_finding_it_was_counted_for():
+    """The count on L1 and the findings on L2 have to be the same set.
+
+    _merge_panels folds several column spans into one panel and kept only the
+    first member's cluster_id, so drilling it reached one span and reported
+    `kinds_total == kinds_shown` -- a truncated view declaring itself complete,
+    which is this tool's worst failure.
+    """
+    scan = _saturated_scan()
+    view = overview(scan, max_locations=20)
+
+    # Compared against the unmerged clusters, not against drill: both layers read
+    # one list now, so a panel that dropped its members' seeds would report the
+    # same reduced count at every layer and any consistency check would hold.
+    # The property that matters is that merging loses nothing.
+    from paperconan._drill import _clusters_of, _merge_panels
+
+    raw, _seeding = _clusters_of(scan)
+    before = sum(len(c["seeds"]) for c in raw)
+    after = sum(len(p["seeds"]) for p in _merge_panels(raw))
+    assert after == before, (
+        f"merging panels dropped {before - after} of {before} findings"
+    )
+
+    merged = [loc for loc in view["locations"] if loc["signals"] > 1]
+    assert merged, "fixture no longer produces a location with several findings"
+    for loc in merged[:6]:
+        opened = drill(scan, loc["n"])
+        shown = sum(group["n"] for group in opened["by_kind"])
+        assert shown == loc["signals"], (
+            f"location #{loc['n']} was counted for {loc['signals']} findings and "
+            f"opens with {shown}"
+        )
+
+
+def test_a_merged_panel_still_names_where_its_evidence_is():
+    """Merging must not cost the reader the column span.
+
+    The panel used to set block_cols=None so the label dropped the span
+    entirely, leaving a row range and no way to find the cells.
+    """
+    scan = _saturated_scan()
+    view = overview(scan, max_locations=20)
+
+    spanned = [loc for loc in view["locations"] if "rows" in loc["location"]]
+    assert spanned, "fixture no longer produces a block-scoped location"
+    assert all("cols" in loc["location"] for loc in spanned), (
+        f"a block location names no column span: "
+        f"{[loc['location'] for loc in spanned if 'cols' not in loc['location']][:3]}"
+    )
+    # A panel built from several column groups has to say so, or the reader is
+    # sent to one group's cells for evidence that is spread across four.
+    multi = [loc for loc in view["locations"] if loc["signals"] > 1
+             and "more" in loc["location"]]
+    assert multi, (
+        f"no merged panel discloses its extra column groups: "
+        f"{[l['location'] for l in view['locations'][:5]]}"
+    )
+
+
+def test_merging_re_ranks_so_the_strongest_panel_leads():
+    """Merging changes the counts the ranking is built on.
+
+    Without a re-rank a panel whose evidence arrived split across several column
+    groups sorts on its first fragment's count, so a panel with more high
+    findings ends up behind one with fewer.
+    """
+    def block(sheet, cols, n_high):
+        return {
+            "file": "split.xlsx", "sheet": sheet,
+            "block": {"rows": "3-40", "cols": cols, "header": []},
+            "relations": [
+                {"kind": "identical_column", "severity": "high",
+                 "raw_severity": "high", "n": 6,
+                 "rule": f"col[{cols}] == col[{i}]"}
+                for i in range(n_high)
+            ],
+        }
+
+    # One panel, seven high findings arriving split across four column groups,
+    # none of which alone beats the rival.
+    blocks = [block("Fig 1a", "0-2", 2), block("Fig 1a", "3-5", 2),
+              block("Fig 1a", "6-8", 2), block("Fig 1a", "9-11", 1)]
+    # A rival that arrives whole with six.
+    blocks.append(block("Fig 2b", "0-9", 6))
+    scan = {"relations_blocks": blocks, "cross_sheet_findings": []}
+
+    leader = overview(scan, max_locations=10)["locations"][0]
+
+    assert leader["high"] == 7, (
+        f"the merged seven-high panel did not lead; got {leader['location']} "
+        f"with {leader['high']} high"
+    )
+
+
+def test_explain_serves_the_right_finding_for_a_disambiguated_id():
+    """L4 has to answer for the finding the id names, not the first one like it.
+
+    Colliding seed ids get a `#N` suffix. _match_raw_finding recomputed the bare
+    hash and compared it to the suffixed id, so it never matched: explain
+    returned an empty evidence table and the profile defaults -- reporting a
+    finding as kept when the profile had demoted it. The suffix is assigned over
+    the whole seed list, so recovering the finding means replaying that
+    enumeration, not parsing the suffix as an index into one block.
+    """
+    twin = {
+        "kind": "identical_column", "severity": "high", "raw_severity": "high",
+        "n": 6, "rule": "col[1] == col[3]",
+    }
+    first = dict(twin, profile_action="kept",
+                 evidence={"rows": ["r1"], "cols": ["c1"], "cells": [[1.5]]})
+    second = dict(twin, profile_action="demoted",
+                  false_positive_context=["shared axis"],
+                  evidence={"rows": ["r9"], "cols": ["c9"], "cells": [[9.5]]})
+    scan = {
+        "relations_blocks": [{
+            "file": "t.xlsx", "sheet": "Fig 1a",
+            "block": {"rows": "3-9", "cols": "1-4", "header": []},
+            "relations": [first, second],
+        }],
+        "cross_sheet_findings": [],
+    }
+
+    from paperconan._drill import _clusters_of
+
+    clusters, _seeding = _clusters_of(scan)
+    ids = [s["seed_id"] for c in clusters for s in c["seeds"]]
+    assert any("#" in i for i in ids), (
+        f"fixture no longer produces colliding ids: {ids}"
+    )
+
+    bare = next(i for i in ids if "#" not in i)
+    suffixed = next(i for i in ids if "#" in i)
+
+    assert explain(scan, bare)["evidence"] == first["evidence"]
+    got = explain(scan, suffixed)
+    assert got["evidence"] == second["evidence"], (
+        f"the suffixed id served the wrong finding's evidence: {got['evidence']}"
+    )
+    # The falsehood this fixes: with no raw match, profile_action fell back to
+    # its "kept" default, so a demoted finding was reported as kept.
+    assert got["severity"]["profile_action"] == "demoted", (
+        f"explain reported {got['severity']['profile_action']!r} for a demoted finding"
+    )
+    assert "shared axis" in str(got["severity"]["context"]), (
+        f"the demotion reason did not reach the reader: {got['severity']}"
+    )
+
+
+def test_a_member_cluster_id_opens_the_panel_that_absorbed_it():
+    """Ids outlive the merge that hid them.
+
+    explain reports the member cluster's own id, and the workflow packet cites
+    raw cluster ids -- neither of which appears in overview's listing once the
+    panel absorbs them. If _resolve did not accept a member id, those ids would
+    reference nothing. Deleting that branch left the whole suite green.
+    """
+    scan = _saturated_scan()
+    view = overview(scan, max_locations=20)
+    panel = next(loc for loc in view["locations"] if "more" in loc["location"])
+
+    from paperconan._drill import _clusters_of, _merge_panels
+
+    raw, _seeding = _clusters_of(scan)
+    merged = next(p for p in _merge_panels(raw) if p["cluster_id"] == panel["cluster_id"])
+    members = [m for m in merged["member_ids"] if m != merged["cluster_id"]]
+    assert members, "fixture no longer produces a panel with absorbed members"
+
+    opened = drill(scan, members[0])
+    assert opened["cluster_id"] == panel["cluster_id"], (
+        f"a member id opened {opened['cluster_id']} instead of its panel "
+        f"{panel['cluster_id']}"
+    )

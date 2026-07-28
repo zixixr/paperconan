@@ -52,10 +52,18 @@ class ScanCoverage:
     def add_limitation(self, scope: str, reason: str, **details: Any) -> None:
         item = {"scope": scope, "reason": reason}
         item.update({k: v for k, v in details.items() if v is not None})
-        # Deduplicate identical (scope, reason, file, sheet) events so a repeated
-        # cause records once, and cap the retained list so a pathological input
-        # cannot balloon the report (GH#15-class size guard).
-        key = (scope, reason, item.get("file"), item.get("sheet"))
+        # Deduplicate identical events so a repeated cause records once, and cap
+        # the retained list so a pathological input cannot balloon the report
+        # (GH#15-class size guard). The identity is
+        # (scope, reason, file, sheet, detector). `detector` has to be part of
+        # it because detector records carry no file and no sheet: on a 4-tuple
+        # key every capped detector after the first matches the first and is
+        # silently discarded, so a scan that capped three detectors would name
+        # only one. Detector records still collapse across blocks and sheets --
+        # one entry per (detector, reason) per scan, since `reason` is in the key
+        # too -- which is why they carry no counts.
+        key = (scope, reason, item.get("file"), item.get("sheet"),
+               item.get("detector"))
         if key in self._limitation_keys:
             return
         if len(self.limitations) >= _limitations_cap():
