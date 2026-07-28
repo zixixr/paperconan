@@ -2101,10 +2101,12 @@ def detect_decimal_tail_clustering(values, label, top_k=6):
     # floor was a mistake -- but not for the reason first given here. Measured:
     # a fine instrument step (14-16 bit) gives top-6 shares of 4-8%, and this
     # gate holds it. A coarse one (10 bit) reaches 62%, and division by a small
-    # constant reaches 100%. Neither actually arrives here -- both are stopped
-    # one gate earlier, by the distinct-fraction test, which over 210 coarse-grid
-    # configurations is what rejects 125 of them to this gate's 60. So the
-    # coarse-grid separator is the gate above, not this one.
+    # constant reaches 100%. Which gate stops which shape depends on the mix:
+    # division by a small constant is caught by the distinct-fraction test above
+    # (seven distinct fractions), while a coarse instrument grid can clear every
+    # gate here and be reported -- a pre-existing false positive this branch does
+    # not fix. Earlier versions of this comment attributed the split with figures
+    # that do not reproduce; no attribution is offered now.
     #
     # What this gate demonstrably does is suppress a concentration diluted across
     # a whole sheet: remove it and the only test that breaks is the one
@@ -2163,6 +2165,17 @@ def detect_decimal_tail_clustering(values, label, top_k=6):
             # are readings added together, and readings are recorded to about
             # three decimals. A sum off that grid means the coincidence is with
             # the tail, not with an averaging process.
+            #
+            # Three decimals, deliberately, and it has a cost. Readings at four
+            # decimals give sums that `round(av*d, 4)` puts on the 1e-4 grid by
+            # construction, so admitting that grid too makes this clause nearly
+            # vacuous: measured, false positives go 2 -> 0 out of 88 while
+            # single-tail recall collapses 285 -> 150 out of 300. For a tool
+            # whose finding a human adjudicates, a false positive costs minutes
+            # and a miss costs the case, so the grid stays coarse. The residue
+            # is real and documented rather than hidden: means of 4dp readings
+            # on small panels can still be reported, and the skill tells an
+            # adjudicating agent to check for exactly that.
             sums = [round(av * d, 4) for av in hits]
             on_grid = sum(1 for x in sums
                           if abs(x * 1000 - round(x * 1000)) < 1e-6)

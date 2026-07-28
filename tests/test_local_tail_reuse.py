@@ -280,9 +280,37 @@ def test_widening_the_averaging_tolerance_did_not_cost_partial_reuse():
     tails = [f"{t:03d}" for t in range(100, 400)]
     found = sum(1 for t in tails if detect_decimal_tail_clustering(partial(t, int(t)), "p"))
 
-    # Measured 172/300 on main and 285/300 here; the floor is set below that with
-    # room for fixture drift but far above what the tolerance alone would leave.
-    assert found >= 260, (
+    # Measured: 264/300 on main, 150/300 with the widened tolerance alone, and
+    # 285/300 here. The floor sits above main's baseline so a regression against
+    # the merge target cannot pass, and far above what the tolerance alone leaves.
+    assert found >= 264, (
         f"only {found}/300 single-tail panels were reported; the averaging guard "
         f"is explaining away tails it should not"
+    )
+
+
+@pytest.mark.parametrize("d,dec,n", [(3, 4, 30), (3, 4, 60), (7, 4, 30)])
+def test_four_decimal_replicate_means_are_a_known_reported_shape(d, dec, n):
+    """Pins the cost of keeping the sum grid coarse, so it cannot drift silently.
+
+    The averaging guard asks whether the implied sums lie on a 1e-3 grid. Sums
+    from readings at four decimals do not -- `round(av*d, 4)` puts them on 1e-4
+    by construction -- so this shape is reported. Admitting the 1e-4 grid would
+    silence it, and would also make the clause nearly vacuous: measured, false
+    positives go 2 to 0 out of 88 while single-tail recall collapses 285 to 150
+    out of 300.
+
+    That trade was made deliberately for a tool whose findings a human
+    adjudicates. This test exists so the residue stays visible: if it starts
+    failing, the guard changed and the recall test next to it should be re-read
+    before anything is celebrated. `skills/paperconan/references/detectors.md`
+    tells an adjudicating agent how to recognise this shape.
+    """
+    rng = np.random.default_rng(20260728 + d * 100 + dec * 10 + n)
+    vals = [round(float(np.mean(np.round(rng.uniform(1, 100, d), dec))), 6)
+            for _ in range(n)]
+
+    assert detect_decimal_tail_clustering(vals, "Fig 1a") is not None, (
+        "4dp replicate means are no longer reported -- if the guard was tightened, "
+        "check that single-tail recall did not collapse with it"
     )
