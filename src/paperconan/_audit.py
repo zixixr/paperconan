@@ -1355,31 +1355,15 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=None):
     n_cols = c1 - c0
     # Two different bounds share this line. The column floor is scope: with
     # fewer than _ROW_REL_MIN_COLS columns a "relation between rows" is not
-    # evidence of anything. The row ceiling is not — it is a cost cap on the
-    # O(rows^2 * cols) pair loop, and it truncates: a 61x14 block is squarely in
-    # this detector's orientation, and an exact ratio between two of its rows is
-    # found at 60 rows and lost at 61 while scan_status stays "complete".
+    # evidence of anything. The row ceiling is a cost cap on the O(rows^2) pair
+    # loop, and it truncates -- at 60 an exact ratio between two rows of a 61-row
+    # block was lost while scan_status stayed "complete". It is 200 now, which
+    # measurement showed is where the recall is; 400 and 1000 add nothing.
     #
-    # Left unreported on purpose, for now: 61x14 is among the commonest
-    # supplementary shapes, so emitting a limitation here would fire on ordinary
-    # scans and train readers to skip the coverage line. The workflow's
-    # deliberately over-broad caveat ("too wide or too tall") is what covers it,
-    # and test_a_block_past_the_row_cap_loses_relations_and_says_nothing pins
-    # the loss so it cannot widen unnoticed. That caveat reaches the workflow
-    # packet and the layered views that render a coverage block — `paperconan
-    # overview` and both `drill` forms, via _build_clusters. `explain` renders no
-    # coverage block, and a plain `paperconan <dir>` run gets scan.json and
-    # report.html, neither of which carries it either.
-    #
-    # _ROW_REL_MAX_ROWS is also the gate in _scaled_row_candidates, so the same
-    # constant drops a second detector; that site has its own note.
-    #
-    # At the 12-14 column shapes above, this ceiling is ~15x tighter than
-    # _ROW_REL_BUDGET, which bounds the same loop and *does* report. The two
-    # cross near 3,400 columns and past that the budget is the tighter one — so
-    # "redundant" holds for ordinary panels, not for the genome-scale wide
-    # blocks this detector also covers. Raising it is a detection change (recall
-    # against cost and false positives) and belongs in its own PR.
+    # A ceiling still exists, so a tall enough block still loses relations and
+    # still says nothing about it. That residue is covered by the workflow's
+    # over-broad "too wide or too tall" caveat, and
+    # test_skips_block_with_too_many_rows pins where the skip begins.
     if n_rows < 2 or n_cols < _ROW_REL_MIN_COLS or n_rows > _ROW_REL_MAX_ROWS:
         return findings
 
@@ -3469,13 +3453,13 @@ def _scaled_row_candidates(grid_sheets):
     for (fname, sname), sheet in grid_sheets.items():
         for bi, (r0, r1) in enumerate(_row_bands(sheet)):
             if (r1 - r0) < 2 or (r1 - r0) > _ROW_REL_MAX_ROWS:
-                # Second site sharing _ROW_REL_MAX_ROWS, and it is a cost cap here
-                # too, not orientation: a band's height says nothing about whether
-                # a row in it is a scalar multiple of a row in *another* band or
-                # sheet, which is what this detector compares. A 61-row band drops
-                # out entirely, taking identical_row_reuse with it. Unreported, for
-                # the same reason as detect_row_relations' ceiling — see the note
-                # there, and test_a_tall_band_loses_scaled_row_reuse_and_says_nothing.
+                # Second site sharing _ROW_REL_MAX_ROWS, and a cost cap here
+                # too, not orientation: a band's height says nothing about
+                # whether a row in it is a scalar multiple of a row in another
+                # band or sheet. At 60 a 61-row band dropped out entirely,
+                # taking identical_row_reuse with it; the ceiling is 200 now,
+                # and _SCALED_ROW_BUDGET moved with it because this detector
+                # pools candidates across every sheet.
                 continue
             for r in range(r0, r1):
                 a = sheet.numeric[r, :]
