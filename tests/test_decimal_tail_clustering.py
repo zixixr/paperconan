@@ -42,8 +42,20 @@ def test_no_false_positive_on_diffuse_tails():
     assert detect_decimal_tail_clustering(_diffuse(300), "Fig X") is None
 
 
-def test_partial_cluster_below_threshold_does_not_fire():
-    # only ~30% clustered, rest diffuse — below the concentration threshold
+def test_a_partial_cluster_below_the_share_gate_does_not_fire():
+    """~30% of 200 values on two tails — improbable, but still not reported.
+
+    Measured, this is 870 collision pairs against 22.1 expected (C(200,2)/900). The Poisson gate
+    passes it easily. The share gate does not, and that gate is deliberately kept:
+    it suppresses a concentration diluted across a whole sheet (the coarse-grid
+    separator is the distinct-fraction gate above it), and
+    measured, a constant denominator reaches 100% here (a constant
+    denominator) against this case's 32%.
+
+    So this is a known miss, held conservatively rather than bought with an
+    eight-point empirical margin. Closing it properly means modelling the tail
+    space the data can actually reach instead of using concentration as a proxy.
+    """
     vals = _clustered(60, ["714", "286"]) + _diffuse(140)
     assert detect_decimal_tail_clustering(vals, "Fig Y") is None
 
@@ -54,9 +66,15 @@ def test_low_precision_values_are_ignored():
     assert detect_decimal_tail_clustering(vals, "Fig Z") is None
 
 
-def test_small_n_does_not_fire():
+def test_a_small_panel_with_the_same_concentration_is_reported():
+    """40 values on 6 tails — 114 collision pairs against 0.87 expected (C(40,2)/900), 132x.
+
+    This is the shape the hard-threshold audit records as a real miss: the old
+    count floor of 100 made it invisible, and the previous version of this test
+    fixed that miss in place as expected behaviour.
+    """
     vals = _clustered(40, ["714", "286", "572", "428", "143", "857"])
-    assert detect_decimal_tail_clustering(vals, "Fig S") is None
+    assert detect_decimal_tail_clustering(vals, "Fig S") is not None
 
 
 def test_common_denominator_column_is_not_flagged():
@@ -84,11 +102,24 @@ def test_negative_values_counted_by_magnitude():
     assert r is not None and r["top_share"] >= 0.9
 
 
-def test_min_n_boundary():
-    tails = ["714", "286", "572", "428", "143", "857"]
-    assert detect_decimal_tail_clustering(_clustered(99, tails), "a") is None
-    assert detect_decimal_tail_clustering(_clustered(100, tails), "b") is not None
+def test_below_the_validity_floor_nothing_is_reported():
+    """A floor stays, but it is a validity one: with a handful of values there
+    is no concentration to measure. What went is the sample-size floor above it.
 
+    Literal sizes, not sizes derived from the constant: deriving them makes the
+    test pass for any value of it, which is how the boundary went unpinned.
+    """
+    from paperconan._audit import _TAIL_CLUSTER_MIN_VALUES
+
+    assert _TAIL_CLUSTER_MIN_VALUES == 12, "update the literals below deliberately"
+    # Not sevenths. 714/286 and the rest of this file's tails are the decimal
+    # residues of k/7, so values carrying them are indistinguishable from data
+    # divided by 7 -- which the averaging guard now correctly calls benign. The
+    # boundary this test pins is the validity floor, so it needs tails that are
+    # not a d-fold artifact for any d the guard scans.
+    tails = ["137", "409"]
+    assert detect_decimal_tail_clustering(_clustered(11, tails), "Fig B") is None
+    assert detect_decimal_tail_clustering(_clustered(12, tails), "Fig B") is not None
 
 def _triplicate_means(n):
     # n DISTINCT means of three limited-precision readings: mean = (a+b+c)/3.

@@ -205,6 +205,12 @@ def _distill_tail_clusters(scan: dict[str, Any]) -> list[dict[str, Any]]:
             "rule": d.get("rule"),
             "top5_a": [t for t, _ in top[:5]],
             "top5_b": [],
+            # The share an adjudicating agent would otherwise weigh is
+            # arithmetically forced below about twenty values; the Poisson result
+            # is the case, so it travels into the packet too.
+            "collision_pairs": d.get("collision_pairs"),
+            "expected_pairs": d.get("expected_pairs"),
+            "p_value": d.get("p_value"),
             "high_precision": True,
             "mass": bool(n >= 200),
             "evidence_confidence": evidence_confidence(n, 1.0, True),

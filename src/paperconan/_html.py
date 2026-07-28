@@ -555,6 +555,9 @@ def _render_tail_cluster_section(scan: dict) -> str:
             f'<tr><td class="loc">{_esc(d.get("label"))}</td>'
             f'<td>{_esc(d.get("n"))}</td>'
             f'<td>{_esc(round(100 * (d.get("top_share") or 0)))}%</td>'
+            # Below about twenty values the share is arithmetically forced, so
+            # the Poisson result is the whole case and has to travel with it.
+            f'<td>{_esc(d.get("collision_pairs"))} / {_esc(d.get("expected_pairs"))}</td>'
             f'<td>{_esc(comp)}</td>'
             f'<td class="ends">{_esc(top)}</td></tr>'
         )
@@ -565,7 +568,7 @@ def _render_tail_cluster_section(scan: dict) -> str:
         f'与独立测量的均匀尾数分布不符，属待解释异常。</p>'
         f'<div class="ev-wrap"><table class="ev meta-table">'
         '<thead><tr><th>sheet</th><th>hi-prec n</th><th>top-6 share</th>'
-        '<th>compl. pairs</th><th>top tails</th></tr></thead>'
+        '<th>碰撞/期望 obs/exp</th><th>compl. pairs</th><th>top tails</th></tr></thead>'
         f'<tbody>{"".join(rows)}</tbody></table></div>'
         '</section>'
     )

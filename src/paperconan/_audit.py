@@ -2037,8 +2037,15 @@ def detect_repeated_decimals(values, label):
     return dict(label=label, n=n, n_unique=len(counts), top=flags)
 
 
-_TAIL_CLUSTER_MIN_N = int(os.environ.get("PAPERCONAN_TAIL_CLUSTER_MIN_N", "100"))
+# Validity floor: fewer than this and there is nothing to be concentrated. Not a
+# statistical-power floor — tail collision is an exact-coincidence test, so the
+# evidence comes from the collisions, not from the number of values.
+_TAIL_CLUSTER_MIN_VALUES = int(os.environ.get("PAPERCONAN_TAIL_CLUSTER_MIN_VALUES", "12"))
 _TAIL_CLUSTER_SHARE = float(os.environ.get("PAPERCONAN_TAIL_CLUSTER_SHARE", "0.40"))
+# Reachable 3-digit tails. The last digit cannot be 0 (see the collision gate).
+_TAIL_SPACE = 900
+# Poisson upper-tail cut for observed vs expected tail-collision pairs.
+_TAIL_CLUSTER_ALPHA = float(os.environ.get("PAPERCONAN_TAIL_CLUSTER_ALPHA", "1e-6"))
 
 
 def detect_decimal_tail_clustering(values, label, top_k=6):
@@ -2049,7 +2056,7 @@ def detect_decimal_tail_clustering(values, label, top_k=6):
     Distinct from detect_last_digit (a single last digit), detect_repeated_decimals
     (2-digit endings, no concentration test) and within_col_value_duplication (repeated
     whole VALUES, not shared tails). Gated hard: only values with >=3 fractional digits
-    (at read precision) count; needs >=_TAIL_CLUSTER_MIN_N of them; the top-`top_k`
+    (at read precision) count; needs >=_TAIL_CLUSTER_MIN_VALUES of them; the top-`top_k`
     3-digit tails must cover >=_TAIL_CLUSTER_SHARE of them; AND the full fractional parts
     must be MOSTLY DISTINCT — otherwise a quantized / common-denominator column (values
     like k/7 or eighths) trivially shares tails and would false-positive. Large-magnitude
@@ -2068,18 +2075,61 @@ def detect_decimal_tail_clustering(values, label, top_k=6):
             full.append(frac)
             hp_vals.append(av)
     n = len(tails)
-    if n < _TAIL_CLUSTER_MIN_N:
+    # Validity floor, not a sample-size floor: below a handful of values there is
+    # no concentration to measure. The old count floor of 100 was the latter, and
+    # it made an 87%-concentrated panel of 99 values invisible while the same
+    # concentration at 120 read as high — the evidence never came from the count.
+    if n < _TAIL_CLUSTER_MIN_VALUES:
         return None
-    # Quantized / common-denominator data (few distinct fractions) shares tails trivially.
-    # The genuine fingerprint is MANY independent values that nonetheless collide on a few
-    # tails, so require the full fractional parts to be mostly distinct.
-    if len(set(full)) < max(50, n // 2):
+    # Quantized / common-denominator data (few distinct fractions) shares tails
+    # trivially. The genuine fingerprint is independent values that nonetheless
+    # collide on a few tails, so require the full fractional parts to be mostly
+    # distinct. Scaled to n: a fixed floor of 50 was itself unreachable below 50
+    # values, a third hidden count gate.
+    # Ratio stays n//2. Lowering the floor was the point; raising the ratio to
+    # 2n/3 rode along unannounced and is stricter above n=75 -- a panel of 200
+    # with 131 distinct fractions fired before this branch and would not after,
+    # which is the loss the branch exists to stop.
+    if len(set(full)) < max(_TAIL_CLUSTER_MIN_VALUES, n // 2):
         return None
     counts = Counter(tails)
     top = counts.most_common(top_k)
     top_sum = sum(c for _, c in top)
     share = top_sum / n
+
+    # Concentration still has to be high, and removing it alongside the count
+    # floor was a mistake -- but not for the reason first given here. Measured:
+    # a fine instrument step (14-16 bit) gives top-6 shares of 4-8%, and this
+    # gate holds it. A coarse one (10 bit) reaches 62%, and division by a small
+    # constant reaches 100%. Which gate stops which shape depends on the mix:
+    # division by a small constant is caught by the distinct-fraction test above
+    # (seven distinct fractions), while a coarse instrument grid can clear every
+    # gate here and be reported -- a pre-existing false positive this branch does
+    # not fix. Earlier versions of this comment attributed the split with figures
+    # that do not reproduce; no attribution is offered now.
+    #
+    # What this gate demonstrably does is suppress a concentration diluted across
+    # a whole sheet: remove it and the only test that breaks is the one
+    # documenting that miss. Not, as an earlier version of this comment said,
+    # holding diffuse data quiet against a Poisson test gaining power -- with the
+    # null corrected to 900 that test stays at p in [0.07, 0.75] out to n=200000
+    # and never fires on diffuse data at all.
     if share < _TAIL_CLUSTER_SHARE:
+        return None
+
+    # And the concentration has to be improbable, not just high — the birthday
+    # model the duplication detectors already use. This is what replaces the
+    # count floor: the evidence comes from the collisions, so a small panel with
+    # a strong pattern now clears the bar that 100 values used to guard.
+    pairs_obs = sum(c * (c - 1) // 2 for c in counts.values())
+    # 900, not 1000: the tail is read off a `rstrip("0")` string, so its last
+    # digit can never be 0 and the space is 10 x 10 x 9. Assuming 1000 understates
+    # the expectation by 1.111x, and since the Poisson test gains power with n
+    # that fixed bias crosses p < 1e-6 on pure noise somewhere past n = 2000 —
+    # exactly the size an ordinary supplement reaches.
+    lam = (n * (n - 1) / 2) / _TAIL_SPACE
+    p_value = _poisson_sf(pairs_obs, lam)
+    if p_value > _TAIL_CLUSTER_ALPHA:
         return None
     top_tails = [t for t, _ in top]
     # Averaging artifact: a reported MEAN of d replicates is (sum of d limited-precision
@@ -2092,18 +2142,60 @@ def detect_decimal_tail_clustering(values, label, top_k=6):
     carriers = [av for av, t in zip(hp_vals, tails) if t in set(top_tails)]
     if carriers:
         for d in range(2, 13):
-            terminating = sum(1 for av in carriers
-                              if abs(av * d - round(av * d, 4)) < 1e-6)
-            if terminating >= 0.9 * len(carriers):
+            # Tolerance scales with d because the error does: a d-fold mean of
+            # values recorded at a few decimals, stored at 6dp, carries up to
+            # d * 5e-7 of rounding error, so av*d misses a short decimal by that
+            # much. The fixed 1e-6 only ever covered d=2, which is why ordinary
+            # replicate means at d>=3 were not recognised as averaging artifacts
+            # -- invisible while a count floor of 100 hid them, and severity=high
+            # on a 30-row panel once that floor came off.
+            hits = [av for av in carriers
+                    if abs(av * d - round(av * d, 4)) < d * 5e-7 + 1e-9]
+            if len(hits) < 0.9 * len(carriers):
+                continue
+            # The tolerance alone is too generous to stand on. Acceptance depends
+            # only on the 3-digit tail (d*F mod 100 == d*T mod 100), so widening
+            # it from 1e-6 took the unconditionally-explainable tails from 20 of
+            # 900 to 400 of 900 -- any panel dominated by one of those went
+            # silent however improbable its concentration, a 43% loss on partial
+            # single-tail reuse.
+            #
+            # So require the hypothesis to be consistent, not just arithmetically
+            # possible: if these values are means of d readings, the implied sums
+            # are readings added together, and readings are recorded to about
+            # three decimals. A sum off that grid means the coincidence is with
+            # the tail, not with an averaging process.
+            #
+            # Three decimals, deliberately, and it has a cost. Readings at four
+            # decimals give sums that `round(av*d, 4)` puts on the 1e-4 grid by
+            # construction, so admitting that grid too makes this clause nearly
+            # vacuous: measured, false positives go 2 -> 0 out of 88 while
+            # single-tail recall collapses 285 -> 150 out of 300. For a tool
+            # whose finding a human adjudicates, a false positive costs minutes
+            # and a miss costs the case, so the grid stays coarse. The residue
+            # is real and documented rather than hidden: means of 4dp readings
+            # on small panels can still be reported, and the skill tells an
+            # adjudicating agent to check for exactly that.
+            sums = [round(av * d, 4) for av in hits]
+            on_grid = sum(1 for x in sums
+                          if abs(x * 1000 - round(x * 1000)) < 1e-6)
+            if on_grid >= 0.9 * len(sums):
                 return None
     # complementary pairs (t + t' = 1000) among the dominant tails — a stronger sub-signal
     comp = sum(1 for t in top_tails if int(t) < 500 and f"{1000 - int(t):03d}" in top_tails)
     return dict(label=label, n=n, n_unique=len(counts), n_distinct_fraction=len(set(full)),
                 top=[[t, c] for t, c in top], top_share=round(share, 4),
+                # Below about twenty values the top-k share is arithmetically
+                # forced -- six tails out of at most nineteen distinct ones are
+                # always most of them -- so the share carries no information and
+                # the Poisson result is the entire case. A reader who cannot see
+                # it cannot weigh the finding.
+                collision_pairs=pairs_obs, expected_pairs=round(lam, 3),
+                p_value=float(f"{p_value:.3g}"),
                 complementary_pairs=comp, severity="high",
                 rule=(f"the {top_k} most common 3-digit fractional tails cover "
                       f"{top_sum}/{n} ({share:.0%}) of the high-precision values "
-                      f"(uniform expectation ~{100 * top_k / 1000:.1f}%), which have "
+                      f"(uniform expectation ~{100 * top_k / _TAIL_SPACE:.1f}%), which have "
                       f"{len(set(full))} distinct fractional parts"))
 
 
