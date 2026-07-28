@@ -1274,7 +1274,11 @@ def test_a_scaled_rectangle_is_not_explained_as_a_shared_control():
     """
     import paperconan._audit as audit
 
-    found = audit.detect_scaled_row_reuse(_panels(None, None, ratio=1.14),
+    # ratio=2.0, not 1.14: at 1.14 six-decimal rounding breaks the constant-ratio
+    # run at a different column per row, so the rectangle fragments into findings
+    # of at most five rows and never reaches the benign gate -- the test passed on
+    # the very code it was written to catch.
+    found = audit.detect_scaled_row_reuse(_panels(None, None, ratio=2.0),
                                           profile="review", max_findings=10**6)
     scaled = [f for f in found if f["kind"] == "scaled_row_reuse"]
     assert scaled, "fixture no longer produces a scaled reuse"
@@ -1356,4 +1360,68 @@ def test_one_row_repeated_many_times_is_one_row_not_many():
     assert f.get("likely_benign") is None, (
         f"one row reappearing {f['rows_matched']} times was explained away: "
         f"{f['likely_benign']}"
+    )
+
+
+def test_the_repeated_row_case_holds_in_either_panel_order():
+    """Which panel is A is decided by sheet order, so the gate cannot read one side.
+
+    Nine replicates of one row is nine pairs and one row whichever panel the
+    loop reaches first. Counting only the A side made the answer depend on
+    filename order: reversed, the same data read as nine rows and crossed the
+    benign gate.
+    """
+    import paperconan._audit as audit
+    from paperconan._sheet import Sheet
+
+    vec = [13.40712, 27.91834, 8.52619, 41.06375, 19.73408, 33.28951, 22.61483,
+           9.34026, 37.15792, 14.80613, 29.47158, 6.92374, 31.08627, 17.25913]
+    small = [[f"c{j}" for j in range(14)]]
+    for i in range(4):
+        small.append([round(v * (1 + 0.05 * i), 6) for v in vec])
+    many = [[f"c{j}" for j in range(14)]]
+    for _ in range(9):
+        many.append([round(v, 6) for v in vec])
+
+    for order in (("Figure 4a", small, "Figure 4b", many),
+                  ("Figure 4a", many, "Figure 4b", small)):
+        na, ra, nb, rb = order
+        grids = {(f"{na}.csv", na): Sheet.from_rows(ra),
+                 (f"{nb}.csv", nb): Sheet.from_rows(rb)}
+        found = [f for f in audit.detect_scaled_row_reuse(grids, profile="review",
+                                                          max_findings=10**6)
+                 if f["kind"] == "identical_row_reuse"]
+        assert found, f"fixture produced nothing for {na}={len(ra)} rows"
+        f = found[0]
+        assert f["distinct_rows_matched"] == 1, (
+            f"one repeated row counted as {f['distinct_rows_matched']} with "
+            f"{na} first"
+        )
+        assert f.get("likely_benign") is None, (
+            f"nine replicates of one row were explained away with {na} first"
+        )
+
+
+def test_a_blank_first_row_does_not_make_a_named_rectangle_unnamed():
+    """The gate has to see every row it folded, not one representative pair.
+
+    row_a/row_b are the labels of whichever pair built the rectangle first. A
+    supplement whose first data row carries no label, with named treatment arms
+    below it, answered "unnamed" and got the shared-control note while its own
+    matched_row_pairs listed Vehicle against Drug-treated.
+    """
+    import paperconan._audit as audit
+
+    a = [None] + [f"Vehicle mouse {i}" for i in range(1, 12)]
+    b = [None] + [f"Drug-treated mouse {i}" for i in range(1, 12)]
+    found = [f for f in audit.detect_scaled_row_reuse(_panels(a, b),
+                                                      profile="review",
+                                                      max_findings=10**6)
+             if f["kind"] == "identical_row_reuse"]
+    assert found, "fixture no longer produces a reuse"
+    f = found[0]
+    assert f["distinct_rows_matched"] >= 8, "fixture must reach the benign gate"
+    assert f.get("likely_benign") is None, (
+        f"a rectangle of named arms with one blank row was explained away: "
+        f"{f['likely_benign']}\nrows: {f['matched_row_pairs']}"
     )

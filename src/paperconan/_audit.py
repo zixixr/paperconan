@@ -641,12 +641,6 @@ def benign_reason(f):
             # between two panels is this detector's strongest signal, not a
             # shared control: a replotted cohort is k == 1 by definition and a
             # shared axis cannot be rescaled.
-            #
-            # Not mutation-proven: deleting this line leaves the suite green,
-            # because every scaled fixture available here folds to 2 rows and
-            # the branch below needs _ROW_REUSE_BENIGN_ROWS. The line is still
-            # correct and load-bearing for a scaled rectangle tall enough to
-            # reach that gate; what is missing is a fixture that builds one.
             return None
         # The same explanation as the named-row branch above, reached without row
         # names. A whole block matching its counterpart down its height is a
@@ -662,8 +656,7 @@ def benign_reason(f):
         # unexplained -- the comment above and the shipped skill both say so.
         if (f.get("same_figure") and not f.get("same_sheet")
                 and (f.get("distinct_rows_matched") or 1) >= _ROW_REUSE_BENIGN_ROWS
-                and not _norm_label(f.get("row_a"))
-                and not _norm_label(f.get("row_b"))):
+                and f.get("all_rows_unnamed")):
             return (f"{f.get('distinct_rows_matched')} unnamed rows of one block "
                     "matching another across two panels of one figure is usually a "
                     "shared control/baseline or a shared axis replotted — confirm "
@@ -979,9 +972,15 @@ _ROW_PAIR_MAX_FINDINGS_PER_BLOCK = 25
 # At 60 a band of 61 rows dropped out of both detectors that gate on this --
 # detect_row_relations and, through _scaled_row_candidates, detect_scaled_row_reuse,
 # taking identical_row_reuse with it. Measured over seven real supplementary sets,
-# moving to 200 takes one paper's row-relation family from 31 findings to 68 and
-# costs nothing anywhere; 400 and 1000 add nothing further, so this is where the
-# recall is.
+# moving to 200 is where the available recall is: 400 and 1000 add nothing
+# further on any of them.
+#
+# The counts this was first justified with (one paper 31 -> 68) no longer
+# describe the output. Rectangle folding, added in the same branch, collapses a
+# duplicated block into one finding, so the gain that remains is the rectangles
+# that were previously invisible plus the blocks that stopped being skipped
+# outright -- not a larger count. It is not free either: measured +15% to +48%
+# runtime on four of seven corpora, the pair loop being 11x larger per block.
 #
 # Moving it alone is worse than not moving it. detect_scaled_row_reuse pools
 # candidates across every sheet and compares them pairwise, so a taller ceiling
@@ -1397,11 +1396,6 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=None):
     # loop, and it truncates -- at 60 an exact ratio between two rows of a 61-row
     # block was lost while scan_status stayed "complete". It is 200 now, which
     # measurement showed is where the recall is; 400 and 1000 add nothing.
-# The row-relation counts this was first justified with (31 -> 68 on one paper)
-# no longer describe the output: rectangle folding, added in the same branch,
-# absorbed them into one finding each. The gain that remains is one previously
-# invisible rectangle plus the blocks that stopped being skipped outright, and
-# the raise costs runtime -- measured +15% to +48% on four of seven corpora.
     #
     # A ceiling still exists, so a tall enough block still loses relations and
     # still says nothing about it. That residue is covered by the workflow's
@@ -3625,10 +3619,17 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
             if prior is not None:
                 prior["rows_matched"] += 1
                 # Pairs, not rows: one row repeated nine times in the other panel
-                # is nine pairs and one row. The rule and the benign gate speak
-                # about rows, so they read this instead.
+                # is nine pairs and one row. Counted on both sides and gated on
+                # the smaller, because counting only one side made the answer
+                # depend on which sheet the loop reached first -- nine replicates
+                # of one row read as nine rows whenever the replicate panel
+                # sorted first, and got the shared-control note.
                 prior["_rows_a"].add(A["row"])
-                prior["distinct_rows_matched"] = len(prior["_rows_a"])
+                prior["_rows_b"].add(B["row"])
+                prior["_any_named"] = prior["_any_named"] or bool(
+                    _norm_label(A["label"]) or _norm_label(B["label"]))
+                prior["distinct_rows_matched"] = min(len(prior["_rows_a"]),
+                                                     len(prior["_rows_b"]))
                 if len(prior["matched_row_pairs"]) < _ROW_REUSE_EXAMPLE_ROWS:
                     prior["matched_row_pairs"].append([A["label"], B["label"]])
                 continue
@@ -3653,10 +3654,18 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
                 severity="high",
                 rows_matched=1,
                 distinct_rows_matched=1,
+                all_rows_unnamed=True,
                 matched_row_pairs=[[A["label"], B["label"]]],
                 rule=(f"row '{A['label']}' ({sa_name}) {rel} over a run of {run_len} "
                       f"positionally-aligned columns across 2 {scope}"))
             finding["_rows_a"] = {A["row"]}
+            finding["_rows_b"] = {B["row"]}
+            # Accumulated over the whole fold, not read off one representative
+            # pair: row_a/row_b are the labels of whichever pair built the
+            # rectangle first, so a blank first row let a rectangle of named
+            # treatment arms answer "unnamed".
+            finding["_any_named"] = bool(_norm_label(A["label"])
+                                         or _norm_label(B["label"]))
             by_rect[rect] = finding
             findings.append(finding)
             if len(findings) >= max_findings:
@@ -3691,7 +3700,9 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
     # Restated after folding: a finding that turned out to cover 40 rows must not
     # keep the wording of the first row it was built from.
     for f in findings:
+        f["all_rows_unnamed"] = not f.pop("_any_named", False)
         f.pop("_rows_a", None)
+        f.pop("_rows_b", None)
         if f["rows_matched"] > 1:
             scope = ("blocks" if f["same_sheet"]
                      else ("sheets" if f["same_file"] else "files"))
@@ -3700,17 +3711,16 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
             # Not "positionally matching": the loop pairs any row with any row,
             # and on real data two of three matches were off-diagonal. Naming
             # the pair count separately keeps both numbers honest.
-            f["rule"] = (f"{f['distinct_rows_matched']} rows of {f['sheet_a']} "
+            noun = "row" if f["distinct_rows_matched"] == 1 else "rows"
+            f["rule"] = (f"{f['distinct_rows_matched']} {noun} of {f['sheet_a']} "
                          f"({f['block_a']}) {verb} rows of {f['sheet_b']} "
                          f"({f['block_b']}) over a run of {f['run_length']} "
                          f"columns across 2 {scope} "
                          f"({f['rows_matched']} row pairs)")
 
-    # Re-evaluated after folding: benign_reason reads distinct_rows_matched, and
-    # at append time every finding still stands for its first row alone. Whoever
-    # attached a note earlier decided on a one-row view of a rectangle.
-    for f in findings:
-        f.pop("likely_benign", None)
+    # Attached here rather than only at the call site, so the detector's own
+    # output is complete for anyone calling it directly. benign_reason reads the
+    # folded counts, which are final by this point.
     _attach_benign(findings)
 
     if _capped:
