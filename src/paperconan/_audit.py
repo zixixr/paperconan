@@ -631,6 +631,21 @@ def benign_reason(f):
                 and _norm_label(f.get("row_a"))):
             return ("the same-named row reused across two panels of one figure is usually "
                     "a shared control/baseline replot — confirm the legend discloses the reuse")
+        # The same explanation, reached without row names. A whole block matching
+        # its counterpart row-for-row down its height is a replotted cohort, and
+        # the rows carrying it are usually positional ("row 13"), which
+        # _norm_label deliberately treats as unnamed -- so the branch above could
+        # never fire for the shape it describes best. Measured on a real
+        # supplement: 117 aligned rows across two panels of one figure, disclosed
+        # in that figure's own legend as a shared control, reported as high with
+        # no context while the column detector had already called the same
+        # rectangle benign.
+        if (f.get("same_figure") and not f.get("same_sheet")
+                and (f.get("rows_matched") or 1) >= _ROW_REUSE_BENIGN_ROWS):
+            return (f"{f.get('rows_matched')} rows matching position-for-position "
+                    "across two panels of one figure is usually a shared "
+                    "control/baseline or a shared axis replotted — confirm the "
+                    "legend discloses the reuse")
         if kind != "identical_row_reuse":
             ratio = f.get("ratio")
             if ratio is not None and _is_round_power_of_ten(float(ratio)):
@@ -1013,6 +1028,10 @@ _SCALED_ROW_BUDGET = int(os.environ.get("PAPERCONAN_SCALED_ROW_BUDGET", "2000000
 # How many row pairs a folded rectangle names. The reader needs the shape of the
 # match and a few rows to check against the paper; the count carries the rest.
 _ROW_REUSE_EXAMPLE_ROWS = int(os.environ.get("PAPERCONAN_ROW_REUSE_EXAMPLE_ROWS", "5"))
+# A folded rectangle this tall across two panels of one figure reads as a
+# replotted cohort rather than a copied row. Kept above a handful so a genuine
+# two- or three-row reuse is not explained away.
+_ROW_REUSE_BENIGN_ROWS = int(os.environ.get("PAPERCONAN_ROW_REUSE_BENIGN_ROWS", "8"))
 _SHORT_ROW_BUDGET = int(os.environ.get("PAPERCONAN_SHORT_ROW_BUDGET", "4000000"))
 _WITHIN_ROW_FRAC_BUDGET = int(os.environ.get("PAPERCONAN_WITHIN_ROW_FRAC_BUDGET", "8000000"))
 _ROW_PAIR_FRAC_BUDGET = int(os.environ.get("PAPERCONAN_ROW_PAIR_FRAC_BUDGET", "40000000"))
@@ -3479,6 +3498,32 @@ def _scaled_row_candidates(grid_sheets):
     return cands
 
 
+def _stratified_head(cands, limit):
+    """The first `limit` candidates, taking a turn from each sheet in rotation.
+
+    Extracted so it can be tested against directly: a test that rebuilds the
+    rotation to check it proves only that the test agrees with itself.
+    """
+    by_sheet: dict[tuple, list] = {}
+    for c in cands:
+        by_sheet.setdefault((c["file"], c["sheet"]), []).append(c)
+    picked: list = []
+    queues = list(by_sheet.values())
+    depth = 0
+    while len(picked) < limit:
+        took = False
+        for q in queues:
+            if depth < len(q):
+                picked.append(q[depth])
+                took = True
+                if len(picked) >= limit:
+                    break
+        if not took:
+            break
+        depth += 1
+    return picked
+
+
 def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
                             max_findings=40, coverage=None):
     """Two DATA ROWS in DIFFERENT blocks (cross-block within a sheet) or different
@@ -3502,7 +3547,14 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
     # quantity that says how much was dropped.
     pool_size = len(cands)
     if truncated:
-        cands = cands[:max_candidates]
+        # Round-robin across sheets, not the first max_candidates in iteration
+        # order. The pool is built file by file, so a positional cut examines the
+        # early files exhaustively and the later ones not at all -- measured on
+        # one paper, 11,804 candidates cut to 1,500 meant whole workbooks were
+        # never compared, and which ones depended on filename order. Taking a
+        # turn from each sheet keeps every sheet represented, and a cross-sheet
+        # detector cannot see a match at all unless both of its sides survive.
+        cands = _stratified_head(cands, max_candidates)
     findings = []
     by_rect: dict[tuple, dict] = {}
     _capped = False   # set only where a loop is actually abandoned

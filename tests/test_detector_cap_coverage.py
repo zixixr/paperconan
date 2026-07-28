@@ -1184,3 +1184,59 @@ def test_restatements_of_one_rectangle_do_not_consume_the_result_cap():
     assert "detector_finding_limit" not in reasons, (
         f"a 60-row rectangle exhausted a 3-finding cap: {reasons}"
     )
+
+
+def test_the_candidate_pool_cut_does_not_exclude_whole_sheets():
+    """Which sheets get compared must not depend on filename order.
+
+    The pool is built file by file, so cutting the first max_candidates examined
+    the early files exhaustively and the later ones not at all -- on one paper
+    11,804 candidates cut to 1,500 meant whole workbooks were never compared. A
+    cross-sheet detector cannot see a match unless both sides survive the cut.
+    """
+    from paperconan._audit import _stratified_head
+
+    pool = [{"file": f"f{s}.xlsx", "sheet": f"Figure {s}a", "row": r}
+            for s in range(12) for r in range(60)]
+
+    cut = _stratified_head(pool, 24)
+
+    assert len(cut) == 24
+    assert len({(c["file"], c["sheet"]) for c in cut}) == 12, (
+        "a 24-candidate cut over 12 sheets missed some of them; the cut is "
+        "positional, so later sheets are never compared"
+    )
+    # And it must still be a prefix-like cut within each sheet, so the result is
+    # deterministic for a given input rather than a sample.
+    assert [c["row"] for c in cut if c["file"] == "f0.xlsx"] == [0, 1]
+
+
+def test_the_detector_cuts_its_pool_through_the_stratified_head():
+    """Testing the helper says nothing about whether the detector calls it.
+
+    A positional cut leaves later sheets entirely uncompared, so a match that
+    needs one of them is invisible. Driven end to end: the planted rectangle is
+    on the last two sheets, and the cap admits far fewer candidates than the
+    pool holds.
+    """
+    import paperconan._audit as audit
+    from paperconan._sheet import Sheet
+
+    vec = [13.40712, 27.91834, 8.52619, 41.06375, 19.73408, 33.28951, 22.61483,
+           9.34026, 37.15792, 14.80613, 29.47158, 6.92374, 31.08627, 17.25913]
+    grids = {}
+    for s in range(12):
+        rows = [[f"c{j}" for j in range(14)]]
+        for i in range(40):
+            # The last two sheets carry the same block; every other sheet differs.
+            off = 0.0 if s >= 10 else 0.31 * s
+            rows.append([round(v * (1 + 0.017 * i) + off + 0.7 * i, 5) for v in vec])
+        grids[(f"Figure {s}a.csv", f"Figure {s}a")] = Sheet.from_rows(rows)
+    found = audit.detect_scaled_row_reuse(grids, profile="review",
+                                          max_candidates=48, max_findings=10**6)
+
+    pairs = {(f["sheet_a"], f["sheet_b"]) for f in found}
+    assert ("Figure 10a", "Figure 11a") in pairs, (
+        f"the match on the last two sheets was not found; the pool cut dropped "
+        f"them. found: {sorted(pairs)}"
+    )
