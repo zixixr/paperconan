@@ -626,9 +626,16 @@ def benign_reason(f):
         # figure number) is the classic shared control/baseline replot — benign. A
         # same-sheet cross-block pair (e.g. a DMSO vs MMS arm) or a DIFFERENT-named row
         # is NOT a shared control and stays unexplained.
+        # Read off the fold, not off row_a/row_b -- those are the labels of
+        # whichever pair built the rectangle first, so one same-named pair
+        # excused eleven Vehicle-vs-Drug-treated pairs folded in behind it. A
+        # finding that never folded carries all_rows_same_named from its only
+        # pair, so this is the same test it always was for those.
         if (f.get("same_figure") and not f.get("same_sheet")
-                and _norm_label(f.get("row_a")) == _norm_label(f.get("row_b"))
-                and _norm_label(f.get("row_a"))):
+                and (f.get("all_rows_same_named")
+                     if "all_rows_same_named" in f else
+                     (_norm_label(f.get("row_a")) == _norm_label(f.get("row_b"))
+                      and _norm_label(f.get("row_a"))))):
             return ("the same-named row reused across two panels of one figure is usually "
                     "a shared control/baseline replot — confirm the legend discloses the reuse")
         if kind != "identical_row_reuse":
@@ -637,6 +644,30 @@ def benign_reason(f):
                 return ("a whole power-of-ten ratio between two rows is usually a unit "
                         "conversion or percentage-vs-fraction restatement of the same row, "
                         "not two independent measurements")
+            # Nothing below applies to a scaled reuse. An arbitrary constant
+            # between two panels is this detector's strongest signal, not a
+            # shared control: a replotted cohort is k == 1 by definition and a
+            # shared axis cannot be rescaled.
+            return None
+        # The same explanation as the named-row branch above, reached without row
+        # names. A whole block matching its counterpart down its height is a
+        # replotted cohort, and the rows carrying it are positional ("row 13"),
+        # which _norm_label deliberately treats as unnamed -- so that branch could
+        # never fire for the shape it describes best. Measured: 117 aligned rows
+        # across two panels of one figure, disclosed as a shared control in that
+        # figure's own legend, reported high with no context while the column
+        # detector had already called the same rectangle benign.
+        #
+        # Unnamed only. Rows that carry names state what they are, and two
+        # differently-named arms copying each other is exactly what stays
+        # unexplained -- the comment above and the shipped skill both say so.
+        if (f.get("same_figure") and not f.get("same_sheet")
+                and (f.get("distinct_rows_matched") or 1) >= _ROW_REUSE_BENIGN_ROWS
+                and f.get("all_rows_unnamed")):
+            return (f"{f.get('distinct_rows_matched')} unnamed rows of one block "
+                    "matching another across two panels of one figure is usually a "
+                    "shared control/baseline or a shared axis replotted — confirm "
+                    "the legend discloses the reuse")
         return None
     if kind in ("cross_sheet_value_overlap", "cross_sheet_position_identical"):
         if f.get("same_figure"):
@@ -944,6 +975,10 @@ _ROW_PAIR_MAX_FINDINGS_PER_BLOCK = 25
 # row count keeps the O(rows^2) pair loop cheap on tall entity-in-rows tables (which
 # are not this orientation anyway); the column floor keeps a proportional pair from
 # firing on too few cells to be distinctive.
+# A cost cap on the O(rows^2) pair loop, shared with _scaled_row_candidates.
+# Raising it is a detection change and is being evaluated separately; folding
+# applies at this ceiling too, where the row-per-line output was already the
+# shape it is here, just smaller.
 _ROW_REL_MAX_ROWS = int(os.environ.get("PAPERCONAN_ROW_REL_MAX_ROWS", "60"))
 _ROW_REL_MIN_COLS = int(os.environ.get("PAPERCONAN_ROW_REL_MIN_COLS", "12"))
 # Short-run row reuse (detect_short_row_reuse): the long-run detectors above miss the
@@ -980,6 +1015,11 @@ _ROW_REL_RTOL = float(os.environ.get("PAPERCONAN_ROW_REL_RTOL", "1e-3"))
 # pair runs a pure-Python O(cols) scan, so a very wide block (e.g. 60x160000, still
 # under _MAX_CELLS) would otherwise cost ~minutes. Bound total pair*cols work; a
 # starved run stops early (stderr note) rather than hanging.
+# Bounds one block's pair loop, unlike _SCALED_ROW_BUDGET below, which
+# accumulates candidates across every sheet. That difference matters to anyone
+# raising _ROW_REL_MAX_ROWS: measured, the pooled budget is the one that has to
+# move with it, and moving the ceiling without it took one paper from 21
+# findings to 1. Neither is raised here.
 _ROW_REL_BUDGET = int(os.environ.get("PAPERCONAN_ROW_REL_BUDGET", "6000000"))
 # The remaining detector compute budgets. Module constants rather than in-function
 # literals so a truncation they cause can be reproduced in a test and tuned by an
@@ -988,6 +1028,16 @@ _ROW_REL_BUDGET = int(os.environ.get("PAPERCONAN_ROW_REL_BUDGET", "6000000"))
 _RECURRING_VEC_BUDGET = int(os.environ.get("PAPERCONAN_RECURRING_VEC_BUDGET", "3000000"))
 _WITHIN_ROW_VEC_BUDGET = int(os.environ.get("PAPERCONAN_WITHIN_ROW_VEC_BUDGET", "2000000"))
 _SCALED_ROW_BUDGET = int(os.environ.get("PAPERCONAN_SCALED_ROW_BUDGET", "4000000"))
+# How many row pairs a folded rectangle names. The reader needs the shape of the
+# match and a few rows to check against the paper; the count carries the rest.
+_ROW_REUSE_EXAMPLE_ROWS = int(os.environ.get("PAPERCONAN_ROW_REUSE_EXAMPLE_ROWS", "5"))
+# A folded rectangle this tall across two panels of one figure reads as a
+# replotted cohort rather than a copied row. Kept above a handful so a genuine
+# two- or three-row reuse is not explained away.
+_ROW_REUSE_BENIGN_ROWS = int(os.environ.get("PAPERCONAN_ROW_REUSE_BENIGN_ROWS", "8"))
+# How many label pairs a fold retains for consumers that must decide about the
+# whole rectangle. Past this the finding says so and those consumers abstain.
+_ROW_REUSE_LABEL_CAP = int(os.environ.get("PAPERCONAN_ROW_REUSE_LABEL_CAP", "200"))
 _SHORT_ROW_BUDGET = int(os.environ.get("PAPERCONAN_SHORT_ROW_BUDGET", "4000000"))
 _WITHIN_ROW_FRAC_BUDGET = int(os.environ.get("PAPERCONAN_WITHIN_ROW_FRAC_BUDGET", "8000000"))
 _ROW_PAIR_FRAC_BUDGET = int(os.environ.get("PAPERCONAN_ROW_PAIR_FRAC_BUDGET", "40000000"))
@@ -1333,31 +1383,16 @@ def detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=None):
     n_cols = c1 - c0
     # Two different bounds share this line. The column floor is scope: with
     # fewer than _ROW_REL_MIN_COLS columns a "relation between rows" is not
-    # evidence of anything. The row ceiling is not — it is a cost cap on the
-    # O(rows^2 * cols) pair loop, and it truncates: a 61x14 block is squarely in
-    # this detector's orientation, and an exact ratio between two of its rows is
-    # found at 60 rows and lost at 61 while scan_status stays "complete".
+    # evidence of anything. The row ceiling is a cost cap on the O(rows^2) pair
+    # loop, and it truncates -- at 60 an exact ratio between two rows of a 61-row
+    # block is lost while scan_status stays "complete". Raising it is a
+    # detection change under separate evaluation, and it cannot be raised alone
+    # -- see the note above _ROW_REL_BUDGET on which budget has to move with it.
     #
-    # Left unreported on purpose, for now: 61x14 is among the commonest
-    # supplementary shapes, so emitting a limitation here would fire on ordinary
-    # scans and train readers to skip the coverage line. The workflow's
-    # deliberately over-broad caveat ("too wide or too tall") is what covers it,
-    # and test_a_block_past_the_row_cap_loses_relations_and_says_nothing pins
-    # the loss so it cannot widen unnoticed. That caveat reaches the workflow
-    # packet and the layered views that render a coverage block — `paperconan
-    # overview` and both `drill` forms, via _build_clusters. `explain` renders no
-    # coverage block, and a plain `paperconan <dir>` run gets scan.json and
-    # report.html, neither of which carries it either.
-    #
-    # _ROW_REL_MAX_ROWS is also the gate in _scaled_row_candidates, so the same
-    # constant drops a second detector; that site has its own note.
-    #
-    # At the 12-14 column shapes above, this ceiling is ~15x tighter than
-    # _ROW_REL_BUDGET, which bounds the same loop and *does* report. The two
-    # cross near 3,400 columns and past that the budget is the tighter one — so
-    # "redundant" holds for ordinary panels, not for the genome-scale wide
-    # blocks this detector also covers. Raising it is a detection change (recall
-    # against cost and false positives) and belongs in its own PR.
+    # A ceiling still exists, so a tall enough block still loses relations and
+    # still says nothing about it. That residue is covered by the workflow's
+    # over-broad "too wide or too tall" caveat, and
+    # test_skips_block_with_too_many_rows pins where the skip begins.
     if n_rows < 2 or n_cols < _ROW_REL_MIN_COLS or n_rows > _ROW_REL_MAX_ROWS:
         return findings
 
@@ -3440,20 +3475,33 @@ def _row_bands(sheet):
     return bands
 
 
+def _scaled_row_candidate_key(candidate):
+    """Canonical identity and comparison order for a scaled-row candidate."""
+    # ``row`` is the absolute sheet row, so it already orders bands within a
+    # sheet; the band range is fold metadata, not part of candidate ordering.
+    return (candidate["file"], candidate["sheet"], candidate["row"])
+
+
 def _scaled_row_candidates(grid_sheets):
     """Collect high-information data-rows from row-oriented bands, tagged by band so
-    same-band pairs (detect_row_relations' job) are excluded downstream."""
+    same-band pairs (detect_row_relations' job) are excluded downstream.
+
+    Candidates are returned in canonical file/sheet/row order.  Workbook tab
+    order is discovery metadata, not detector input: normalizing it here keeps
+    truncation, pair direction, fold representatives, and output independent of
+    ``grid_sheets`` insertion order.
+    """
     cands = []
     for (fname, sname), sheet in grid_sheets.items():
         for bi, (r0, r1) in enumerate(_row_bands(sheet)):
             if (r1 - r0) < 2 or (r1 - r0) > _ROW_REL_MAX_ROWS:
-                # Second site sharing _ROW_REL_MAX_ROWS, and it is a cost cap here
-                # too, not orientation: a band's height says nothing about whether
-                # a row in it is a scalar multiple of a row in *another* band or
-                # sheet, which is what this detector compares. A 61-row band drops
-                # out entirely, taking identical_row_reuse with it. Unreported, for
-                # the same reason as detect_row_relations' ceiling — see the note
-                # there, and test_a_tall_band_loses_scaled_row_reuse_and_says_nothing.
+                # Second site sharing _ROW_REL_MAX_ROWS, and a cost cap here
+                # too, not orientation: a band's height says nothing about
+                # whether a row in it is a scalar multiple of a row in another
+                # band or sheet. A 61-row band drops out entirely, taking
+                # identical_row_reuse with it. Raising the ceiling needs
+                # _SCALED_ROW_BUDGET raised with it, since this detector pools
+                # candidates across every sheet.
                 continue
             for r in range(r0, r1):
                 a = sheet.numeric[r, :]
@@ -3467,7 +3515,35 @@ def _scaled_row_candidates(grid_sheets):
                     continue
                 cands.append(dict(file=fname, sheet=sname, band=(fname, sname, bi),
                                   rows=(r0, r1), row=r, label=label, a=a))
-    return cands
+    return sorted(cands, key=_scaled_row_candidate_key)
+
+
+def _stratified_head(cands, limit):
+    """Select `limit` candidates by sheet rotation, then restore canonical order.
+
+    Rotation controls which rows survive a coverage cap; it must not also control
+    pair direction or fold representation.  Sorting both the incoming queues and
+    the selected result keeps this helper independent of caller iteration order.
+    """
+    by_sheet: dict[tuple, list] = {}
+    for c in sorted(cands, key=_scaled_row_candidate_key):
+        by_sheet.setdefault((c["file"], c["sheet"]), []).append(c)
+    picked: list = []
+    # by_sheet inherits the canonical first-seen order from the sorted stream.
+    queues = list(by_sheet.values())
+    depth = 0
+    while len(picked) < limit:
+        took = False
+        for q in queues:
+            if depth < len(q):
+                picked.append(q[depth])
+                took = True
+                if len(picked) >= limit:
+                    break
+        if not took:
+            break
+        depth += 1
+    return sorted(picked, key=_scaled_row_candidate_key)
 
 
 def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
@@ -3493,14 +3569,24 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
     # quantity that says how much was dropped.
     pool_size = len(cands)
     if truncated:
-        cands = cands[:max_candidates]
+        # Round-robin across sheets, not the first max_candidates in iteration
+        # order. The pool is built file by file, so a positional cut examines the
+        # early files exhaustively and the later ones not at all -- measured on
+        # one paper, 11,804 candidates cut to 1,500 meant whole workbooks were
+        # never compared, and which ones depended on filename order. Taking a
+        # turn from each sheet keeps every sheet represented, and a cross-sheet
+        # detector cannot see a match at all unless both of its sides survive.
+        cands = _stratified_head(cands, max_candidates)
     findings = []
+    by_rect: dict[tuple, dict] = {}
     _capped = False   # set only where a loop is actually abandoned
     budget = _SCALED_ROW_BUDGET
     for i in range(len(cands)):
-        A = cands[i]
         for j in range(i + 1, len(cands)):
-            B = cands[j]
+            # Candidate collection and the optional stratified cut both restore
+            # this order.  Thus i < j fixes A/B ownership and the measurement
+            # direction once for every downstream fold field.
+            A, B = cands[i], cands[j]
             if A["band"] == B["band"]:
                 continue                                  # same block → detect_row_relations
             a, b = A["a"], B["a"]
@@ -3526,9 +3612,48 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
             same_file = fa == fb
             same_sheet = same_file and sa_name == sb_name
             scope = "blocks" if same_sheet else ("sheets" if same_file else "files")
+            # k is mean(b/a), so B = k x A.  A/B come from the canonical
+            # candidate stream; the sentence below follows that same direction.
             rel = (f"== row '{B['label']}'" if kind == "identical_row_reuse"
-                   else f"= row '{B['label']}' ({sb_name}) * {k:.6g}")
-            findings.append(dict(
+                   else f"-> row '{B['label']}' ({sb_name}) = this row * {k:.6g}")
+            # One duplicated rectangle is one event, not one event per row.
+            # Two blocks that share a leading run of columns match row-for-row
+            # down their whole height, so the loop emitted a finding per row --
+            # measured, 117 for a single shared control cohort, truncated by
+            # max_findings to 40, which then evicted three unrelated cross-file
+            # findings and put the rectangle at the top of the report. Rows fold
+            # into the finding for their rectangle; only distinct rectangles
+            # count against the cap.
+            # A and B are already in canonical order, so the key is too.
+            rect = ((fa, sa_name, A["rows"]), (fb, sb_name, B["rows"]),
+                    kind, round(k, 9), run_len)
+            prior = by_rect.get(rect)
+            if prior is not None:
+                prior["rows_matched"] += 1
+                # Pairs, not rows: one row repeated nine times in the other panel
+                # is nine pairs and one row. Counted on both sides and gated on
+                # the smaller, because counting only one side made the answer
+                # depend on which sheet the loop reached first -- nine replicates
+                # of one row read as nine rows whenever the replicate panel
+                # sorted first, and got the shared-control note.
+                prior["_rows_a"].add(A["row"])
+                prior["_rows_b"].add(B["row"])
+                prior["_any_named"] = prior["_any_named"] or bool(
+                    _norm_label(A["label"]) or _norm_label(B["label"]))
+                prior["_all_same_named"] = prior["_all_same_named"] and bool(
+                    _norm_label(A["label"])
+                    and _norm_label(A["label"]) == _norm_label(B["label"]))
+                if len(prior["_label_pairs"]) < _ROW_REUSE_LABEL_CAP:
+                    prior["_label_pairs"].append((A["label"], B["label"]))
+                else:
+                    prior["_labels_complete"] = False
+                prior["distinct_rows_matched"] = min(len(prior["_rows_a"]),
+                                                     len(prior["_rows_b"]))
+                if len(prior["matched_row_pairs"]) < _ROW_REUSE_EXAMPLE_ROWS:
+                    prior["matched_row_pairs"].append([A["label"], B["label"]])
+                continue
+
+            finding = dict(
                 kind=kind,
                 file=fa if same_file else f"{fa} + {fb}",
                 file_a=fa, file_b=fb, same_file=same_file, same_sheet=same_sheet,
@@ -3546,8 +3671,31 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
                 examples=[{"row": A["label"], "col": None, "value": float(v)}
                           for v in x_run[:5]],
                 severity="high",
+                rows_matched=1,
+                distinct_rows_matched=1,
+                all_rows_unnamed=True,
+                matched_row_pairs=[[A["label"], B["label"]]],
                 rule=(f"row '{A['label']}' ({sa_name}) {rel} over a run of {run_len} "
-                      f"positionally-aligned columns across 2 {scope}")))
+                      f"positionally-aligned columns across 2 {scope}"))
+            finding["_rows_a"] = {A["row"]}
+            finding["_rows_b"] = {B["row"]}
+            # Accumulated over the whole fold, not read off one representative
+            # pair: row_a/row_b are the labels of whichever pair built the
+            # rectangle first, so a blank first row let a rectangle of named
+            # treatment arms answer "unnamed".
+            finding["_any_named"] = bool(_norm_label(A["label"])
+                                         or _norm_label(B["label"]))
+            finding["_all_same_named"] = bool(
+                _norm_label(A["label"])
+                and _norm_label(A["label"]) == _norm_label(B["label"]))
+            # Every label pair the fold saw, so a consumer deciding about the
+            # rectangle is not left reading whichever pair happened to build it.
+            # Capped, with a flag when it overflows: a consumer that needs all of
+            # them must treat an incomplete list as "cannot conclude".
+            finding["_label_pairs"] = [(A["label"], B["label"])]
+            finding["_labels_complete"] = True
+            by_rect[rect] = finding
+            findings.append(finding)
             if len(findings) >= max_findings:
                 _capped = True
                 break
@@ -3577,6 +3725,43 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
         if budget <= 0:
             _note_detector_cap(coverage, "detect_scaled_row_reuse",
                                "detector_compute_budget_limit")
+    # Restated after folding: a finding that turned out to cover 40 rows must not
+    # keep the wording of the first row it was built from.
+    for f in findings:
+        # Fail closed: an emit path that skipped the accumulators must not read
+        # as "unnamed" or "all the same name", both of which grant an excuse.
+        f["all_rows_unnamed"] = not f.pop("_any_named", True)
+        f["all_rows_same_named"] = f.pop("_all_same_named", False)
+        f["row_labels"] = [list(x) for x in f.pop("_label_pairs", [])]
+        f["row_labels_complete"] = f.pop("_labels_complete", False)
+        f.pop("_rows_a", None)
+        f.pop("_rows_b", None)
+        if f["rows_matched"] > 1:
+            scope = ("blocks" if f["same_sheet"]
+                     else ("sheets" if f["same_file"] else "files"))
+            # Stated in the direction the ratio was measured: k is mean(b/a),
+            # so sheet_b is k x sheet_a.  Candidate canonicalization fixes that
+            # direction before the fold and every accumulated row keeps it.
+            #
+            # Not "positionally matching" either: the loop pairs any row with
+            # any row, and on real data two of three matches were off-diagonal.
+            noun = "row" if f["distinct_rows_matched"] == 1 else "rows"
+            if f["kind"] == "identical_row_reuse":
+                body = (f"{f['distinct_rows_matched']} {noun} of {f['sheet_a']} "
+                        f"({f['block_a']}) are identical to rows of "
+                        f"{f['sheet_b']} ({f['block_b']})")
+            else:
+                body = (f"{f['distinct_rows_matched']} {noun} of {f['sheet_b']} "
+                        f"({f['block_b']}) are {f['ratio']:.6g} x rows of "
+                        f"{f['sheet_a']} ({f['block_a']})")
+            f["rule"] = (f"{body} over a run of {f['run_length']} columns "
+                         f"across 2 {scope} ({f['rows_matched']} row pairs)")
+
+    # Attached here rather than only at the call site, so the detector's own
+    # output is complete for anyone calling it directly. benign_reason reads the
+    # folded counts, which are final by this point.
+    _attach_benign(findings)
+
     if _capped:
         _note_detector_cap(coverage, "detect_scaled_row_reuse", "detector_finding_limit",
                            limit=max_findings)
@@ -3818,6 +4003,15 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
                 rel = "row '{}' = row '{}' * {:.6g}".format(b_label, a_label, k)
             findings.append(dict(
                 kind=kind, short_run=True,
+                # The same kinds detect_scaled_row_reuse emits, so they carry the
+                # same fold fields. A short-run match is one row pair by nature,
+                # and a consumer reading a missing key as "unnamed" or "all the
+                # same name" would grant an excuse this finding never earned.
+                rows_matched=1, distinct_rows_matched=1,
+                all_rows_unnamed=not (_norm_label(a_label) or _norm_label(b_label)),
+                all_rows_same_named=bool(
+                    _norm_label(a_label)
+                    and _norm_label(a_label) == _norm_label(b_label)),
                 file=fname, file_a=fname, file_b=fname,
                 same_file=True, same_sheet=True,
                 sheet_a=sname, sheet_b=sname,

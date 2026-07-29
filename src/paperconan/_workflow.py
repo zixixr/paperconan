@@ -43,9 +43,8 @@ NUMERIC_CANONICALIZATION_VERSION = 1
 # can check from the source, both whole-detector skips:
 # scan_dir's `wide` gate drops detect_relations, detect_equal_pairs and
 # detect_row_pair_digit_coupling outright past
-# _MAX_BLOCK_COLS, and _ROW_REL_MAX_ROWS silently disables two detectors at 61
-# rows -- detect_row_relations loses an exact relation, and _scaled_row_candidates
-# drops the band entirely, taking identical_row_reuse with it. All while the scan
+# _MAX_BLOCK_COLS, and _ROW_REL_MAX_ROWS still disables both row-relation
+# detectors on a block past its 60-row ceiling, while the scan
 # reports itself complete. So this stays
 # False: the caveat below is over-broad, but it is true, and a wrong all-clear
 # is worse than a broad warning. No count is given here on purpose; an earlier

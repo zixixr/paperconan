@@ -142,6 +142,19 @@ def _is_derived_relation(f: dict) -> bool:
         b = " ".join(str(f.get("row_b") or "").split()).casefold()
         if a and a == b:
             return False
+    # A folded rectangle stands for many row pairs, and row_a/row_b are only the
+    # ones that built it first. Demoting the whole rectangle because that pair
+    # happened to be labelled "Mean baseline (ng)" silences every other pair in
+    # it -- and this path changes severity, not just context. Decide on all of
+    # them, and abstain when the fold did not keep all of them.
+    # Read before the representative short-circuit above would matter for a
+    # fold: that check returns False (keep), so it fails safe, but a rectangle
+    # should be decided on all its pairs either way.
+    pairs = f.get("row_labels")
+    if pairs is not None and (f.get("rows_matched") or 1) > 1:
+        if not f.get("row_labels_complete"):
+            return False
+        return all(_DERIVED_RE.search(f"{a} {b}") for a, b in pairs)
     return bool(_DERIVED_RE.search(_names_for(f)))
 
 

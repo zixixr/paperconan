@@ -578,12 +578,12 @@ def test_a_block_past_the_row_cap_loses_relations_and_says_nothing(tmp_path):
 
     detect_row_relations returns early above _ROW_REL_MAX_ROWS. That bound is a
     cost cap, not a scope rule: a 61x14 block is well inside the detector's
-    orientation (14 >= _ROW_REL_MIN_COLS), and an exact relation there is lost
-    while scan_status stays "complete". The behaviour is deliberate for now --
-    the shape is common enough that reporting it would train readers to skip
-    the coverage line -- but it is a gap, and the workflow's caveat is what
-    currently covers it. If this test starts failing because the relation is
-    found, the cap was raised: delete the test.
+    orientation, and an exact relation there is lost while scan_status stays
+    "complete". Raising it is a detection change under separate evaluation; this
+    change folds what the detector does report and leaves the ceiling alone.
+
+    If this starts failing because the relation is found, the ceiling moved:
+    read the recall and cost measurements on that change before celebrating.
     """
     import csv
 
@@ -595,14 +595,14 @@ def test_a_block_past_the_row_cap_loses_relations_and_says_nothing(tmp_path):
         with open(d / "t.csv", "w", newline="") as fh:
             csv.writer(fh).writerows(grid)
         scan = scan_dir(str(d), str(d / "out"), write_html=False)
-        return {f.get("kind") for b in scan["relations_blocks"]
-                for f in (b.get("row_relations") or [])}, scan
+        return ({f.get("kind") for b in scan["relations_blocks"]
+                 for f in (b.get("row_relations") or [])}, scan)
 
     under, _ = kinds_at(60)
     over, scan_over = kinds_at(61)
 
     assert "constant_ratio_row" in under, "fixture no longer plants a detectable relation"
-    assert "constant_ratio_row" not in over, "the row cap no longer drops it -- delete this test"
+    assert "constant_ratio_row" not in over, "the row cap no longer drops it -- see the docstring"
     assert scan_over["scan_status"] == "complete", "the gap is now reported; update this test"
 
 
@@ -673,11 +673,9 @@ def test_a_tall_band_loses_scaled_row_reuse_and_says_nothing():
 
     _scaled_row_candidates drops any band taller than the constant, so at 61
     rows this detector goes silent entirely -- including identical_row_reuse,
-    verbatim row copies across sheets. A band's height says nothing about
-    whether one of its rows is a scalar multiple of a row in another sheet, so
-    this is a cost cap, not orientation. Deliberate for now and covered only by
-    the workflow's over-broad caveat; if it is ever raised or reported, this
-    test fails loudly and should be updated.
+    verbatim row copies across sheets. Deliberate for now and covered only by
+    the workflow's over-broad caveat; raising the ceiling is under separate
+    evaluation.
     """
     import paperconan._audit as audit
     from paperconan._sheet import Sheet
@@ -696,11 +694,12 @@ def test_a_tall_band_loses_scaled_row_reuse_and_says_nothing():
             grids[(f"{name}.csv", name)] = Sheet.from_rows(rows)
         return grids
 
-    under = audit.detect_scaled_row_reuse(sheets(60), profile="review", max_findings=10**6)
-    over = audit.detect_scaled_row_reuse(sheets(61), profile="review", max_findings=10**6)
-
-    assert under, "fixture no longer produces cross-sheet row reuse at 60 rows"
-    assert not over, "the band ceiling no longer silences this detector -- update this test"
+    assert audit.detect_scaled_row_reuse(sheets(60), profile="review",
+                                         max_findings=10**6), "fixture broke"
+    assert not audit.detect_scaled_row_reuse(sheets(61), profile="review",
+                                             max_findings=10**6), (
+        "the band ceiling no longer silences this detector -- see the docstring"
+    )
 
 
 def test_the_html_coverage_row_distinguishes_one_capped_detector_from_another(tmp_path):
@@ -1063,4 +1062,589 @@ def test_two_budgets_in_one_detector_survive_a_real_scan(tmp_path, monkeypatch):
     assert len(reasons) >= 2, (
         f"both starved budgets collapsed to {reasons}; a reader is told one pass "
         f"was bounded and cannot learn the other was too"
+    )
+
+
+def _duplicated_rectangle(n_rows=60, shared_cols=14):
+    """Two sheets sharing a leading run of columns over their whole height.
+
+    The shape a shared control cohort makes: every row of one block matches the
+    positionally corresponding row of the other, so the detector sees n_rows
+    matches for a single duplicated rectangle.
+    """
+    from paperconan._sheet import Sheet
+
+    vec = [13.40712, 27.91834, 8.52619, 41.06375, 19.73408, 33.28951, 22.61483,
+           9.34026, 37.15792, 14.80613, 29.47158, 6.92374, 31.08627, 17.25913]
+    grids = {}
+    for name in ("Figure 7a", "Figure 7b"):
+        rows = [[f"c{j}" for j in range(shared_cols)]]
+        for i in range(n_rows):
+            rows.append([round(v * (1 + 0.017 * i) + 0.7 * i, 5) for v in vec])
+        grids[(f"{name}.csv", name)] = Sheet.from_rows(rows)
+    return grids
+
+
+def test_a_duplicated_rectangle_is_one_finding_not_one_per_row():
+    """A shared rectangle is one event however many rows it spans.
+
+    Two blocks sharing a leading run of columns match row-for-row down their
+    whole height. Emitting a finding per row produced 117 restatements of a
+    single shared control cohort on a real supplement, which then filled the
+    result cap and evicted unrelated findings elsewhere in the scan.
+    """
+    import paperconan._audit as audit
+
+    found = audit.detect_scaled_row_reuse(_duplicated_rectangle(60),
+                                          profile="review", max_findings=10**6)
+    reuse = [f for f in found if f["kind"] == "identical_row_reuse"]
+
+    assert len(reuse) == 1, (
+        f"one duplicated rectangle produced {len(reuse)} findings; rows are not "
+        f"folding into their rectangle"
+    )
+    assert reuse[0]["rows_matched"] == 60, reuse[0]["rows_matched"]
+    assert reuse[0]["distinct_rows_matched"] == 60
+    assert reuse[0]["matched_row_pairs"], "the folded finding names none of its rows"
+    # json.dump(..., default=str) stringifies a leaked set instead of raising, so
+    # internal accumulator state reaches scan.json with nothing failing.
+    leaked = [k for f in reuse for k in f if k.startswith("_")]
+    assert not leaked, f"internal keys reached the finding: {sorted(set(leaked))}"
+    assert len(reuse[0]["matched_row_pairs"]) <= 5, "the examples are not bounded"
+    assert "60 rows" in reuse[0]["rule"], (
+        f"the rule still describes one row: {reuse[0]['rule']}"
+    )
+
+
+def test_restatements_of_one_rectangle_do_not_consume_the_result_cap():
+    """The cap bounds findings; it must not be spent on one event's rows.
+
+    The break abandons both loops, so restatements filling the cap stopped the
+    search before it reached other sheets -- on real data that cost three
+    cross-file findings in a different workbook.
+    """
+    import paperconan._audit as audit
+
+    coverage = ScanCoverage(files_discovered=2)
+    found = audit.detect_scaled_row_reuse(_duplicated_rectangle(60),
+                                          profile="review", max_findings=3,
+                                          coverage=coverage)
+
+    assert found, "the fixture produced nothing"
+    reasons = [i["reason"] for i in coverage.to_dict()["limitations"]]
+    assert "detector_finding_limit" not in reasons, (
+        f"a 60-row rectangle exhausted a 3-finding cap: {reasons}"
+    )
+
+
+def test_the_candidate_pool_cut_does_not_exclude_whole_sheets():
+    """Which sheets get compared must not depend on filename order.
+
+    The pool is built file by file, so cutting the first max_candidates examined
+    the early files exhaustively and the later ones not at all -- on one paper
+    11,804 candidates cut to 1,500 meant whole workbooks were never compared. A
+    cross-sheet detector cannot see a match unless both sides survive the cut.
+    """
+    from paperconan._audit import _stratified_head
+
+    pool = [{"file": f"f{s}.xlsx", "sheet": f"Figure {s}a", "row": r}
+            for s in range(12) for r in range(60)]
+
+    cut = _stratified_head(pool, 24)
+
+    assert len(cut) == 24
+    assert len({(c["file"], c["sheet"]) for c in cut}) == 12, (
+        "a 24-candidate cut over 12 sheets missed some of them; the cut is "
+        "positional, so later sheets are never compared"
+    )
+    # And it must still be a prefix-like cut within each sheet, so the result is
+    # deterministic for a given input rather than a sample.
+    assert [c["row"] for c in cut if c["file"] == "f0.xlsx"] == [0, 1]
+
+
+def test_the_stratified_head_canonicalizes_an_unsorted_pool():
+    """Discovery order must affect neither selection nor comparison direction.
+
+    The remainder at a non-divisible cap belongs to the canonical first sheet,
+    and rows within each sheet are selected from their canonical head.  The
+    returned candidates are then globally canonical rather than left in
+    round-robin order.
+    """
+    from paperconan._audit import _stratified_head
+
+    pool = [
+        {"file": "z.xlsx", "sheet": "Figure 2", "row": 9},
+        {"file": "a.xlsx", "sheet": "Figure 1", "row": 4},
+        {"file": "z.xlsx", "sheet": "Figure 2", "row": 1},
+        {"file": "a.xlsx", "sheet": "Figure 1", "row": 0},
+    ]
+
+    cut = _stratified_head(pool, 3)
+
+    assert [(c["file"], c["sheet"], c["row"]) for c in cut] == [
+        ("a.xlsx", "Figure 1", 0),
+        ("a.xlsx", "Figure 1", 4),
+        ("z.xlsx", "Figure 2", 1),
+    ]
+
+
+def test_the_detector_cuts_its_pool_through_the_stratified_head():
+    """Testing the helper says nothing about whether the detector calls it.
+
+    A positional cut leaves later sheets entirely uncompared, so a match that
+    needs one of them is invisible. Driven end to end: the planted rectangle is
+    on the last two sheets, and the cap admits far fewer candidates than the
+    pool holds.
+    """
+    import paperconan._audit as audit
+    from paperconan._sheet import Sheet
+
+    vec = [13.40712, 27.91834, 8.52619, 41.06375, 19.73408, 33.28951, 22.61483,
+           9.34026, 37.15792, 14.80613, 29.47158, 6.92374, 31.08627, 17.25913]
+    grids = {}
+    for s in range(12):
+        rows = [[f"c{j}" for j in range(14)]]
+        for i in range(40):
+            # The last two sheets carry the same block; every other sheet differs.
+            off = 0.0 if s >= 10 else 0.31 * s
+            rows.append([round(v * (1 + 0.017 * i) + off + 0.7 * i, 5) for v in vec])
+        grids[(f"Figure {s}a.csv", f"Figure {s}a")] = Sheet.from_rows(rows)
+    found = audit.detect_scaled_row_reuse(grids, profile="review",
+                                          max_candidates=48, max_findings=10**6)
+
+    pairs = {(f["sheet_a"], f["sheet_b"]) for f in found}
+    assert ("Figure 10a", "Figure 11a") in pairs, (
+        f"the match on the last two sheets was not found; the pool cut dropped "
+        f"them. found: {sorted(pairs)}"
+    )
+
+
+def _panels(rows_a, rows_b, *, ratio=1.0, label=None, n=12, cols=14):
+    """Two panels of one figure, the second a copy (or scalar multiple) of the first."""
+    from paperconan._sheet import Sheet
+
+    import numpy as np
+
+    rng = np.random.default_rng(20260728)
+    # Irregular per row: a smooth progression makes _vector_is_patterned drop
+    # most candidates, which left an earlier version of this fixture with two
+    # matched rows -- under the benign threshold, so it could not discriminate.
+    base = [[round(float(rng.uniform(5, 500)), 5) for _ in range(cols)]
+            for _ in range(n)]
+    grids = {}
+    for name, labels, k in (("Figure 3a", rows_a, 1.0), ("Figure 3b", rows_b, ratio)):
+        out = [[f"c{j}" for j in range(cols + 1)]]
+        for i in range(n):
+            out.append([labels[i] if labels else None,
+                        *[round(v * k, 6) for v in base[i]]])
+        grids[(f"{name}.csv", name)] = Sheet.from_rows(out)
+    return grids
+
+
+def test_a_scaled_rectangle_is_not_explained_as_a_shared_control():
+    """A shared control replot is k == 1; a shared axis cannot be rescaled.
+
+    An arbitrary constant between two panels is this detector's strongest
+    signal. The unnamed-rectangle branch fired for any ratio, so a 10-row block
+    at x1.14 across two panels came back as "usually a shared control".
+    """
+    import paperconan._audit as audit
+
+    # ratio=2.0, not 1.14: at 1.14 six-decimal rounding breaks the constant-ratio
+    # run at a different column per row, so the rectangle fragments into findings
+    # of at most five rows and never reaches the benign gate -- the test passed on
+    # the very code it was written to catch.
+    found = audit.detect_scaled_row_reuse(_panels(None, None, ratio=2.0),
+                                          profile="review", max_findings=10**6)
+    scaled = [f for f in found if f["kind"] == "scaled_row_reuse"]
+    assert scaled, "fixture no longer produces a scaled reuse"
+    # The missing assertion is what made this unfalsifiable at ratio 1.14: the
+    # rectangle fragmented below the gate, so the branch under test was never
+    # reached and the test passed on the code it was written to catch.
+    assert max(f["distinct_rows_matched"] for f in scaled) >= 8, (
+        "fixture no longer reaches the benign gate; this test cannot fail"
+    )
+    assert all(f.get("likely_benign") is None for f in scaled), (
+        f"a scaled rectangle was explained away: {scaled[0]['likely_benign']}"
+    )
+
+
+def test_named_arms_copying_each_other_stay_unexplained():
+    """Rows that carry names state what they are.
+
+    Two differently-named treatment arms matching is what the branch above the
+    fold deliberately leaves unexplained, and the shipped skill says so. The
+    unnamed-rectangle branch overrode that for any block of 8 rows or more.
+    """
+    import paperconan._audit as audit
+
+    a = [f"Vehicle mouse {i}" for i in range(12)]
+    b = [f"Drug-treated mouse {i}" for i in range(12)]
+    found = audit.detect_scaled_row_reuse(_panels(a, b), profile="review",
+                                          max_findings=10**6)
+    reuse = [f for f in found if f["kind"] == "identical_row_reuse"]
+    assert reuse, "fixture no longer produces a reuse"
+    assert all(f.get("likely_benign") is None for f in reuse), (
+        f"differently-named arms were explained away: {reuse[0]['likely_benign']}"
+    )
+
+
+def test_an_unnamed_rectangle_across_two_panels_carries_its_context():
+    """The case that motivated the branch: positional rows, one figure.
+
+    Measured on a real supplement as 117 aligned rows disclosed in that figure's
+    own legend as a shared control, reported high with no context.
+    """
+    import paperconan._audit as audit
+
+    found = audit.detect_scaled_row_reuse(_panels(None, None), profile="review",
+                                          max_findings=10**6)
+    reuse = [f for f in found if f["kind"] == "identical_row_reuse"]
+    assert reuse, "fixture no longer produces a reuse"
+    assert any("shared control" in (f.get("likely_benign") or "") for f in reuse), (
+        f"the unnamed rectangle carries no context: {reuse[0].get('likely_benign')}"
+    )
+
+
+def test_one_row_repeated_many_times_is_one_row_not_many():
+    """`rows_matched` counts pairs; the rule and the benign gate speak of rows.
+
+    A single row of a small block reappearing nine times in the other panel is
+    nine pairs and one row. Counted as rows it both contradicts itself -- a
+    four-row block described as nine rows -- and crosses the benign threshold,
+    handing "usually a shared control" to one donor's values reappearing as nine
+    replicates, which is the opposite of benign.
+    """
+    import paperconan._audit as audit
+    from paperconan._sheet import Sheet
+
+    vec = [13.40712, 27.91834, 8.52619, 41.06375, 19.73408, 33.28951, 22.61483,
+           9.34026, 37.15792, 14.80613, 29.47158, 6.92374, 31.08627, 17.25913]
+    a = [[f"c{j}" for j in range(14)]]
+    for i in range(4):
+        a.append([round(v * (1 + 0.05 * i), 6) for v in vec])
+    b = [[f"c{j}" for j in range(14)]]
+    for _ in range(9):                      # row 0 of A, nine times over
+        b.append([round(v, 6) for v in vec])
+    grids = {("Figure 4a.csv", "Figure 4a"): Sheet.from_rows(a),
+             ("Figure 4b.csv", "Figure 4b"): Sheet.from_rows(b)}
+
+    found = [f for f in audit.detect_scaled_row_reuse(grids, profile="review",
+                                                      max_findings=10**6)
+             if f["kind"] == "identical_row_reuse"]
+    assert found, "fixture no longer produces a reuse"
+    f = found[0]
+
+    assert f["distinct_rows_matched"] == 1, (
+        f"one repeated row counted as {f['distinct_rows_matched']} rows"
+    )
+    assert f["rows_matched"] > f["distinct_rows_matched"], "fixture is not discriminating"
+    assert f.get("likely_benign") is None, (
+        f"one row reappearing {f['rows_matched']} times was explained away: "
+        f"{f['likely_benign']}"
+    )
+
+
+def test_the_repeated_row_case_holds_in_either_panel_order():
+    """Which panel is A is decided by sheet order, so the gate cannot read one side.
+
+    Nine replicates of one row is nine pairs and one row whichever panel the
+    loop reaches first. Counting only the A side made the answer depend on
+    filename order: reversed, the same data read as nine rows and crossed the
+    benign gate.
+    """
+    import paperconan._audit as audit
+    from paperconan._sheet import Sheet
+
+    vec = [13.40712, 27.91834, 8.52619, 41.06375, 19.73408, 33.28951, 22.61483,
+           9.34026, 37.15792, 14.80613, 29.47158, 6.92374, 31.08627, 17.25913]
+    small = [[f"c{j}" for j in range(14)]]
+    for i in range(4):
+        small.append([round(v * (1 + 0.05 * i), 6) for v in vec])
+    many = [[f"c{j}" for j in range(14)]]
+    for _ in range(9):
+        many.append([round(v, 6) for v in vec])
+
+    for order in (("Figure 4a", small, "Figure 4b", many),
+                  ("Figure 4a", many, "Figure 4b", small)):
+        na, ra, nb, rb = order
+        grids = {(f"{na}.csv", na): Sheet.from_rows(ra),
+                 (f"{nb}.csv", nb): Sheet.from_rows(rb)}
+        found = [f for f in audit.detect_scaled_row_reuse(grids, profile="review",
+                                                          max_findings=10**6)
+                 if f["kind"] == "identical_row_reuse"]
+        assert found, f"fixture produced nothing for {na}={len(ra)} rows"
+        f = found[0]
+        assert f["distinct_rows_matched"] == 1, (
+            f"one repeated row counted as {f['distinct_rows_matched']} with "
+            f"{na} first"
+        )
+        assert f.get("likely_benign") is None, (
+            f"nine replicates of one row were explained away with {na} first"
+        )
+
+
+def test_a_blank_first_row_does_not_make_a_named_rectangle_unnamed():
+    """The gate has to see every row it folded, not one representative pair.
+
+    row_a/row_b are the labels of whichever pair built the rectangle first. A
+    supplement whose first data row carries no label, with named treatment arms
+    below it, answered "unnamed" and got the shared-control note while its own
+    matched_row_pairs listed Vehicle against Drug-treated.
+    """
+    import paperconan._audit as audit
+
+    a = [None] + [f"Vehicle mouse {i}" for i in range(1, 12)]
+    b = [None] + [f"Drug-treated mouse {i}" for i in range(1, 12)]
+    found = [f for f in audit.detect_scaled_row_reuse(_panels(a, b),
+                                                      profile="review",
+                                                      max_findings=10**6)
+             if f["kind"] == "identical_row_reuse"]
+    assert found, "fixture no longer produces a reuse"
+    f = found[0]
+    assert f["distinct_rows_matched"] >= 8, "fixture must reach the benign gate"
+    assert f.get("likely_benign") is None, (
+        f"a rectangle of named arms with one blank row was explained away: "
+        f"{f['likely_benign']}\nrows: {f['matched_row_pairs']}"
+    )
+
+
+def test_one_same_named_pair_does_not_excuse_the_rectangle_behind_it():
+    """The sibling of the branch fixed last round, with the identical defect.
+
+    row_a/row_b are the labels of whichever pair built the rectangle first, so a
+    single Control-vs-Control pair explained away eleven Vehicle-vs-Drug-treated
+    pairs folded in behind it. That branch has no row-count floor and sits above
+    the scaled early return, so it reached further than the one below it.
+    """
+    import paperconan._audit as audit
+
+    a = ["Control"] + [f"Vehicle mouse {i}" for i in range(1, 12)]
+    b = ["Control"] + [f"Drug-treated mouse {i}" for i in range(1, 12)]
+    found = [f for f in audit.detect_scaled_row_reuse(_panels(a, b),
+                                                      profile="review",
+                                                      max_findings=10**6)
+             if f["kind"] == "identical_row_reuse"]
+    assert found, "fixture no longer produces a reuse"
+    f = found[0]
+    assert f["rows_matched"] > 1, "fixture must fold"
+    assert f.get("likely_benign") is None, (
+        f"one same-named pair excused the rectangle: {f['likely_benign']}\n"
+        f"rows: {f['matched_row_pairs']}"
+    )
+
+
+def test_one_derived_looking_label_does_not_demote_the_rectangle():
+    """The same defect on the path that changes severity rather than context.
+
+    _is_derived_relation read row_a/row_b too. One incidental "Mean baseline
+    (ng)" in the pair that built the rectangle demoted every other pair in it --
+    to low under review, hidden under triage.
+    """
+    import paperconan._audit as audit
+
+    # Different labels on the two sides: an identical pair short-circuits to
+    # "not derived" before _DERIVED_RE is consulted, so a same-label fixture
+    # cannot exercise this path at all.
+    a = ["Mean baseline (ng)"] + [f"Arm A {i}" for i in range(1, 12)]
+    b = ["Normalized signal (%)"] + [f"Arm B {i}" for i in range(1, 12)]
+    found = [f for f in audit.detect_scaled_row_reuse(_panels(a, b, ratio=2.0),
+                                                      profile="review",
+                                                      max_findings=10**6)
+             if f["kind"] == "scaled_row_reuse"]
+    assert found, "fixture no longer produces a scaled reuse"
+    f = found[0]
+    assert f["rows_matched"] > 1, "fixture must fold"
+    assert f.get("profile_action") != "demoted", (
+        f"one derived-looking label demoted the whole rectangle; rows: "
+        f"{f['matched_row_pairs']}"
+    )
+
+
+def test_a_permuted_rectangle_does_not_split_when_the_pool_truncates():
+    """Fair truncation must preserve the canonical comparison direction.
+
+    _stratified_head interleaves sheets while selecting candidates.  Returning
+    that rotation order directly makes an off-diagonal pair arrive reversed:
+    scaled pairs key on 1/k, and row sets can acquire indices from the wrong
+    sheet.  The selected set is therefore restored to canonical order before
+    comparison.  Both kinds and their counts are asserted because a fold that
+    merges but miscounts passes a count-free test.
+    """
+    import numpy as np
+
+    import paperconan._audit as audit
+    from paperconan._sheet import Sheet
+
+    rng = np.random.default_rng(5)
+    base = [[round(float(rng.uniform(5, 500)), 5) for _ in range(14)]
+            for _ in range(12)]
+
+    def sheets(k):
+        grids = {}
+        for name, rows in (("Figure 9a", base), ("Figure 9b", list(reversed(base)))):
+            scale = k if name.endswith("b") else 1.0
+            out = [[f"c{j}" for j in range(14)]]
+            out += [[round(v * scale, 6) for v in r] for r in rows]
+            grids[(f"{name}.csv", name)] = Sheet.from_rows(out)
+        return grids
+
+    # cap=20 is where returning the rotation order directly splits the scaled
+    # case into k=2 and k=0.5. A larger cap merges by luck, which is how an
+    # earlier version of this test passed on the unfixed code.
+    for k, kind in ((1.0, "identical_row_reuse"), (2.0, "scaled_row_reuse")):
+        for cap in (10 ** 6, 20):
+            found = [f for f in audit.detect_scaled_row_reuse(
+                sheets(k), profile="review", max_candidates=cap,
+                max_findings=10 ** 6) if f["kind"] == kind]
+            assert len(found) == 1, (
+                f"{kind} at max_candidates={cap} split into {len(found)}: "
+                f"{[(f['sheet_a'], f['sheet_b'], f['ratio']) for f in found]}"
+            )
+            f = found[0]
+            assert f["ratio"] == k, (
+                f"{kind} reported k={f['ratio']} for a x{k} rectangle; the pair "
+                f"was not compared in canonical order"
+            )
+            # Asserted at both caps. Guarding it to the untruncated one left
+            # the count unchecked at exactly the cap where the reversal occurs,
+            # so the row-set cross-contamination passed the whole suite.
+            expected = 12 if cap > 10 ** 5 else 8
+            assert f["distinct_rows_matched"] == expected, (
+                f"{kind} at max_candidates={cap} counted "
+                f"{f['distinct_rows_matched']} of {expected} rows; the row sets "
+                f"mixed the two sheets"
+            )
+
+
+def test_a_small_unnamed_rectangle_keeps_no_shared_control_excuse():
+    """The floor is pinned from above but not from below.
+
+    _ROW_REUSE_BENIGN_ROWS says it is "kept above a handful so a genuine two- or
+    three-row reuse is not explained away" -- lowering it to 2 left the suite
+    green, and below is the direction where a real small reuse acquires an
+    excuse.
+    """
+    import paperconan._audit as audit
+
+    found = [f for f in audit.detect_scaled_row_reuse(_panels(None, None, n=3),
+                                                      profile="review",
+                                                      max_findings=10 ** 6)
+             if f["kind"] == "identical_row_reuse"]
+    assert found, "fixture no longer produces a reuse"
+    assert found[0]["distinct_rows_matched"] <= 3, "fixture must stay small"
+    assert found[0].get("likely_benign") is None, (
+        f"a {found[0]['distinct_rows_matched']}-row reuse was explained away: "
+        f"{found[0]['likely_benign']}"
+    )
+
+
+def test_a_fully_derived_rectangle_demotes_and_an_overflowed_one_does_not():
+    """The demote arm had no coverage: nothing showed it can fire at all.
+
+    Both mutations survived -- never demoting a folded rectangle, and forcing
+    every fold to abstain -- so the tests could not tell deliberate abstention
+    from a dead branch.
+    """
+    import paperconan._audit as audit
+
+    derived_a = [f"Mean of {i} (ng/mL)" for i in range(12)]
+    derived_b = [f"Normalized {i} (%)" for i in range(12)]
+
+    found = [f for f in audit.detect_scaled_row_reuse(
+        _panels(derived_a, derived_b, ratio=2.0), profile="review",
+        max_findings=10 ** 6) if f["kind"] == "scaled_row_reuse"]
+    assert found, "fixture no longer produces a scaled reuse"
+    assert found[0]["rows_matched"] > 1, "fixture must fold"
+    assert found[0].get("profile_action") == "demoted", (
+        f"a rectangle whose every label is derived-looking was not demoted: "
+        f"{found[0].get('profile_action')}"
+    )
+
+
+def test_a_fold_that_overflows_its_label_cap_is_kept_not_demoted(monkeypatch):
+    """Abstention on overflow, asserted rather than inferred."""
+    import paperconan._audit as audit
+
+    monkeypatch.setattr(audit, "_ROW_REUSE_LABEL_CAP", 2)
+    derived_a = [f"Mean of {i} (ng/mL)" for i in range(12)]
+    derived_b = [f"Normalized {i} (%)" for i in range(12)]
+
+    found = [f for f in audit.detect_scaled_row_reuse(
+        _panels(derived_a, derived_b, ratio=2.0), profile="review",
+        max_findings=10 ** 6) if f["kind"] == "scaled_row_reuse"]
+    assert found, "fixture no longer produces a scaled reuse"
+    assert found[0]["row_labels_complete"] is False, "fixture must overflow the cap"
+    assert found[0].get("profile_action") != "demoted", (
+        "a fold whose labels were not all kept was demoted anyway"
+    )
+
+
+def test_a_rectangle_is_found_whole_when_tab_order_is_not_alphabetical():
+    """Workbook tab order must not determine candidate or pair direction.
+
+    Tab order is discovery metadata and can be the reverse of lexical sheet
+    order.  Candidate normalization happens before comparison, so a six-row
+    rectangle must be recovered whole without mutating A/B inside the pair loop.
+    """
+    import numpy as np
+
+    import paperconan._audit as audit
+    from paperconan._sheet import Sheet
+
+    rng = np.random.default_rng(11)
+    rows = [[round(float(rng.uniform(5, 500)), 5) for _ in range(14)]
+            for _ in range(6)]
+
+    grids = {}
+    # Tab order deliberately the reverse of lexicographic order.
+    for name in ("Source Data Fig 2", "Extended Data Fig 2"):
+        grids[("wb.xlsx", name)] = Sheet.from_rows(
+            [[f"c{j}" for j in range(14)]] + [list(r) for r in rows])
+
+    found = [f for f in audit.detect_scaled_row_reuse(grids, profile="review",
+                                                      max_findings=10 ** 6)
+             if f["kind"] == "identical_row_reuse"]
+
+    assert len(found) == 1, f"expected one rectangle, got {len(found)}"
+    assert found[0]["distinct_rows_matched"] == 6, (
+        f"the rectangle reported {found[0]['distinct_rows_matched']} of 6 rows; "
+        f"candidate normalization did not preserve the whole fold"
+    )
+    assert found[0]["rows_matched"] == 6, found[0]["rows_matched"]
+
+
+def test_the_rule_states_the_ratio_in_the_direction_it_was_measured():
+    """The sentence a reader takes to the spreadsheet has to be the right way round.
+
+    k is mean(b/a), so sheet_b is k x sheet_a. Candidate normalization fixes
+    which sheet is A before measurement; the rule must state that same direction.
+    An inverted claim either burns the check or reads as a data inconsistency
+    that is not present.
+    """
+    import numpy as np
+
+    import paperconan._audit as audit
+    from paperconan._sheet import Sheet
+
+    rng = np.random.default_rng(3)
+    base = [[round(float(rng.uniform(5, 500)), 5) for _ in range(14)]
+            for _ in range(3)]
+    grids = {}
+    for name, k in (("Figure 9a", 1.0), ("Figure 9b", 2.0)):   # 9b = 2 x 9a
+        grids[(f"{name}.csv", name)] = Sheet.from_rows(
+            [[f"c{j}" for j in range(14)]]
+            + [[round(v * k, 6) for v in r] for r in base])
+
+    found = [f for f in audit.detect_scaled_row_reuse(grids, profile="review",
+                                                      max_findings=10 ** 6)
+             if f["kind"] == "scaled_row_reuse"]
+    assert found, "fixture no longer produces a scaled reuse"
+    rule = found[0]["rule"]
+
+    assert "of Figure 9b" in rule.split(" are ")[0], (
+        f"the multiple is attributed to the wrong sheet: {rule}"
+    )
+    assert "are 2 x rows of Figure 9a" in rule, (
+        f"the ratio direction is inverted: {rule}"
     )

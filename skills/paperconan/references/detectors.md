@@ -188,8 +188,9 @@
 ### `scaled_row_reuse` / `identical_row_reuse`
 - **原理**：`constant_ratio_row` / `identical_row` 的**跨块 / 跨 sheet** 版。把每张表按连续数据行切成 band（cohort 块），比较**不同 band 或不同 sheet** 的行对（只比不同 band，避免与同块的 `constant_ratio_row` 重复），找 `row_b = row_a × k`（k≠1，`scaled`）或逐值完全相同（k=1，`identical`）的最长连续列段。带候选/预算上限，超限走 stderr、不静默截断。
 - **典型命中**：同一条件在两种处理下应独立，却是标量倍关系（DMSO 组 `shUSP15-2+pPARP1` = MMS 组同条件 × 1.05，逐列 204 格全中）；某队列的数据组原样出现在另一队列/图。
-- **常见误报**：power-of-ten 比值标 benign；**同图号 + 不同 sheet + 同名行**的 `identical_row_reuse` 视为跨面板共享对照（benign）；同 sheet 跨 block（如 DMSO↔MMS）和不同名行保持 HIGH。
-- **解读时**：看 `ratio`/`run_length`/`same_sheet`/`same_figure`/`block_a`/`block_b`；`same_sheet=true` 的跨块关系（两处理臂之间）最值得看。
+- **常见误报**：power-of-ten 比值标 benign；**同图号 + 不同 sheet** 且满足以下之一的 `identical_row_reuse` 视为跨面板共享对照（benign）——**所有**行对同名，或**所有**行都无名（位置标签）且匹配行数 ≥8。判据取自整个折叠矩形，不是某一对代表行。同 sheet 跨 block（如 DMSO↔MMS）和混有具名不同名行保持 HIGH。**注意一个例外**：同名行那条分支在代码里排在"仅限 k=1"的判断之前，所以两行**同名**且跨面板时，即使是任意常数比的 `scaled_row_reuse` 也会拿到共享对照注记——而跨面板的任意常数比正是本检测器最强的信号之一。看到 `scaled_row_reuse` 带 benign 注记时，请核对两行是否真的同名同物，注记不构成排除理由。
+- **一条 finding 可能代表整个矩形**：两块共享前若干列时会逐行匹配，这些行**折叠成一条**。读 `distinct_rows_matched`（匹配的行数）、`rows_matched`（行对数，一行被复制多次时会大于前者）、`matched_row_pairs`（前几对行标签的样例）。`row_a`/`row_b` 只是**建起该矩形的第一对**，不代表整体——判断整体请看 `all_rows_unnamed` / `all_rows_same_named` / `row_labels`（`row_labels_complete=false` 表示标签未全部保留，此时不应据其下结论）。
+- **解读时**：看 `ratio`/`run_length`/`same_sheet`/`same_figure`/`block_a`/`block_b` 与上面的折叠字段；`same_sheet=true` 的跨块关系（两处理臂之间）最值得看。
 
 ---
 
