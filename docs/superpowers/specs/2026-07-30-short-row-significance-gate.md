@@ -149,6 +149,17 @@ Treated  35.43   49.54   16.29   59.87   28.46   22.33   41.22   51.95
 已提交的强关系 fixture 必须保留，除非经结构证据证明它属于另一种明确关系类型，并同步修改设计和回归
 测试。不得只因为总数相同就接受一组 `+N/-N`。
 
+回归硬锚点分两层：
+
+1. 仓库已提交的强关系 fixture；
+2. gitignored 的本地锚点清单，只收录 #56 新覆盖中已经独立人工复核、确认可被同一个 `k` 逐格重建且
+   不属于当前已知结构解释的**具体候选**。
+
+第二层不把整份文件的全部现有输出锁成真值，也不得把论文是否撤稿作为候选标签；撤稿状态与某个具体数值
+关系是否构成高置信统计信号是两个独立问题。本地清单只保存复核所需的候选身份与预期 context，不把真实
+数据、DOI 或复核判断提交到 git。两层锚点都必须在原始 sheet 规模下继续过门槛并得到预期结构分类，
+否则阻塞正式替换。
+
 ---
 
 ## 4. 有效记录步长
@@ -353,6 +364,43 @@ M2 必须在语料和零假设台架上验证 20 bits。若它不能同时满足
 score(8列、2位小数) > score(3列、高精度)
 ```
 
+### 6.5 表大小敏感性必须量出来
+
+`-log2(n_tests)` 有意惩罚更大的搜索域，所以同一条关系放进更大的 sheet 后会降分。这在多重搜索意义上
+合理，但会带来检出能力差异，不能只验证小面板。
+
+M2 必须产出：
+
+- 212 份语料的 `n_tests` 与 `log2(n_tests)` 分布；
+- 所有 shadow 候选相对 20-bit 门槛的 margin 分布，并按 sheet 行数分层；
+- 把完全相同的 planted relation 嵌入 2、10、30、100、400 行无关背景后的 padding 曲线；
+- 每个 committed / 本地强锚点在原始 sheet 规模下的 raw bits、搜索惩罚与最终 margin；
+- 每个锚点在 padding 曲线中第一次跌破 20 bits 的行数。
+
+padding 实验用于决定惩罚应继续按整 sheet、structural block 还是 block pair 计，不预设结果。任何强锚点
+在其**原始 sheet 规模**下跌破门槛都直接阻塞；不得通过 cap `n_tests` 或按当前 fixture 特调门槛绕过。
+
+### 6.6 两列 run 的显式边界
+
+两个目标值 `x < y` 在线性百分位定义下满足：
+
+```text
+percentile90 - percentile10 = 0.8 * (y - x)
+```
+
+所以两列 run 不会一律退化；但当目标值相同或只差一个量化格时，`R` 会被 `median(q)` 托到约 `q`，
+`G_i=1`，唯一确认格贡献 0 bits。这应是可见、固定的拒绝行为。
+
+M2 固定测试目标值：
+
+- 相同量化格；
+- 相邻 1 个量化格；
+- 相隔 2、10、100 个量化格；
+- 源值不同但目标值因取整相同；
+- 两个生成方向各自的 `R`、`G_i` 和最终分数。
+
+相同或相邻量化格的两列候选不得过 20-bit 门槛；若未来改变百分位或 `R` 定义，这组测试必须变红。
+
 ---
 
 ## 7. 结构分类与误报控制
@@ -390,7 +438,7 @@ ratio 臂的数据行最低定义：
 | context class | 判定 | 处理 |
 |---|---|---|
 | `isolated_cross_block_ratio` | 两行分属不同 structural block，关系孤立 | 输出待复核统计信号 |
-| `partial_within_block_ratio` | 同 block，但只覆盖部分可比较列 | 输出；报告部分区间 |
+| `partial_within_block_ratio` | 同 block，但只覆盖部分可比较列 | 先进入 block 内关系图；只有未被系列/比例族解释的孤立边才输出 |
 | `within_block_global_scale` | 同 block 且覆盖 >=85% 可比较列 | 先进入 block 内关系图，再按下述确定顺序处理 |
 | `proportional_series` | 邻近多行在相同列域形成连续比例关系 | 作为曲线/序列结构解释，不输出 pair finding |
 | `proportional_family` | 同一 block 内比例关系图密集 | 输出至多一条 `medium` 表级模式，禁止逐对占满 finding cap |
@@ -400,20 +448,26 @@ ratio 臂的数据行最低定义：
 系列与比例族使用确定性的 block 内关系图：
 
 - 节点是 structural block 中的数据行；
-- 只有覆盖 `>=85%` 可比较列的 qualifying global-scale relation 才形成边；
-- `proportional_series` 是至少 3 个连续数据行组成的链，链上每一对相邻行都有边；
+- 所有过 20 bits 的同 block qualifying relation 都形成边，并保留它是 partial 还是 global；
+- 两条边属于同一列域，当且仅当它们的 run 至少重叠 2 个有信息列，且交集长度至少为较短 run 的 50%；
+- `proportional_series` 是至少 3 个连续数据行组成的链，链上每一对相邻行都有同列域边；
 - `proportional_family` 是至少 4 个节点的连通分量，且无向边密度
   `2E / (V*(V-1)) >= 0.5`；
 - 同一分量同时满足两者时，密集的 `proportional_family` 优先；否则连续链按
   `proportional_series` 处理。
 
-block 内 global-scale edge 的处理顺序固定为：
+block 内 edge 的处理顺序固定为：
 
 1. 先折叠所有 `proportional_family`，使用既有 `scaled_row_reuse` kind、`medium` severity 和
    `context_class="proportional_family"`，每个分量至多一条；
-2. 剩余边中，连续链和单独的相邻行边都作为曲线/序列结构解释，不输出 pair finding；
-3. 剩余的非相邻、非密集 global-scale edge 以
+2. 剩余边中的 `proportional_series` 作为曲线/序列结构解释，不输出链内 pair finding；
+3. 剩余的相邻 global-scale edge 即使没有形成 3 行链，也作为单步曲线/全局缩放解释，不输出 pair
+   finding；
+4. 剩余的非相邻、非密集 global-scale edge 以
    `context_class="within_block_global_scale"` 输出，不能仅因同 block 而静默删除。
+5. 剩余的 partial edge（包括没有形成系列的相邻 partial edge）以
+   `context_class="partial_within_block_ratio"` 输出；这保留 #56 已覆盖的相邻部分区间关系，但其最终
+   数量仍受 §7.5 的曲线阻塞闸约束。
 
 两类聚合都以 structural block 为边界。跨多个明确分隔面板的 qualifying relation 永远不因 block 内图
 密集而删除。以跨 block 关系为边再建一张图：单边输出普通 `isolated_cross_block_ratio`；含至少 2 条边
@@ -427,6 +481,71 @@ block 内 global-scale edge 的处理顺序固定为：
   `_is_short_hp` 候选。
 - `_vector_is_patterned`：保留为行语义特征；等差/等比坐标行不进入孤立 ratio 输出。
 - `_same_band`：ratio 臂删除，职责由 `row_layout` 和关系后的 context class 接管。
+
+### 7.5 曲线台架是带数字的阻塞闸
+
+20 bits 不能单独解释曲线。以 30 行 × 8 列、每个确认格约 9 bits 的 2 位小数曲线为例：
+
+```text
+n_tests                 = 2 * C(30, 2) * 7 = 6090
+log2(n_tests)            = 12.57
+3列 prediction_bits     ~= 2 * 9 - 12.57 = 5.43
+6列 prediction_bits     ~= 5 * 9 - 12.57 = 32.43
+```
+
+6 列部分匹配会越过 20 bits；因此必须由关系图和 context classification 处理，不能宣称分数自己兜住。
+
+M0 把 §2.4 曲线生成器的 seed、参数、运行命令与当前 detector 最终输出冻结成 baseline artifact。M3 同时
+记录：
+
+```text
+raw_over_20_bits
+proportional_series_edges
+proportional_family_edges
+final_isolated_scaled_row_reuse
+```
+
+阻塞条件针对**结构分类后的最终孤立输出**，不是 raw 候选：
+
+```text
+final_isolated_new(curve, 1dp) = 0
+final_isolated_new(curve, 2dp) = 0
+final_isolated_new(curve, d>=3, run_length=L)
+    <= frozen_current_baseline(d, L)
+```
+
+旧 detector 因精度闸在 1–2 位曲线上的最终孤立输出基线为 0。3 位以上按小数位和 run length 分层比较，
+不得用一层减少抵消另一层增加。任一不等式失败都阻塞 M4/M5；只能修正结构分类或回到设计评审，不能静默
+提高 20-bit 门槛把曲线问题转嫁给所有数据。
+
+### 7.6 `_same_band` 压制集合必须专项审计
+
+shadow 运行要从旧算法额外导出：
+
+```text
+old_same_band_suppressed_pairs
+```
+
+它精确定义为：旧 pass 1 的 ratio run 已通过长度、distinct、`_rare` 和 power-of-ten 等其他条件，唯一因
+`_same_band` 未输出的行对。对集合中的每一对，新方案必须记录唯一去向：
+
+```text
+no_common_ratio_interval
+below_prediction_bits
+power_of_ten_conversion
+patterned_source_or_target
+proportional_series
+proportional_family
+quantized_common_pool
+partial_within_block_ratio
+within_block_global_scale
+isolated_cross_block_ratio
+coverage_not_examined
+```
+
+专项表按文件、行距、run 长度、`k`、新分数和 context 汇总。所有被新方案重新输出的旧压制行对逐条复核；
+所有未输出的行对也必须有上述机器可枚举原因；出现 `coverage_not_examined` 直接阻塞 M4 验收。该集合不得
+混进总体 `+N/-N` 后只看净变化。
 
 ---
 
@@ -492,12 +611,16 @@ _classify_ratio_context(candidate, row_layout, relation_graph)
 ### M0 — 修正度量与量化输入
 
 - [ ] 固化 §2.4 零假设生成器和 212 份语料逐文件 diff 命令。
+- [ ] 冻结曲线生成器的 seed、参数、运行命令，并保存当前 detector 按小数位和 run length 分层的最终
+  孤立输出 baseline artifact。
 - [ ] 直接统计当前 ratio 候选覆盖，修正「23.7% 完全不可见」的表述。
 - [ ] 实现并测试行级有效步长推断。
 - [ ] fixture：`71.20` float 化为 `71.2` 后，在同行 2 位小数上下文中仍推断 `q=0.01`。
 - [ ] fixture：混合精度、全整数、科学计数法、末尾零密集行。
+- [ ] 建立 gitignored 本地锚点清单，只录入独立复核过的 #56 具体候选；不以整份文件或撤稿状态作标签。
 
-**验收**：覆盖数字可由一条命令重跑；量化推断确定性一致；报告只称 `row_inferred`。
+**验收**：覆盖数字与曲线基线都可由一条命令重跑；量化推断确定性一致；报告只称
+`row_inferred`；本地锚点及其候选身份、数据和复核判断全部保持 gitignored，不进入 committed diff。
 
 ### M1 — 量化重建纯函数
 
@@ -515,9 +638,14 @@ _classify_ratio_context(candidate, row_layout, relation_graph)
 - [ ] 固定断言：8 列 2 位小数分数高于 3 列高精度。
 - [ ] 在独立随机、百分比、小量程、归一化、量化网格和平滑曲线台架上测量候选与过门槛数。
 - [ ] 验证默认 20 bits 能保留现有强 fixture，并压住独立随机与归一化爆发。
+- [ ] 输出语料的 `n_tests` / `log2(n_tests)`、20-bit margin 与 sheet 行数联合分布。
+- [ ] 对相同 planted relation 跑 2、10、30、100、400 行 padding test，记录首次跌破门槛的规模。
+- [ ] 对每个 committed / 本地强锚点记录原始 sheet 规模下的 raw bits、搜索惩罚和最终 margin。
+- [ ] 固化两列 run 的 0、1、2、10、100 量化格间距与方向互换边界测试。
 - [ ] mutation：去掉确认列、量化步长、值域或搜索惩罚中的任一项，必须使测试变红。
 
-**验收**：20 bits 同时满足上述条件。若不满足，停止实现、把测量结果写回本设计并重新评审门槛。
+**验收**：20 bits 同时满足上述条件；所有强锚点在原始 sheet 规模下继续过门槛；相同或相邻量化格的
+两列候选不过门槛。若不满足，停止实现、把测量结果写回本设计并重新评审门槛或 `n_tests` 作用域。
 
 ### M3 — 结构分类与比例族折叠
 
@@ -525,19 +653,25 @@ _classify_ratio_context(candidate, row_layout, relation_graph)
 - [ ] 全局缩放、部分区间、跨 block、同 block 系列分别有 fixture。
 - [ ] 合成比例表不再返回 12–60 条逐对 high finding，而是最多一条表级模式。
 - [ ] 一行跨多个分隔面板被统一缩放的 fixture 仍输出一条折叠统计信号，不被比例族吞掉。
-- [ ] 曲线台架没有孤立 `scaled_row_reuse` 增长。
+- [ ] 曲线台架分别记录 raw 过门槛、series/family edge 和最终孤立输出。
+- [ ] 硬闸：1–2 位小数最终孤立曲线输出均为 0；3 位以上每个 `(decimal, run_length)` 分层都不超过
+  M0 冻结的当前 baseline。
 
-**验收**：结构分类的输入不随小数位变化；曲线、比例表和跨面板关系得到不同且可解释的输出。
+**验收**：结构分类的输入不随小数位变化；曲线、比例表和跨面板关系得到不同且可解释的输出；任一曲线
+硬闸失败都阻塞后续里程碑。
 
 ### M4 — shadow 全精度对比
 
 - [ ] 新 ratio 核 shadow 跑 212 份语料，旧输出仍为正式输出。
 - [ ] 逐文件记录新增、丢失、context 变化、候选池大小、预算、runtime。
 - [ ] 每一条旧强信号丢失都有逐条解释；不得只比较总数。
+- [ ] 单独导出 `old_same_band_suppressed_pairs`，逐对记录新分数、context 和唯一去向。
+- [ ] 对旧压制集合中新方案重新输出的每一对做人工复核，并按文件、行距、run 长度和 `k` 汇总。
 - [ ] 检查 <=2 位、3 位、4 位、>=5 位各层的新增与丢失分布。
 - [ ] 确认没有新增 result-cap 爆发；预算截断全部记 coverage。
 
-**验收**：差异已逐条归因；已提交强 fixture 全部保留；新覆盖不是由曲线或量化网格集中贡献。
+**验收**：总体差异与旧 `_same_band` 压制集合都已逐条归因；committed fixture 和本地独立复核锚点全部
+保留并得到预期 context；新覆盖不是由曲线或量化网格集中贡献。
 
 ### M5 — 替换 ratio 两个 pass
 
