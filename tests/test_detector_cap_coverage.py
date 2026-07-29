@@ -63,7 +63,7 @@ def _shared_tail_across_rows():
 def _repeated_short_rows():
     """Short high-precision rows repeated verbatim, one repeat per band.
 
-    detect_short_row_reuse wants 3..11 columns at >=5 significant figures, and
+    detect_short_row_reuse wants 3..11 columns recorded to >=3 decimals, and
     _short_row_candidates drops any row _vector_is_patterned accepts -- so the
     values have to be irregular, not a progression. Each pair is separated by a
     label row so the two rows sit in different bands.

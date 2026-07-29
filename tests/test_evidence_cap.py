@@ -263,12 +263,27 @@ def _small_panel(path, rows=8, cols=4):
 
 
 def _any_finding(scan):
-    from paperconan._drill import drill, overview
+    """The first routed finding that actually carries a stored evidence window.
+
+    Not merely the first finding. Cross-sheet findings travel the same layers but
+    carry no evidence payload, and `explain(..., full=True)` on one answers
+    "unavailable" because its synthetic `a <-> b` pseudo-sheet never resolves --
+    whether or not the source was touched.
+
+    The TypeError that follows is the harmless symptom. The dangerous one is that
+    every caller here asserts `"unavailable" in full["evidence"]`, so an id from
+    that channel makes those assertions pass VACUOUSLY: green whether or not the
+    replaced source was actually refused, in the two tests whose entire job is to
+    prove that it is. Selecting a finding that owns a window is what gives them
+    teeth, and it restores the selection these tests were written against.
+    """
+    from paperconan._drill import drill, explain, overview
 
     for loc in overview(scan, max_locations=50)["locations"]:
         for group in drill(scan, loc["n"])["by_kind"]:
             for f in drill(scan, loc["n"], kind=group["kind"])["findings"]:
-                return f["finding_id"]
+                if isinstance(explain(scan, f["finding_id"]).get("evidence"), dict):
+                    return f["finding_id"]
     return None
 
 
