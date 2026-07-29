@@ -3475,9 +3475,22 @@ def _row_bands(sheet):
     return bands
 
 
+def _scaled_row_candidate_key(candidate):
+    """Canonical identity and comparison order for a scaled-row candidate."""
+    # ``row`` is the absolute sheet row, so it already orders bands within a
+    # sheet; the band range is fold metadata, not part of candidate ordering.
+    return (candidate["file"], candidate["sheet"], candidate["row"])
+
+
 def _scaled_row_candidates(grid_sheets):
     """Collect high-information data-rows from row-oriented bands, tagged by band so
-    same-band pairs (detect_row_relations' job) are excluded downstream."""
+    same-band pairs (detect_row_relations' job) are excluded downstream.
+
+    Candidates are returned in canonical file/sheet/row order.  Workbook tab
+    order is discovery metadata, not detector input: normalizing it here keeps
+    truncation, pair direction, fold representatives, and output independent of
+    ``grid_sheets`` insertion order.
+    """
     cands = []
     for (fname, sname), sheet in grid_sheets.items():
         for bi, (r0, r1) in enumerate(_row_bands(sheet)):
@@ -3502,19 +3515,21 @@ def _scaled_row_candidates(grid_sheets):
                     continue
                 cands.append(dict(file=fname, sheet=sname, band=(fname, sname, bi),
                                   rows=(r0, r1), row=r, label=label, a=a))
-    return cands
+    return sorted(cands, key=_scaled_row_candidate_key)
 
 
 def _stratified_head(cands, limit):
-    """The first `limit` candidates, taking a turn from each sheet in rotation.
+    """Select `limit` candidates by sheet rotation, then restore canonical order.
 
-    Extracted so it can be tested against directly: a test that rebuilds the
-    rotation to check it proves only that the test agrees with itself.
+    Rotation controls which rows survive a coverage cap; it must not also control
+    pair direction or fold representation.  Sorting both the incoming queues and
+    the selected result keeps this helper independent of caller iteration order.
     """
     by_sheet: dict[tuple, list] = {}
-    for c in cands:
+    for c in sorted(cands, key=_scaled_row_candidate_key):
         by_sheet.setdefault((c["file"], c["sheet"]), []).append(c)
     picked: list = []
+    # by_sheet inherits the canonical first-seen order from the sorted stream.
     queues = list(by_sheet.values())
     depth = 0
     while len(picked) < limit:
@@ -3528,7 +3543,7 @@ def _stratified_head(cands, limit):
         if not took:
             break
         depth += 1
-    return picked
+    return sorted(picked, key=_scaled_row_candidate_key)
 
 
 def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
@@ -3568,30 +3583,12 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
     budget = _SCALED_ROW_BUDGET
     for i in range(len(cands)):
         for j in range(i + 1, len(cands)):
-            # Both rebound every inner pass. Binding A once outside this loop and
-            # then swapping it left the swapped-in candidate in place for every
-            # remaining j: the band guard below tested the wrong candidate and
-            # skipped genuine cross-band pairs, so only the first partner per i
-            # was ever examined. Measured, a six-row duplicated rectangle came
-            # back as one row, and a reuse at a mismatched index vanished.
+            # Candidate collection and the optional stratified cut both restore
+            # this order.  Thus i < j fixes A/B ownership and the measurement
+            # direction once for every downstream fold field.
             A, B = cands[i], cands[j]
             if A["band"] == B["band"]:
                 continue                                  # same block → detect_row_relations
-            # Canonical order for the PAIR, before anything is computed from it.
-            # Ordering only the fold key was not enough: a reversed arrival
-            # computes k on swapped operands, so a mirrored scaled pair keys on
-            # 1/k and never merges -- only k == 1 is self-inverse. And the row
-            # sets took the arriving pair's A-side index, which for a reversed
-            # pair belongs to the other sheet, so the counts mixed two sheets:
-            # a permuted rectangle under-reported its height, and one row
-            # replicated across a panel over-reported it past the benign gate.
-            # Both are reachable once _stratified_head interleaves sheets, which
-            # is the ordinary case on the corpora this fold is for.
-            #
-            # Fixing the direction here also makes which row is the denominator
-            # deterministic, rather than depending on which arrived first.
-            if (B["file"], B["sheet"], B["rows"]) < (A["file"], A["sheet"], A["rows"]):
-                A, B = B, A
             a, b = A["a"], B["a"]
             m = min(len(a), len(b))
             budget -= m
@@ -3615,10 +3612,8 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
             same_file = fa == fb
             same_sheet = same_file and sa_name == sb_name
             scope = "blocks" if same_sheet else ("sheets" if same_file else "files")
-            # k is mean(b/a), so B = k x A. The sentence used to read
-            # "A = B * k", which inverts it -- and canonicalizing the pair turned
-            # that from an arrival-order coin flip into a fixed wrong direction.
-            # This is the claim a reader checks against the spreadsheet.
+            # k is mean(b/a), so B = k x A.  A/B come from the canonical
+            # candidate stream; the sentence below follows that same direction.
             rel = (f"== row '{B['label']}'" if kind == "identical_row_reuse"
                    else f"-> row '{B['label']}' ({sb_name}) = this row * {k:.6g}")
             # One duplicated rectangle is one event, not one event per row.
@@ -3745,10 +3740,8 @@ def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
             scope = ("blocks" if f["same_sheet"]
                      else ("sheets" if f["same_file"] else "files"))
             # Stated in the direction the ratio was measured: k is mean(b/a),
-            # so sheet_b is k x sheet_a. The old wording put sheet_a first and
-            # read "A are k x B", inverting it -- and canonicalizing the pair
-            # turned that from an arrival-order coin flip into a fixed wrong
-            # direction. This is the claim a reader checks against the sheet.
+            # so sheet_b is k x sheet_a.  Candidate canonicalization fixes that
+            # direction before the fold and every accumulated row keeps it.
             #
             # Not "positionally matching" either: the loop pairs any row with
             # any row, and on real data two of three matches were off-diagonal.

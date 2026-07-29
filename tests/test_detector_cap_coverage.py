@@ -1162,6 +1162,32 @@ def test_the_candidate_pool_cut_does_not_exclude_whole_sheets():
     assert [c["row"] for c in cut if c["file"] == "f0.xlsx"] == [0, 1]
 
 
+def test_the_stratified_head_canonicalizes_an_unsorted_pool():
+    """Discovery order must affect neither selection nor comparison direction.
+
+    The remainder at a non-divisible cap belongs to the canonical first sheet,
+    and rows within each sheet are selected from their canonical head.  The
+    returned candidates are then globally canonical rather than left in
+    round-robin order.
+    """
+    from paperconan._audit import _stratified_head
+
+    pool = [
+        {"file": "z.xlsx", "sheet": "Figure 2", "row": 9},
+        {"file": "a.xlsx", "sheet": "Figure 1", "row": 4},
+        {"file": "z.xlsx", "sheet": "Figure 2", "row": 1},
+        {"file": "a.xlsx", "sheet": "Figure 1", "row": 0},
+    ]
+
+    cut = _stratified_head(pool, 3)
+
+    assert [(c["file"], c["sheet"], c["row"]) for c in cut] == [
+        ("a.xlsx", "Figure 1", 0),
+        ("a.xlsx", "Figure 1", 4),
+        ("z.xlsx", "Figure 2", 1),
+    ]
+
+
 def test_the_detector_cuts_its_pool_through_the_stratified_head():
     """Testing the helper says nothing about whether the detector calls it.
 
@@ -1436,16 +1462,14 @@ def test_one_derived_looking_label_does_not_demote_the_rectangle():
 
 
 def test_a_permuted_rectangle_does_not_split_when_the_pool_truncates():
-    """The rotation is what activates the fold key's direction sensitivity.
+    """Fair truncation must preserve the canonical comparison direction.
 
-    Grouped by sheet, the earlier sheet is always the A side and arrival order is
-    stable. _stratified_head interleaves them, so an off-diagonal pair whose rows
-    sit at different depths arrives reversed. Ordering only the key was not
-    enough: a reversed scaled pair computes k on swapped operands, keys on 1/k
-    and never merges, and the row sets took the arriving pair's A-side index,
-    which then belonged to the other sheet. Both kinds are asserted, and the
-    counts as well as the split, because a fold that merges but miscounts passes
-    a count-free test.
+    _stratified_head interleaves sheets while selecting candidates.  Returning
+    that rotation order directly makes an off-diagonal pair arrive reversed:
+    scaled pairs key on 1/k, and row sets can acquire indices from the wrong
+    sheet.  The selected set is therefore restored to canonical order before
+    comparison.  Both kinds and their counts are asserted because a fold that
+    merges but miscounts passes a count-free test.
     """
     import numpy as np
 
@@ -1465,10 +1489,9 @@ def test_a_permuted_rectangle_does_not_split_when_the_pool_truncates():
             grids[(f"{name}.csv", name)] = Sheet.from_rows(out)
         return grids
 
-    # cap=20 is where a reversed arrival actually occurs for this fixture:
-    # without pair canonicalization the scaled case splits into k=2 and k=0.5
-    # there. A larger cap merges by luck, which is how an earlier version of this
-    # test passed on the unfixed code.
+    # cap=20 is where returning the rotation order directly splits the scaled
+    # case into k=2 and k=0.5. A larger cap merges by luck, which is how an
+    # earlier version of this test passed on the unfixed code.
     for k, kind in ((1.0, "identical_row_reuse"), (2.0, "scaled_row_reuse")):
         for cap in (10 ** 6, 20):
             found = [f for f in audit.detect_scaled_row_reuse(
@@ -1481,7 +1504,7 @@ def test_a_permuted_rectangle_does_not_split_when_the_pool_truncates():
             f = found[0]
             assert f["ratio"] == k, (
                 f"{kind} reported k={f['ratio']} for a x{k} rectangle; the pair "
-                f"was not put in canonical order before k was computed"
+                f"was not compared in canonical order"
             )
             # Asserted at both caps. Guarding it to the untruncated one left
             # the count unchecked at exactly the cap where the reversal occurs,
@@ -1558,17 +1581,11 @@ def test_a_fold_that_overflows_its_label_cap_is_kept_not_demoted(monkeypatch):
 
 
 def test_a_rectangle_is_found_whole_when_tab_order_is_not_alphabetical():
-    """The canonical swap must not survive into the next inner iteration.
+    """Workbook tab order must not determine candidate or pair direction.
 
-    A is bound once per outer pass. Swapping it in place left the swapped-in
-    candidate there for every remaining j, so the band guard tested the wrong
-    candidate and skipped genuine cross-band pairs -- only the first partner per
-    outer pass was examined. A six-row duplicated rectangle came back as one row,
-    and a reuse at a mismatched index vanished.
-
-    Sheet insertion order is workbook tab order, which nothing sorts, so this
-    needs no truncation to fire: the permuted-rectangle test cannot reach it,
-    since Figure 9a sorts before Figure 9b in both arrival and canonical order.
+    Tab order is discovery metadata and can be the reverse of lexical sheet
+    order.  Candidate normalization happens before comparison, so a six-row
+    rectangle must be recovered whole without mutating A/B inside the pair loop.
     """
     import numpy as np
 
@@ -1592,7 +1609,7 @@ def test_a_rectangle_is_found_whole_when_tab_order_is_not_alphabetical():
     assert len(found) == 1, f"expected one rectangle, got {len(found)}"
     assert found[0]["distinct_rows_matched"] == 6, (
         f"the rectangle reported {found[0]['distinct_rows_matched']} of 6 rows; "
-        f"the swap leaked into the next inner iteration"
+        f"candidate normalization did not preserve the whole fold"
     )
     assert found[0]["rows_matched"] == 6, found[0]["rows_matched"]
 
@@ -1600,10 +1617,10 @@ def test_a_rectangle_is_found_whole_when_tab_order_is_not_alphabetical():
 def test_the_rule_states_the_ratio_in_the_direction_it_was_measured():
     """The sentence a reader takes to the spreadsheet has to be the right way round.
 
-    k is mean(b/a), so sheet_b is k x sheet_a. The rule read "A are k x B",
-    inverting it -- and canonicalizing the pair turned an arrival-order coin flip
-    into a fixed wrong direction. An inverted claim either burns the check or
-    reads as a false positive.
+    k is mean(b/a), so sheet_b is k x sheet_a. Candidate normalization fixes
+    which sheet is A before measurement; the rule must state that same direction.
+    An inverted claim either burns the check or reads as a data inconsistency
+    that is not present.
     """
     import numpy as np
 
