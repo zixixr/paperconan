@@ -982,13 +982,23 @@ _ROW_PAIR_MAX_FINDINGS_PER_BLOCK = 25
 _ROW_REL_MAX_ROWS = int(os.environ.get("PAPERCONAN_ROW_REL_MAX_ROWS", "60"))
 _ROW_REL_MIN_COLS = int(os.environ.get("PAPERCONAN_ROW_REL_MIN_COLS", "12"))
 # Short-run row reuse (detect_short_row_reuse): the long-run detectors above miss the
-# JCI "Supporting Data Values" layout, where each sub-panel is its own 1-4 row block and
-# the copied/scaled segment is only 3-8 columns. A short run is safe from chance only if
-# every value carries enough significant figures — so this path requires >=5 sig figs per
-# cell and a shorter minimum run. FP math: two independent >=5-sig-fig cells collide at
-# ~1e-4, so a 3-cell identical/ratio run is ~1e-8..1e-12 by chance.
+# "Supporting Data Values" layout, where each sub-panel is its own 1-4 row block and the
+# copied/scaled segment is only 3-8 columns, so this path accepts a much shorter run.
+#
+# What makes such a run improbable is the TOLERANCE, not the size of the numbers: the
+# per-column ratios of two independent rows spread over O(0.1-1), so a second column
+# landing within _SHORT_ROW_RTOL of the first is ~1e-4 and a 3-cell run ~1e-8. The
+# precision floor below exists for a different reason — coarse or integer data lives on a
+# grid fine enough to manufacture exact ties, which no tolerance argument covers.
+#
+# That floor therefore counts FRACTIONAL DIGITS: how finely the value was recorded.
+# Significant figures conflate precision with magnitude — at three decimals 12.346 and
+# 7.891 are the same measurement precision but 5 vs 4 sig figs — and one rejected cell in
+# the middle of a run splits it below _SHORT_ROW_MIN_COLS, taking the whole relation with
+# it. tests/test_short_row_precision_gate.py pins that pair of cases, and the separation
+# between this bar and `_can_pin_a_ratio` that had to come with it.
 _SHORT_ROW_MIN_COLS = int(os.environ.get("PAPERCONAN_SHORT_ROW_MIN_COLS", "3"))
-_SHORT_ROW_MIN_SIGFIGS = int(os.environ.get("PAPERCONAN_SHORT_ROW_MIN_SIGFIGS", "5"))
+_SHORT_ROW_MIN_FRAC_DIGITS = int(os.environ.get("PAPERCONAN_SHORT_ROW_MIN_FRAC_DIGITS", "3"))
 # Tighter than _ROW_REL_RTOL: a short ratio run has fewer cells to corroborate the
 # constant, so the constancy must be crisp to stay clear of chance.
 _SHORT_ROW_RTOL = float(os.environ.get("PAPERCONAN_SHORT_ROW_RTOL", "1e-4"))
@@ -3782,14 +3792,70 @@ def _sigfigs_and_frac(v):
 
 
 def _is_short_hp(v):
-    """A value is 'high-precision' for short-run matching only if it carries real
-    FRACTIONAL precision — >=3 fractional digits AND >=5 significant figures. Requiring a
-    fractional part is what keeps collision-prone INTEGER data (read counts, IDs, genomic
-    coordinates) — where a 3-cell match is easy chance — out of the detector entirely."""
+    """A value is 'high-precision' for short-run matching only if it was RECORDED finely —
+    >=_SHORT_ROW_MIN_FRAC_DIGITS fractional digits. Requiring a fractional part is what
+    keeps collision-prone INTEGER data (read counts, IDs, genomic coordinates) — where a
+    3-cell match is easy chance — out of the detector entirely.
+
+    The count is of DECIMALS, not significant figures, so two cells written to the same
+    precision get the same verdict whether they happen to sit above or below ten — see the
+    note over _SHORT_ROW_MIN_FRAC_DIGITS for why that distinction cost whole relations.
+
+    Widening this predicate reaches further than the runs themselves: it feeds the sheet-wide
+    frequency counter behind the `_rare` gate, and it sets candidate membership, which is
+    what the band test reads. Both change the verdict for pairs that never leave pass 1 — on
+    the corpus measured for this change they accounted for every one of the losses. It no
+    longer decides which PASS sees a pair; `_can_pin_a_ratio` does, precisely so that moving
+    this bar cannot move that boundary."""
     if math.isnan(v):
         return False
-    sig, frac = _sigfigs_and_frac(v)
-    return frac >= 3 and sig >= _SHORT_ROW_MIN_SIGFIGS
+    _, frac = _sigfigs_and_frac(v)
+    return frac >= _SHORT_ROW_MIN_FRAC_DIGITS
+
+
+def _can_pin_a_ratio(v):
+    """Can this cell hold a ratio to `_SHORT_ROW_RTOL` on its OWN?
+
+    A value written to d decimals moves in steps of 10^-d, so its own contribution to a
+    ratio is granular to 10^-d/|v|. Once that exceeds the tolerance a run is judged at, the
+    cell cannot pin the constant by itself and needs a more precise partner to do it —
+    which is precisely the case detect_short_row_reuse's second pass exists for.
+
+    This is a RELATIVE question and `_is_short_hp` is an ABSOLUTE one, and using a single
+    predicate for both is what the sig-figs gate got wrong. "Does this grid manufacture
+    exact ties?" depends on the decimal step alone; "can this cell pin a ratio?" depends on
+    the step measured against the value. Derived from _SHORT_ROW_RTOL rather than being a
+    second knob: at the current 1e-4 this is exactly the old >=5-significant-figure bar, and
+    it tracks the tolerance automatically if that ever moves.
+
+    ONE CAVEAT on that model, because the clean statement above is not quite what runs. `d`
+    is the decimals visible in the STORED FLOAT, not the decimals the author recorded: a
+    sheet holding 42.130 parses to the same float as 42.13, so the trailing zero is gone
+    before this ever sees it and the cell reads one decade coarser PER trailing zero —
+    42.100 by two, and 42.000 by three, which also drops it from `_is_short_hp` entirely.
+    42.130 and 42.131 are
+    written to identical precision and get opposite verdicts here. That is the same species
+    of error this predicate exists to remove, moved from magnitude onto the last digit's
+    value, and it is not fixable at this layer — the information is destroyed at parse.
+    `_is_short_hp` and `_short_row_candidates` carry the same bias. A trailing-zero-heavy
+    divisor reads coarser and sends the pair to pass 2; a trailing-zero-heavy dividend reads
+    coarser and gets the pair dropped, so it errs in both directions."""
+    if not math.isfinite(v) or abs(v) <= 1e-12:
+        return False
+    _, frac = _sigfigs_and_frac(v)
+    return 10.0 ** (-frac) / abs(v) <= _SHORT_ROW_RTOL
+
+
+def _row_can_pin_a_ratio(vals):
+    """Whether a whole row can pin a ratio unaided: enough cells that individually can, and
+    enough DISTINCT ones. Distinctness is the load-bearing half — three cells holding the
+    same precise number are a plateau, which fixes no ratio anywhere else in the row.
+
+    At the default `_SHORT_ROW_MIN_COLS` of 3 the count is implied by the distinct count
+    and no test can separate them; it is kept so the predicate follows that floor if it is
+    ever raised, and mirrors the shape of the candidate test so the two read alike."""
+    pinning = [v for v in vals if _can_pin_a_ratio(v)]
+    return len(pinning) >= _SHORT_ROW_MIN_COLS and len(set(pinning)) >= 3
 
 
 def _near_power_of_ten(k):
@@ -3807,8 +3873,9 @@ def _near_power_of_ten(k):
 
 def _longest_hp_identical_run(a, b):
     """Longest contiguous run where a[c] == b[c] (tight tol) AND both cells are
-    high-precision (>=5 sig figs). A low-precision or NaN column breaks the run, so a
-    coincidental match on small integers can never extend one. Returns (run_len, x_run)."""
+    high-precision (>=_SHORT_ROW_MIN_FRAC_DIGITS decimals). A low-precision or NaN column
+    breaks the run, so a coincidental match on small integers can never extend one.
+    Returns (run_len, x_run)."""
     best_len, best_start = 0, 0
     cur_len, cur_start = 0, 0
     for i in range(len(a)):
@@ -3874,7 +3941,7 @@ def _lowdiv_accept(av, bv):
 def _longest_lowdiv_ratio_run(divisor, dividend):
     """Longest contiguous run where dividend[c] == k * divisor[c] (k != 1), where the DIVIDEND
     cell is high-precision but the DIVISOR may be lower precision (non-integer). The copy-then-
-    scale case the both-sides-hp scanner drops (Group A at 4 sig figs, Group B at 6): the
+    scale case the both-sides-hp scanner drops (Group A at 2 decimals, Group B at 6): the
     constant exact ratio is pinned by the high-precision dividend, so one precise side suffices,
     and the tight 1e-4 tolerance keeps a >=3-column run's chance ~(1e-4)^2. Returns
     (k, run_len, divisor_run, dividend_run) or None. Used ONLY by the isolated low-divisor pass."""
@@ -3956,9 +4023,26 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
     column `detect_scaled_row_reuse` and `detect_row_relations` cannot see: a control
     block copied verbatim across two sub-panels, a whole condition row shared by two
     different genes, or one panel's row = another's * a constant (e.g. Group B = 0.8409 *
-    Group A). Every run cell must be >=5 significant figures so a short run is not chance.
-    A whole power-of-ten ratio is a unit restatement (benign) and is skipped. Signal, not
-    verdict — confirm against the legend/Methods before drawing any conclusion."""
+    Group A). Every run cell must be recorded to >=_SHORT_ROW_MIN_FRAC_DIGITS decimals, so
+    integer and coarse-grid data — where a short exact match is easy chance — never enters
+    a run. A whole power-of-ten ratio is a unit restatement (benign) and is skipped.
+    Signal, not verdict — confirm against the legend/Methods before drawing any conclusion.
+
+    Two questions this detector asks are deliberately kept apart, because using one
+    predicate for both is how a change to one silently moved the other. What may join a RUN
+    is `_is_short_hp`, an ABSOLUTE question about the decimal grid. Which PASS judges an
+    adjacent pair is `_can_pin_a_ratio`, a RELATIVE question derived from _SHORT_ROW_RTOL.
+    Pass 1 drops every same-band pair; pass 2 owns a neighbouring pair whose divisor cannot
+    pin the ratio alone, and asks the finer question -- sub-range or whole row.
+
+    Pass 1's blanket drop stays blanket ON MEASUREMENT. Giving it the same sub-range test
+    took the local corpus from 312 findings to 582, and to 460 when limited to immediate
+    neighbours, with several sheets pinned at the result cap. Deciding ownership by a
+    precision GRADIENT between the two rows instead reached 346: no losses, but every one of
+    the 39 additions was a minimum-length 3-column run between adjacent rows, several at
+    ratios within 0.3% of 1.0 -- curve steps. Pass 2 stays narrow because its premise is an
+    asymmetry, not a gradient, and that narrowness is load-bearing.
+    tests/test_short_row_precision_gate.py pins both halves."""
     by_sheet = {}
     for c in _short_row_candidates(grid_sheets, coverage=coverage):
         by_sheet.setdefault((c["file"], c["sheet"]), []).append(c)
@@ -3992,7 +4076,24 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
             lo, hi = (ra, rb) if ra < rb else (rb, ra)
             return all(k in cand_idx for k in range(lo + 1, hi))
 
+        # Row pairs pass 1 has already spoken for. Pass 1 picks ONE relation per pair via
+        # the arm preference below, and pass 2 must not add a second: it can reach an
+        # adjacent pair that pass 1 reported through the identical arm (which `_same_band`
+        # does not suppress) and report a scaled run over different columns of the same two
+        # rows. Both would be `high`, carry the same block_a/block_b, and each consume a
+        # slot of the finding cap.
+        #
+        # Keyed on the PAIR, not on a row: a row already named in one finding may still
+        # anchor a different relation with a different partner, which pass 1 reports too.
+        # Note the asymmetry with the arm preference below, which prefers `identical` only
+        # when its run is at least as long: across passes, pass 1's arm wins regardless of
+        # length. Comparing lengths across passes would mean holding pass 1's emission back
+        # until pass 2 had run, and the pair surfaces at `high` at the right location
+        # either way, so it is not worth that restructuring.
+        reported_pairs = set()
+
         def _add_finding(a_label, b_label, a_row, b_row, kind, k, run_len, x_run):
+            reported_pairs.add((min(a_row, b_row), max(a_row, b_row)))
             # k is dividend/divisor (offset likewise), so the dividend row b = a <op> k. State
             # the relation in that direction so the printed equation is numerically true.
             if kind == "identical_row_reuse":
@@ -4088,7 +4189,7 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
 
         # Second pass — isolated low-precision divisor case: B = k * A over a PARTIAL run where
         # the divisor row A is an IMMEDIATE neighbor that is a fractional data row but not a
-        # high-precision candidate (Group A at 4 sig figs, Group B at 6). Bounded to
+        # high-precision candidate (Group A at 2 decimals, Group B at 6). Bounded to
         # O(candidates) and RATIO-only; it reads no shared state (candidate pool, cand_idx,
         # freq, cap all unchanged) so identical/offset/scaled detection is untouched. Charges
         # the SAME budget as pass 1 so total work stays bounded.
@@ -4099,19 +4200,27 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
                     break
                 bvals = B["a"]
                 for nbr in (B["row"] - 1, B["row"] + 1):       # immediate neighbors only
-                    if nbr < 0 or nbr >= sheet.nrows or nbr in cand_idx:
+                    if nbr < 0 or nbr >= sheet.nrows:
                         continue
+                    if (min(nbr, B["row"]), max(nbr, B["row"])) in reported_pairs:
+                        continue                       # pass 1 already spoke for this pair
                     avals = sheet.numeric[nbr, :]
                     m = min(len(avals), len(bvals))
                     budget -= m
                     if budget <= 0:
                         break
-                    # A neighbor that itself qualifies as an hp candidate is NOT a low-precision
-                    # divisor: it is either already handled by the main both-hp loop (with its
-                    # _same_band curve-step guard) or was only dropped by the per-sheet candidate
-                    # cap — either way it must not be scaled here and bypass that guard.
-                    nbr_hp = [v for v in avals if _is_short_hp(v)]
-                    if len(nbr_hp) >= _SHORT_ROW_MIN_COLS and len(set(nbr_hp)) >= 3:
+                    # This pass owns the pair when the DIVISOR cannot pin the ratio by itself
+                    # and the DIVIDEND can — its whole premise, and the thing that keeps it
+                    # narrow. A pair that could be judged from either side belongs to pass 1
+                    # and its curve-step guard; admitting those is what floods (measured: the
+                    # local corpus goes from 312 findings to 460 that way).
+                    #
+                    # Ownership is asked in `_can_pin_a_ratio`'s RELATIVE units, NOT with
+                    # `_is_short_hp`. Tying it to the run gate is what let a change to run
+                    # membership silently move pairs between passes and flip their verdict.
+                    # Requiring the dividend to pin also fixes the direction, so an adjacent
+                    # pair is examined once and cannot be reported as both k and 1/k.
+                    if _row_can_pin_a_ratio(avals) or not _row_can_pin_a_ratio(bvals):
                         continue
                     frac = [v for v in avals if not math.isnan(v) and v != math.floor(v)]
                     if len(frac) < _SHORT_ROW_MIN_COLS or len(set(round(v, 9) for v in frac)) < 3:

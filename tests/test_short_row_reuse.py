@@ -59,7 +59,7 @@ def test_detects_short_constant_ratio_between_single_row_panels():
 
 
 def test_detects_three_column_constant_ratio_high_precision():
-    # p6: only a 3-column run, but 6-7 significant figures each → not chance.
+    # p6: only a 3-column run, but every cell carries 4+ decimals → not chance.
     sheet = Sheet.from_rows([
         ["Figure 3D", "PBS", None, None],
         ["TNF-a", *P6_3D],
@@ -92,10 +92,10 @@ def test_detects_short_identical_row_across_genes():
 
 def test_partial_ratio_low_precision_adjacent_divisor_fires():
     # Synthetic S4D shape: adjacent rows, B = 1.17 * A EXACTLY over a PARTIAL run (5 of 8),
-    # divisor A only 4 sig figs (never an hp candidate), dividend B high-precision. The 3
+    # divisor A only 2 decimals (never an hp candidate), dividend B high-precision. The 3
     # non-run dividend cells are ALSO high-precision (like the real case) but at a DIFFERENT
     # ratio, so the whole-row guard sees 5/8 eligible columns matching -> partial, not whole.
-    A = [42.13, 57.68, 31.94, 68.05, 25.47, 90.11, 33.22, 71.40]      # 4 sig figs (low prec)
+    A = [42.13, 57.68, 31.94, 68.05, 25.47, 90.11, 33.22, 71.40]      # 2 decimals (low prec)
     B = [round(v * 1.17, 6) for v in A[:5]] + [88.5314, 12.8873, 44.1962]   # 1.17 on 5/8 only
     sheet = Sheet.from_rows([["cond_A", *A], ["cond_B", *B]])
     scaled = [f for f in detect_short_row_reuse({("f.xlsx", "S1"): sheet})
@@ -209,7 +209,7 @@ def test_no_false_positive_on_two_value_overlap():
 
 
 def test_no_false_positive_on_quantized_grid():
-    # k/19 body-weight normalization: every value is high-precision (7 sig figs) but drawn
+    # k/19 body-weight normalization: every value is high-precision (4 decimals) but drawn
     # from a tiny pool, so adjacent rows share 3 by chance. Must NOT fire (JCI182394 Fig11J).
     grid = [round(k / 19 * 100, 4) for k in range(13, 26)]   # 68.42..136.84, 13 distinct
     rows = []
