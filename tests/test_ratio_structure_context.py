@@ -9,6 +9,8 @@ All fixtures are synthetic.  Nothing here is wired into the production detector.
 """
 from __future__ import annotations
 
+import math
+
 from paperconan._audit import _classify_ratio_structure, _rank1_relative_residual
 
 
@@ -62,6 +64,44 @@ def test_one_planted_pair_in_an_unrelated_block_stays_isolated():
     assert got["families"] == []
     assert len(got["isolated_relations"]) == 1
     assert got["isolated_relations"][0]["context_class"] == "isolated_ratio"
+
+
+def test_family_edge_count_deduplicates_directions_and_multiple_runs():
+    """Changing the topology count back to relation count recreates the 10k-edge myth."""
+    base = [2.0, 7.0, 3.0, 11.0]
+    rows = [base, [2.0 * v for v in base], [3.0 * v for v in base]]
+    relations = [
+        _relation(0, 1, 0, 3),
+        _relation(1, 0, 0, 3),        # reciprocal direction, same topology edge
+        _relation(0, 1, 1, 3),        # another maximal run, still the same pair
+    ]
+
+    got = _classify_ratio_structure(rows, relations)
+
+    assert got["families"][0]["edge_count"] == 1
+    assert got["families"][0]["relation_count"] == 3
+    assert len(got["relations"]) == 3, "classification keeps evidence; only summary folds"
+
+
+def test_nearby_relations_in_a_smooth_profile_sequence_are_a_series():
+    """Rank-1 alone misses curves whose shape parameter changes gradually by row."""
+    xs = [-3.0 + 6.0 * j / 7 for j in range(8)]
+    rows = []
+    for amplitude, shift in zip(
+            [0.5 + 2.5 * i / 29 for i in range(30)],
+            [-0.5 + i / 29 for i in range(30)]):
+        response = [10.0 / (1.0 + math.exp(-(x - shift))) for x in xs]
+        rows.append([round(amplitude * value, 1) for value in response])
+    relations = [_relation(0, 2, 0, 6), _relation(5, 6, 0, 6)]
+
+    got = _classify_ratio_structure(rows, relations)
+
+    assert got["block_rank1_residual"] > 0.02
+    assert {r["context_class"] for r in got["relations"]} == {
+        "proportional_series"
+    }
+    assert len(got["series"]) == 1
+    assert got["isolated_relations"] == []
 
 
 def test_unusable_matrices_cannot_grant_a_family_explanation():

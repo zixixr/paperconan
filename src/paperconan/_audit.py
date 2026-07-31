@@ -4027,8 +4027,25 @@ def _rank1_relative_residual(matrix):
     return residual if math.isfinite(residual) else math.inf
 
 
+def _row_profile_step_p90(matrix):
+    """90th percentile change between consecutive unit-normalized row profiles."""
+    m = np.asarray(matrix, dtype=float)
+    if m.ndim != 2 or m.shape[0] < 3 or m.shape[1] < 2:
+        return math.inf
+    m = m[:, np.all(np.isfinite(m), axis=0)]
+    if m.shape[1] < 2:
+        return math.inf
+    norms = np.linalg.norm(m, axis=1)
+    if np.any(~np.isfinite(norms)) or np.any(norms <= 1e-300):
+        return math.inf
+    profiles = m / norms[:, None]
+    steps = sorted(float(v) for v in np.linalg.norm(np.diff(profiles, axis=0), axis=1))
+    return _percentile_linear(steps, 90) if steps else math.inf
+
+
 def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
-                              min_family_rows=3):
+                              min_family_rows=3, max_profile_step=0.05,
+                              max_series_row_gap=2):
     """Separate isolated ratio relations from edges of a larger proportional family.
 
     Arithmetic validity and strength have already been decided by M1/M2. This pure
@@ -4039,6 +4056,7 @@ def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
     matrix = np.asarray(rows, dtype=float)
     nrows = matrix.shape[0] if matrix.ndim == 2 else 0
     block_residual = _rank1_relative_residual(matrix)
+    profile_step = _row_profile_step_p90(matrix)
 
     valid_edges = []
     adjacency = {row: set() for row in range(nrows)}
@@ -4070,10 +4088,12 @@ def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
     if (nrows >= min_family_rows and valid_edges
             and block_residual <= max_rank1_residual):
         indexes = {index for index, _a, _b in valid_edges}
+        pairs = {(min(a, b), max(a, b)) for _index, a, b in valid_edges}
         family_indexes.update(indexes)
         families.append({
             "scope": "block", "rows": list(range(nrows)),
-            "edge_count": len(indexes), "rank1_residual": block_residual,
+            "edge_count": len(pairs), "relation_count": len(indexes),
+            "rank1_residual": block_residual,
         })
     else:
         for members in components:
@@ -4090,25 +4110,53 @@ def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
                 matrix[members, common_start:common_end + 1])
             if residual > max_rank1_residual:
                 continue
+            pairs = {(min(a, b), max(a, b)) for index, a, b in valid_edges
+                     if index in indexes}
             family_indexes.update(indexes)
             families.append({
                 "scope": "component", "rows": members,
-                "edge_count": len(indexes), "rank1_residual": residual,
+                "edge_count": len(pairs), "relation_count": len(indexes),
+                "rank1_residual": residual,
                 "start": common_start, "end": common_end,
+            })
+
+    series_indexes = set()
+    series = []
+    if profile_step <= max_profile_step:
+        series_indexes = {
+            index for index, row_a, row_b in valid_edges
+            if index not in family_indexes
+            and abs(row_a - row_b) <= max_series_row_gap
+        }
+        if series_indexes:
+            pairs = {
+                (min(row_a, row_b), max(row_a, row_b))
+                for index, row_a, row_b in valid_edges if index in series_indexes
+            }
+            series.append({
+                "scope": "block", "rows": list(range(nrows)),
+                "edge_count": len(pairs), "relation_count": len(series_indexes),
+                "profile_step_p90": profile_step,
             })
 
     classified, isolated = [], []
     for index, relation in enumerate(relations):
         item = dict(relation)
-        item["context_class"] = (
-            "proportional_family" if index in family_indexes else "isolated_ratio")
+        if index in family_indexes:
+            item["context_class"] = "proportional_family"
+        elif index in series_indexes:
+            item["context_class"] = "proportional_series"
+        else:
+            item["context_class"] = "isolated_ratio"
         classified.append(item)
         if item["context_class"] == "isolated_ratio":
             isolated.append(item)
     return {
         "block_rank1_residual": block_residual,
+        "block_profile_step_p90": profile_step,
         "relations": classified,
         "families": families,
+        "series": series,
         "isolated_relations": isolated,
     }
 
