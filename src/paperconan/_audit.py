@@ -3791,6 +3791,54 @@ def _sigfigs_and_frac(v):
     return sig, len(fr)
 
 
+_MAX_READ_DECIMALS = 10          # the read precision `_sigfigs_and_frac` works at
+
+
+def _effective_row_quantums(values):
+    """The decimal step each cell of a row was RECORDED in, inferred from the row.
+
+    `Sheet` holds floats, so a sheet that wrote 71.20 is indistinguishable from one
+    that wrote 71.2 — the trailing zero is gone before any detector sees it. The
+    ratio arm needs that step to ask whether a value could have come from rounding
+    `k * a`, so it is inferred rather than read:
+
+      1. each cell's surviving decimals, at `_MAX_READ_DECIMALS` read precision;
+      2. the row's step is the commonest of those, ties resolving to the FINER;
+      3. a cell is read at `max(its own, the row's)`.
+
+    Step 3 is `max` on purpose. A cell carrying MORE decimals than its neighbours has
+    real extra precision and coarsening it would widen its allowed interval, which is
+    the direction that invents relations. Reading a cell finer than it truly is only
+    narrows the interval, which loses relations instead — the safe direction for a
+    tool whose findings ask people to go and check something.
+
+    The tie rule resolves the same way and for the same reason.
+
+    Non-finite cells get NaN: they carry no recorded precision, they cannot join a
+    run, and they must not vote on the row's step.
+
+    This is an INFERENCE about how the sheet was written, not recovered metadata, and
+    every finding built on it says so (`precision_source = "row_inferred"`).
+    """
+    decimals = []
+    for v in values:
+        fv = float(v)
+        if not math.isfinite(fv):
+            decimals.append(None)
+            continue
+        decimals.append(min(_sigfigs_and_frac(fv)[1], _MAX_READ_DECIMALS))
+
+    seen = [d for d in decimals if d is not None]
+    if not seen:
+        return [float("nan")] * len(decimals)
+    counts = Counter(seen)
+    top = max(counts.values())
+    row_decimals = max(d for d, n in counts.items() if n == top)   # tie -> finer
+
+    return [float("nan") if d is None else 10.0 ** -max(d, row_decimals)
+            for d in decimals]
+
+
 def _is_short_hp(v):
     """A value is 'high-precision' for short-run matching only if it was RECORDED finely —
     >=_SHORT_ROW_MIN_FRAC_DIGITS fractional digits. Requiring a fractional part is what
