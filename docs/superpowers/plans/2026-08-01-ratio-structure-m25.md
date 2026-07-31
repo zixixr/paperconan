@@ -31,13 +31,13 @@
 - Produces: `_ratio_prediction_bits(target_values, quantums, n_tests, *, informative=None, max_quantum_ratio=None)`; `informative` is an optional Boolean sequence aligned with the two input sequences.
 - Consumes: M2 runner converts each run's absolute informative column indexes into a slice-local Boolean mask.
 
-- [ ] Add a failing scanner test asserting a `0 -> 0` column appears in the run span but not in `informative_columns`.
-- [ ] Run that test and observe failure because the field is absent.
-- [ ] Add `informative_columns` to the scanner result and rerun the scanner tests.
-- [ ] Add a failing score test asserting an uninformative leading column neither anchors nor confirms the ratio.
-- [ ] Run that test and observe the current scorer over-counting it.
-- [ ] Filter the score input by the optional mask before anchor/confirmation accounting.
-- [ ] Pass the run mask in `m2_threshold.py`; rerun M1/M2 tests and the frozen threshold measurement.
+- [x] Add a failing scanner test asserting a `0 -> 0` column appears in the run span but not in `informative_columns`.
+- [x] Run that test and observe failure because the field is absent.
+- [x] Add `informative_columns` to the scanner result and rerun the scanner tests.
+- [x] Add a failing score test asserting an uninformative leading column neither anchors nor confirms the ratio.
+- [x] Run that test and observe the current scorer over-counting it.
+- [x] Filter the score input by the optional mask before anchor/confirmation accounting.
+- [x] Pass the run mask in `m2_threshold.py`; rerun M1/M2 tests and the frozen threshold measurement.
 
 ### Task 2: Classify Block-Wide Proportional Families
 
@@ -51,13 +51,13 @@
 - Relation inputs contain integer `row_a`, `row_b`, `start`, and `end`; output copies each relation and adds `context_class` equal to `proportional_family` or `isolated_ratio`.
 - Output also contains `block_rank1_residual`, `families`, and `isolated_relations` so the offline runner never infers classification from private state.
 
-- [ ] Add a failing test where four exact multiples form one family and every edge becomes `proportional_family`.
-- [ ] Run it and observe import/function failure.
-- [ ] Implement finite rectangular rank-1 residual plus undirected components and make the family test pass.
-- [ ] Add a failing test where one planted proportional pair sits inside an otherwise independent block and stays `isolated_ratio`.
-- [ ] Implement component/block classification narrowly enough to retain that pair.
-- [ ] Add malformed/NaN/zero-matrix boundary tests; return `inf` rather than granting a family classification when the residual cannot be estimated.
-- [ ] Run the focused structure tests and the existing M1/M2 suite.
+- [x] Add a failing test where four exact multiples form one family and every edge becomes `proportional_family`.
+- [x] Run it and observe import/function failure.
+- [x] Implement finite rectangular rank-1 residual plus undirected components and make the family test pass.
+- [x] Add a failing test where one planted proportional pair sits inside an otherwise independent block and stays `isolated_ratio`.
+- [x] Implement component/block classification narrowly enough to retain that pair.
+- [x] Add malformed/NaN/zero-matrix boundary tests; return `inf` rather than granting a family classification when the residual cannot be estimated.
+- [x] Run the focused structure tests and the existing M1/M2 suite.
 
 ### Task 3: Run the Frozen M2.5 Acceptance Bench
 
@@ -70,12 +70,12 @@
 - The local runner emits aggregate JSON only: raw runs, qualifying directed runs, unique row edges, family summaries, and final isolated relations by shape/precision.
 - The committed test imports the frozen synthetic generator from `tests/test_curve_bench_baseline.py`; it contains no real data.
 
-- [ ] Add a failing committed acceptance test for one frozen curve sheet at 1, 2, and 3 decimals: final isolated count must be zero.
-- [ ] Add a failing committed test for an isolated planted two-row ratio in an independent block: exactly one unique isolated row pair remains.
-- [ ] Adjust only the structure classifier until both tests pass; do not add a precision branch or raise the bits threshold.
-- [ ] Run all 40 frozen sheets for continuous and paneled curve streams plus independent shapes; save aggregate results under `recheck/sigplan/`.
-- [ ] Add at least one affine/shifted curve-family stress bench and one quantized common-pool bench; record unsupported shapes instead of weakening the hard gate silently.
-- [ ] Write measured component/family/final-isolated counts back into the M2.5 section of the design.
+- [x] Add a failing committed acceptance test for one frozen curve sheet at 1, 2, and 3 decimals: final isolated count must be zero.
+- [x] Add a failing committed test for an isolated planted two-row ratio in an independent block: exactly one unique isolated row pair remains.
+- [x] Adjust only the structure classifier until both tests pass; do not add a precision branch or raise the bits threshold.
+- [x] Run all 40 frozen sheets for continuous and paneled curve streams plus independent shapes; save aggregate results under `recheck/sigplan/`.
+- [x] Add at least one affine/shifted curve-family stress bench and one quantized common-pool bench; record unsupported shapes instead of weakening the hard gate silently.
+- [x] Write measured component/family/final-isolated counts back into the M2.5 section of the design.
 
 ### Task 4: Verify the Offline Boundary
 
