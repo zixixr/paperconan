@@ -13,8 +13,11 @@ surviving digits. A cell that kept MORE decimals than its neighbours is left alo
 because that is real precision rather than a lost zero.
 
 It is an inference, not recovered metadata, and it is reported as such
-(`precision_source = "row_inferred"`). Where it is wrong it makes a cell's allowed
-interval narrower than the truth, which loses relations rather than inventing them.
+(`precision_source = "row_inferred"`). Getting it wrong narrows a cell's allowed
+interval, which loses matches -- but it also hands any surviving match a finer grid
+to be scored against, and that direction inflates. The last case here pins how far:
+one formula-cached cell can out-resolve its row by eight decades. So this module
+establishes an input assumption, not a safety property.
 
 Design: docs/superpowers/specs/2026-07-30-short-row-significance-gate.md section 4.
 """
@@ -101,3 +104,35 @@ def test_the_inference_is_deterministic():
     row = [1.5, 2.5, 1.25, 2.25, 3.5, 4.25]
 
     assert _effective_row_quantums(row) == _effective_row_quantums(list(row))
+
+
+def test_one_float_artifact_cell_can_out_resolve_its_whole_row():
+    """A KNOWN HAZARD, pinned so a scoring stage cannot inherit it silently.
+
+    `max(cell, row)` protects genuine extra precision, but it has no ceiling. A
+    formula-cached value keeps every float decimal it was computed with, so a single
+    such cell in an otherwise two-decimal row is read at 1e-10 -- eight decades finer
+    than its neighbours, from a spreadsheet that recorded nothing of the sort.
+
+    Matching is unaffected in the dangerous direction: a narrower interval only loses
+    runs. Scoring is not. Where evidence is counted as distinguishable positions,
+    `range / step`, this cell is worth roughly 38 bits by itself, which clears a
+    20-bit reporting gate with no help from any other column.
+
+    Pinned rather than fixed: the ceiling belongs with whichever consumer turns the
+    step into a score, and the design requires that consumer to measure its
+    sensitivity to this inference. If a fix lands here instead, this test should fail
+    and be replaced by one asserting the bound.
+    """
+    import math
+
+    row = [42.13, 58.91, 1 / 3, 33.84, 26.55]
+    q = _effective_row_quantums(row)
+
+    assert q[0] == 0.01 and q[1] == 0.01, q
+    assert q[2] <= 1e-9, f"the artifact cell was expected to out-resolve its row: {q}"
+
+    span = 40.0                       # a plausible target spread
+    assert math.log2(span / q[2]) > 20, (
+        "the hazard is no longer worth pinning here -- re-derive it"
+    )

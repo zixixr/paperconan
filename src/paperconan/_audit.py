@@ -3806,13 +3806,22 @@ def _effective_row_quantums(values):
       2. the row's step is the commonest of those, ties resolving to the FINER;
       3. a cell is read at `max(its own, the row's)`.
 
-    Step 3 is `max` on purpose. A cell carrying MORE decimals than its neighbours has
-    real extra precision and coarsening it would widen its allowed interval, which is
-    the direction that invents relations. Reading a cell finer than it truly is only
-    narrows the interval, which loses relations instead — the safe direction for a
-    tool whose findings ask people to go and check something.
+    Step 3 is `max` on purpose: a cell carrying MORE decimals than its neighbours has
+    real extra precision, and coarsening it would widen its allowed interval, which is
+    the direction that invents matches. The tie rule resolves finer for the same reason.
 
-    The tie rule resolves the same way and for the same reason.
+    THAT ARGUMENT COVERS MATCHING ONLY, and it does not make the inference safe overall.
+    Reading a cell finer than it truly is narrows its interval, so fewer runs match —
+    but any run that still matches is then SCORED against a finer grid. Where a score
+    counts distinguishable positions as `range / step`, a step ten times too fine adds
+    log2(10) ≈ 3.3 bits per confirming cell, and one cell whose float carries a full
+    complement of decimals — a formula-cached value such as 1/3 sitting in an otherwise
+    2-decimal row — reaches `q = 1e-10` and contributes upwards of 38 bits on its own.
+    The two effects run in opposite directions and the net is NOT one-sided.
+
+    So this is an input assumption, not a safety guarantee. Any consumer that turns the
+    step into a score has to measure its sensitivity to the inference and bound the
+    contribution a single cell may make; `test_row_quantum.py` pins the hazard.
 
     Non-finite cells get NaN: they carry no recorded precision, they cannot join a
     run, and they must not vote on the row's step.
