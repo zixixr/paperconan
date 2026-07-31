@@ -3902,6 +3902,98 @@ def _scan_quantized_ratio_runs(source, target, target_quantums, min_informative=
     return maximal
 
 
+_SHORT_ROW_MIN_PREDICTION_BITS = float(
+    os.environ.get("PAPERCONAN_SHORT_ROW_MIN_PREDICTION_BITS", "20"))
+# How much finer than its run's own step a single cell may be SCORED at.
+# `_effective_row_quantums` reads a cell at max(its own decimals, its row's), which
+# has no ceiling: one formula-cached value in an otherwise 2-decimal row is read at
+# 1e-10 and is worth ~38 bits by itself, clearing any sane bar unaided. That step is
+# right for MATCHING, where extra precision is real information, and wrong for
+# SCORING, where eight spare decades are a computational artifact rather than
+# something a person wrote down.
+#
+# Expressed as a RATIO to the run's median step rather than as an absolute bit cap,
+# because an absolute cap punishes genuine precision: a run over values spanning ~30
+# recorded at 0.001 legitimately distinguishes ~30000 places, which is ~15 bits, and
+# a flat 12-bit ceiling would quietly discard real evidence. Two decades of headroom
+# admits any ordinary mixed-precision panel and still bounds the artifact.
+_SHORT_ROW_MAX_QUANTUM_RATIO = float(
+    os.environ.get("PAPERCONAN_SHORT_ROW_MAX_QUANTUM_RATIO", "100"))
+
+
+def _percentile_linear(sorted_values, pct):
+    """Linear-interpolated percentile, written out rather than taken from numpy so the
+    two-column boundary in the design is exactly the arithmetic that runs: for two
+    values the p90-p10 spread is 0.8*(hi-lo), which is what makes a two-column run at
+    one quantum's separation score zero."""
+    n = len(sorted_values)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return float(sorted_values[0])
+    pos = (pct / 100.0) * (n - 1)
+    lo_i = int(math.floor(pos))
+    hi_i = min(lo_i + 1, n - 1)
+    frac = pos - lo_i
+    return float(sorted_values[lo_i]) * (1 - frac) + float(sorted_values[hi_i]) * frac
+
+
+def _ratio_prediction_bits(target_values, quantums, n_tests,
+                           max_quantum_ratio=None):
+    """How much description does one constant save, over this run?
+
+    A person judging a scaled row does three things: estimate k from one cell, predict
+    the rest with it, and notice how many distinct values were predicted and how
+    finely. This puts a number on the third. A cell recorded at step `q` over a spread
+    `R` had roughly `R/q` places it could have landed, so a correct prediction is worth
+    `log2(R/q)` bits. The cell that fixed k predicts nothing and earns nothing.
+
+    `log2(n_tests)` is then subtracted, because scanning many pairs and many start
+    columns is many chances to find something and a score that ignored the size of the
+    search would reward searching harder.
+
+    This is a MODEL COMPRESSION score, not a probability. It does not claim "one in a
+    million"; it says one constant accounted for about this much of what was written.
+    It says nothing whatever about why — a shared control, a derived column and a unit
+    restatement all compress just as well, which is why structural classification is a
+    separate question and stays that way.
+
+    `quantums` is what to score each cell against. No cell is scored more than
+    `max_quantum_ratio` times finer than the run's median step, which is what keeps a
+    single artifact cell from carrying the run.
+
+    Returns raw_bits, penalty, bits, confirming, per_cell.
+    """
+    finite = [(float(v), float(q)) for v, q in zip(target_values, quantums)
+              if math.isfinite(float(v)) and math.isfinite(float(q)) and float(q) > 0]
+    ratio_cap = (_SHORT_ROW_MAX_QUANTUM_RATIO if max_quantum_ratio is None
+                 else max_quantum_ratio)
+
+    if len(finite) < 2:
+        return {"raw_bits": 0.0, "penalty": 0.0, "bits": 0.0,
+                "confirming": max(0, len(finite) - 1), "per_cell": []}
+
+    values = sorted(v for v, _ in finite)
+    quants = sorted(q for _, q in finite)
+    spread = _percentile_linear(values, 90) - _percentile_linear(values, 10)
+    median_q = _percentile_linear(quants, 50)
+    # The floor matters: without it a run over values that barely differ would be
+    # scored against a spread of zero and take a log of it.
+    extent = max(median_q, spread)
+
+    # No cell is credited for resolution its run as a whole does not show.
+    q_floor = median_q / ratio_cap if ratio_cap and ratio_cap > 0 else 0.0
+    per_cell = []
+    for _v, q in finite[1:]:                      # the first informative cell anchors k
+        places = max(1.0, extent / max(q, q_floor))
+        per_cell.append(math.log2(places))
+
+    raw = float(sum(per_cell))
+    penalty = math.log2(n_tests) if n_tests and n_tests > 1 else 0.0
+    return {"raw_bits": raw, "penalty": penalty, "bits": raw - penalty,
+            "confirming": len(per_cell), "per_cell": per_cell}
+
+
 def _interval_holds_a_power_of_ten(lo, hi):
     """Does [lo, hi] contain a whole power of ten, in either sign?
 
