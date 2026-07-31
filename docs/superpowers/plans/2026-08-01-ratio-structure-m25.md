@@ -85,8 +85,8 @@
 **Interfaces:**
 - No production detector integration is permitted.
 
-- [ ] Run `pytest` for row quantum, quantized core, prediction bits, curve baseline, and both new structure test files.
-- [ ] Run the M2 and M2.5 local measurement commands twice and compare JSON outputs byte-for-byte.
-- [ ] Run the full test suite.
-- [ ] Inspect `git diff --check`, `git status --short`, and the production detector call graph to confirm M2.5 remains offline.
-- [ ] Record remaining unsupported curve/common-pool shapes and keep M3–M5 blocked unless every hard acceptance passes.
+- [x] Run `pytest` for row quantum, quantized core, prediction bits, curve baseline, and both new structure test files.
+- [x] Run the M2 and M2.5 local measurement commands twice and compare JSON outputs byte-for-byte.
+- [x] Run the full test suite.
+- [x] Inspect `git diff --check`, `git status --short`, and the production detector call graph to confirm M2.5 remains offline.
+- [x] Record remaining unsupported curve/common-pool shapes and keep M3–M5 blocked unless every hard acceptance passes.
