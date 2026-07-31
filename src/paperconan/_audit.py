@@ -4005,6 +4005,114 @@ def _ratio_prediction_bits(target_values, quantums, n_tests, *, informative=None
             "confirming": len(per_cell), "per_cell": per_cell}
 
 
+def _rank1_relative_residual(matrix):
+    """Relative error left by the best shared-profile (rank-1) explanation.
+
+    The measure is deliberately independent of decimal count. Non-finite columns are
+    removed as a whole so every retained row is compared on the same coordinates.
+    An unusable or all-zero matrix returns infinity: missing evidence must never grant
+    a family explanation.
+    """
+    m = np.asarray(matrix, dtype=float)
+    if m.ndim != 2 or m.shape[0] < 2 or m.shape[1] < 2:
+        return math.inf
+    m = m[:, np.all(np.isfinite(m), axis=0)]
+    if m.shape[1] < 2:
+        return math.inf
+    norm = float(np.linalg.norm(m))
+    if not math.isfinite(norm) or norm <= 1e-300:
+        return math.inf
+    singular = np.linalg.svd(m, compute_uv=False)
+    residual = float(np.linalg.norm(singular[1:]) / norm)
+    return residual if math.isfinite(residual) else math.inf
+
+
+def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
+                              min_family_rows=3):
+    """Separate isolated ratio relations from edges of a larger proportional family.
+
+    Arithmetic validity and strength have already been decided by M1/M2. This pure
+    offline layer retains every relation and adds context only. A family is summarized
+    rather than discarded so downstream output can fold many pair edges into one
+    table-level statistical pattern without claiming why the structure exists.
+    """
+    matrix = np.asarray(rows, dtype=float)
+    nrows = matrix.shape[0] if matrix.ndim == 2 else 0
+    block_residual = _rank1_relative_residual(matrix)
+
+    valid_edges = []
+    adjacency = {row: set() for row in range(nrows)}
+    for index, relation in enumerate(relations):
+        row_a, row_b = int(relation["row_a"]), int(relation["row_b"])
+        if 0 <= row_a < nrows and 0 <= row_b < nrows and row_a != row_b:
+            valid_edges.append((index, row_a, row_b))
+            adjacency[row_a].add(row_b)
+            adjacency[row_b].add(row_a)
+
+    components = []
+    visited = set()
+    for root in range(nrows):
+        if root in visited or not adjacency[root]:
+            continue
+        pending, members = [root], []
+        visited.add(root)
+        while pending:
+            row = pending.pop()
+            members.append(row)
+            for neighbour in sorted(adjacency[row]):
+                if neighbour not in visited:
+                    visited.add(neighbour)
+                    pending.append(neighbour)
+        components.append(sorted(members))
+
+    family_indexes = set()
+    families = []
+    if (nrows >= min_family_rows and valid_edges
+            and block_residual <= max_rank1_residual):
+        indexes = {index for index, _a, _b in valid_edges}
+        family_indexes.update(indexes)
+        families.append({
+            "scope": "block", "rows": list(range(nrows)),
+            "edge_count": len(indexes), "rank1_residual": block_residual,
+        })
+    else:
+        for members in components:
+            if len(members) < min_family_rows:
+                continue
+            member_set = set(members)
+            indexes = [index for index, a, b in valid_edges
+                       if a in member_set and b in member_set]
+            common_start = max(int(relations[index]["start"]) for index in indexes)
+            common_end = min(int(relations[index]["end"]) for index in indexes)
+            if common_end - common_start + 1 < 2:
+                continue
+            residual = _rank1_relative_residual(
+                matrix[members, common_start:common_end + 1])
+            if residual > max_rank1_residual:
+                continue
+            family_indexes.update(indexes)
+            families.append({
+                "scope": "component", "rows": members,
+                "edge_count": len(indexes), "rank1_residual": residual,
+                "start": common_start, "end": common_end,
+            })
+
+    classified, isolated = [], []
+    for index, relation in enumerate(relations):
+        item = dict(relation)
+        item["context_class"] = (
+            "proportional_family" if index in family_indexes else "isolated_ratio")
+        classified.append(item)
+        if item["context_class"] == "isolated_ratio":
+            isolated.append(item)
+    return {
+        "block_rank1_residual": block_residual,
+        "relations": classified,
+        "families": families,
+        "isolated_relations": isolated,
+    }
+
+
 def _interval_holds_a_power_of_ten(lo, hi):
     """Does [lo, hi] contain a whole power of ten, in either sign?
 
