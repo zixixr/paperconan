@@ -3861,6 +3861,7 @@ def _scan_quantized_ratio_runs(source, target, target_quantums, min_informative=
     for start in range(n):
         lo, hi = -math.inf, math.inf
         informative = 0
+        informative_columns = []
         seen_source = set()
         end = start - 1
         for j in range(start, n):
@@ -3874,6 +3875,7 @@ def _scan_quantized_ratio_runs(source, target, target_quantums, min_informative=
             end = j
             if math.isfinite(span[0]):
                 informative += 1
+                informative_columns.append(j)
                 seen_source.add(float(source[j]))
         if end < start or informative < min_informative:
             continue
@@ -3883,6 +3885,7 @@ def _scan_quantized_ratio_runs(source, target, target_quantums, min_informative=
             "start": start, "end": end,
             "k_lo": lo, "k_hi": hi,
             "informative": informative,
+            "informative_columns": informative_columns,
             "distinct_source": len(seen_source),
             "contains_one": lo <= 1.0 <= hi,
             "contains_power_of_ten": _interval_holds_a_power_of_ten(lo, hi),
@@ -3938,7 +3941,7 @@ def _percentile_linear(sorted_values, pct):
     return float(sorted_values[lo_i]) * (1 - frac) + float(sorted_values[hi_i]) * frac
 
 
-def _ratio_prediction_bits(target_values, quantums, n_tests,
+def _ratio_prediction_bits(target_values, quantums, n_tests, *, informative=None,
                            max_quantum_ratio=None):
     """How much description does one constant save, over this run?
 
@@ -3958,14 +3961,22 @@ def _ratio_prediction_bits(target_values, quantums, n_tests,
     restatement all compress just as well, which is why structural classification is a
     separate question and stays that way.
 
+    `informative` is the reconstruction core's aligned mask: a finite target such as
+    zero in a `0 -> 0` column still confirms nothing and must not become the anchor or
+    earn prediction bits merely because the scorer can see its value.
+
     `quantums` is what to score each cell against. No cell is scored more than
     `max_quantum_ratio` times finer than the run's median step, which is what keeps a
     single artifact cell from carrying the run.
 
     Returns raw_bits, penalty, bits, confirming, per_cell.
     """
-    finite = [(float(v), float(q)) for v, q in zip(target_values, quantums)
-              if math.isfinite(float(v)) and math.isfinite(float(q)) and float(q) > 0]
+    flags = ([True] * min(len(target_values), len(quantums))
+             if informative is None else informative)
+    finite = [(float(v), float(q)) for v, q, keep
+              in zip(target_values, quantums, flags)
+              if keep and math.isfinite(float(v)) and math.isfinite(float(q))
+              and float(q) > 0]
     ratio_cap = (_SHORT_ROW_MAX_QUANTUM_RATIO if max_quantum_ratio is None
                  else max_quantum_ratio)
 

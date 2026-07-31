@@ -230,6 +230,21 @@ def test_a_column_that_confirms_nothing_is_not_counted_as_confirmation():
     assert _runs([0.0, 4.0], [0.0, 3.0], [0.01, 0.01]) == []
 
 
+def test_a_run_names_only_the_columns_that_narrow_its_ratio_interval():
+    """A zero-to-zero column may sit inside a run but cannot anchor or confirm k.
+
+    The scorer consumes this field directly.  Omitting it makes the target value
+    alone look informative and pays a column that the reconstruction core explicitly
+    says contributed nothing.
+    """
+    runs = _runs([0.0, 4.0, 8.0], [0.0, 3.0, 6.0], [0.01] * 3)
+
+    assert len(runs) == 1, runs
+    assert (runs[0]["start"], runs[0]["end"]) == (0, 2)
+    assert runs[0]["informative"] == 2
+    assert runs[0]["informative_columns"] == [1, 2]
+
+
 def test_a_power_of_ten_inside_the_interval_counts_even_off_centre():
     """Asked of the interval, not of a chosen k.
 

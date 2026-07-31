@@ -68,6 +68,22 @@ def test_the_anchor_column_is_not_paid_for_predicting_itself():
     assert three["bits"] > two["bits"]
 
 
+def test_a_column_that_does_not_narrow_k_neither_anchors_nor_confirms():
+    """The reconstruction core marks zero-to-zero columns as uninformative.
+
+    A leading such column must be removed before choosing the anchor.  Otherwise the
+    first real constraint is incorrectly paid as a confirming prediction.
+    """
+    masked = _ratio_prediction_bits(
+        [0.0, 10.0, 20.0], [0.01, 0.01, 0.01], 1,
+        informative=[False, True, True],
+    )
+    direct = _ratio_prediction_bits([10.0, 20.0], [0.01, 0.01], 1)
+
+    assert masked == direct
+    assert masked["confirming"] == 1
+
+
 def test_a_longer_run_scores_higher_at_the_same_precision():
     scores = [_bits(COARSE_LONG[:n], 0.01)["bits"] for n in range(2, 9)]
 
