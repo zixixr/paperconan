@@ -3794,6 +3794,133 @@ def _sigfigs_and_frac(v):
 _MAX_READ_DECIMALS = 10          # the read precision `_sigfigs_and_frac` works at
 
 
+def _directed_ratio_interval(a, b, q_target):
+    """Which constants k could have written `b` from `a`, at target step `q_target`?
+
+    A cell written as `b` on a grid of step `q` came from anything in
+    `[b - q/2, b + q/2]`, so a single column does not pin k to a point — it admits an
+    interval. Asking the question this way removes the tolerance constant entirely:
+    nothing here decides whether a ratio is "close enough", it computes what rounding
+    could have produced.
+
+    DIRECTED on purpose. Only the target row carries write-back rounding, because
+    only it was computed and re-rounded; the source is used as stored. So a->b and
+    b->a are different questions and callers ask both.
+
+    Returns (lo, hi) with lo <= hi; `None` where the column breaks a run (a non-finite
+    cell, or a zero source against a non-zero target, which no constant reproduces);
+    or (-inf, +inf) where the column is compatible with every k and therefore confirms
+    nothing (zero against zero).
+    """
+    av, bv = float(a), float(b)
+    if not (math.isfinite(av) and math.isfinite(bv)):
+        return None
+    if av == 0.0:
+        return (-math.inf, math.inf) if bv == 0.0 else None
+    lo = (bv - q_target / 2.0) / av
+    hi = (bv + q_target / 2.0) / av
+    return (lo, hi) if lo <= hi else (hi, lo)      # a negative source swaps the ends
+
+
+def _scan_quantized_ratio_runs(source, target, target_quantums, min_informative=2,
+                               min_distinct_source=2):
+    """Maximal contiguous runs of columns that ONE constant could have written.
+
+    A run holds together exactly when its columns' k-intervals intersect, so the run
+    is grown by intersecting and stops where the intersection would empty. Because
+    intersecting only ever narrows, a run's extent from a given start is well defined
+    and any run contained in a longer one is dropped — a sub-run is not a separate
+    relation.
+
+    A run needs at least `min_informative` informative columns: the first fixes k and
+    contributes no evidence, so one column can never be a finding. It also needs
+    `min_distinct_source` distinct source values, since the same value repeated says
+    nothing about a constant.
+
+    At the defaults the second requirement implies the first — only informative
+    columns contribute a source value, so `distinct >= 2` forces `informative >= 2`,
+    and no input can separate them. Both are kept because they stop being equivalent
+    the moment a caller lowers `min_distinct_source`, and because they answer
+    different questions: how many columns confirmed the constant, and whether they
+    confirmed it against more than one number.
+
+    `contains_one` and `contains_power_of_ten` are reported, not acted on. A run whose
+    interval contains 1 is indistinguishable from no scaling at this precision and
+    belongs to the identical arm; one containing a whole power of ten is a unit
+    restatement. Both are the caller's decision — swallowing them here would make an
+    empty result mean two different things.
+
+    Returns a list of dicts ordered by start column. Pure; no detector state.
+    """
+    n = min(len(source), len(target), len(target_quantums))
+    spans = []
+    for i in range(n):
+        spans.append(_directed_ratio_interval(source[i], target[i], target_quantums[i]))
+
+    found = []
+    for start in range(n):
+        lo, hi = -math.inf, math.inf
+        informative = 0
+        seen_source = set()
+        end = start - 1
+        for j in range(start, n):
+            span = spans[j]
+            if span is None:
+                break
+            new_lo, new_hi = max(lo, span[0]), min(hi, span[1])
+            if new_lo > new_hi:
+                break
+            lo, hi = new_lo, new_hi
+            end = j
+            if math.isfinite(span[0]):
+                informative += 1
+                seen_source.add(float(source[j]))
+        if end < start or informative < min_informative:
+            continue
+        if len(seen_source) < min_distinct_source:
+            continue
+        found.append({
+            "start": start, "end": end,
+            "k_lo": lo, "k_hi": hi,
+            "informative": informative,
+            "distinct_source": len(seen_source),
+            "contains_one": lo <= 1.0 <= hi,
+            "contains_power_of_ten": _interval_holds_a_power_of_ten(lo, hi),
+        })
+
+    # Drop any run wholly inside another. Kept O(n^2) and explicit rather than clever:
+    # runs per row pair are few, and a subtle containment bug here would silently
+    # duplicate every relation.
+    maximal = []
+    for r in found:
+        if any(o is not r and o["start"] <= r["start"] and o["end"] >= r["end"]
+               and (o["start"], o["end"]) != (r["start"], r["end"]) for o in found):
+            continue
+        if any(m["start"] == r["start"] and m["end"] == r["end"] for m in maximal):
+            continue
+        maximal.append(r)
+    return maximal
+
+
+def _interval_holds_a_power_of_ten(lo, hi):
+    """Does [lo, hi] contain a whole power of ten, in either sign?
+
+    Asked of the interval rather than of a chosen k: at coarse precision the interval
+    can straddle 10^n while its midpoint does not, and a unit restatement that reads
+    as an arbitrary constant is exactly the misreading to avoid.
+    """
+    for sign in (1.0, -1.0):
+        a, b = (lo, hi) if sign > 0 else (-hi, -lo)
+        if b <= 0:
+            continue
+        top = math.floor(math.log10(b)) if b > 0 else 0
+        bottom = math.floor(math.log10(a)) if a > 0 else top - 1
+        for e in range(int(bottom) - 1, int(top) + 2):
+            if a <= 10.0 ** e <= b:
+                return True
+    return False
+
+
 def _effective_row_quantums(values):
     """The decimal step each cell of a row was RECORDED in, inferred from the row.
 
