@@ -87,10 +87,11 @@
 
 - [x] Run `pytest` for row quantum, quantized core, prediction bits, curve baseline, and both new structure test files.
 - [x] Run the M2 and M2.5 local measurement commands twice and compare JSON outputs byte-for-byte.
-- [x] Run the test suite. `uv run pytest` alone cannot collect: `tests/test_detection_recall_e2e.py`
-      fails at import with `ModuleNotFoundError: No module named 'tests'`. That break predates this
-      work (it reproduces on `main`) and is untouched here, but the earlier tick claimed a run that
-      cannot have happened. Measured with `--ignore` on that one file: 1669 passed, 1 skipped.
+- [x] Run the full test suite with `env PYTHONPATH=. .venv/bin/pytest`. Bare `uv run pytest`
+      has a pre-existing collection-path problem on `tests/test_detection_recall_e2e.py`, but that
+      does not make the earlier full verification impossible; setting the repository root on
+      `PYTHONPATH` runs that file and the rest of the suite without ignoring tests. Latest result:
+      1685 passed, 1 skipped.
 - [x] Inspect `git diff --check`, `git status --short`, and the production detector call graph to confirm M2.5 remains offline.
 - [x] Record remaining unsupported curve/common-pool shapes and keep M3–M5 blocked unless every hard acceptance passes.
 

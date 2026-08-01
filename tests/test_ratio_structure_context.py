@@ -12,12 +12,23 @@ from __future__ import annotations
 import math
 
 from paperconan._audit import (
-    _classify_ratio_structure, _rank1_relative_residual, _row_profile_step_p90,
+    _classify_ratio_structure, _rank1_relative_residual,
+    _row_profile_step_p90, _second_endpoint_peer_miss,
 )
 
 
 def _relation(a, b, start=0, end=3):
     return {"row_a": a, "row_b": b, "start": start, "end": end}
+
+
+def test_endpoint_peer_lookup_excludes_the_candidate_and_stops_at_two_supports():
+    """A lookup must not rescan every pair in the block for every relation."""
+    incident = {
+        0: [(0.01, (0, 1)), (0.02, (0, 2)), (0.04, (0, 3))],
+        1: [(0.01, (0, 1)), (0.03, (1, 2)), (0.05, (1, 3))],
+    }
+
+    assert _second_endpoint_peer_miss(incident, 0, 1) == 0.03
 
 
 def test_an_exact_multirow_proportional_block_is_one_family():

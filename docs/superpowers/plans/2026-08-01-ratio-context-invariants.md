@@ -84,14 +84,15 @@
 **Files:**
 - Modify: `docs/superpowers/specs/2026-07-30-short-row-significance-gate.md`
 - Modify: `docs/superpowers/plans/2026-08-01-ratio-context-invariants.md`
+- Modify: `docs/superpowers/plans/2026-08-01-ratio-structure-m25.md`
 
 **Interfaces:**
 - The main design records the approved product rule, measured calibration/holdout counts, known ambiguity boundary, and an explicit M3–M5 go/no-go result.
 
-- [ ] Replace the contradictory unconditional planted acceptance with the approved separability rule.
-- [ ] Remove the claim that a one-decimal miss is an information-theoretic limit; describe only what the measured evidence can and cannot separate.
-- [ ] Correct the full-suite verification note and record the exact command used.
-- [ ] Run focused ratio tests, `git diff --check`, and the full test suite.
-- [ ] Inspect the call graph and assert `_classify_ratio_structure` still has zero production callers.
-- [ ] Profile the offline classifier at the 400-row candidate cap and record runtime/peak-memory evidence; keep M3–M5 blocked if it violates repository resource limits or any hard acceptance gate.
-- [ ] Commit the documentation and verification record.
+- [x] Replace the contradictory unconditional planted acceptance with the approved separability rule.
+- [x] Remove the claim that a one-decimal miss is an information-theoretic limit; describe only what the measured evidence can and cannot separate.
+- [x] Correct the full-suite verification note and record the exact command used.
+- [x] Run focused ratio tests (`83 passed`), `git diff --check`, and the full test suite (`1685 passed, 1 skipped`).
+- [x] Inspect the call graph and assert `_classify_ratio_structure` still has zero production callers and no `_effective_row_quantums` dependency.
+- [x] Profile the offline classifier at the 400-row candidate cap. Fix the observed `O(E*n^2)` rescan and repeated-scope cache first; record the resulting ~0.71 s runtime, ~285 MB process peak, and ~123 MB traced classifier allocation peak. M3–M5 remain blocked on the still-missing evidence gates rather than on this synthetic performance upper bound.
+- [x] Commit the documentation and verification record.

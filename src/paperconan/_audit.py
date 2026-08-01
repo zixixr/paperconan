@@ -24,6 +24,7 @@ import argparse
 import csv as _csv
 import datetime
 import glob
+import heapq
 import json
 import math
 import os
@@ -4096,6 +4097,19 @@ def _symmetric_ratio_miss(row_a, row_b, start, end):
     return value if math.isfinite(value) else math.inf
 
 
+def _second_endpoint_peer_miss(incident, row_a, row_b):
+    """Second-nearest finite peer touching either endpoint, excluding their own pair."""
+    candidate = (min(row_a, row_b), max(row_a, row_b))
+    supports = 0
+    for miss, pair in heapq.merge(incident.get(row_a, ()), incident.get(row_b, ())):
+        if pair == candidate:
+            continue
+        supports += 1
+        if supports == 2:
+            return miss
+    return math.inf
+
+
 def _ratio_peer_comparison(rows, scope, row_a, row_b, start, end, *, _cache=None):
     """Compare one canonical pair's shape miss with nearby row pairs.
 
@@ -4112,32 +4126,38 @@ def _ratio_peer_comparison(rows, scope, row_a, row_b, start, end, *, _cache=None
     its scope is not explained by anything, and the safe direction is to report it.
     """
     key = (start, end)
-    peers = None if _cache is None else _cache.get(key)
-    if peers is None:
-        peers = {}
+    context = None if _cache is None else _cache.get(key)
+    if context is None:
+        misses = {}
+        incident = {row: [] for row in scope}
         for i_index, i in enumerate(scope):
             for j in scope[i_index + 1:]:
-                peers[(i, j)] = _symmetric_ratio_miss(
-                    rows[i], rows[j], start, end)
+                pair = (i, j)
+                miss = _symmetric_ratio_miss(rows[i], rows[j], start, end)
+                misses[pair] = miss
+                if math.isfinite(miss):
+                    incident[i].append((miss, pair))
+                    incident[j].append((miss, pair))
+        for peers in incident.values():
+            peers.sort()
+        context = {"misses": misses, "incident": incident}
         if _cache is not None:
-            _cache[key] = peers
+            _cache[key] = context
 
-    mine = _symmetric_ratio_miss(rows[row_a], rows[row_b], start, end)
+    pair = (min(row_a, row_b), max(row_a, row_b))
+    mine = context["misses"].get(pair, math.inf)
     if not math.isfinite(mine):
         return {"mine": math.inf, "peer_miss": math.inf,
                 "improvement": math.inf, "excess": math.inf}
 
-    pair = (min(row_a, row_b), max(row_a, row_b))
     # Context must be local to the relation. A three-row panel contributes only three
     # pairs to a 30-row block; a percentile over all 435 block pairs erases precisely
     # the third-row evidence a person would inspect first. Requiring the second-nearest
     # endpoint peer prevents one accidental neighbour from explaining the relation.
-    others = sorted(v for k, v in peers.items()
-                    if k != pair and (row_a in k or row_b in k) and math.isfinite(v))
-    if len(others) < 2:
+    peer_miss = _second_endpoint_peer_miss(context["incident"], row_a, row_b)
+    if not math.isfinite(peer_miss):
         return {"mine": mine, "peer_miss": math.inf,
                 "improvement": math.inf, "excess": math.inf}
-    peer_miss = others[1]
     numerical_zero = 32.0 * np.finfo(float).eps
     if mine <= numerical_zero:
         excess = 0.0 if peer_miss <= numerical_zero else math.inf
@@ -4206,23 +4226,25 @@ def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
     block_residual = _rank1_relative_residual(rows)
     profile_step = _row_profile_step_p90(rows)
     peer_cache = {}
-    comparison_cache = {}
+    decision_cache = {}
 
-    def context_decision(scope, index, row_a, row_b, structural_class):
+    def context_decision(scope, scope_key, index, row_a, row_b, structural_class):
         """Return structural, ambiguous, or isolated for one canonical relation."""
-        context_key = (tuple(scope), _ratio_context_key(relations[index]))
-        if context_key not in comparison_cache:
+        context_key = (scope_key, _ratio_context_key(relations[index]))
+        if context_key not in decision_cache:
             _lo, _hi, start, end = context_key[1]
-            comparison_cache[context_key] = _ratio_peer_comparison(
+            comparison = _ratio_peer_comparison(
                 rows, scope, min(row_a, row_b), max(row_a, row_b), start, end,
-                _cache=peer_cache.setdefault(tuple(scope), {}))
-        comparison = comparison_cache[context_key]
-        if (comparison["excess"] > min_peer_excess
-                and comparison["improvement"] > min_peer_improvement):
-            return "isolated_ratio"
-        if comparison["excess"] > min_ambiguous_excess:
-            return "ambiguous_within_context"
-        return structural_class
+                _cache=peer_cache.setdefault(scope_key, {}))
+            if (comparison["excess"] > min_peer_excess
+                    and comparison["improvement"] > min_peer_improvement):
+                decision = "isolated_ratio"
+            elif comparison["excess"] > min_ambiguous_excess:
+                decision = "ambiguous_within_context"
+            else:
+                decision = structural_class
+            decision_cache[context_key] = decision
+        return decision_cache[context_key]
 
     valid_edges = []
     adjacency = {row: set() for row in range(nrows)}
@@ -4256,10 +4278,11 @@ def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
     if (nrows >= min_family_rows and valid_edges
             and block_residual <= max_rank1_residual):
         scope = list(range(nrows))
+        scope_key = tuple(scope)
         indexes, ambiguous, skipped = set(), set(), set()
         for index, row_a, row_b in valid_edges:
             decision = context_decision(
-                scope, index, row_a, row_b, "proportional_family")
+                scope, scope_key, index, row_a, row_b, "proportional_family")
             if decision == "isolated_ratio":
                 skipped.add(index)
             else:
@@ -4297,9 +4320,11 @@ def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
             if residual > max_rank1_residual:
                 continue
             indexes, ambiguous, skipped = set(), set(), set()
+            scope_key = tuple(members)
             for index, row_a, row_b in candidates:
                 decision = context_decision(
-                    members, index, row_a, row_b, "proportional_family")
+                    members, scope_key, index, row_a, row_b,
+                    "proportional_family")
                 if decision == "isolated_ratio":
                     skipped.add(index)
                 else:
@@ -4326,12 +4351,13 @@ def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
     series = []
     if profile_step <= max_profile_step and nrows >= min_family_rows:
         scope = list(range(nrows))
+        scope_key = tuple(scope)
         ambiguous, skipped = set(), set()
         for index, row_a, row_b in valid_edges:
             if index in family_indexes:
                 continue
             decision = context_decision(
-                scope, index, row_a, row_b, "proportional_series")
+                scope, scope_key, index, row_a, row_b, "proportional_series")
             if decision == "isolated_ratio":
                 skipped.add(index)
             else:
