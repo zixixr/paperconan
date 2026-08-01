@@ -100,9 +100,10 @@ def test_nearby_relations_in_a_smooth_profile_sequence_are_a_series():
 
     assert got["block_rank1_residual"] > 0.02
     assert {r["context_class"] for r in got["relations"]} == {
-        "proportional_series"
+        "ambiguous_within_context"
     }
     assert len(got["series"]) == 1
+    assert got["series"][0]["ambiguous_relation_count"] == 2
     assert got["isolated_relations"] == []
 
 
@@ -157,6 +158,51 @@ def test_a_relation_far_tighter_than_its_block_is_not_absorbed_by_it():
     assert classes[(0, 3)] == "isolated_ratio", classes
     assert classes[(0, 1)] == "proportional_family", classes
     assert classes[(0, 2)] == "proportional_family", classes
+
+
+def test_reciprocal_relations_receive_one_context_decision():
+    """Reversing source and target cannot change an undirected context judgement.
+
+    The old implementation measured the candidate against only the target row's
+    inferred recording grid.  The same exact pair therefore landed in both the family
+    summary and the isolated output when reconstruction returned both directions.
+    """
+    base = [21.4, 73.9, 34.2, 112.6, 52.8, 131.5, 41.7, 94.3]
+    jitter = [1.012, 0.989, 1.007, 0.994, 1.015, 0.986, 1.003, 0.991]
+    rows = [
+        [round(v, 2) for v in base],
+        [round(v * 1.31 * j, 2) for v, j in zip(base, jitter)],
+        [round(v * 1.77 / j, 2) for v, j in zip(base, jitter)],
+        [round(v * 2.19, 2) for v in base],
+    ]
+    relations = [
+        _relation(0, 1, 0, 7), _relation(1, 0, 0, 7),
+        _relation(0, 2, 0, 7), _relation(2, 0, 0, 7),
+        _relation(0, 3, 0, 7), _relation(3, 0, 0, 7),
+    ]
+
+    got = _classify_ratio_structure(rows, relations)
+    classes = {(r["row_a"], r["row_b"]): r["context_class"]
+               for r in got["relations"]}
+
+    for row in (1, 2, 3):
+        assert classes[(0, row)] == classes[(row, 0)], classes
+
+
+def test_context_class_is_invariant_to_unit_scale():
+    """A unit conversion must not turn one proportional family into isolated pairs."""
+    base = [2.0, 7.0, 3.0, 11.0]
+    relations = [_relation(0, 1), _relation(0, 2),
+                 _relation(1, 2), _relation(2, 3)]
+    observed = []
+
+    for scale in (1e-14, 1.0, 1e14):
+        rows = [[scale * k * value for value in base]
+                for k in (1.0, 1.5, 2.0, 3.0)]
+        got = _classify_ratio_structure(rows, relations)
+        observed.append([relation["context_class"] for relation in got["relations"]])
+
+    assert observed == [["proportional_family"] * 4] * 3
 
 
 def test_the_profile_step_separates_an_ordered_block_from_a_shuffled_one():

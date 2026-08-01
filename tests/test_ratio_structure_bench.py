@@ -190,6 +190,10 @@ def test_an_exact_copy_between_adjacent_rows_survives_a_smooth_block():
         assert isolated == {(source, source + gap)}, (
             f"gap {gap}: expected the planted copy to survive, got {isolated}"
         )
+        planted = [r for r in classified["relations"]
+                   if {r["row_a"], r["row_b"]} == {source, source + gap}]
+        assert planted
+        assert {r["context_class"] for r in planted} == {"isolated_ratio"}
 
 
 def test_an_exact_copy_survives_a_three_row_near_proportional_panel():
@@ -215,18 +219,20 @@ def test_an_exact_copy_survives_a_three_row_near_proportional_panel():
     assert isolated == {(0, 2)}
 
 
-def test_one_decimal_inside_a_smooth_block_is_reported_as_a_limit_not_a_find():
-    """The boundary of what this layer can do, asserted rather than left implicit.
-
-    The same planted copy at one decimal is NOT separable: rounding to 0.1 leaves the
-    pair no tighter than the block's own relations, so it is absorbed. Recording that
-    here keeps the limit visible instead of surfacing later as a surprise.
-    """
+def test_one_decimal_inside_a_smooth_block_is_folded_as_ambiguous_context():
+    """A non-separable pair stays in the table summary, never as an isolated output."""
     rows = _shifted_curve_rows(1)
     rows[15] = [round(0.8371 * v, 1) for v in rows[14]]
 
     relations = _qualifying_relations(rows)
     classified = _classify_ratio_structure(rows, relations)
+    planted = [r for r in classified["relations"]
+               if {r["row_a"], r["row_b"]} == {14, 15}]
 
     assert relations, "the planted copy was never scored"
+    assert planted, "the non-separable relation disappeared instead of being folded"
+    assert {r["context_class"] for r in planted} == {"ambiguous_within_context"}
     assert classified["isolated_relations"] == []
+    summaries = classified["families"] + classified["series"]
+    assert summaries
+    assert sum(s["ambiguous_relation_count"] for s in summaries) >= len(planted)

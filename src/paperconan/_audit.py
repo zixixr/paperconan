@@ -4057,51 +4057,48 @@ def _rank1_relative_residual(matrix):
     return residual if math.isfinite(residual) else math.inf
 
 
-def _ratio_pair_relative_miss(row_a, row_b, start, end):
-    """How far one constant is from reproducing `row_b` out of `row_a`.
+def _ratio_context_key(relation):
+    """Canonical identity of one undirected row relation over one column window."""
+    row_a, row_b = int(relation["row_a"]), int(relation["row_b"])
+    return (min(row_a, row_b), max(row_a, row_b),
+            int(relation["start"]), int(relation["end"]))
 
-    Median over the window of |b - k*a| / |b| at the least-squares k. Dimensionless,
-    so it can be compared across rows of any magnitude or precision.
+
+def _symmetric_ratio_miss(row_a, row_b, start, end):
+    """Scale-invariant shape miss for an undirected proportional relation.
+
+    Each vector is first divided by its own largest absolute coordinate. That avoids
+    both overflow and a fixed absolute-value cutoff when a table is expressed in very
+    small or very large units. The sine of the angle between the rescaled vectors is
+    symmetric under swapping the rows and is zero for either sign of exact scaling.
     """
     x = np.asarray(row_a[start:end + 1], dtype=float)
     y = np.asarray(row_b[start:end + 1], dtype=float)
     if x.shape != y.shape:
         return math.inf
-    ok = (np.isfinite(x) & np.isfinite(y)
-          & (np.abs(x) > 1e-12) & (np.abs(y) > 1e-12))
+    ok = np.isfinite(x) & np.isfinite(y)
     if int(ok.sum()) < 2:
         return math.inf
     x, y = x[ok], y[ok]
-    denom = float(x @ x)
-    if denom <= 1e-300:
+    scale_x = float(np.max(np.abs(x)))
+    scale_y = float(np.max(np.abs(y)))
+    if not (math.isfinite(scale_x) and math.isfinite(scale_y)):
         return math.inf
-    miss = np.abs(y - (float(x @ y) / denom) * x) / np.abs(y)
-    value = float(np.median(miss))
+    if scale_x == 0.0 or scale_y == 0.0:
+        return math.inf
+    x, y = x / scale_x, y / scale_y
+    norm_x = float(np.linalg.norm(x))
+    norm_y = float(np.linalg.norm(y))
+    if norm_x == 0.0 or norm_y == 0.0:
+        return math.inf
+    cosine = abs(float(x @ y) / (norm_x * norm_y))
+    value = math.sqrt(max(0.0, 1.0 - min(1.0, cosine) ** 2))
     return value if math.isfinite(value) else math.inf
 
 
-def _ratio_grid_resolution(row_b, quantums_b, start, end):
-    """The tightest agreement the recording grid is able to express, as a fraction.
-
-    A value written at step `q` cannot be shown to agree with anything more closely
-    than `q/|v|`, so this is the floor under any claim about how exact a pair is. It
-    is a resolution floor, NOT an eligibility gate: no relation is dropped for being
-    coarse, and nothing here compares a decimal count against a threshold.
-    """
-    y = np.asarray(row_b[start:end + 1], dtype=float)
-    q = np.asarray(quantums_b[start:end + 1], dtype=float)
-    if y.shape != q.shape:
-        return math.inf
-    ok = np.isfinite(y) & np.isfinite(q) & (np.abs(y) > 1e-12) & (q > 0)
-    if int(ok.sum()) < 1:
-        return math.inf
-    value = float(np.median(q[ok] / np.abs(y[ok])))
-    return value if math.isfinite(value) and value > 0 else math.inf
-
-
-def _ratio_peer_excess(rows, quantums, scope, row_a, row_b, start, end,
-                       *, peer_percentile=10.0, _cache=None):
-    """How much tighter this pair is than the tight pairs around it.
+def _ratio_peer_comparison(rows, scope, row_a, row_b, start, end,
+                           *, peer_percentile=10.0, _cache=None):
+    """Compare one canonical pair's shape miss with nearby row pairs.
 
     A proportional context explains a relation only when the relation looks like the
     context. Rows that merely approximate one profile miss each other at the percent
@@ -4109,11 +4106,10 @@ def _ratio_peer_excess(rows, quantums, scope, row_a, row_b, start, end,
     on the strength of its neighbours' approximate agreement discards the one thing
     that made it worth a second look.
 
-    The comparison is a ratio of two dimensionless misses, so it carries no unit and
-    no decimal count. Its denominator floors at the recording resolution, which is
-    what stops a coincidental exact tie on a coarse grid from scoring as remarkable.
+    The comparison is a ratio of two symmetric dimensionless misses, so it carries no
+    unit, direction, inferred quantum or decimal count.
 
-    Returns infinity when there is no context to compare against -- a pair alone in
+    Returns infinities when there is no context to compare against -- a pair alone in
     its scope is not explained by anything, and the safe direction is to report it.
     """
     key = (start, end)
@@ -4122,21 +4118,37 @@ def _ratio_peer_excess(rows, quantums, scope, row_a, row_b, start, end,
         peers = {}
         for i_index, i in enumerate(scope):
             for j in scope[i_index + 1:]:
-                peers[(i, j)] = _ratio_pair_relative_miss(
+                peers[(i, j)] = _symmetric_ratio_miss(
                     rows[i], rows[j], start, end)
         if _cache is not None:
             _cache[key] = peers
 
-    mine = max(_ratio_pair_relative_miss(rows[row_a], rows[row_b], start, end),
-               _ratio_grid_resolution(rows[row_b], quantums[row_b], start, end))
-    if not math.isfinite(mine) or mine <= 0.0:
-        return math.inf
+    mine = _symmetric_ratio_miss(rows[row_a], rows[row_b], start, end)
+    if not math.isfinite(mine):
+        return {"mine": math.inf, "peer_miss": math.inf,
+                "improvement": math.inf, "excess": math.inf}
 
     pair = (min(row_a, row_b), max(row_a, row_b))
     others = sorted(v for k, v in peers.items() if k != pair and math.isfinite(v))
     if len(others) < 2:
-        return math.inf
-    return _percentile_linear(others, peer_percentile) / mine
+        return {"mine": mine, "peer_miss": math.inf,
+                "improvement": math.inf, "excess": math.inf}
+    peer_miss = _percentile_linear(others, peer_percentile)
+    numerical_zero = 32.0 * np.finfo(float).eps
+    if mine <= numerical_zero:
+        excess = 0.0 if peer_miss <= numerical_zero else math.inf
+    else:
+        excess = peer_miss / mine
+    return {"mine": mine, "peer_miss": peer_miss,
+            "improvement": max(0.0, peer_miss - mine), "excess": excess}
+
+
+def _ratio_peer_excess(rows, scope, row_a, row_b, start, end,
+                       *, peer_percentile=10.0, _cache=None):
+    """How many times tighter a canonical pair is than its structural peers."""
+    return _ratio_peer_comparison(
+        rows, scope, row_a, row_b, start, end,
+        peer_percentile=peer_percentile, _cache=_cache)["excess"]
 
 
 def _row_profile_step_p90(matrix):
@@ -4157,7 +4169,9 @@ def _row_profile_step_p90(matrix):
 
 def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
                               min_family_rows=3, max_profile_step=0.05,
-                              min_peer_excess=7.0):
+                              min_peer_excess=7.0,
+                              min_peer_improvement=0.005,
+                              min_ambiguous_excess=1.0):
     """Separate isolated ratio relations from edges of a larger proportional family.
 
     Arithmetic validity and strength have already been decided by M1/M2. This pure
@@ -4171,10 +4185,10 @@ def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
       different amplitudes (small rank-1 residual on unit-normalized rows), or whose
       profile changes gradually down the rows (small consecutive profile step).
 
-      DOES THAT CONTEXT EXPLAIN THIS RELATION?  Only if the relation is no tighter
-      than the tight relations around it. `_ratio_peer_excess` asks that directly, and
-      an edge above `min_peer_excess` keeps its own class no matter how proportional
-      its surroundings look.
+      DOES THAT CONTEXT EXPLAIN THIS RELATION?  A row-pair becomes isolated only when
+      it is both multiplicatively and absolutely tighter than its structural peers.
+      A ratio alone exaggerates tiny differences around zero, so an improvement below
+      `min_peer_improvement` is folded as ambiguous rather than promoted.
 
     The second question is why nothing here reads row distance. An earlier form folded
     any edge within two rows of its partner whenever the block looked smooth, which
@@ -4188,16 +4202,24 @@ def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
         nrows = 0
     block_residual = _rank1_relative_residual(rows)
     profile_step = _row_profile_step_p90(rows)
-    quantums = [_effective_row_quantums(row) for row in rows] if nrows else []
     peer_cache = {}
+    comparison_cache = {}
 
-    def explained_by(scope, index, row_a, row_b):
-        """Does a proportional context account for this edge, or is it exceptional?"""
-        excess = _ratio_peer_excess(
-            rows, quantums, scope, row_a, row_b,
-            int(relations[index]["start"]), int(relations[index]["end"]),
-            _cache=peer_cache.setdefault(tuple(scope), {}))
-        return excess <= min_peer_excess
+    def context_decision(scope, index, row_a, row_b, structural_class):
+        """Return structural, ambiguous, or isolated for one canonical relation."""
+        context_key = (tuple(scope), _ratio_context_key(relations[index]))
+        if context_key not in comparison_cache:
+            _lo, _hi, start, end = context_key[1]
+            comparison_cache[context_key] = _ratio_peer_comparison(
+                rows, scope, min(row_a, row_b), max(row_a, row_b), start, end,
+                _cache=peer_cache.setdefault(tuple(scope), {}))
+        comparison = comparison_cache[context_key]
+        if (comparison["excess"] > min_peer_excess
+                and comparison["improvement"] > min_peer_improvement):
+            return "isolated_ratio"
+        if comparison["excess"] > min_ambiguous_excess:
+            return "ambiguous_within_context"
+        return structural_class
 
     valid_edges = []
     adjacency = {row: set() for row in range(nrows)}
@@ -4225,15 +4247,24 @@ def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
         components.append(sorted(members))
 
     family_indexes = set()
+    ambiguous_indexes = set()
     families = []
     exceptional = set()
     if (nrows >= min_family_rows and valid_edges
             and block_residual <= max_rank1_residual):
         scope = list(range(nrows))
-        indexes, skipped = set(), set()
+        indexes, ambiguous, skipped = set(), set(), set()
         for index, row_a, row_b in valid_edges:
-            (indexes if explained_by(scope, index, row_a, row_b) else skipped).add(index)
+            decision = context_decision(
+                scope, index, row_a, row_b, "proportional_family")
+            if decision == "isolated_ratio":
+                skipped.add(index)
+            else:
+                indexes.add(index)
+                if decision == "ambiguous_within_context":
+                    ambiguous.add(index)
         exceptional |= skipped
+        ambiguous_indexes |= ambiguous
         if indexes:
             pairs = {(min(a, b), max(a, b)) for index, a, b in valid_edges
                      if index in indexes}
@@ -4243,6 +4274,7 @@ def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
                 "edge_count": len(pairs), "relation_count": len(indexes),
                 "rank1_residual": block_residual,
                 "exceptional_relations": len(skipped),
+                "ambiguous_relation_count": len(ambiguous),
             })
     else:
         for members in components:
@@ -4261,11 +4293,18 @@ def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
                 matrix[members, common_start:common_end + 1])
             if residual > max_rank1_residual:
                 continue
-            indexes, skipped = set(), set()
+            indexes, ambiguous, skipped = set(), set(), set()
             for index, row_a, row_b in candidates:
-                (indexes if explained_by(members, index, row_a, row_b)
-                 else skipped).add(index)
+                decision = context_decision(
+                    members, index, row_a, row_b, "proportional_family")
+                if decision == "isolated_ratio":
+                    skipped.add(index)
+                else:
+                    indexes.add(index)
+                    if decision == "ambiguous_within_context":
+                        ambiguous.add(index)
             exceptional |= skipped
+            ambiguous_indexes |= ambiguous
             if not indexes:
                 continue
             pairs = {(min(a, b), max(a, b)) for index, a, b in candidates
@@ -4277,21 +4316,27 @@ def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
                 "rank1_residual": residual,
                 "start": common_start, "end": common_end,
                 "exceptional_relations": len(skipped),
+                "ambiguous_relation_count": len(ambiguous),
             })
 
     series_indexes = set()
     series = []
     if profile_step <= max_profile_step and nrows >= min_family_rows:
         scope = list(range(nrows))
-        skipped = set()
+        ambiguous, skipped = set(), set()
         for index, row_a, row_b in valid_edges:
             if index in family_indexes:
                 continue
-            if explained_by(scope, index, row_a, row_b):
-                series_indexes.add(index)
-            else:
+            decision = context_decision(
+                scope, index, row_a, row_b, "proportional_series")
+            if decision == "isolated_ratio":
                 skipped.add(index)
+            else:
+                series_indexes.add(index)
+                if decision == "ambiguous_within_context":
+                    ambiguous.add(index)
         exceptional |= skipped
+        ambiguous_indexes |= ambiguous
         if series_indexes:
             pairs = {
                 (min(row_a, row_b), max(row_a, row_b))
@@ -4302,12 +4347,15 @@ def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
                 "edge_count": len(pairs), "relation_count": len(series_indexes),
                 "profile_step_p90": profile_step,
                 "exceptional_relations": len(skipped),
+                "ambiguous_relation_count": len(ambiguous),
             })
 
     classified, isolated = [], []
     for index, relation in enumerate(relations):
         item = dict(relation)
-        if index in family_indexes:
+        if index in ambiguous_indexes:
+            item["context_class"] = "ambiguous_within_context"
+        elif index in family_indexes:
             item["context_class"] = "proportional_family"
         elif index in series_indexes:
             item["context_class"] = "proportional_series"

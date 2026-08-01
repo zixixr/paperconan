@@ -31,13 +31,13 @@
 - `_symmetric_ratio_miss` rescales each finite vector by its own maximum absolute value before normalization, then returns the sine of the angle between the two row vectors. It returns `math.inf` for incompatible shapes, fewer than two shared finite coordinates, or an all-zero vector. It has no absolute value cutoff.
 - `_ratio_peer_excess` consumes only rows, scope, canonical row pair and window. It must not consume quantums.
 
-- [ ] Add a failing end-to-end test containing both directions of the existing `2.19x` fixture; assert identical context classes for the same canonical key.
-- [ ] Run the test and observe `isolated_ratio` in one direction and `proportional_family` in the other.
-- [ ] Add a failing scale-invariance test for factors `1e-14`, `1`, and `1e14`; assert the same class at every scale.
-- [ ] Run it and observe the current `1e-12` cutoff changing the result.
-- [ ] Implement `_ratio_context_key` and `_symmetric_ratio_miss`; remove `_ratio_grid_resolution` and quantum reconstruction from `_classify_ratio_structure`.
-- [ ] Compute one decision per canonical key and copy it to every directed relation carrying that key.
-- [ ] Run `tests/test_ratio_structure_context.py` and commit.
+- [x] Add a failing end-to-end test containing both directions of the existing `2.19x` fixture; assert identical context classes for the same canonical key.
+- [x] Run the test and observe `isolated_ratio` in one direction and `proportional_family` in the other.
+- [x] Add a failing scale-invariance test for factors `1e-14`, `1`, and `1e14`; assert the same class at every scale.
+- [x] Run it and observe the current `1e-12` cutoff changing the result.
+- [x] Implement `_ratio_context_key` and `_symmetric_ratio_miss`; remove `_ratio_grid_resolution` and quantum reconstruction from `_classify_ratio_structure`.
+- [x] Compute one decision per canonical key and copy it to every directed relation carrying that key.
+- [x] Run `tests/test_ratio_structure_context.py` and commit together with Task 2 because removing the quantum floor intentionally exposed the ambiguity cases Task 2 owns.
 
 ### Task 2: Separate Structural Context From Isolation Decision
 
@@ -50,14 +50,14 @@
 - A canonical relation can be `proportional_family`, `proportional_series`, `ambiguous_within_context`, or `isolated_ratio`.
 - `ambiguous_within_context` is included in a family/series summary and excluded from `isolated_relations`.
 - `_ratio_peer_excess` returns `0.0` when the candidate and the peer reference quantile are both numerically exact; returns `math.inf` when no peer context exists.
-- `min_peer_excess=7.0` remains provisional: excess above it is isolated only when a dense qualifying-relation component does not already make the pair non-separable. Excess in `(1.0, 7.0]`, or excess above the bar inside a qualifying component spanning at least three rows, is `ambiguous_within_context`.
+- `min_peer_excess=7.0` and `min_peer_improvement=0.005` remain provisional. A relation is isolated only when both thresholds pass. Excess above `1.0` which fails either isolation threshold is `ambiguous_within_context`; using both a ratio and an absolute dimensionless improvement prevents a tiny denominator from promoting negligible differences.
 
-- [ ] Add a failing test that an ordinary exact multi-row family produces one family summary and no isolated relation after removal of the quantum floor.
-- [ ] Add a failing test that the one-decimal planted relation inside a dense smooth block is present, classified `ambiguous_within_context`, absent from `isolated_relations`, and counted by a table-level summary.
-- [ ] Add a failing test that the two-decimal planted relation which is clearly tighter than sparse structural peers remains `isolated_ratio` in both directions.
-- [ ] Implement the tri-state isolation decision once per canonical key and attach ambiguous relations to the relevant summary.
-- [ ] Assert family/series summaries expose `ambiguous_relation_count` and retain raw `relation_count`.
-- [ ] Run both ratio-structure test files and commit.
+- [x] Run the existing exact multi-row family test after removal of the quantum floor and confirm it still produces one family summary with no isolated relation.
+- [x] Add a failing test that the one-decimal planted relation inside a dense smooth block is present, classified `ambiguous_within_context`, absent from `isolated_relations`, and counted by a table-level summary.
+- [x] Strengthen the existing two-decimal planted test to require `isolated_ratio` in both directions; confirm the Task 1 symmetric implementation already satisfies it.
+- [x] Implement the tri-state isolation decision once per canonical key and attach ambiguous relations to the relevant summary.
+- [x] Assert family/series summaries expose `ambiguous_relation_count` and retain raw `relation_count`.
+- [x] Run both ratio-structure test files and commit.
 
 ### Task 3: Independent Holdout Bench
 
@@ -94,4 +94,3 @@
 - [ ] Inspect the call graph and assert `_classify_ratio_structure` still has zero production callers.
 - [ ] Profile the offline classifier at the 400-row candidate cap and record runtime/peak-memory evidence; keep M3–M5 blocked if it violates repository resource limits or any hard acceptance gate.
 - [ ] Commit the documentation and verification record.
-
