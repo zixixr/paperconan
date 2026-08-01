@@ -4096,8 +4096,7 @@ def _symmetric_ratio_miss(row_a, row_b, start, end):
     return value if math.isfinite(value) else math.inf
 
 
-def _ratio_peer_comparison(rows, scope, row_a, row_b, start, end,
-                           *, peer_percentile=10.0, _cache=None):
+def _ratio_peer_comparison(rows, scope, row_a, row_b, start, end, *, _cache=None):
     """Compare one canonical pair's shape miss with nearby row pairs.
 
     A proportional context explains a relation only when the relation looks like the
@@ -4129,11 +4128,16 @@ def _ratio_peer_comparison(rows, scope, row_a, row_b, start, end,
                 "improvement": math.inf, "excess": math.inf}
 
     pair = (min(row_a, row_b), max(row_a, row_b))
-    others = sorted(v for k, v in peers.items() if k != pair and math.isfinite(v))
+    # Context must be local to the relation. A three-row panel contributes only three
+    # pairs to a 30-row block; a percentile over all 435 block pairs erases precisely
+    # the third-row evidence a person would inspect first. Requiring the second-nearest
+    # endpoint peer prevents one accidental neighbour from explaining the relation.
+    others = sorted(v for k, v in peers.items()
+                    if k != pair and (row_a in k or row_b in k) and math.isfinite(v))
     if len(others) < 2:
         return {"mine": mine, "peer_miss": math.inf,
                 "improvement": math.inf, "excess": math.inf}
-    peer_miss = _percentile_linear(others, peer_percentile)
+    peer_miss = others[1]
     numerical_zero = 32.0 * np.finfo(float).eps
     if mine <= numerical_zero:
         excess = 0.0 if peer_miss <= numerical_zero else math.inf
@@ -4144,11 +4148,10 @@ def _ratio_peer_comparison(rows, scope, row_a, row_b, start, end,
 
 
 def _ratio_peer_excess(rows, scope, row_a, row_b, start, end,
-                       *, peer_percentile=10.0, _cache=None):
+                       *, _cache=None):
     """How many times tighter a canonical pair is than its structural peers."""
     return _ratio_peer_comparison(
-        rows, scope, row_a, row_b, start, end,
-        peer_percentile=peer_percentile, _cache=_cache)["excess"]
+        rows, scope, row_a, row_b, start, end, _cache=_cache)["excess"]
 
 
 def _row_profile_step_p90(matrix):

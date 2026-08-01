@@ -50,6 +50,7 @@
 - A canonical relation can be `proportional_family`, `proportional_series`, `ambiguous_within_context`, or `isolated_ratio`.
 - `ambiguous_within_context` is included in a family/series summary and excluded from `isolated_relations`.
 - `_ratio_peer_excess` returns `0.0` when the candidate and the peer reference quantile are both numerically exact; returns `math.inf` when no peer context exists.
+- Structural peers are local to either endpoint of the candidate relation. The second-nearest endpoint peer is the reference miss, so a three-row panel remains visible inside a much larger block while one accidental neighbour cannot explain the candidate by itself.
 - `min_peer_excess=7.0` and `min_peer_improvement=0.005` remain provisional. A relation is isolated only when both thresholds pass. Excess above `1.0` which fails either isolation threshold is `ambiguous_within_context`; using both a ratio and an absolute dimensionless improvement prevents a tiny denominator from promoting negligible differences.
 
 - [x] Run the existing exact multi-row family test after removal of the quantum floor and confirm it still produces one family summary with no isolated relation.
@@ -62,7 +63,7 @@
 ### Task 3: Independent Holdout Bench
 
 **Files:**
-- Modify: `tests/test_ratio_structure_bench.py`
+- Create: `tests/test_ratio_structure_holdout.py`
 - Modify: `recheck/sigplan/m25_structure.py` (gitignored aggregate runner)
 - Create: `recheck/sigplan/m25_holdout.py` (gitignored aggregate runner)
 
@@ -71,12 +72,12 @@
 - Holdout uses disjoint seeds and at least three new shape families: sigmoid with a non-zero baseline, saturating response with varying half-max, and exponential decay with varying amplitude/rate.
 - Holdout output contains aggregate counts only and reports classes by shape, precision and threshold; it contains no real supplementary identities.
 
-- [ ] Add failing presence-first holdout tests: each null family must generate at least one qualifying relation across its sweep before zero isolated output is accepted.
-- [ ] Add planted sweeps over multiple constants, row positions and scales; separable planted relations must remain isolated while dense-context planted relations must fold as ambiguous/table-level structure.
-- [ ] Run thresholds `5`, `7`, and `9` on calibration and holdout; record the stable interval rather than selecting a value from the acceptance set.
-- [ ] If no shared stable interval exists, keep the threshold unset and stop before Task 4 instead of tuning to one fixture.
-- [ ] Run both aggregate scripts twice and compare their JSON byte-for-byte.
-- [ ] Commit only synthetic tests; keep local aggregate scripts/results gitignored.
+- [x] Add failing presence-first holdout tests: each null family must generate at least one qualifying relation at every tested precision before zero isolated output is accepted.
+- [x] Add planted sweeps over multiple constants, row positions and structural contexts; separable planted relations must remain isolated while context-supported planted relations must fold as ambiguous/table-level structure. Unit-scale invariance remains covered by Task 1 because M1's float-precision inference is intentionally outside this context-only holdout.
+- [x] Run thresholds `5`, `7`, and `9` on calibration and holdout; all three are stable after endpoint-local peer comparison, so `7` remains the provisional midpoint rather than a value selected at an acceptance boundary.
+- [x] Confirm a shared stable interval exists; otherwise this task would have stopped before Task 4.
+- [x] Run both aggregate scripts twice and compare their JSON byte-for-byte.
+- [x] Commit only synthetic tests; keep local aggregate scripts/results gitignored.
 
 ### Task 4: Documentation and Offline Verification
 
