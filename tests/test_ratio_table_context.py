@@ -146,3 +146,150 @@ def test_reciprocal_only_evidence_and_input_order_give_one_table_decision():
     assert {relation["context_class"] for relation in forward["relations"]} == {
         "proportional_table_transform"
     }
+
+
+def test_a_rank1_shape_cannot_merge_relations_across_explicit_blocks():
+    """Block separators survive even when every numeric row has the same profile."""
+    base = _profile(67)
+    panel_a = [_scaled(base, constant) for constant in (1.0, 1.3, 1.7)]
+    rows = panel_a + [_scaled(row, 0.84) for row in panel_a]
+    relations = [
+        {
+            "row_a": source,
+            "row_b": target,
+            "start": 0,
+            "end": 7,
+            "k_lo": 0.839,
+            "k_hi": 0.841,
+            "prediction_bits": 40.0,
+        }
+        for source, target in ((0, 3), (1, 4), (2, 5))
+    ]
+
+    got = _classify_ratio_table_context(
+        rows, relations, row_blocks=[0, 0, 0, 1, 1, 1])
+
+    assert got["families"] == []
+    assert len(got["table_transforms"]) == 1
+    assert got["table_transforms"][0]["scope"] == "cross_block"
+    assert got["table_transforms"][0]["pair_count"] == 3
+
+
+def test_repeated_floor_cells_fold_as_a_quantized_common_pool():
+    source = [70.0, 71.0, 72.0, 0.1, 0.1, 0.1, 0.1, 0.1]
+    target = [35.0, 35.5, 36.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    rows = [source, _profile(71), _profile(73),
+            target, _profile(79), _profile(83)]
+    # Make the floor bins common inside each structural block, independently of the
+    # candidate pair itself.
+    for row in (rows[1], rows[2]):
+        row[3:] = [0.1] * 5
+    for row in (rows[4], rows[5]):
+        row[3:] = [0.0] * 5
+    forward = {
+        "row_a": 0, "row_b": 3, "start": 0, "end": 7,
+        "informative_columns": list(range(8)),
+        "k_lo": 0.49, "k_hi": 0.51, "n_tests": 48,
+        "prediction_bits": 35.0,
+    }
+    reverse = {
+        "row_a": 3, "row_b": 0, "start": 0, "end": 7,
+        "informative_columns": list(range(8)),
+        "k_lo": 1 / 0.51, "k_hi": 1 / 0.49, "n_tests": 48,
+        "prediction_bits": 35.0,
+    }
+
+    got = _classify_ratio_table_context(
+        rows, [forward, reverse], row_blocks=[0, 0, 0, 1, 1, 1])
+
+    assert got["isolated_relations"] == []
+    assert [item["context_class"] for item in got["relations"]] == [
+        "quantized_common_pool", "quantized_common_pool",
+    ]
+    assert len(got["quantized_common_pools"]) == 1
+    assert got["quantized_common_pools"][0]["pair_count"] == 1
+
+
+def test_one_common_grid_cell_cannot_explain_an_otherwise_distinctive_pair():
+    source = [19.3, 42.7, 67.1, 83.9, 51.4, 28.6, 74.2, 0.1]
+    target = _scaled(source, 0.63)
+    rows = [source, _profile(89), _profile(97),
+            target, _profile(101), _profile(103)]
+    for row in (rows[1], rows[2], rows[4], rows[5]):
+        row[-1] = 0.1
+    relations = [{
+        "row_a": 0, "row_b": 3, "start": 0, "end": 7,
+        "informative_columns": list(range(8)),
+        "k_lo": 0.629, "k_hi": 0.631, "n_tests": 48,
+        "prediction_bits": 40.0,
+    }]
+
+    got = _classify_ratio_table_context(
+        rows, relations, row_blocks=[0, 0, 0, 1, 1, 1])
+
+    assert got["quantized_common_pools"] == []
+    assert len(got["isolated_relations"]) == 1
+    assert got["isolated_relations"][0]["context_class"] == (
+        "isolated_cross_block_ratio")
+
+
+def test_common_values_on_only_one_side_do_not_erase_target_evidence():
+    source = [70.0, 72.0, 0.2, 0.2, 0.2, 0.2]
+    target = [35.0, 36.0, 0.1, 0.1, 0.1, 0.1]
+    rows = [source, target]
+    rows.extend([
+        [80.0 + index, 90.0 + index, 0.2, 0.2, 0.2, 0.2]
+        for index in range(3)
+    ])
+    relations = [{
+        "row_a": 0, "row_b": 1, "start": 0, "end": 5,
+        "informative_columns": list(range(6)),
+        "k_lo": 0.49, "k_hi": 0.51, "n_tests": 40,
+        "prediction_bits": 30.0,
+    }]
+
+    got = _classify_ratio_table_context(
+        rows, relations, row_blocks=[0, 1, 2, 3, 4])
+
+    assert got["quantized_common_pools"] == []
+    assert len(got["isolated_relations"]) == 1
+
+
+def test_common_floor_bins_accumulate_across_small_panels():
+    rows = [
+        [70.0 + index, 71.0 + index, 72.0 + index, 0.1, 0.1, 0.1]
+        for index in range(5)
+    ]
+    relations = [{
+        "row_a": 0, "row_b": 4, "start": 0, "end": 5,
+        "informative_columns": list(range(6)),
+        "k_lo": 1.04, "k_hi": 1.07, "n_tests": 100,
+        "prediction_bits": 30.0,
+    }]
+
+    got = _classify_ratio_table_context(
+        rows, relations, row_blocks=[0, 1, 2, 3, 4])
+
+    assert got["relations"][0]["context_class"] == "quantized_common_pool"
+    assert got["isolated_relations"] == []
+
+
+def test_common_bins_do_not_hide_enough_distinctive_confirmation_columns():
+    source = [19.3, 42.7, 67.1, 83.9, 51.4, 28.6, 0.1, 0.1]
+    target = _scaled(source, 0.63)
+    rows = [source, _profile(107), _profile(109),
+            target, _profile(113), _profile(127)]
+    for row in rows:
+        row[-2:] = [0.1, 0.1]
+    relations = [{
+        "row_a": 0, "row_b": 3, "start": 0, "end": 7,
+        "informative_columns": list(range(8)),
+        "k_lo": 0.629, "k_hi": 0.631, "n_tests": 48,
+        "prediction_bits": 45.0,
+    }]
+
+    got = _classify_ratio_table_context(
+        rows, relations, row_blocks=[0, 0, 0, 1, 1, 1])
+
+    assert got["quantized_common_pools"] == []
+    assert len(got["isolated_relations"]) == 1

@@ -31,6 +31,35 @@ def test_endpoint_peer_lookup_excludes_the_candidate_and_stops_at_two_supports()
     assert _second_endpoint_peer_miss(incident, 0, 1) == 0.03
 
 
+def test_two_column_domains_do_not_destroy_each_others_family_context():
+    """A person inspects the two windows separately, not their empty intersection.
+
+    The same four rows can carry proportional relations in columns 0-1 and 3-4.
+    Joining all edges into one row component and then intersecting every run leaves no
+    common columns, which used to leak all twelve relations as isolated outputs.
+    """
+    rows = [
+        [2000.0, 2.70e-10, 91.0, 1004.004004, 1.354789e-10],
+        [3000.0, 3.63e-10, 17.0, 1008.008008, 1.359578e-10],
+        [4000.0, 4.90e-10, 53.0, 1012.012012, 1.364366e-10],
+        [5000.0, 6.18e-10, 29.0, 1016.016016, 1.369155e-10],
+    ]
+    relations = [
+        _relation(row_a, row_b, start, end)
+        for start, end in ((0, 1), (3, 4))
+        for row_a in range(4)
+        for row_b in range(row_a + 1, 4)
+    ]
+
+    got = _classify_ratio_structure(rows, relations)
+
+    assert got["isolated_relations"] == []
+    assert len(got["families"]) == 2
+    assert {tuple(family["column_domain"]) for family in got["families"]} == {
+        (0, 1), (3, 4)
+    }
+
+
 def test_an_exact_multirow_proportional_block_is_one_family():
     """Removing rank-1/component detection would leak every pair as isolated."""
     base = [2.0, 7.0, 3.0, 11.0]

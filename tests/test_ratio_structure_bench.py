@@ -48,6 +48,7 @@ def _qualifying_relations(rows, minimum_bits=20.0):
                     "row_a": row_a, "row_b": row_b,
                     "start": start, "end": end,
                     "k_lo": run["k_lo"], "k_hi": run["k_hi"],
+                    "n_tests": n_tests,
                     "prediction_bits": score["bits"],
                 })
     return relations

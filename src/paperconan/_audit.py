@@ -4190,6 +4190,61 @@ def _row_profile_step_p90(matrix):
     return _percentile_linear(steps, 90) if steps else math.inf
 
 
+def _ratio_relation_columns(relation):
+    """Informative column domain for one scored relation, with a run fallback."""
+    columns = relation.get("informative_columns")
+    if columns is None:
+        columns = range(int(relation["start"]), int(relation["end"]) + 1)
+    return tuple(sorted({int(column) for column in columns}))
+
+
+def _same_ratio_column_domain(columns_a, columns_b):
+    """The overlap rule from the ratio-context design's relation graph."""
+    if len(columns_a) < 2 or len(columns_b) < 2:
+        return False
+    overlap = len(set(columns_a) & set(columns_b))
+    return overlap >= 2 and 2 * overlap >= min(len(columns_a), len(columns_b))
+
+
+def _ratio_edge_components(nrows, edges):
+    """Connected row components induced by a selected set of relation edges."""
+    adjacency = {row: set() for row in range(nrows)}
+    for _index, row_a, row_b in edges:
+        adjacency[row_a].add(row_b)
+        adjacency[row_b].add(row_a)
+    components = []
+    visited = set()
+    for root in range(nrows):
+        if root in visited or not adjacency[root]:
+            continue
+        pending, members = [root], []
+        visited.add(root)
+        while pending:
+            row = pending.pop()
+            members.append(row)
+            for neighbour in sorted(adjacency[row]):
+                if neighbour not in visited:
+                    visited.add(neighbour)
+                    pending.append(neighbour)
+        components.append(sorted(members))
+    return components
+
+
+def _has_consecutive_ratio_chain(pairs, minimum_rows=3):
+    """Whether undirected row edges contain a physical-row chain of this length."""
+    pairs = set(pairs)
+    starts = sorted({row for pair in pairs for row in pair})
+    for start in starts:
+        length = 1
+        row = start
+        while (row, row + 1) in pairs:
+            length += 1
+            row += 1
+        if length >= minimum_rows:
+            return True
+    return False
+
+
 def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
                               min_family_rows=3, max_profile_step=0.05,
                               min_peer_excess=7.0,
@@ -4247,33 +4302,16 @@ def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
         return decision_cache[context_key]
 
     valid_edges = []
-    adjacency = {row: set() for row in range(nrows)}
     for index, relation in enumerate(relations):
         row_a, row_b = int(relation["row_a"]), int(relation["row_b"])
         if 0 <= row_a < nrows and 0 <= row_b < nrows and row_a != row_b:
             valid_edges.append((index, row_a, row_b))
-            adjacency[row_a].add(row_b)
-            adjacency[row_b].add(row_a)
-
-    components = []
-    visited = set()
-    for root in range(nrows):
-        if root in visited or not adjacency[root]:
-            continue
-        pending, members = [root], []
-        visited.add(root)
-        while pending:
-            row = pending.pop()
-            members.append(row)
-            for neighbour in sorted(adjacency[row]):
-                if neighbour not in visited:
-                    visited.add(neighbour)
-                    pending.append(neighbour)
-        components.append(sorted(members))
 
     family_indexes = set()
+    series_indexes = set()
     ambiguous_indexes = set()
     families = []
+    series = []
     exceptional = set()
     if (nrows >= min_family_rows and valid_edges
             and block_residual <= max_rank1_residual):
@@ -4303,52 +4341,84 @@ def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
                 "ambiguous_relation_count": len(ambiguous),
             })
     else:
-        for members in components:
-            if len(members) < min_family_rows:
-                continue
-            member_set = set(members)
-            candidates = [(index, a, b) for index, a, b in valid_edges
-                          if a in member_set and b in member_set]
-            common_start = max(int(relations[index]["start"])
-                               for index, _a, _b in candidates)
-            common_end = min(int(relations[index]["end"])
-                             for index, _a, _b in candidates)
-            if common_end - common_start + 1 < 2:
-                continue
-            residual = _rank1_relative_residual(
-                matrix[members, common_start:common_end + 1])
-            if residual > max_rank1_residual:
-                continue
-            indexes, ambiguous, skipped = set(), set(), set()
-            scope_key = tuple(members)
-            for index, row_a, row_b in candidates:
-                decision = context_decision(
-                    members, scope_key, index, row_a, row_b,
-                    "proportional_family")
-                if decision == "isolated_ratio":
-                    skipped.add(index)
+        domains = sorted({_ratio_relation_columns(relation)
+                          for relation in relations
+                          if len(_ratio_relation_columns(relation)) >= 2})
+        for domain in domains:
+            domain_edges = [
+                edge for edge in valid_edges
+                if edge[0] not in family_indexes
+                and edge[0] not in series_indexes
+                and edge[0] not in exceptional
+                and _same_ratio_column_domain(
+                    domain, _ratio_relation_columns(relations[edge[0]]))
+            ]
+            for members in _ratio_edge_components(nrows, domain_edges):
+                if len(members) < min_family_rows:
+                    continue
+                member_set = set(members)
+                candidates = [
+                    edge for edge in domain_edges
+                    if edge[1] in member_set and edge[2] in member_set
+                ]
+                usable_columns = [column for column in domain
+                                  if 0 <= column < matrix.shape[1]]
+                if len(usable_columns) < 2:
+                    continue
+                local_matrix = matrix[np.ix_(members, usable_columns)]
+                residual = _rank1_relative_residual(local_matrix)
+                local_step = _row_profile_step_p90(local_matrix)
+                candidate_pairs = {
+                    (min(row_a, row_b), max(row_a, row_b))
+                    for _index, row_a, row_b in candidates
+                }
+                if residual <= max_rank1_residual:
+                    structural_class = "proportional_family"
+                elif (_has_consecutive_ratio_chain(candidate_pairs,
+                                                    min_family_rows)
+                      and local_step <= max_profile_step):
+                    structural_class = "proportional_series"
                 else:
-                    indexes.add(index)
-                    if decision == "ambiguous_within_context":
-                        ambiguous.add(index)
-            exceptional |= skipped
-            ambiguous_indexes |= ambiguous
-            if not indexes:
-                continue
-            pairs = {(min(a, b), max(a, b)) for index, a, b in candidates
-                     if index in indexes}
-            family_indexes.update(indexes)
-            families.append({
-                "scope": "component", "rows": members,
-                "edge_count": len(pairs), "relation_count": len(indexes),
-                "rank1_residual": residual,
-                "start": common_start, "end": common_end,
-                "exceptional_relations": len(skipped),
-                "ambiguous_relation_count": len(ambiguous),
-            })
+                    continue
 
-    series_indexes = set()
-    series = []
+                indexes, ambiguous, skipped = set(), set(), set()
+                scope_key = tuple(members)
+                for index, row_a, row_b in candidates:
+                    decision = context_decision(
+                        members, scope_key, index, row_a, row_b,
+                        structural_class)
+                    if decision == "isolated_ratio":
+                        skipped.add(index)
+                    else:
+                        indexes.add(index)
+                        if decision == "ambiguous_within_context":
+                            ambiguous.add(index)
+                exceptional |= skipped
+                ambiguous_indexes |= ambiguous
+                if not indexes:
+                    continue
+                pairs = {
+                    (min(row_a, row_b), max(row_a, row_b))
+                    for index, row_a, row_b in candidates if index in indexes
+                }
+                summary = {
+                    "scope": "component",
+                    "rows": members,
+                    "column_domain": list(domain),
+                    "edge_count": len(pairs),
+                    "relation_count": len(indexes),
+                    "exceptional_relations": len(skipped),
+                    "ambiguous_relation_count": len(ambiguous),
+                }
+                if structural_class == "proportional_family":
+                    summary["rank1_residual"] = residual
+                    family_indexes.update(indexes)
+                    families.append(summary)
+                else:
+                    summary["profile_step_p90"] = local_step
+                    series_indexes.update(indexes)
+                    series.append(summary)
+
     if profile_step <= max_profile_step and nrows >= min_family_rows:
         scope = list(range(nrows))
         scope_key = tuple(scope)
@@ -4414,6 +4484,76 @@ def _invert_ratio_interval(lo, hi):
         return None
     values = (1.0 / lo, 1.0 / hi)
     return min(values), max(values)
+
+
+def _classify_ratio_blocks(rows, relations, row_blocks):
+    """Apply within-block context without allowing separators to disappear."""
+    block_rows = {}
+    for row, block in enumerate(row_blocks):
+        block_rows.setdefault(block, []).append(row)
+    if len(block_rows) <= 1:
+        return _classify_ratio_structure(rows, relations)
+
+    classified = [None] * len(relations)
+    families = []
+    series = []
+    block_metrics = []
+    for block, global_rows in block_rows.items():
+        local_by_global = {row: index for index, row in enumerate(global_rows)}
+        original_indexes = []
+        local_relations = []
+        for index, relation in enumerate(relations):
+            try:
+                row_a, row_b = int(relation["row_a"]), int(relation["row_b"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if row_a not in local_by_global or row_b not in local_by_global:
+                continue
+            item = dict(relation)
+            item["row_a"] = local_by_global[row_a]
+            item["row_b"] = local_by_global[row_b]
+            original_indexes.append(index)
+            local_relations.append(item)
+        local_rows = [rows[row] for row in global_rows]
+        local = _classify_ratio_structure(local_rows, local_relations)
+        block_metrics.append({
+            "block": block,
+            "rows": list(global_rows),
+            "rank1_residual": local["block_rank1_residual"],
+            "profile_step_p90": local["block_profile_step_p90"],
+        })
+        for original_index, item in zip(original_indexes, local["relations"]):
+            restored = dict(item)
+            restored["row_a"] = int(relations[original_index]["row_a"])
+            restored["row_b"] = int(relations[original_index]["row_b"])
+            classified[original_index] = restored
+        for destination, summaries in ((families, local["families"]),
+                                       (series, local["series"])):
+            for summary in summaries:
+                restored = dict(summary)
+                restored["block"] = block
+                restored["rows"] = [global_rows[row] for row in summary["rows"]]
+                destination.append(restored)
+
+    isolated = []
+    for index, relation in enumerate(relations):
+        item = classified[index]
+        if item is None:
+            item = dict(relation)
+            item["context_class"] = "isolated_ratio"
+            item["exceptional_within_context"] = False
+            classified[index] = item
+        if item["context_class"] == "isolated_ratio":
+            isolated.append(item)
+    return {
+        "block_rank1_residual": math.inf,
+        "block_profile_step_p90": math.inf,
+        "block_metrics": block_metrics,
+        "relations": classified,
+        "families": families,
+        "series": series,
+        "isolated_relations": isolated,
+    }
 
 
 def _ratio_table_evidence(relation, row_blocks, block_order, row_positions):
@@ -4488,8 +4628,62 @@ def _common_interval_groups(evidence):
     return groups
 
 
+def _quantized_grid_key(value, quantum):
+    """Stable identity of a recorded value on its row-inferred decimal grid."""
+    value, quantum = float(value), float(quantum)
+    if not (math.isfinite(value) and math.isfinite(quantum) and quantum > 0):
+        return None
+    exponent = int(round(math.log10(quantum)))
+    return exponent, int(round(value / quantum))
+
+
+def _ratio_block_grid_frequencies(rows, row_blocks):
+    """Frequency of quantized values inside each precision-agnostic block."""
+    frequencies = {}
+    table_frequency = Counter()
+    quantums = []
+    for row, block in zip(rows, row_blocks):
+        row_quantums = _effective_row_quantums(row)
+        quantums.append(row_quantums)
+        counter = frequencies.setdefault(block, Counter())
+        for value, quantum in zip(row, row_quantums):
+            key = _quantized_grid_key(value, quantum)
+            if key is not None:
+                counter[key] += 1
+                table_frequency[key] += 1
+    return frequencies, table_frequency, quantums
+
+
+def _relation_common_pool_columns(relation, rows, row_blocks, frequencies,
+                                  table_frequency, quantums, max_frequency):
+    """Informative columns landing on a high-frequency grid bin on either side."""
+    try:
+        row_a, row_b = int(relation["row_a"]), int(relation["row_b"])
+    except (KeyError, TypeError, ValueError):
+        return (), ()
+    if not (0 <= row_a < len(rows) and 0 <= row_b < len(rows)):
+        return (), ()
+    columns = _ratio_relation_columns(relation)
+    common = []
+    for row in (row_a, row_b):
+        block = row_blocks[row]
+        found = []
+        for column in columns:
+            if not (0 <= column < len(rows[row])):
+                continue
+            key = _quantized_grid_key(rows[row][column], quantums[row][column])
+            if (key is not None
+                    and max(frequencies[block][key], table_frequency[key])
+                    > max_frequency):
+                found.append(column)
+        common.append(tuple(found))
+    return tuple(common)
+
+
 def _classify_ratio_table_context(rows, relations, *, row_blocks=None,
-                                  min_transform_pairs=3):
+                                  min_transform_pairs=3,
+                                  min_common_pool_columns=2,
+                                  max_common_value_frequency=None):
     """Fold repeated aligned ratios after the within-block context decision.
 
     A person does not count reciprocal detector directions as two observations.  This
@@ -4497,9 +4691,11 @@ def _classify_ratio_table_context(rows, relations, *, row_blocks=None,
     pair in the same block layout and column window admits the same scale constant.
     Two pairs are retained as ambiguous table context; three or more form one stable
     table-transform summary.  A single unsupported pair remains isolated for human
-    re-check.  Labels and formulas are deliberately outside this numeric-only step.
+    re-check.  A relation supported mainly by quantized values that are common on both
+    sides is folded only after removing those paired columns makes its original score
+    fall below the reporting bar.  Labels and formulas are deliberately outside this
+    numeric-only step.
     """
-    result = _classify_ratio_structure(rows, relations)
     nrows = len(rows)
     if row_blocks is None:
         row_blocks = [0] * nrows
@@ -4507,6 +4703,7 @@ def _classify_ratio_table_context(rows, relations, *, row_blocks=None,
         row_blocks = list(row_blocks)
     if len(row_blocks) != nrows:
         raise ValueError("row_blocks must contain one block id per row")
+    result = _classify_ratio_blocks(rows, relations, row_blocks)
 
     block_order = {}
     block_labels = []
@@ -4595,6 +4792,69 @@ def _classify_ratio_table_context(rows, relations, *, row_blocks=None,
                 "context_class": context_class,
             })
 
+    max_frequency = (_SHORT_ROW_MAX_VALUE_FREQ
+                     if max_common_value_frequency is None
+                     else max_common_value_frequency)
+    frequencies, table_frequency, quantums = _ratio_block_grid_frequencies(
+        rows, row_blocks)
+    common_pool_details = {}
+    common_pool_groups = {}
+    for index, relation in enumerate(result["relations"]):
+        if index in folded_indexes or relation["context_class"] != "isolated_ratio":
+            continue
+        common_a, common_b = _relation_common_pool_columns(
+            relation, rows, row_blocks, frequencies, table_frequency,
+            quantums, max_frequency)
+        common_columns = set(common_a) & set(common_b)
+        if len(common_columns) < min_common_pool_columns:
+            continue
+        try:
+            n_tests = int(relation["n_tests"])
+            row_b = int(relation["row_b"])
+            start, end = int(relation["start"]), int(relation["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        informative_columns = set(_ratio_relation_columns(relation))
+        residual_score = _ratio_prediction_bits(
+            rows[row_b][start:end + 1],
+            quantums[row_b][start:end + 1],
+            n_tests,
+            informative=[
+                column in informative_columns and column not in common_columns
+                for column in range(start, end + 1)
+            ],
+        )
+        if residual_score["bits"] >= _SHORT_ROW_MIN_PREDICTION_BITS:
+            continue
+        common_pool_details[index] = (
+            common_a, common_b, residual_score["bits"])
+        row_a, row_b = int(relation["row_a"]), int(relation["row_b"])
+        block_a = block_order[row_blocks[row_a]]
+        block_b = block_order[row_blocks[row_b]]
+        lo_block, hi_block = sorted((block_a, block_b))
+        group_key = (lo_block, hi_block,
+                     int(relation["start"]), int(relation["end"]))
+        common_pool_groups.setdefault(group_key, []).append(index)
+
+    quantized_common_pools = []
+    for (block_a, block_b, start, end), indexes in sorted(common_pool_groups.items()):
+        pairs = {_ratio_context_key(result["relations"][index]) for index in indexes}
+        quantized_common_pools.append({
+            "scope": "within_block" if block_a == block_b else "cross_block",
+            "block_a": block_labels[block_a],
+            "block_b": block_labels[block_b],
+            "start": start,
+            "end": end,
+            "pair_count": len(pairs),
+            "relation_count": len(indexes),
+            "rows": sorted({
+                row for index in indexes
+                for row in (int(result["relations"][index]["row_a"]),
+                            int(result["relations"][index]["row_b"]))
+            }),
+            "context_class": "quantized_common_pool",
+        })
+
     classified = []
     isolated = []
     for index, relation in enumerate(result["relations"]):
@@ -4603,6 +4863,13 @@ def _classify_ratio_table_context(rows, relations, *, row_blocks=None,
             item["context_class"] = (
                 "ambiguous_table_transform" if index in ambiguous_indexes
                 else "proportional_table_transform")
+            item.pop("exceptional_within_context", None)
+        elif index in common_pool_details:
+            common_a, common_b, residual_bits = common_pool_details[index]
+            item["context_class"] = "quantized_common_pool"
+            item["common_pool_columns_a"] = list(common_a)
+            item["common_pool_columns_b"] = list(common_b)
+            item["bits_without_common_pool"] = residual_bits
             item.pop("exceptional_within_context", None)
         elif (index in cross_block_indexes
               and item["context_class"] == "isolated_ratio"):
@@ -4613,6 +4880,7 @@ def _classify_ratio_table_context(rows, relations, *, row_blocks=None,
             isolated.append(item)
     result["relations"] = classified
     result["table_transforms"] = table_transforms
+    result["quantized_common_pools"] = quantized_common_pools
     result["isolated_relations"] = isolated
     return result
 
