@@ -4407,6 +4407,216 @@ def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
     }
 
 
+def _invert_ratio_interval(lo, hi):
+    """Invert a finite ratio interval, or return None when it crosses zero."""
+    lo, hi = float(lo), float(hi)
+    if not (math.isfinite(lo) and math.isfinite(hi)) or lo <= 0.0 <= hi:
+        return None
+    values = (1.0 / lo, 1.0 / hi)
+    return min(values), max(values)
+
+
+def _ratio_table_evidence(relation, row_blocks, block_order, row_positions):
+    """Canonical table-layout signature and directed interval for one relation.
+
+    Direction follows table layout rather than detector iteration: earlier block,
+    then earlier row position.  If only the reciprocal arithmetic relation exists,
+    its interval is inverted into that canonical direction.
+    """
+    try:
+        row_a, row_b = int(relation["row_a"]), int(relation["row_b"])
+        lo, hi = float(relation["k_lo"]), float(relation["k_hi"])
+        start, end = int(relation["start"]), int(relation["end"])
+        block_a, block_b = row_blocks[row_a], row_blocks[row_b]
+    except (IndexError, KeyError, TypeError, ValueError):
+        return None
+    if (not (0 <= row_a < len(row_blocks) and 0 <= row_b < len(row_blocks))
+            or row_a == row_b or start > end or lo > hi
+            or not (math.isfinite(lo) and math.isfinite(hi))):
+        return None
+
+    key_a = (block_order[block_a], row_positions[row_a], row_a)
+    key_b = (block_order[block_b], row_positions[row_b], row_b)
+    follows_layout = key_a < key_b
+    if not follows_layout:
+        inverted = _invert_ratio_interval(lo, hi)
+        if inverted is None:
+            return None
+        lo, hi = inverted
+        row_a, row_b = row_b, row_a
+        block_a, block_b = block_b, block_a
+
+    block_a_order, block_b_order = block_order[block_a], block_order[block_b]
+    offset = row_positions[row_b] - row_positions[row_a]
+    signature = (block_a_order, block_b_order, offset, start, end)
+    pair = (min(row_a, row_b), max(row_a, row_b), start, end)
+    return {
+        "signature": signature,
+        "pair": pair,
+        "lo": lo,
+        "hi": hi,
+        "follows_layout": follows_layout,
+        "block_a": block_a,
+        "block_b": block_b,
+        "row_a": row_a,
+        "row_b": row_b,
+    }
+
+
+def _common_interval_groups(evidence):
+    """Partition interval evidence into deterministic groups sharing one constant."""
+    remaining = list(evidence)
+    groups = []
+    while len(remaining) >= 2:
+        points = sorted({item["lo"] for item in remaining})
+        best = []
+        best_point = None
+        for point in points:
+            members = [item for item in remaining
+                       if item["lo"] <= point <= item["hi"]]
+            member_key = tuple(item["pair"] for item in members)
+            best_key = tuple(item["pair"] for item in best)
+            if (len(members) > len(best)
+                    or (len(members) == len(best)
+                        and (not best_key or member_key < best_key))):
+                best, best_point = members, point
+        if len(best) < 2:
+            break
+        groups.append((best_point, best))
+        used = {item["pair"] for item in best}
+        remaining = [item for item in remaining if item["pair"] not in used]
+    return groups
+
+
+def _classify_ratio_table_context(rows, relations, *, row_blocks=None,
+                                  min_transform_pairs=3):
+    """Fold repeated aligned ratios after the within-block context decision.
+
+    A person does not count reciprocal detector directions as two observations.  This
+    pure offline layer therefore deduplicates each row pair, then asks whether another
+    pair in the same block layout and column window admits the same scale constant.
+    Two pairs are retained as ambiguous table context; three or more form one stable
+    table-transform summary.  A single unsupported pair remains isolated for human
+    re-check.  Labels and formulas are deliberately outside this numeric-only step.
+    """
+    result = _classify_ratio_structure(rows, relations)
+    nrows = len(rows)
+    if row_blocks is None:
+        row_blocks = [0] * nrows
+    else:
+        row_blocks = list(row_blocks)
+    if len(row_blocks) != nrows:
+        raise ValueError("row_blocks must contain one block id per row")
+
+    block_order = {}
+    block_labels = []
+    row_positions = {}
+    block_counts = {}
+    for row, block in enumerate(row_blocks):
+        if block not in block_order:
+            block_order[block] = len(block_order)
+            block_labels.append(block)
+        row_positions[row] = block_counts.get(block, 0)
+        block_counts[block] = row_positions[row] + 1
+
+    eligible = {}
+    for index, item in enumerate(result["relations"]):
+        if item["context_class"] != "isolated_ratio":
+            continue
+        table_evidence = _ratio_table_evidence(
+            item, row_blocks, block_order, row_positions)
+        if table_evidence is None:
+            continue
+        key = (table_evidence["signature"], table_evidence["pair"])
+        prior = eligible.get(key)
+        if prior is None:
+            table_evidence["indexes"] = [index]
+            eligible[key] = table_evidence
+            continue
+        prior["indexes"].append(index)
+        # Prefer the interval measured in canonical table direction.  Its target is
+        # the later row/panel -- the direction the table layout itself supplies -- so
+        # reciprocal detector output cannot narrow the uncertainty twice.
+        if table_evidence["follows_layout"] and not prior["follows_layout"]:
+            table_evidence["indexes"] = prior["indexes"]
+            eligible[key] = table_evidence
+        elif table_evidence["follows_layout"] == prior["follows_layout"]:
+            prior_width = prior["hi"] - prior["lo"]
+            current_width = table_evidence["hi"] - table_evidence["lo"]
+            if ((current_width, -table_evidence["lo"])
+                    > (prior_width, -prior["lo"])):
+                table_evidence["indexes"] = prior["indexes"]
+                eligible[key] = table_evidence
+
+    by_signature = {}
+    for item in eligible.values():
+        by_signature.setdefault(item["signature"], []).append(item)
+    for items in by_signature.values():
+        items.sort(key=lambda item: (item["pair"], item["lo"], item["hi"]))
+
+    table_transforms = []
+    folded_indexes = set()
+    ambiguous_indexes = set()
+    cross_block_indexes = {
+        index for item in eligible.values()
+        if item["block_a"] != item["block_b"]
+        for index in item["indexes"]
+    }
+    for signature in sorted(by_signature):
+        for point, members in _common_interval_groups(by_signature[signature]):
+            relation_indexes = sorted(
+                index for member in members for index in member["indexes"])
+            pair_count = len(members)
+            context_class = (
+                "proportional_table_transform"
+                if pair_count >= min_transform_pairs
+                else "ambiguous_table_transform")
+            folded_indexes.update(relation_indexes)
+            if pair_count < min_transform_pairs:
+                ambiguous_indexes.update(relation_indexes)
+            block_a_order, block_b_order, offset, start, end = signature
+            table_transforms.append({
+                "scope": ("within_block" if block_a_order == block_b_order
+                          else "cross_block"),
+                "block_a": block_labels[block_a_order],
+                "block_b": block_labels[block_b_order],
+                "row_offset": offset,
+                "start": start,
+                "end": end,
+                "ratio_interval": [
+                    max(member["lo"] for member in members),
+                    min(member["hi"] for member in members),
+                ],
+                "representative_ratio": point,
+                "pair_count": pair_count,
+                "relation_count": len(relation_indexes),
+                "rows": sorted({row for member in members
+                                for row in (member["row_a"], member["row_b"])}),
+                "context_class": context_class,
+            })
+
+    classified = []
+    isolated = []
+    for index, relation in enumerate(result["relations"]):
+        item = dict(relation)
+        if index in folded_indexes:
+            item["context_class"] = (
+                "ambiguous_table_transform" if index in ambiguous_indexes
+                else "proportional_table_transform")
+            item.pop("exceptional_within_context", None)
+        elif (index in cross_block_indexes
+              and item["context_class"] == "isolated_ratio"):
+            item["context_class"] = "isolated_cross_block_ratio"
+        classified.append(item)
+        if item["context_class"] in {
+                "isolated_ratio", "isolated_cross_block_ratio"}:
+            isolated.append(item)
+    result["relations"] = classified
+    result["table_transforms"] = table_transforms
+    result["isolated_relations"] = isolated
+    return result
+
+
 def _interval_holds_a_power_of_ten(lo, hi):
     """Does [lo, hi] contain a whole power of ten, in either sign?
 

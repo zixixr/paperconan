@@ -767,7 +767,7 @@ M0 的实测结果推翻了本设计两处前提（覆盖上限的口径、锚�
 - **停止**：若仍然只有合成 fixture 支撑，或曲线候选数量显著多于有价值候选，则**不替换现有 ratio 臂**，
   把测量结果写回本文档结案。
 
-阻塞期间可做的只有 M0 补完、M1 与 M2——三者都是纯函数或离线测量，不改变任何生产输出。
+阻塞期间可做的只有 M0 补完、M1、M2 与 M2.5 离线原型——它们都是纯函数或离线测量，不改变任何生产输出。
 
 ### M0 — 修正度量与量化输入
 
@@ -894,11 +894,11 @@ M2 证明分数只解决两类误报中的一类，所以在碰生产之前先�
 - [x] 对每个 numeric block 做行归一化 / 稳健 rank-1 拟合
 - [x] 把过门槛关系组成图；≥3 行在相同列段上传递一致 → `proportional_family`，整片折叠为一条表级模式
 - [x] 比例关系随行序连续 → `proportional_series`
-- [ ] 只有不属于任何更大比例族的、跨 block / 跨面板的孤立高分行对 → `isolated_cross_block_ratio`
+- [x] 只有不属于任何更大比例族的、跨 block / 跨面板的孤立高分行对 → `isolated_cross_block_ratio`
 - [x] 2 位那批零散关系：**回看候选所在的完整 block**，即使只有一对过门槛，整块仍可能明显接近 rank-1
 - [x] 压力台架：shape 参数连续变化、量化公共池、一条孤立关系混在普通表中
 - [x] 独立 holdout：非零基线 sigmoid、饱和响应、指数衰减，且每种 shape 的 1/2/3 位输入都真正进入 M2.5
-- [ ] 待补台架：局部列近似成比例、共享对照、派生百分比、跨分隔面板关系
+- [x] 压力台架：局部列近似成比例、共享对照、派生百分比、跨分隔面板关系
 
 **验收（看最终孤立 finding，不看 raw edge）**：
 
@@ -976,21 +976,49 @@ M2 证明分数只解决两类误报中的一类，所以在碰生产之前先�
 - **`min_family_rows` 现已冗余**：同伴上下文不足 2 对时一律返回 inf（不吸收），2 行块因此本来就折不动。
   保留仅为省算力，mutation 杀不动它属正常。
 
+**表级平行变换（第二层 context）：**人检查表格时还会看「同一个列窗、同一种面板对应关系、同一个倍率」
+是否在别的行对重复出现。离线 `_classify_ratio_table_context` 据此做第二层折叠：
+
+- 方向按表内 block 顺序与 block 内行序 canonicalize；reciprocal 两个方向只算一个行对；
+- 只把 block 对、相对行 offset、列窗相同，且 M1 的量化兼容 `k` 区间存在共同交集的关系放进同一组；
+- 2 个独立行对说明它已不是「孤立」，但证据还不足以叫稳定变换，记为 `ambiguous_table_transform`；
+- ≥3 个独立行对折叠为一条 `proportional_table_transform`；只有一对或倍率明显不同的跨 block 关系保留为
+  `isolated_cross_block_ratio`。
+
+这里没有新增小数位资格闸或第二套 ratio 探测器：算术候选仍全部来自 M1/M2，这一层只消费已有 `k` 区间和
+布局。`k≈1` 在上游属于 identical arm，不重新进入 ratio arm；单独一组「原值→百分比」如果没有标签、公式
+或第二组相同变换支持，数字本身仍不足以自动解释，因此保留给人工复核。
+
+新增 synthetic stress 结果（aggregate runner 连续两次逐字节一致）：
+
+| 形态 | M2 relation / 去重行对 | 表级去向 | 最终孤立行对 |
+|---|---:|---|---:|
+| 只在局部 5 列成比例、外侧列无关 | 6 / 3 | 1 个 local family | 0 |
+| 3 组相同 denominator 的原值→百分比 | 3 / 3 | 1 个 `proportional_table_transform` | 0 |
+| 单独 1 组原值→百分比 | 1 / 1 | 无可用表级 context | 1 |
+| 2 组对齐的跨面板同倍率关系 | 2 / 2 | 1 个 `ambiguous_table_transform` | 0 |
+| 3 组同倍率跨面板 + 1 组不同倍率 | 4 / 4 | 前 3 组折叠为 1 条稳定变换 | **1**（不同倍率） |
+| exact shared control (`k≈1`) | 0 / 0 | 由 identical arm 负责 | 0（ratio arm） |
+
 **极限性能剖析：**400 行 × 11 列、159,600 个有向 relation、同一列窗的合成上界中，endpoint peer cache
 改为每个 window 一次性构建并预排每行同伴；无追踪运行约 0.71 秒、进程峰值约 285 MB。tracemalloc 测得
 分类阶段新增峰值约 123 MB（追踪本身使运行约 3.55 秒）。优化前每条 relation 重扫全部 pair，90 秒仍未完成。
+在同规模、所有关系均不共享 `k` 的 table-context 反向上界中，第二层约 0.66 秒、进程峰值约 360 MB，且
+159,600 条 relation 全部保持孤立；没有用提前折叠换取性能。
 
-**验证：**`env PYTHONPATH=. .venv/bin/pytest` 为 **1685 passed, 1 skipped**；M2.5 聚焦套件为
-**83 passed**。calibration 与 holdout aggregate runner 均连续两次逐字节一致。`src/` 中
-`_classify_ratio_structure` 仍只有定义、没有生产调用者，且该函数不再调用 `_effective_row_quantums`。
+**验证：**`env PYTHONPATH=. .venv/bin/pytest` 为 **1692 passed, 1 skipped**；M1/M2/M2.5 聚焦套件为
+**90 passed**。calibration、holdout 与 table-context aggregate runner 均连续两次逐字节一致。`src/` 中
+`_classify_ratio_structure` / `_classify_ratio_table_context` 均没有生产调用者；前者不再调用
+`_effective_row_quantums`，后者只消费 M1 已产出的区间，不自行推断 precision。
 
 **测试可证伪性：**把 `_scan_quantized_ratio_runs` 整个改成 `return []` 时，原来 6 个验收测试有 4 个照样绿
 （包括三个 `curve → 0 isolated`）——它们只断言「没有」，从不断言「有」。现已给每个断言补上"确实找到了
 东西"，同一 mutation 下 9 个测试变红。
 
-**阶段结论：**统一结构层在已覆盖的 calibration + 独立 holdout 形态上可行，且方向、单位与小数位资格
-无关。它仍不足以解除 M3–M5：跨 block/layout、局部比例、共享对照与派生列台架尚未补齐，M2 的真实语料
-shadow 和人工锚点也仍未完成。下一步是完成这些离线证据，而不是接生产或恢复小数位资格闸。
+**阶段结论：**统一结构层在 calibration、独立 holdout 和新增表级 layout stress 上可行，且方向、单位与
+小数位资格无关。它仍不足以解除 M3–M5：现在缺的是 M2 的真实语料 shadow、人工锚点，以及生产 row-layout
+接线后的跨面板硬闸，而不是更多 synthetic 调参。下一步应先跑真实 shadow 并逐条复核新候选，不是接生产或
+恢复小数位资格闸。
 
 ### M3 — 结构分类与比例族折叠
 
