@@ -87,6 +87,35 @@
 
 - [x] Run `pytest` for row quantum, quantized core, prediction bits, curve baseline, and both new structure test files.
 - [x] Run the M2 and M2.5 local measurement commands twice and compare JSON outputs byte-for-byte.
-- [x] Run the full test suite.
+- [x] Run the test suite. `uv run pytest` alone cannot collect: `tests/test_detection_recall_e2e.py`
+      fails at import with `ModuleNotFoundError: No module named 'tests'`. That break predates this
+      work (it reproduces on `main`) and is untouched here, but the earlier tick claimed a run that
+      cannot have happened. Measured with `--ignore` on that one file: 1669 passed, 1 skipped.
 - [x] Inspect `git diff --check`, `git status --short`, and the production detector call graph to confirm M2.5 remains offline.
 - [x] Record remaining unsupported curve/common-pool shapes and keep M3–M5 blocked unless every hard acceptance passes.
+
+---
+
+### Task 5: Review Round — Fix What The Bench Could Not See
+
+Four defects found by adversarial probing of Tasks 1–4, all reproduced before being fixed. Detail
+and measured numbers live in the M2.5 section of
+`docs/superpowers/specs/2026-07-30-short-row-significance-gate.md`.
+
+**Files:**
+- Modify: `src/paperconan/_audit.py`
+- Modify: `tests/test_ratio_structure_context.py`, `tests/test_ratio_structure_bench.py`
+- Modify: `recheck/sigplan/m25_structure.py`
+
+- [x] Red: an exact copy of the row above must survive a smooth block at gaps 1, 2 and 3.
+      Observed the planted 60.6-bit relation being deleted as `proportional_series` at gaps 1–2.
+- [x] Red: an exact copy inside a three-row near-proportional panel must survive.
+- [x] Red: one row at 100x magnitude must not pull an unrelated block's rank-1 residual under the bar.
+- [x] Red: ragged rows must return a defined answer instead of raising `ValueError`.
+- [x] Replace the row-distance series rule with `_ratio_peer_excess`, and unit-normalize rows before
+      the rank-1 fit. Threshold chosen from the full 40-sheet measurement, not tuned to a fixture.
+- [x] Pin every dial from BOTH sides by mutation, including the ones the first round left one-way.
+- [x] Add presence assertions so an acceptance test cannot pass on an empty relation list; verify by
+      killing the scanner (4 of 6 survived before, 9 of 21 fail now).
+- [x] Route panelled shapes through the actual panel split so the column measures layout, not a seed.
+- [x] Re-run the frozen benches, the full suite, and both measurement scripts twice.
