@@ -33,10 +33,12 @@ context and presentation, not the stored arithmetic evidence.
 
 ## Evidence ownership
 
-M1 reconstructs directed quantized runs. M2 scores them and owns any use of inferred
-recording resolution. M2.5 does not call `_effective_row_quantums` and does not infer
-decimal precision again. It consumes complete numeric rows plus evidence already
-attached to qualifying relations.
+M1 reconstructs directed quantized runs. M2 scores them and owns the reporting use of
+inferred recording resolution. The M2.5 shape classifier does not call
+`_effective_row_quantums`; its table-context layer reuses the same row-inferred grid
+only to identify common quantized values, then re-runs the M2 score with the original
+`n_tests`. It never creates a decimal-based eligibility branch. M2.5 otherwise
+consumes complete numeric rows plus evidence already attached to qualifying relations.
 
 Structural comparison is canonical and symmetric for a fixed row pair and column
 window. Reversing `row_a` and `row_b` must not change its context class. Multiplying a
@@ -49,7 +51,8 @@ classification must otherwise be invariant to row permutation.
 M2.5 remains offline and M3–M5 remain blocked until all of these pass:
 
 1. Every reciprocal relation over the same row pair and column window receives the
-   same context class.
+   same context class. Their intervals, after normalization into table direction, must
+   share a common constant before the pair can support a table transform.
 2. Unit conversion does not change family, ambiguous, or isolated classification.
 3. Frozen curve benches end with zero isolated row pairs and produce non-empty
    table-level summaries whenever qualifying relations entered M2.5.
@@ -71,4 +74,3 @@ M2.5 remains offline and M3–M5 remain blocked until all of these pass:
 - Do not claim that the classifier recognizes a curve or infers a data-generating
   cause.
 - Do not restore a per-decimal eligibility branch.
-

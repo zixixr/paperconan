@@ -619,8 +619,8 @@ block 内 edge 的处理顺序固定为：
 - `_rare`：继续防量化网格，但频率池改为全部 ratio 数据行，按各自有效量化步长归桶；同时看 source /
   target 所在 structural block 与整张表，避免三行小面板里的 `0/0.1` 因单个 block 太小而假装稀有。
   不能仅凭两个常见格点整条删除：只有同一列的 source 与 target **两侧都**落入高频格点时才屏蔽该列，
-  再用原 `n_tests` 重算 `prediction_bits`；只有剩余独特列已跌破 20 bits 才分类为
-  `quantized_common_pool`。否则仍保留孤立关系。
+  再用原 `n_tests` 重算 `prediction_bits`；同一无向行对的**每个已观测方向**都必须跌破 20 bits，才能统一
+  分类为 `quantized_common_pool`。任一方向仍有足够独特证据时，两个方向都保留为孤立关系。
 - `_vector_is_patterned`：保留为行语义特征；等差/等比坐标行不进入孤立 ratio 输出。
 - `_same_band`：ratio 臂删除，职责由 `row_layout` 和关系后的 context class 接管。
 
@@ -991,7 +991,8 @@ M2 证明分数只解决两类误报中的一类，所以在碰生产之前先�
 **表级平行变换（第二层 context）：**人检查表格时还会看「同一个列窗、同一种面板对应关系、同一个倍率」
 是否在别的行对重复出现。离线 `_classify_ratio_table_context` 据此做第二层折叠：
 
-- 方向按表内 block 顺序与 block 内行序 canonicalize；reciprocal 两个方向只算一个行对；
+- 方向按表内 block 顺序与 block 内行序 canonicalize；reciprocal 两个方向只算一个行对，且所有已观测方向
+  倒数化后的 `k` 区间必须存在共同交集，方向互相矛盾时整对保留为孤立关系；
 - 只把 block 对、相对行 offset、列窗相同，且 M1 的量化兼容 `k` 区间存在共同交集的关系放进同一组；
 - 2 个独立行对说明它已不是「孤立」，但证据还不足以叫稳定变换，记为 `ambiguous_table_transform`；
 - ≥3 个独立行对折叠为一条 `proportional_table_transform`；只有一对或倍率明显不同的跨 block 关系保留为
@@ -1018,8 +1019,8 @@ M2 证明分数只解决两类误报中的一类，所以在碰生产之前先�
 在同规模、所有关系均不共享 `k` 的 table-context 反向上界中，完整两层约 1.75 秒、进程峰值约 366 MB，且
 159,600 条 relation 全部保持孤立；没有用提前折叠换取性能。
 
-**验证：**`env PYTHONPATH=. .venv/bin/pytest` 为 **1699 passed, 1 skipped**；ratio、曲线与现有短行聚焦套件为
-**118 passed**。calibration、holdout 与 table-context aggregate runner 均连续两次逐字节一致。`src/` 中
+**验证：**`env PYTHONPATH=. .venv/bin/pytest` 为 **1701 passed, 1 skipped**；ratio、曲线与现有短行聚焦套件为
+**120 passed**。calibration、holdout 与 table-context aggregate runner 均连续两次逐字节一致。`src/` 中
 `_classify_ratio_table_context` 没有调用者；`_classify_ratio_structure` 只由同一离线原型内部调用，尚未进入
 生产 detector。结构判断不按小数位设置资格分支；公共池只复用 M1 的行级量化推断来识别格点。
 
@@ -1058,9 +1059,9 @@ shadow 只扫描反事实候选池：其余候选条件全部不变，只移除�
 2. **分隔行是硬边界。** 即便所有数值行整体近似 rank-1，也不能越过显式 panel/block 分隔合成一个 family；
    跨 block 关系必须进入表级变换判断。
 3. **高频量化格只能解释它实际贡献的证据。** 在候选两侧及整表按行推断 quantum 计数；只有同一列的
-   source 与 target 两侧都常见时才屏蔽该列，并用原 `n_tests` 重算分数。只有独特列跌破 20 bits 才折叠为
-   `quantized_common_pool`，否则继续作为孤立关系供人工复核。正反方向必须同类，原 relation 与
-   `bits_without_common_pool` 均保留。
+   source 与 target 两侧都常见时才屏蔽该列，并用原 `n_tests` 重算分数。同一无向行对的每个已观测方向都
+   跌破 20 bits 才折叠为 `quantized_common_pool`；任一方向仍有足够独特证据时，全部方向继续作为孤立关系
+   供人工复核。原 relation 与 `bits_without_common_pool` 均保留。
 
 候选池触顶 400 行的 sheet 有 18 个，最大实际候选行为 66,727；其中 1 个窗口耗尽离线预算。为避免只看
 表头，把所有触顶 sheet 另跑连续的中段与尾段 400 行窗口：主 / 中 / 尾三个窗口的最终孤立数均为 **0**。

@@ -148,6 +148,32 @@ def test_reciprocal_only_evidence_and_input_order_give_one_table_decision():
     }
 
 
+def test_conflicting_directions_cannot_support_a_table_transform():
+    panel_a = [_profile(seed) for seed in (63, 65, 67)]
+    rows = panel_a + [_scaled(row, 0.84) for row in panel_a]
+    relations = []
+    for source, target in ((0, 3), (1, 4), (2, 5)):
+        relations.append({
+            "row_a": source, "row_b": target, "start": 0, "end": 7,
+            "k_lo": 0.839, "k_hi": 0.841, "prediction_bits": 40.0,
+        })
+        # Once inverted into table order this claims 0.60–0.61, contradicting
+        # the forward interval. Neither direction may be folded on its own.
+        relations.append({
+            "row_a": target, "row_b": source, "start": 0, "end": 7,
+            "k_lo": 1 / 0.61, "k_hi": 1 / 0.60,
+            "prediction_bits": 40.0,
+        })
+
+    got = _classify_ratio_table_context(
+        rows, relations, row_blocks=[0, 0, 0, 1, 1, 1])
+
+    assert got["table_transforms"] == []
+    assert [item["context_class"] for item in got["relations"]] == [
+        "isolated_cross_block_ratio",
+    ] * len(relations)
+
+
 def test_a_rank1_shape_cannot_merge_relations_across_explicit_blocks():
     """Block separators survive even when every numeric row has the same profile."""
     base = _profile(67)
@@ -208,6 +234,42 @@ def test_repeated_floor_cells_fold_as_a_quantized_common_pool():
     ]
     assert len(got["quantized_common_pools"]) == 1
     assert got["quantized_common_pools"][0]["pair_count"] == 1
+
+
+def test_common_pool_keeps_both_directions_if_either_has_distinctive_evidence():
+    source = [10.0, 50.0, 90.0, 130.0, 0.2, 0.2]
+    target = [3.710, 18.550, 33.390, 48.230, 0.074, 0.074]
+    rows = [source, target]
+    rows.extend([
+        [200.0 + index, 300.0 + index, 400.0 + index, 500.0 + index,
+         0.2, 0.2]
+        for index in range(4)
+    ])
+    rows.extend([
+        [1.111 + index, 2.222 + index, 3.333 + index, 4.444 + index,
+         0.074, 0.074]
+        for index in range(4)
+    ])
+    forward = {
+        "row_a": 0, "row_b": 1, "start": 0, "end": 5,
+        "informative_columns": list(range(6)),
+        "k_lo": 0.3709, "k_hi": 0.3711, "n_tests": 100,
+        "prediction_bits": 40.0,
+    }
+    reverse = {
+        "row_a": 1, "row_b": 0, "start": 0, "end": 5,
+        "informative_columns": list(range(6)),
+        "k_lo": 1 / 0.3711, "k_hi": 1 / 0.3709, "n_tests": 100,
+        "prediction_bits": 40.0,
+    }
+
+    got = _classify_ratio_table_context(
+        rows, [forward, reverse], row_blocks=list(range(len(rows))))
+
+    assert [item["context_class"] for item in got["relations"]] == [
+        "isolated_cross_block_ratio", "isolated_cross_block_ratio",
+    ]
+    assert got["quantized_common_pools"] == []
 
 
 def test_one_common_grid_cell_cannot_explain_an_otherwise_distinctive_pair():

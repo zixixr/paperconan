@@ -4728,25 +4728,22 @@ def _classify_ratio_table_context(rows, relations, *, row_blocks=None,
         prior = eligible.get(key)
         if prior is None:
             table_evidence["indexes"] = [index]
+            table_evidence["directions_compatible"] = True
             eligible[key] = table_evidence
             continue
         prior["indexes"].append(index)
-        # Prefer the interval measured in canonical table direction.  Its target is
-        # the later row/panel -- the direction the table layout itself supplies -- so
-        # reciprocal detector output cannot narrow the uncertainty twice.
-        if table_evidence["follows_layout"] and not prior["follows_layout"]:
-            table_evidence["indexes"] = prior["indexes"]
-            eligible[key] = table_evidence
-        elif table_evidence["follows_layout"] == prior["follows_layout"]:
-            prior_width = prior["hi"] - prior["lo"]
-            current_width = table_evidence["hi"] - table_evidence["lo"]
-            if ((current_width, -table_evidence["lo"])
-                    > (prior_width, -prior["lo"])):
-                table_evidence["indexes"] = prior["indexes"]
-                eligible[key] = table_evidence
+        # Every observed direction is normalized into table order.  Their common
+        # interval is a compatibility requirement, not independent evidence: if the
+        # directions contradict each other, the row pair cannot support a table-level
+        # transform and every direction stays available for review.
+        prior["lo"] = max(prior["lo"], table_evidence["lo"])
+        prior["hi"] = min(prior["hi"], table_evidence["hi"])
+        prior["directions_compatible"] = prior["lo"] <= prior["hi"]
 
     by_signature = {}
     for item in eligible.values():
+        if not item["directions_compatible"]:
+            continue
         by_signature.setdefault(item["signature"], []).append(item)
     for items in by_signature.values():
         items.sort(key=lambda item: (item["pair"], item["lo"], item["hi"]))
@@ -4799,42 +4796,60 @@ def _classify_ratio_table_context(rows, relations, *, row_blocks=None,
         rows, row_blocks)
     common_pool_details = {}
     common_pool_groups = {}
+    common_pool_candidates = {}
     for index, relation in enumerate(result["relations"]):
         if index in folded_indexes or relation["context_class"] != "isolated_ratio":
             continue
-        common_a, common_b = _relation_common_pool_columns(
-            relation, rows, row_blocks, frequencies, table_frequency,
-            quantums, max_frequency)
-        common_columns = set(common_a) & set(common_b)
-        if len(common_columns) < min_common_pool_columns:
-            continue
         try:
-            n_tests = int(relation["n_tests"])
-            row_b = int(relation["row_b"])
-            start, end = int(relation["start"]), int(relation["end"])
+            pair_key = _ratio_context_key(relation)
         except (KeyError, TypeError, ValueError):
             continue
-        informative_columns = set(_ratio_relation_columns(relation))
-        residual_score = _ratio_prediction_bits(
-            rows[row_b][start:end + 1],
-            quantums[row_b][start:end + 1],
-            n_tests,
-            informative=[
-                column in informative_columns and column not in common_columns
-                for column in range(start, end + 1)
-            ],
-        )
-        if residual_score["bits"] >= _SHORT_ROW_MIN_PREDICTION_BITS:
+        common_pool_candidates.setdefault(pair_key, []).append(index)
+
+    for _pair_key, indexes in sorted(common_pool_candidates.items()):
+        direction_details = {}
+        for index in indexes:
+            relation = result["relations"][index]
+            common_a, common_b = _relation_common_pool_columns(
+                relation, rows, row_blocks, frequencies, table_frequency,
+                quantums, max_frequency)
+            common_columns = set(common_a) & set(common_b)
+            if len(common_columns) < min_common_pool_columns:
+                break
+            try:
+                n_tests = int(relation["n_tests"])
+                row_b = int(relation["row_b"])
+                start, end = int(relation["start"]), int(relation["end"])
+            except (KeyError, TypeError, ValueError):
+                break
+            informative_columns = set(_ratio_relation_columns(relation))
+            residual_score = _ratio_prediction_bits(
+                rows[row_b][start:end + 1],
+                quantums[row_b][start:end + 1],
+                n_tests,
+                informative=[
+                    column in informative_columns and column not in common_columns
+                    for column in range(start, end + 1)
+                ],
+            )
+            if residual_score["bits"] >= _SHORT_ROW_MIN_PREDICTION_BITS:
+                break
+            direction_details[index] = (
+                common_a, common_b, residual_score["bits"])
+        if len(direction_details) != len(indexes):
             continue
-        common_pool_details[index] = (
-            common_a, common_b, residual_score["bits"])
+        # A row pair is one observation.  If either measured direction retains enough
+        # distinctive evidence, both directions remain isolated for review; otherwise
+        # iteration order or the target row's inferred precision could decide context.
+        common_pool_details.update(direction_details)
+        relation = result["relations"][indexes[0]]
         row_a, row_b = int(relation["row_a"]), int(relation["row_b"])
         block_a = block_order[row_blocks[row_a]]
         block_b = block_order[row_blocks[row_b]]
         lo_block, hi_block = sorted((block_a, block_b))
         group_key = (lo_block, hi_block,
                      int(relation["start"]), int(relation["end"]))
-        common_pool_groups.setdefault(group_key, []).append(index)
+        common_pool_groups.setdefault(group_key, []).extend(indexes)
 
     quantized_common_pools = []
     for (block_a, block_b, start, end), indexes in sorted(common_pool_groups.items()):

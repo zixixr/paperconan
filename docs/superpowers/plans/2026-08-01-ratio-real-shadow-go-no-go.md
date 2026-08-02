@@ -45,7 +45,8 @@
 - 显式 block/panel 分隔是硬边界；跨 block 关系必须进入表级判断。
 - 高频量化格不是删除规则。只有同一列的 source 与 target 两侧都属于公共格才屏蔽，再用原 `n_tests`
   重算 prediction bits；只有独特列低于 20 bits 才折叠为 `quantized_common_pool`。
-- relation 的原始证据、公共列和屏蔽后的分数必须保留；正反方向必须得到同一 context。
+- relation 的原始证据、公共列和屏蔽后的分数必须保留；只有正反方向都跌破门槛才统一折叠，否则两个方向
+  都保留为孤立 context。
 
 ## 决策
 

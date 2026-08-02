@@ -39,6 +39,8 @@ numeric context layer must not guess that explanation from one pair alone.
 - [x] Canonicalize relation direction by table layout and invert its ratio interval
       when needed.
 - [x] Deduplicate reciprocal directions without counting them as independent support.
+- [x] Require every observed direction of a row pair to admit one common interval;
+      contradictory directions keep the whole pair isolated.
 - [x] Group only relations with the same block pair, relative row offset, and column
       window whose ratio intervals admit one common constant.
 - [x] Mark two-pair groups `ambiguous_table_transform`; summarize groups of at least
@@ -53,9 +55,10 @@ numeric context layer must not guess that explanation from one pair alone.
 - Modify: `docs/superpowers/specs/2026-07-30-short-row-significance-gate.md`
 - Modify: this plan
 
-- [x] Run the focused M1/M2/M2.5 suite and the new stress tests (`90 passed`).
+- [x] Run the focused ratio/curve/short-row suite and the new stress tests
+      (`120 passed`).
 - [x] Run aggregate fixtures twice and compare deterministic output.
 - [x] Run `git diff --check` and the full suite with the repository root on
-      `PYTHONPATH` (`1692 passed, 1 skipped`).
+      `PYTHONPATH` (`1701 passed, 1 skipped`).
 - [x] Record the observed destinations, known limits, and continued M3-M5 block.
 - [x] Commit only the tracked implementation, tests, and documentation.
