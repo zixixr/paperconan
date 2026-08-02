@@ -24,6 +24,7 @@ import argparse
 import csv as _csv
 import datetime
 import glob
+import heapq
 import json
 import math
 import os
@@ -3789,6 +3790,1187 @@ def _sigfigs_and_frac(v):
     ip, _, fr = s.partition(".")
     sig = len(fr.lstrip("0")) if ip == "0" else len(ip) + len(fr)
     return sig, len(fr)
+
+
+_MAX_READ_DECIMALS = 10          # the read precision `_sigfigs_and_frac` works at
+
+
+def _directed_ratio_interval(a, b, q_target):
+    """Which constants k could have written `b` from `a`, at target step `q_target`?
+
+    A cell written as `b` on a grid of step `q` came from anything in
+    `[b - q/2, b + q/2]`, so a single column does not pin k to a point — it admits an
+    interval. Asking the question this way removes the tolerance constant entirely:
+    nothing here decides whether a ratio is "close enough", it computes what rounding
+    could have produced.
+
+    DIRECTED on purpose. Only the target row carries write-back rounding, because
+    only it was computed and re-rounded; the source is used as stored. So a->b and
+    b->a are different questions and callers ask both.
+
+    Returns (lo, hi) with lo <= hi; `None` where the column breaks a run (a non-finite
+    cell, or a zero source against a non-zero target, which no constant reproduces);
+    or (-inf, +inf) where the column is compatible with every k and therefore confirms
+    nothing (zero against zero).
+    """
+    av, bv = float(a), float(b)
+    if not (math.isfinite(av) and math.isfinite(bv)):
+        return None
+    if av == 0.0:
+        return (-math.inf, math.inf) if bv == 0.0 else None
+    lo = (bv - q_target / 2.0) / av
+    hi = (bv + q_target / 2.0) / av
+    return (lo, hi) if lo <= hi else (hi, lo)      # a negative source swaps the ends
+
+
+def _scan_quantized_ratio_runs(source, target, target_quantums, min_informative=2,
+                               min_distinct_source=2):
+    """Maximal contiguous runs of columns that ONE constant could have written.
+
+    A run holds together exactly when its columns' k-intervals intersect, so the run
+    is grown by intersecting and stops where the intersection would empty. Because
+    intersecting only ever narrows, a run's extent from a given start is well defined
+    and any run contained in a longer one is dropped — a sub-run is not a separate
+    relation.
+
+    A run needs at least `min_informative` informative columns: the first fixes k and
+    contributes no evidence, so one column can never be a finding. It also needs
+    `min_distinct_source` distinct source values, since the same value repeated says
+    nothing about a constant.
+
+    At the defaults the second requirement implies the first — only informative
+    columns contribute a source value, so `distinct >= 2` forces `informative >= 2`,
+    and no input can separate them. Both are kept because they stop being equivalent
+    the moment a caller lowers `min_distinct_source`, and because they answer
+    different questions: how many columns confirmed the constant, and whether they
+    confirmed it against more than one number.
+
+    `contains_one` and `contains_power_of_ten` are reported, not acted on. A run whose
+    interval contains 1 is indistinguishable from no scaling at this precision and
+    belongs to the identical arm; one containing a whole power of ten is a unit
+    restatement. Both are the caller's decision — swallowing them here would make an
+    empty result mean two different things.
+
+    Returns a list of dicts ordered by start column. Pure; no detector state.
+    """
+    n = min(len(source), len(target), len(target_quantums))
+    spans = []
+    for i in range(n):
+        spans.append(_directed_ratio_interval(source[i], target[i], target_quantums[i]))
+
+    found = []
+    for start in range(n):
+        lo, hi = -math.inf, math.inf
+        informative = 0
+        informative_columns = []
+        seen_source = set()
+        end = start - 1
+        for j in range(start, n):
+            span = spans[j]
+            if span is None:
+                break
+            new_lo, new_hi = max(lo, span[0]), min(hi, span[1])
+            if new_lo > new_hi:
+                break
+            lo, hi = new_lo, new_hi
+            end = j
+            if math.isfinite(span[0]):
+                informative += 1
+                informative_columns.append(j)
+                seen_source.add(float(source[j]))
+        if end < start or informative < min_informative:
+            continue
+        if len(seen_source) < min_distinct_source:
+            continue
+        found.append({
+            "start": start, "end": end,
+            "k_lo": lo, "k_hi": hi,
+            "informative": informative,
+            "informative_columns": informative_columns,
+            "distinct_source": len(seen_source),
+            "contains_one": lo <= 1.0 <= hi,
+            "contains_power_of_ten": _interval_holds_a_power_of_ten(lo, hi),
+        })
+
+    # Drop any run wholly inside another. Kept O(n^2) and explicit rather than clever:
+    # runs per row pair are few, and a subtle containment bug here would silently
+    # duplicate every relation.
+    maximal = []
+    for r in found:
+        if any(o is not r and o["start"] <= r["start"] and o["end"] >= r["end"]
+               and (o["start"], o["end"]) != (r["start"], r["end"]) for o in found):
+            continue
+        if any(m["start"] == r["start"] and m["end"] == r["end"] for m in maximal):
+            continue
+        maximal.append(r)
+    return maximal
+
+
+_SHORT_ROW_MIN_PREDICTION_BITS = float(
+    os.environ.get("PAPERCONAN_SHORT_ROW_MIN_PREDICTION_BITS", "20"))
+# How much finer than its run's own step a single cell may be SCORED at.
+# `_effective_row_quantums` reads a cell at max(its own decimals, its row's), which
+# has no ceiling: one formula-cached value in an otherwise 2-decimal row is read at
+# 1e-10 and is worth ~38 bits by itself, clearing any sane bar unaided. That step is
+# right for MATCHING, where extra precision is real information, and wrong for
+# SCORING, where eight spare decades are a computational artifact rather than
+# something a person wrote down.
+#
+# Expressed as a RATIO to the run's median step rather than as an absolute bit cap,
+# because an absolute cap punishes genuine precision: a run over values spanning ~30
+# recorded at 0.001 legitimately distinguishes ~30000 places, which is ~15 bits, and
+# a flat 12-bit ceiling would quietly discard real evidence. Two decades of headroom
+# admits any ordinary mixed-precision panel and still bounds the artifact.
+_SHORT_ROW_MAX_QUANTUM_RATIO = float(
+    os.environ.get("PAPERCONAN_SHORT_ROW_MAX_QUANTUM_RATIO", "100"))
+
+
+def _percentile_linear(sorted_values, pct):
+    """Linear-interpolated percentile, written out rather than taken from numpy so the
+    two-column boundary in the design is exactly the arithmetic that runs: for two
+    values the p90-p10 spread is 0.8*(hi-lo), which is what makes a two-column run at
+    one quantum's separation score zero."""
+    n = len(sorted_values)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return float(sorted_values[0])
+    pos = (pct / 100.0) * (n - 1)
+    lo_i = int(math.floor(pos))
+    hi_i = min(lo_i + 1, n - 1)
+    frac = pos - lo_i
+    return float(sorted_values[lo_i]) * (1 - frac) + float(sorted_values[hi_i]) * frac
+
+
+def _ratio_prediction_bits(target_values, quantums, n_tests, *, informative=None,
+                           max_quantum_ratio=None):
+    """How much description does one constant save, over this run?
+
+    A person judging a scaled row does three things: estimate k from one cell, predict
+    the rest with it, and notice how many distinct values were predicted and how
+    finely. This puts a number on the third. A cell recorded at step `q` over a spread
+    `R` had roughly `R/q` places it could have landed, so a correct prediction is worth
+    `log2(R/q)` bits. The cell that fixed k predicts nothing and earns nothing.
+
+    `log2(n_tests)` is then subtracted, because scanning many pairs and many start
+    columns is many chances to find something and a score that ignored the size of the
+    search would reward searching harder.
+
+    This is a MODEL COMPRESSION score, not a probability. It does not claim "one in a
+    million"; it says one constant accounted for about this much of what was written.
+    It says nothing whatever about why — a shared control, a derived column and a unit
+    restatement all compress just as well, which is why structural classification is a
+    separate question and stays that way.
+
+    `informative` is the reconstruction core's aligned mask: a finite target such as
+    zero in a `0 -> 0` column still confirms nothing and must not become the anchor or
+    earn prediction bits merely because the scorer can see its value.
+
+    `quantums` is what to score each cell against. No cell is scored more than
+    `max_quantum_ratio` times finer than the run's median step, which is what keeps a
+    single artifact cell from carrying the run.
+
+    Returns raw_bits, penalty, bits, confirming, per_cell.
+    """
+    flags = ([True] * min(len(target_values), len(quantums))
+             if informative is None else informative)
+    finite = [(float(v), float(q)) for v, q, keep
+              in zip(target_values, quantums, flags)
+              if keep and math.isfinite(float(v)) and math.isfinite(float(q))
+              and float(q) > 0]
+    ratio_cap = (_SHORT_ROW_MAX_QUANTUM_RATIO if max_quantum_ratio is None
+                 else max_quantum_ratio)
+
+    if len(finite) < 2:
+        return {"raw_bits": 0.0, "penalty": 0.0, "bits": 0.0,
+                "confirming": max(0, len(finite) - 1), "per_cell": []}
+
+    values = sorted(v for v, _ in finite)
+    quants = sorted(q for _, q in finite)
+    spread = _percentile_linear(values, 90) - _percentile_linear(values, 10)
+    median_q = _percentile_linear(quants, 50)
+    # The floor matters: without it a run over values that barely differ would be
+    # scored against a spread of zero and take a log of it.
+    extent = max(median_q, spread)
+
+    # No cell is credited for resolution its run as a whole does not show.
+    q_floor = median_q / ratio_cap if ratio_cap and ratio_cap > 0 else 0.0
+    per_cell = []
+    for _v, q in finite[1:]:                      # the first informative cell anchors k
+        places = max(1.0, extent / max(q, q_floor))
+        per_cell.append(math.log2(places))
+
+    raw = float(sum(per_cell))
+    penalty = math.log2(n_tests) if n_tests and n_tests > 1 else 0.0
+    return {"raw_bits": raw, "penalty": penalty, "bits": raw - penalty,
+            "confirming": len(per_cell), "per_cell": per_cell}
+
+
+def _as_rectangular(matrix):
+    """A finite 2-D float array, or None. Ragged input is rejected, never raised on.
+
+    Numeric blocks read off a sheet are routinely ragged, so `np.asarray` on the raw
+    rows would raise rather than answer.
+    """
+    rows = list(matrix)
+    if len(rows) < 2:
+        return None
+    width = len(rows[0])
+    if width < 2 or any(len(r) != width for r in rows):
+        return None
+    try:
+        m = np.asarray(rows, dtype=float)
+    except (TypeError, ValueError):
+        return None
+    return m if m.ndim == 2 else None
+
+
+def _rank1_relative_residual(matrix):
+    """Relative error left by the best shared-profile (rank-1) explanation.
+
+    Each row is scaled to unit length before the fit. Proportionality is a property of
+    a row's SHAPE, so amplitude must not weight the answer: on a raw Frobenius ratio a
+    single row a hundred times larger than its neighbours drives the residual towards
+    zero and folds mutually unrelated rows into one family. Supplementary blocks mix
+    magnitudes across rows as a matter of course, so that is a live failure and not a
+    corner case.
+
+    The measure is independent of decimal count. Non-finite columns are removed as a
+    whole so every retained row is compared on the same coordinates. An unusable,
+    ragged or all-zero matrix returns infinity: missing evidence must never grant a
+    family explanation.
+    """
+    m = _as_rectangular(matrix)
+    if m is None:
+        return math.inf
+    m = m[:, np.all(np.isfinite(m), axis=0)]
+    if m.shape[1] < 2:
+        return math.inf
+    norms = np.linalg.norm(m, axis=1)
+    if np.any(~np.isfinite(norms)) or np.any(norms <= 1e-300):
+        return math.inf
+    profiles = m / norms[:, None]
+    norm = float(np.linalg.norm(profiles))
+    if not math.isfinite(norm) or norm <= 1e-300:
+        return math.inf
+    singular = np.linalg.svd(profiles, compute_uv=False)
+    residual = float(np.linalg.norm(singular[1:]) / norm)
+    return residual if math.isfinite(residual) else math.inf
+
+
+def _ratio_context_key(relation):
+    """Canonical identity of one undirected row relation over one column window."""
+    row_a, row_b = int(relation["row_a"]), int(relation["row_b"])
+    return (min(row_a, row_b), max(row_a, row_b),
+            int(relation["start"]), int(relation["end"]))
+
+
+def _symmetric_ratio_miss(row_a, row_b, start, end):
+    """Scale-invariant shape miss for an undirected proportional relation.
+
+    Each vector is first divided by its own largest absolute coordinate. That avoids
+    both overflow and a fixed absolute-value cutoff when a table is expressed in very
+    small or very large units. The sine of the angle between the rescaled vectors is
+    symmetric under swapping the rows and is zero for either sign of exact scaling.
+    """
+    x = np.asarray(row_a[start:end + 1], dtype=float)
+    y = np.asarray(row_b[start:end + 1], dtype=float)
+    if x.shape != y.shape:
+        return math.inf
+    ok = np.isfinite(x) & np.isfinite(y)
+    if int(ok.sum()) < 2:
+        return math.inf
+    x, y = x[ok], y[ok]
+    scale_x = float(np.max(np.abs(x)))
+    scale_y = float(np.max(np.abs(y)))
+    if not (math.isfinite(scale_x) and math.isfinite(scale_y)):
+        return math.inf
+    if scale_x == 0.0 or scale_y == 0.0:
+        return math.inf
+    x, y = x / scale_x, y / scale_y
+    norm_x = float(np.linalg.norm(x))
+    norm_y = float(np.linalg.norm(y))
+    if norm_x == 0.0 or norm_y == 0.0:
+        return math.inf
+    cosine = abs(float(x @ y) / (norm_x * norm_y))
+    value = math.sqrt(max(0.0, 1.0 - min(1.0, cosine) ** 2))
+    return value if math.isfinite(value) else math.inf
+
+
+def _second_endpoint_peer_miss(incident, row_a, row_b):
+    """Second-nearest finite peer touching either endpoint, excluding their own pair."""
+    candidate = (min(row_a, row_b), max(row_a, row_b))
+    supports = 0
+    for miss, pair in heapq.merge(incident.get(row_a, ()), incident.get(row_b, ())):
+        if pair == candidate:
+            continue
+        supports += 1
+        if supports == 2:
+            return miss
+    return math.inf
+
+
+def _ratio_peer_comparison(rows, scope, row_a, row_b, start, end, *, _cache=None):
+    """Compare one canonical pair's shape miss with nearby row pairs.
+
+    A proportional context explains a relation only when the relation looks like the
+    context. Rows that merely approximate one profile miss each other at the percent
+    level; a pair that agrees to the last recorded digit does not, and folding it away
+    on the strength of its neighbours' approximate agreement discards the one thing
+    that made it worth a second look.
+
+    The comparison is a ratio of two symmetric dimensionless misses, so it carries no
+    unit, direction, inferred quantum or decimal count.
+
+    Returns infinities when there is no context to compare against -- a pair alone in
+    its scope is not explained by anything, and the safe direction is to report it.
+    """
+    key = (start, end)
+    context = None if _cache is None else _cache.get(key)
+    if context is None:
+        misses = {}
+        incident = {row: [] for row in scope}
+        for i_index, i in enumerate(scope):
+            for j in scope[i_index + 1:]:
+                pair = (i, j)
+                miss = _symmetric_ratio_miss(rows[i], rows[j], start, end)
+                misses[pair] = miss
+                if math.isfinite(miss):
+                    incident[i].append((miss, pair))
+                    incident[j].append((miss, pair))
+        for peers in incident.values():
+            peers.sort()
+        context = {"misses": misses, "incident": incident}
+        if _cache is not None:
+            _cache[key] = context
+
+    pair = (min(row_a, row_b), max(row_a, row_b))
+    mine = context["misses"].get(pair, math.inf)
+    if not math.isfinite(mine):
+        return {"mine": math.inf, "peer_miss": math.inf,
+                "improvement": math.inf, "excess": math.inf}
+
+    # Context must be local to the relation. A three-row panel contributes only three
+    # pairs to a 30-row block; a percentile over all 435 block pairs erases precisely
+    # the third-row evidence a person would inspect first. Requiring the second-nearest
+    # endpoint peer prevents one accidental neighbour from explaining the relation.
+    peer_miss = _second_endpoint_peer_miss(context["incident"], row_a, row_b)
+    if not math.isfinite(peer_miss):
+        return {"mine": mine, "peer_miss": math.inf,
+                "improvement": math.inf, "excess": math.inf}
+    numerical_zero = 32.0 * np.finfo(float).eps
+    if mine <= numerical_zero:
+        excess = 0.0 if peer_miss <= numerical_zero else math.inf
+    else:
+        excess = peer_miss / mine
+    return {"mine": mine, "peer_miss": peer_miss,
+            "improvement": max(0.0, peer_miss - mine), "excess": excess}
+
+
+def _ratio_peer_excess(rows, scope, row_a, row_b, start, end,
+                       *, _cache=None):
+    """How many times tighter a canonical pair is than its structural peers."""
+    return _ratio_peer_comparison(
+        rows, scope, row_a, row_b, start, end, _cache=_cache)["excess"]
+
+
+def _row_profile_step_p90(matrix):
+    """90th percentile change between consecutive unit-normalized row profiles."""
+    m = _as_rectangular(matrix)
+    if m is None or m.shape[0] < 3:
+        return math.inf
+    m = m[:, np.all(np.isfinite(m), axis=0)]
+    if m.shape[1] < 2:
+        return math.inf
+    norms = np.linalg.norm(m, axis=1)
+    if np.any(~np.isfinite(norms)) or np.any(norms <= 1e-300):
+        return math.inf
+    profiles = m / norms[:, None]
+    steps = sorted(float(v) for v in np.linalg.norm(np.diff(profiles, axis=0), axis=1))
+    return _percentile_linear(steps, 90) if steps else math.inf
+
+
+def _ratio_relation_columns(relation):
+    """Informative column domain for one scored relation, with a run fallback."""
+    columns = relation.get("informative_columns")
+    if columns is None:
+        columns = range(int(relation["start"]), int(relation["end"]) + 1)
+    return tuple(sorted({int(column) for column in columns}))
+
+
+def _same_ratio_column_domain(columns_a, columns_b):
+    """The overlap rule from the ratio-context design's relation graph."""
+    if len(columns_a) < 2 or len(columns_b) < 2:
+        return False
+    overlap = len(set(columns_a) & set(columns_b))
+    return overlap >= 2 and 2 * overlap >= min(len(columns_a), len(columns_b))
+
+
+def _ratio_edge_components(nrows, edges):
+    """Connected row components induced by a selected set of relation edges."""
+    adjacency = {row: set() for row in range(nrows)}
+    for _index, row_a, row_b in edges:
+        adjacency[row_a].add(row_b)
+        adjacency[row_b].add(row_a)
+    components = []
+    visited = set()
+    for root in range(nrows):
+        if root in visited or not adjacency[root]:
+            continue
+        pending, members = [root], []
+        visited.add(root)
+        while pending:
+            row = pending.pop()
+            members.append(row)
+            for neighbour in sorted(adjacency[row]):
+                if neighbour not in visited:
+                    visited.add(neighbour)
+                    pending.append(neighbour)
+        components.append(sorted(members))
+    return components
+
+
+def _has_consecutive_ratio_chain(pairs, minimum_rows=3):
+    """Whether undirected row edges contain a physical-row chain of this length."""
+    pairs = set(pairs)
+    starts = sorted({row for pair in pairs for row in pair})
+    for start in starts:
+        length = 1
+        row = start
+        while (row, row + 1) in pairs:
+            length += 1
+            row += 1
+        if length >= minimum_rows:
+            return True
+    return False
+
+
+def _classify_ratio_structure(rows, relations, *, max_rank1_residual=0.02,
+                              min_family_rows=3, max_profile_step=0.05,
+                              min_peer_excess=7.0,
+                              min_peer_improvement=0.005,
+                              min_ambiguous_excess=1.0):
+    """Separate isolated ratio relations from edges of a larger proportional family.
+
+    Arithmetic validity and strength have already been decided by M1/M2. This pure
+    offline layer retains every relation and adds context only. A family is summarized
+    rather than discarded so downstream output can fold many pair edges into one
+    table-level statistical pattern without claiming why the structure exists.
+
+    Two questions, kept apart:
+
+      IS THERE A PROPORTIONAL CONTEXT?  A block whose rows are one profile at
+      different amplitudes (small rank-1 residual on unit-normalized rows), or whose
+      profile changes gradually down the rows (small consecutive profile step).
+
+      DOES THAT CONTEXT EXPLAIN THIS RELATION?  A row-pair becomes isolated only when
+      it is both multiplicatively and absolutely tighter than its structural peers.
+      A ratio alone exaggerates tiny differences around zero, so an improvement below
+      `min_peer_improvement` is folded as ambiguous rather than promoted.
+
+    The second question is why nothing here reads row distance. An earlier form folded
+    any edge within two rows of its partner whenever the block looked smooth, which
+    deleted an exact copy of the row above -- the likeliest layout for the pattern this
+    detector exists to surface -- while a weaker relation four rows away survived. The
+    verdict now follows the evidence rather than the seating plan.
+    """
+    nrows = len(rows)
+    matrix = _as_rectangular(rows)
+    if matrix is None:
+        nrows = 0
+    block_residual = _rank1_relative_residual(rows)
+    profile_step = _row_profile_step_p90(rows)
+    peer_cache = {}
+    decision_cache = {}
+
+    def context_decision(scope, scope_key, index, row_a, row_b, structural_class):
+        """Return structural, ambiguous, or isolated for one canonical relation."""
+        context_key = (scope_key, _ratio_context_key(relations[index]))
+        if context_key not in decision_cache:
+            _lo, _hi, start, end = context_key[1]
+            comparison = _ratio_peer_comparison(
+                rows, scope, min(row_a, row_b), max(row_a, row_b), start, end,
+                _cache=peer_cache.setdefault(scope_key, {}))
+            if (comparison["excess"] > min_peer_excess
+                    and comparison["improvement"] > min_peer_improvement):
+                decision = "isolated_ratio"
+            elif comparison["excess"] > min_ambiguous_excess:
+                decision = "ambiguous_within_context"
+            else:
+                decision = structural_class
+            decision_cache[context_key] = decision
+        return decision_cache[context_key]
+
+    valid_edges = []
+    for index, relation in enumerate(relations):
+        row_a, row_b = int(relation["row_a"]), int(relation["row_b"])
+        if 0 <= row_a < nrows and 0 <= row_b < nrows and row_a != row_b:
+            valid_edges.append((index, row_a, row_b))
+
+    family_indexes = set()
+    series_indexes = set()
+    ambiguous_indexes = set()
+    families = []
+    series = []
+    exceptional = set()
+    if (nrows >= min_family_rows and valid_edges
+            and block_residual <= max_rank1_residual):
+        scope = list(range(nrows))
+        scope_key = tuple(scope)
+        indexes, ambiguous, skipped = set(), set(), set()
+        for index, row_a, row_b in valid_edges:
+            decision = context_decision(
+                scope, scope_key, index, row_a, row_b, "proportional_family")
+            if decision == "isolated_ratio":
+                skipped.add(index)
+            else:
+                indexes.add(index)
+                if decision == "ambiguous_within_context":
+                    ambiguous.add(index)
+        exceptional |= skipped
+        ambiguous_indexes |= ambiguous
+        if indexes:
+            pairs = {(min(a, b), max(a, b)) for index, a, b in valid_edges
+                     if index in indexes}
+            family_indexes.update(indexes)
+            families.append({
+                "scope": "block", "rows": scope,
+                "edge_count": len(pairs), "relation_count": len(indexes),
+                "rank1_residual": block_residual,
+                "exceptional_relations": len(skipped),
+                "ambiguous_relation_count": len(ambiguous),
+            })
+    else:
+        domains = sorted({_ratio_relation_columns(relation)
+                          for relation in relations
+                          if len(_ratio_relation_columns(relation)) >= 2})
+        for domain in domains:
+            domain_edges = [
+                edge for edge in valid_edges
+                if edge[0] not in family_indexes
+                and edge[0] not in series_indexes
+                and edge[0] not in exceptional
+                and _same_ratio_column_domain(
+                    domain, _ratio_relation_columns(relations[edge[0]]))
+            ]
+            for members in _ratio_edge_components(nrows, domain_edges):
+                if len(members) < min_family_rows:
+                    continue
+                member_set = set(members)
+                candidates = [
+                    edge for edge in domain_edges
+                    if edge[1] in member_set and edge[2] in member_set
+                ]
+                usable_columns = [column for column in domain
+                                  if 0 <= column < matrix.shape[1]]
+                if len(usable_columns) < 2:
+                    continue
+                local_matrix = matrix[np.ix_(members, usable_columns)]
+                residual = _rank1_relative_residual(local_matrix)
+                local_step = _row_profile_step_p90(local_matrix)
+                candidate_pairs = {
+                    (min(row_a, row_b), max(row_a, row_b))
+                    for _index, row_a, row_b in candidates
+                }
+                if residual <= max_rank1_residual:
+                    structural_class = "proportional_family"
+                elif (_has_consecutive_ratio_chain(candidate_pairs,
+                                                    min_family_rows)
+                      and local_step <= max_profile_step):
+                    structural_class = "proportional_series"
+                else:
+                    continue
+
+                indexes, ambiguous, skipped = set(), set(), set()
+                scope_key = tuple(members)
+                for index, row_a, row_b in candidates:
+                    decision = context_decision(
+                        members, scope_key, index, row_a, row_b,
+                        structural_class)
+                    if decision == "isolated_ratio":
+                        skipped.add(index)
+                    else:
+                        indexes.add(index)
+                        if decision == "ambiguous_within_context":
+                            ambiguous.add(index)
+                exceptional |= skipped
+                ambiguous_indexes |= ambiguous
+                if not indexes:
+                    continue
+                pairs = {
+                    (min(row_a, row_b), max(row_a, row_b))
+                    for index, row_a, row_b in candidates if index in indexes
+                }
+                summary = {
+                    "scope": "component",
+                    "rows": members,
+                    "column_domain": list(domain),
+                    "edge_count": len(pairs),
+                    "relation_count": len(indexes),
+                    "exceptional_relations": len(skipped),
+                    "ambiguous_relation_count": len(ambiguous),
+                }
+                if structural_class == "proportional_family":
+                    summary["rank1_residual"] = residual
+                    family_indexes.update(indexes)
+                    families.append(summary)
+                else:
+                    summary["profile_step_p90"] = local_step
+                    series_indexes.update(indexes)
+                    series.append(summary)
+
+    if profile_step <= max_profile_step and nrows >= min_family_rows:
+        scope = list(range(nrows))
+        scope_key = tuple(scope)
+        ambiguous, skipped = set(), set()
+        for index, row_a, row_b in valid_edges:
+            if index in family_indexes:
+                continue
+            decision = context_decision(
+                scope, scope_key, index, row_a, row_b, "proportional_series")
+            if decision == "isolated_ratio":
+                skipped.add(index)
+            else:
+                series_indexes.add(index)
+                if decision == "ambiguous_within_context":
+                    ambiguous.add(index)
+        exceptional |= skipped
+        ambiguous_indexes |= ambiguous
+        if series_indexes:
+            pairs = {
+                (min(row_a, row_b), max(row_a, row_b))
+                for index, row_a, row_b in valid_edges if index in series_indexes
+            }
+            series.append({
+                "scope": "block", "rows": scope,
+                "edge_count": len(pairs), "relation_count": len(series_indexes),
+                "profile_step_p90": profile_step,
+                "exceptional_relations": len(skipped),
+                "ambiguous_relation_count": len(ambiguous),
+            })
+
+    classified, isolated = [], []
+    for index, relation in enumerate(relations):
+        item = dict(relation)
+        if index in ambiguous_indexes:
+            item["context_class"] = "ambiguous_within_context"
+        elif index in family_indexes:
+            item["context_class"] = "proportional_family"
+        elif index in series_indexes:
+            item["context_class"] = "proportional_series"
+        else:
+            item["context_class"] = "isolated_ratio"
+            # An edge inside a proportional block that its block cannot account for.
+            # Recorded so a reader can tell "no context here" from "the context was
+            # examined and did not cover this one".
+            item["exceptional_within_context"] = index in exceptional
+        classified.append(item)
+        if item["context_class"] == "isolated_ratio":
+            isolated.append(item)
+    return {
+        "block_rank1_residual": block_residual,
+        "block_profile_step_p90": profile_step,
+        "relations": classified,
+        "families": families,
+        "series": series,
+        "isolated_relations": isolated,
+    }
+
+
+def _invert_ratio_interval(lo, hi):
+    """Invert a finite ratio interval, or return None when it crosses zero."""
+    lo, hi = float(lo), float(hi)
+    if not (math.isfinite(lo) and math.isfinite(hi)) or lo <= 0.0 <= hi:
+        return None
+    values = (1.0 / lo, 1.0 / hi)
+    return min(values), max(values)
+
+
+def _classify_ratio_blocks(rows, relations, row_blocks):
+    """Apply within-block context without allowing separators to disappear."""
+    block_rows = {}
+    for row, block in enumerate(row_blocks):
+        block_rows.setdefault(block, []).append(row)
+    if len(block_rows) <= 1:
+        return _classify_ratio_structure(rows, relations)
+
+    classified = [None] * len(relations)
+    families = []
+    series = []
+    block_metrics = []
+    for block, global_rows in block_rows.items():
+        local_by_global = {row: index for index, row in enumerate(global_rows)}
+        original_indexes = []
+        local_relations = []
+        for index, relation in enumerate(relations):
+            try:
+                row_a, row_b = int(relation["row_a"]), int(relation["row_b"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if row_a not in local_by_global or row_b not in local_by_global:
+                continue
+            item = dict(relation)
+            item["row_a"] = local_by_global[row_a]
+            item["row_b"] = local_by_global[row_b]
+            original_indexes.append(index)
+            local_relations.append(item)
+        local_rows = [rows[row] for row in global_rows]
+        local = _classify_ratio_structure(local_rows, local_relations)
+        block_metrics.append({
+            "block": block,
+            "rows": list(global_rows),
+            "rank1_residual": local["block_rank1_residual"],
+            "profile_step_p90": local["block_profile_step_p90"],
+        })
+        for original_index, item in zip(original_indexes, local["relations"]):
+            restored = dict(item)
+            restored["row_a"] = int(relations[original_index]["row_a"])
+            restored["row_b"] = int(relations[original_index]["row_b"])
+            classified[original_index] = restored
+        for destination, summaries in ((families, local["families"]),
+                                       (series, local["series"])):
+            for summary in summaries:
+                restored = dict(summary)
+                restored["block"] = block
+                restored["rows"] = [global_rows[row] for row in summary["rows"]]
+                destination.append(restored)
+
+    isolated = []
+    for index, relation in enumerate(relations):
+        item = classified[index]
+        if item is None:
+            item = dict(relation)
+            item["context_class"] = "isolated_ratio"
+            item["exceptional_within_context"] = False
+            classified[index] = item
+        if item["context_class"] == "isolated_ratio":
+            isolated.append(item)
+    return {
+        "block_rank1_residual": math.inf,
+        "block_profile_step_p90": math.inf,
+        "block_metrics": block_metrics,
+        "relations": classified,
+        "families": families,
+        "series": series,
+        "isolated_relations": isolated,
+    }
+
+
+def _ratio_table_evidence(relation, row_blocks, block_order, row_positions):
+    """Canonical table-layout signature and directed interval for one relation.
+
+    Direction follows table layout rather than detector iteration: earlier block,
+    then earlier row position.  If only the reciprocal arithmetic relation exists,
+    its interval is inverted into that canonical direction.
+    """
+    try:
+        row_a, row_b = int(relation["row_a"]), int(relation["row_b"])
+        lo, hi = float(relation["k_lo"]), float(relation["k_hi"])
+        start, end = int(relation["start"]), int(relation["end"])
+        block_a, block_b = row_blocks[row_a], row_blocks[row_b]
+    except (IndexError, KeyError, TypeError, ValueError):
+        return None
+    if (not (0 <= row_a < len(row_blocks) and 0 <= row_b < len(row_blocks))
+            or row_a == row_b or start > end or lo > hi
+            or not (math.isfinite(lo) and math.isfinite(hi))):
+        return None
+
+    key_a = (block_order[block_a], row_positions[row_a], row_a)
+    key_b = (block_order[block_b], row_positions[row_b], row_b)
+    follows_layout = key_a < key_b
+    if not follows_layout:
+        inverted = _invert_ratio_interval(lo, hi)
+        if inverted is None:
+            return None
+        lo, hi = inverted
+        row_a, row_b = row_b, row_a
+        block_a, block_b = block_b, block_a
+
+    block_a_order, block_b_order = block_order[block_a], block_order[block_b]
+    offset = row_positions[row_b] - row_positions[row_a]
+    signature = (block_a_order, block_b_order, offset, start, end)
+    pair = (min(row_a, row_b), max(row_a, row_b), start, end)
+    return {
+        "signature": signature,
+        "pair": pair,
+        "lo": lo,
+        "hi": hi,
+        "follows_layout": follows_layout,
+        "block_a": block_a,
+        "block_b": block_b,
+        "row_a": row_a,
+        "row_b": row_b,
+    }
+
+
+def _common_interval_groups(evidence):
+    """Partition interval evidence into deterministic groups sharing one constant."""
+    remaining = list(evidence)
+    groups = []
+    while len(remaining) >= 2:
+        points = sorted({item["lo"] for item in remaining})
+        best = []
+        best_point = None
+        for point in points:
+            members = [item for item in remaining
+                       if item["lo"] <= point <= item["hi"]]
+            member_key = tuple(item["pair"] for item in members)
+            best_key = tuple(item["pair"] for item in best)
+            if (len(members) > len(best)
+                    or (len(members) == len(best)
+                        and (not best_key or member_key < best_key))):
+                best, best_point = members, point
+        if len(best) < 2:
+            break
+        groups.append((best_point, best))
+        used = {item["pair"] for item in best}
+        remaining = [item for item in remaining if item["pair"] not in used]
+    return groups
+
+
+def _quantized_grid_key(value, quantum):
+    """Stable identity of a recorded value on its row-inferred decimal grid."""
+    value, quantum = float(value), float(quantum)
+    if not (math.isfinite(value) and math.isfinite(quantum) and quantum > 0):
+        return None
+    exponent = int(round(math.log10(quantum)))
+    return exponent, int(round(value / quantum))
+
+
+def _ratio_block_grid_frequencies(rows, row_blocks):
+    """Frequency of quantized values inside each precision-agnostic block."""
+    frequencies = {}
+    table_frequency = Counter()
+    quantums = []
+    for row, block in zip(rows, row_blocks):
+        row_quantums = _effective_row_quantums(row)
+        quantums.append(row_quantums)
+        counter = frequencies.setdefault(block, Counter())
+        for value, quantum in zip(row, row_quantums):
+            key = _quantized_grid_key(value, quantum)
+            if key is not None:
+                counter[key] += 1
+                table_frequency[key] += 1
+    return frequencies, table_frequency, quantums
+
+
+def _relation_common_pool_columns(relation, rows, row_blocks, frequencies,
+                                  table_frequency, quantums, max_frequency):
+    """Informative columns landing on a high-frequency grid bin on either side."""
+    try:
+        row_a, row_b = int(relation["row_a"]), int(relation["row_b"])
+    except (KeyError, TypeError, ValueError):
+        return (), ()
+    if not (0 <= row_a < len(rows) and 0 <= row_b < len(rows)):
+        return (), ()
+    columns = _ratio_relation_columns(relation)
+    common = []
+    for row in (row_a, row_b):
+        block = row_blocks[row]
+        found = []
+        for column in columns:
+            if not (0 <= column < len(rows[row])):
+                continue
+            key = _quantized_grid_key(rows[row][column], quantums[row][column])
+            if (key is not None
+                    and max(frequencies[block][key], table_frequency[key])
+                    > max_frequency):
+                found.append(column)
+        common.append(tuple(found))
+    return tuple(common)
+
+
+def _classify_ratio_table_context(rows, relations, *, row_blocks=None,
+                                  min_transform_pairs=3,
+                                  min_common_pool_columns=2,
+                                  max_common_value_frequency=None):
+    """Fold repeated aligned ratios after the within-block context decision.
+
+    A person does not count reciprocal detector directions as two observations.  This
+    pure offline layer therefore deduplicates each row pair, then asks whether another
+    pair in the same block layout and column window admits the same scale constant.
+    Two pairs are retained as ambiguous table context; three or more form one stable
+    table-transform summary.  A single unsupported pair remains isolated for human
+    re-check.  A relation supported mainly by quantized values that are common on both
+    sides is folded only after removing those paired columns makes its original score
+    fall below the reporting bar.  Labels and formulas are deliberately outside this
+    numeric-only step.
+    """
+    nrows = len(rows)
+    if row_blocks is None:
+        row_blocks = [0] * nrows
+    else:
+        row_blocks = list(row_blocks)
+    if len(row_blocks) != nrows:
+        raise ValueError("row_blocks must contain one block id per row")
+    result = _classify_ratio_blocks(rows, relations, row_blocks)
+
+    block_order = {}
+    block_labels = []
+    row_positions = {}
+    block_counts = {}
+    for row, block in enumerate(row_blocks):
+        if block not in block_order:
+            block_order[block] = len(block_order)
+            block_labels.append(block)
+        row_positions[row] = block_counts.get(block, 0)
+        block_counts[block] = row_positions[row] + 1
+
+    eligible = {}
+    for index, item in enumerate(result["relations"]):
+        if item["context_class"] != "isolated_ratio":
+            continue
+        table_evidence = _ratio_table_evidence(
+            item, row_blocks, block_order, row_positions)
+        if table_evidence is None:
+            continue
+        key = (table_evidence["signature"], table_evidence["pair"])
+        prior = eligible.get(key)
+        if prior is None:
+            table_evidence["indexes"] = [index]
+            table_evidence["directions_compatible"] = True
+            eligible[key] = table_evidence
+            continue
+        prior["indexes"].append(index)
+        # Every observed direction is normalized into table order.  Their common
+        # interval is a compatibility requirement, not independent evidence: if the
+        # directions contradict each other, the row pair cannot support a table-level
+        # transform and every direction stays available for review.
+        prior["lo"] = max(prior["lo"], table_evidence["lo"])
+        prior["hi"] = min(prior["hi"], table_evidence["hi"])
+        prior["directions_compatible"] = prior["lo"] <= prior["hi"]
+
+    by_signature = {}
+    for item in eligible.values():
+        if not item["directions_compatible"]:
+            continue
+        by_signature.setdefault(item["signature"], []).append(item)
+    for items in by_signature.values():
+        items.sort(key=lambda item: (item["pair"], item["lo"], item["hi"]))
+
+    table_transforms = []
+    folded_indexes = set()
+    ambiguous_indexes = set()
+    cross_block_indexes = {
+        index for item in eligible.values()
+        if item["block_a"] != item["block_b"]
+        for index in item["indexes"]
+    }
+    for signature in sorted(by_signature):
+        for point, members in _common_interval_groups(by_signature[signature]):
+            relation_indexes = sorted(
+                index for member in members for index in member["indexes"])
+            pair_count = len(members)
+            context_class = (
+                "proportional_table_transform"
+                if pair_count >= min_transform_pairs
+                else "ambiguous_table_transform")
+            folded_indexes.update(relation_indexes)
+            if pair_count < min_transform_pairs:
+                ambiguous_indexes.update(relation_indexes)
+            block_a_order, block_b_order, offset, start, end = signature
+            table_transforms.append({
+                "scope": ("within_block" if block_a_order == block_b_order
+                          else "cross_block"),
+                "block_a": block_labels[block_a_order],
+                "block_b": block_labels[block_b_order],
+                "row_offset": offset,
+                "start": start,
+                "end": end,
+                "ratio_interval": [
+                    max(member["lo"] for member in members),
+                    min(member["hi"] for member in members),
+                ],
+                "representative_ratio": point,
+                "pair_count": pair_count,
+                "relation_count": len(relation_indexes),
+                "rows": sorted({row for member in members
+                                for row in (member["row_a"], member["row_b"])}),
+                "context_class": context_class,
+            })
+
+    max_frequency = (_SHORT_ROW_MAX_VALUE_FREQ
+                     if max_common_value_frequency is None
+                     else max_common_value_frequency)
+    frequencies, table_frequency, quantums = _ratio_block_grid_frequencies(
+        rows, row_blocks)
+    common_pool_details = {}
+    common_pool_groups = {}
+    common_pool_candidates = {}
+    for index, relation in enumerate(result["relations"]):
+        if index in folded_indexes or relation["context_class"] != "isolated_ratio":
+            continue
+        try:
+            pair_key = _ratio_context_key(relation)
+        except (KeyError, TypeError, ValueError):
+            continue
+        common_pool_candidates.setdefault(pair_key, []).append(index)
+
+    for _pair_key, indexes in sorted(common_pool_candidates.items()):
+        direction_details = {}
+        for index in indexes:
+            relation = result["relations"][index]
+            common_a, common_b = _relation_common_pool_columns(
+                relation, rows, row_blocks, frequencies, table_frequency,
+                quantums, max_frequency)
+            common_columns = set(common_a) & set(common_b)
+            if len(common_columns) < min_common_pool_columns:
+                break
+            try:
+                n_tests = int(relation["n_tests"])
+                row_b = int(relation["row_b"])
+                start, end = int(relation["start"]), int(relation["end"])
+            except (KeyError, TypeError, ValueError):
+                break
+            informative_columns = set(_ratio_relation_columns(relation))
+            residual_score = _ratio_prediction_bits(
+                rows[row_b][start:end + 1],
+                quantums[row_b][start:end + 1],
+                n_tests,
+                informative=[
+                    column in informative_columns and column not in common_columns
+                    for column in range(start, end + 1)
+                ],
+            )
+            if residual_score["bits"] >= _SHORT_ROW_MIN_PREDICTION_BITS:
+                break
+            direction_details[index] = (
+                common_a, common_b, residual_score["bits"])
+        if len(direction_details) != len(indexes):
+            continue
+        # A row pair is one observation.  If either measured direction retains enough
+        # distinctive evidence, both directions remain isolated for review; otherwise
+        # iteration order or the target row's inferred precision could decide context.
+        common_pool_details.update(direction_details)
+        relation = result["relations"][indexes[0]]
+        row_a, row_b = int(relation["row_a"]), int(relation["row_b"])
+        block_a = block_order[row_blocks[row_a]]
+        block_b = block_order[row_blocks[row_b]]
+        lo_block, hi_block = sorted((block_a, block_b))
+        group_key = (lo_block, hi_block,
+                     int(relation["start"]), int(relation["end"]))
+        common_pool_groups.setdefault(group_key, []).extend(indexes)
+
+    quantized_common_pools = []
+    for (block_a, block_b, start, end), indexes in sorted(common_pool_groups.items()):
+        pairs = {_ratio_context_key(result["relations"][index]) for index in indexes}
+        quantized_common_pools.append({
+            "scope": "within_block" if block_a == block_b else "cross_block",
+            "block_a": block_labels[block_a],
+            "block_b": block_labels[block_b],
+            "start": start,
+            "end": end,
+            "pair_count": len(pairs),
+            "relation_count": len(indexes),
+            "rows": sorted({
+                row for index in indexes
+                for row in (int(result["relations"][index]["row_a"]),
+                            int(result["relations"][index]["row_b"]))
+            }),
+            "context_class": "quantized_common_pool",
+        })
+
+    classified = []
+    isolated = []
+    for index, relation in enumerate(result["relations"]):
+        item = dict(relation)
+        if index in folded_indexes:
+            item["context_class"] = (
+                "ambiguous_table_transform" if index in ambiguous_indexes
+                else "proportional_table_transform")
+            item.pop("exceptional_within_context", None)
+        elif index in common_pool_details:
+            common_a, common_b, residual_bits = common_pool_details[index]
+            item["context_class"] = "quantized_common_pool"
+            item["common_pool_columns_a"] = list(common_a)
+            item["common_pool_columns_b"] = list(common_b)
+            item["bits_without_common_pool"] = residual_bits
+            item.pop("exceptional_within_context", None)
+        elif (index in cross_block_indexes
+              and item["context_class"] == "isolated_ratio"):
+            item["context_class"] = "isolated_cross_block_ratio"
+        classified.append(item)
+        if item["context_class"] in {
+                "isolated_ratio", "isolated_cross_block_ratio"}:
+            isolated.append(item)
+    result["relations"] = classified
+    result["table_transforms"] = table_transforms
+    result["quantized_common_pools"] = quantized_common_pools
+    result["isolated_relations"] = isolated
+    return result
+
+
+def _interval_holds_a_power_of_ten(lo, hi):
+    """Does [lo, hi] contain a whole power of ten, in either sign?
+
+    Asked of the interval rather than of a chosen k: at coarse precision the interval
+    can straddle 10^n while its midpoint does not, and a unit restatement that reads
+    as an arbitrary constant is exactly the misreading to avoid.
+    """
+    for sign in (1.0, -1.0):
+        a, b = (lo, hi) if sign > 0 else (-hi, -lo)
+        if b <= 0:
+            continue
+        top = math.floor(math.log10(b)) if b > 0 else 0
+        bottom = math.floor(math.log10(a)) if a > 0 else top - 1
+        for e in range(int(bottom) - 1, int(top) + 2):
+            if a <= 10.0 ** e <= b:
+                return True
+    return False
+
+
+def _effective_row_quantums(values):
+    """The decimal step each cell of a row was RECORDED in, inferred from the row.
+
+    `Sheet` holds floats, so a sheet that wrote 71.20 is indistinguishable from one
+    that wrote 71.2 — the trailing zero is gone before any detector sees it. The
+    ratio arm needs that step to ask whether a value could have come from rounding
+    `k * a`, so it is inferred rather than read:
+
+      1. each cell's surviving decimals, at `_MAX_READ_DECIMALS` read precision;
+      2. the row's step is the commonest of those, ties resolving to the FINER;
+      3. a cell is read at `max(its own, the row's)`.
+
+    Step 3 is `max` on purpose: a cell carrying MORE decimals than its neighbours has
+    real extra precision, and coarsening it would widen its allowed interval, which is
+    the direction that invents matches. The tie rule resolves finer for the same reason.
+
+    THAT ARGUMENT COVERS MATCHING ONLY, and it does not make the inference safe overall.
+    Reading a cell finer than it truly is narrows its interval, so fewer runs match —
+    but any run that still matches is then SCORED against a finer grid. Where a score
+    counts distinguishable positions as `range / step`, a step ten times too fine adds
+    log2(10) ≈ 3.3 bits per confirming cell, and one cell whose float carries a full
+    complement of decimals — a formula-cached value such as 1/3 sitting in an otherwise
+    2-decimal row — reaches `q = 1e-10` and contributes upwards of 38 bits on its own.
+    The two effects run in opposite directions and the net is NOT one-sided.
+
+    So this is an input assumption, not a safety guarantee. Any consumer that turns the
+    step into a score has to measure its sensitivity to the inference and bound the
+    contribution a single cell may make; `test_row_quantum.py` pins the hazard.
+
+    Non-finite cells get NaN: they carry no recorded precision, they cannot join a
+    run, and they must not vote on the row's step.
+
+    This is an INFERENCE about how the sheet was written, not recovered metadata, and
+    every finding built on it says so (`precision_source = "row_inferred"`).
+    """
+    decimals = []
+    for v in values:
+        fv = float(v)
+        if not math.isfinite(fv):
+            decimals.append(None)
+            continue
+        decimals.append(min(_sigfigs_and_frac(fv)[1], _MAX_READ_DECIMALS))
+
+    seen = [d for d in decimals if d is not None]
+    if not seen:
+        return [float("nan")] * len(decimals)
+    counts = Counter(seen)
+    top = max(counts.values())
+    row_decimals = max(d for d, n in counts.items() if n == top)   # tie -> finer
+
+    return [float("nan") if d is None else 10.0 ** -max(d, row_decimals)
+            for d in decimals]
 
 
 def _is_short_hp(v):
