@@ -162,11 +162,13 @@ Expected: `README language switches and relative file links resolve` and exit st
 Run:
 
 ```bash
-rg -n -i 'fraud|fabricat|faked|misconduct|guilty|弊病|编造|造假|欺诈|不端结论|算法标注的可疑模式|定位可疑数值模式' README.md README.zh-CN.md
+.venv/bin/python -m pytest \
+  tests/test_skill_docs.py::test_tracked_product_surfaces_follow_neutral_language_policy \
+  -q
 git diff --check -- README.md README.zh-CN.md
 ```
 
-Expected: `rg` returns no matches and `git diff --check` returns no errors. If the two commands are run separately, `rg` exits 1 because there are no matches and `git diff --check` exits 0.
+Expected: the policy test passes and `git diff --check` returns no errors.
 
 - [ ] **Step 7: Review the final diff for translation completeness and scope**
 

@@ -64,19 +64,26 @@ def test_case_patterns_do_not_publish_real_paper_identifiers() -> None:
     assert "s415" not in text
 
 
-def test_readme_points_to_public_adjudication_docs() -> None:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+def test_readmes_point_to_public_adjudication_docs() -> None:
+    readmes = {
+        "English": (ROOT / "README.md").read_text(encoding="utf-8"),
+        "简体中文": (ROOT / "README.zh-CN.md").read_text(encoding="utf-8"),
+    }
 
-    for name in [
-        "adjudication-tiers.md",
-        "report-templates.md",
-        "adversarial-review.md",
-        "batch-workflow.md",
-        "case-patterns.md",
-    ]:
-        assert f"skills/paperconan/references/{name}" in readme
+    for language, readme in readmes.items():
+        for name in [
+            "adjudication-tiers.md",
+            "report-templates.md",
+            "adversarial-review.md",
+            "batch-workflow.md",
+            "case-patterns.md",
+        ]:
+            assert f"skills/paperconan/references/{name}" in readme, language
 
-    assert "不是作者意图判断" in readme
+    assert "not conclusions about author intent" in readmes["English"]
+    assert "不是作者意图判断" in readmes["简体中文"]
+    assert "[简体中文](README.zh-CN.md)" in readmes["English"]
+    assert "[English](README.md)" in readmes["简体中文"]
 
 
 def _python_comments_and_docstrings(path: Path) -> str:
