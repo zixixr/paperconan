@@ -1,6 +1,7 @@
 """nature.com / Springer ESM source: a paper's own article page links its
-supplementary / Source Data files on the open static-content.springer.com CDN —
-reachable for both OA and paywalled articles without a login."""
+supplementary / Source Data files on the open static-content.springer.com and
+media.springernature.com CDNs — reachable for both OA and paywalled articles
+without a login."""
 from __future__ import annotations
 
 import html as html_lib
@@ -11,14 +12,25 @@ from . import _http
 from ._files import make_fileref
 from ._sources import _candidate
 
+# Older articles link ESM from static-content.springer.com/esm/...; newer ones
+# from media.springernature.com/<view>/springer-static/esm/... — accept both.
 _ESM_HREF = re.compile(
-    r'href="(https://static-content\.springer\.com/esm/[^"]+)"', re.I)
+    r'href="(https://(?:static-content\.springer\.com/esm'
+    r'|media\.springernature\.com/[a-z0-9_-]+/springer-static/esm)'
+    r'/[^"]+)"',
+    re.I,
+)
 _HREF = re.compile(r"""\bhref\s*=\s*(["'])(.*?)\1""", re.I | re.S)
 _FULL_IMAGE_SRC = re.compile(
     r'(https://media\.springernature\.com/full/[^"\']+\.(?:png|jpe?g|tiff?))',
     re.I,
 )
 _NATURE_ORIGIN = "https://www.nature.com"
+# nature.com bounces anonymous readers through its cookie-consent gateway
+# (303 → idp.nature.com/authorize → /transit → back to the article), so the
+# origin allowlist must include it or the article fetch fails mid-redirect.
+_IDP_ORIGIN = "https://idp.nature.com"
+_ALLOWED_ORIGINS = {_NATURE_ORIGIN, _IDP_ORIGIN}
 # One article may lead to at most this many bounded figure-page requests.
 _MAX_FIGURE_PAGES = 100
 # Article and figure HTML bodies share this deterministic per-response ceiling.
@@ -118,7 +130,7 @@ def search_nature_esm(query, size=5):
             url,
             timeout=60,
             max_bytes=_MAX_NATURE_HTML_BYTES,
-            allowed_origins={_NATURE_ORIGIN},
+            allowed_origins=_ALLOWED_ORIGINS,
         )
     except Exception:
         return []
@@ -129,7 +141,7 @@ def search_nature_esm(query, size=5):
                 figure_url,
                 timeout=60,
                 max_bytes=_MAX_NATURE_HTML_BYTES,
-                allowed_origins={_NATURE_ORIGIN},
+                allowed_origins=_ALLOWED_ORIGINS,
             )
             ref = parse_nature_full_image(figure_html)
         except Exception:

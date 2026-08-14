@@ -27,6 +27,25 @@ def test_parse_nature_esm_links_extracts_and_classifies():
     assert by_ext["xlsx"]["download_url"].startswith("https://static-content.springer.com/esm/")
 
 
+# Newer article pages serve ESM from the media.springernature.com CDN instead.
+MEDIA_ESM_HTML = '''
+<html><body>
+<a href="https://media.springernature.com/original/springer-static/esm/art%3A10.1038%2Fs41586-024-08248-5/MediaObjects/41586_2024_8248_MOESM4_ESM.xlsx">Supplementary Tables</a>
+<a href="https://media.springernature.com/original/springer-static/esm/art%3A10.1038%2Fs41586-024-08248-5/MediaObjects/41586_2024_8248_MOESM1_ESM.pdf">Supplementary Information</a>
+</body></html>
+'''
+
+
+def test_parse_nature_esm_links_accepts_media_cdn_urls():
+    refs = nat.parse_nature_esm_links(MEDIA_ESM_HTML)
+    by_ext = {r["ext"]: r for r in refs}
+    assert set(by_ext) == {"pdf", "xlsx"}
+    assert by_ext["xlsx"]["name"] == "41586_2024_8248_MOESM4_ESM.xlsx"
+    assert by_ext["xlsx"]["download_url"].startswith(
+        "https://media.springernature.com/original/springer-static/esm/"
+    )
+
+
 def test_search_nature_esm_builds_confident_candidate(monkeypatch):
     monkeypatch.setattr(nat._http, "get_text", lambda url, **k: FIXTURE_HTML)
     cands = nat.search_nature_esm("10.1038/s41467-022-28338-0")
@@ -145,7 +164,10 @@ def test_search_nature_esm_bounds_article_and_figure_text_fetches(monkeypatch):
     assert len(calls) == 2
     for _, kwargs in calls:
         assert kwargs["max_bytes"] == 5 * 1024 * 1024
-        assert kwargs["allowed_origins"] == {"https://www.nature.com"}
+        assert kwargs["allowed_origins"] == {
+            "https://www.nature.com",
+            "https://idp.nature.com",   # cookie-consent bounce gateway
+        }
 
 
 def test_search_nature_esm_caps_figure_fetch_count(monkeypatch):
