@@ -8,18 +8,22 @@ essentials; this file is the complete reference (it travels in the skill bundle)
 ```json
 {
   "tool": "paperconan",
-  "tool_version": "0.8.2",        // matches the pyproject version; provenance for archived reports
-  "scanned_at": "2026-05-29T02:08:53+00:00",
+  "tool_version": "0.8.4",        // matches the pyproject version; provenance for archived reports
+  "schema_version": 2,            // scan.json shape version; sidecar packets carry it too
+  "scan_status": "complete",      // "complete" | "partial" | "failed" — check BEFORE adjudicating (see below)
+  "coverage": {...},              // explicit scan-coverage accounting (see below)
+  "scanned_at": "2026-05-29T02:08:53+00:00",  // null unless --runtime-metadata (scan.json stays byte-reproducible by default)
   "profile": "review",            // which FP profile ran (review|forensic|triage) — severities are post-filter unless "forensic"
-  "input_dir": "...",
+  "input_dir": "...",             // absolute path
   "paper": {"doi": "10.1038/...", "title": "..."},  // provenance, or null (see below)
   "n_files": 3,
   "n_blocks_with_findings": 8,
+  "findings_omitted": 0,          // total findings dropped by the per-block/global finding caps, all blocks
   "scan_errors": [                // files that failed to parse — surface these, don't imply a clean scan
     {"file": "broken.xlsx", "error": "..."}
   ],
-  "scan_stats": {                 // per-file / per-sheet sizing + timing (files[], sheets[], elapsed_ms)
-    "files": [...], "sheets": [...], "elapsed_ms": 412.5
+  "scan_stats": {                 // per-file / per-sheet sizing + timing (files[], sheets[], elapsed_ms);
+    "files": [...], "sheets": [...], "elapsed_ms": 412.5   // elapsed_* are null without --runtime-metadata
   },
   "n_image_source_files": 2,
   "n_image_assets": 3,
@@ -28,13 +32,18 @@ essentials; this file is the complete reference (it travels in the skill bundle)
       "file": "ED_Fig8b.xlsx",
       "sheet": "Sheet1",
       "block": {"rows": "6-15", "cols": "1-30", "header": [...]},
+      "findings_omitted": 0,           // findings this block dropped to stay under the finding caps
+                                       // (PAPERCONAN_MAX_FINDINGS_PER_BLOCK / PAPERCONAN_MAX_TOTAL_FINDINGS;
+                                       // highest severity kept first — never a silent truncation)
       "relations": [...],              // cross-column relations
       "progressions": [...],           // arithmetic progressions
       "equal_pairs": [...],            // pairs of columns with many equal rows
       "row_pairs": [...],              // pairs of rows with suspicious low-digit coupling
+      "row_relations": [...],          // within-block row-to-row relations (constant_ratio_row / identical_row)
       "within_col": [...],             // within-column anomalies
       "identical_after_rounding": [...], // cells matching after rounding
-      "grim": [...]                    // GRIM/GRIMMER: reported mean/SD impossible for integer data
+      "grim": [...],                   // GRIM/GRIMMER: reported mean/SD inconsistent for integer data
+      "block_dups": [...]              // block-level distributed exact-repeat signal (block_value_duplication, see below)
     }
   ],
   // per-sheet last-digit χ². Each: {label, n, chi2, p, p_adj, fdr_significant, counts, top}
@@ -42,6 +51,10 @@ essentials; this file is the complete reference (it travels in the skill bundle)
   "digit_distribution": [...],
   // per-sheet two-decimal ending counts. Each: {label, n, n_unique, top}
   "decimal_endings": [...],
+  // per-sheet 3-decimal tail clustering (detectors.md `decimal_tail_clustering`).
+  // Each: {label, n, top, top_share, complementary_pairs, n_distinct_fraction,
+  //        collision_pairs, expected_pairs, p_value, ...}
+  "decimal_tail_clusters": [...],
   // bit-identical / value-overlap across sheets (same file OR cross-file). See fields below.
   "cross_sheet_findings": [...],
   // complete registered inventory when --images is enabled
@@ -55,6 +68,35 @@ essentials; this file is the complete reference (it travels in the skill bundle)
 `paperconan fetch --download/--auto` writes alongside the data, or from
 `paperconan <dir> --doi <DOI> --title <T>`. It is `null` when neither is present
 (a bare directory audit) — never read `null` as "no paper".
+
+## `scan_status` and `coverage`
+
+A scan can legitimately leave work undone (oversized file skipped, unreadable
+workbook, detector compute budget spent). Without this record a *partial* scan
+reads as a *clean* one. `scan_status` is derived from `coverage`:
+
+- `"complete"` — everything discovered was analyzed, no limitations recorded
+- `"partial"` — any file failed, sheet/block skipped, or limitation recorded;
+  a quiet detector here is NOT a negative result for the capped region
+- `"failed"` — files were discovered but none succeeded
+
+```json
+{
+  "files_discovered": 2, "files_succeeded": 2, "files_failed": 0,
+  "sheets_succeeded": 3, "sheets_skipped": 0,
+  "blocks_analyzed": 3, "blocks_skipped": 0,
+  "truncated": false,       // true when blocks were skipped or any *_limit limitation fired
+  "limitations": [          // bounded, deduplicated event list; why coverage fell short
+    {"scope": "detector", "reason": "detector_compute_budget_limit",
+     "detector": "detect_row_pair_shared_fraction"}
+    // scope: "file" | "sheet" | "detector" | ... ; file/sheet entries carry file/sheet keys
+  ],
+  "limitations_omitted": 3  // only present when the list itself hit PAPERCONAN_MAX_LIMITATIONS
+}
+```
+
+The record only says what the scanner reached — never a judgement about the
+data or its authors.
 
 ## `image_assets[]`
 
@@ -247,7 +289,11 @@ A complete mixed verdict still has one `findings[]` and produces one report:
 ## Every finding has
 
 - `kind`: detector name (see [detectors.md](detectors.md))
-- `severity`: `"high"` | `"medium"` | `"low"`
+- `severity`: `"high"` | `"medium"` | `"low"` — the post-profile value
+- `raw_severity`: the severity the detector originally assigned, frozen before
+  any profile demotion rewrites `severity` in place. When `profile_action` is
+  `"demoted"`/`"hidden"`, compare the two to see what the filter changed
+  without re-running `--profile forensic`
 - `rule`: human-readable rule string e.g. `col[27] ≡ col[28] in 9/10 rows`
 - `n`: sample size for the rule
 - `evidence`: numeric block snippet `{headers, rows, highlight_cols, ...}`, or an image path block; deterministic image hints may use `null` when evidence publication fails while source identity remains stable
@@ -259,6 +305,36 @@ A complete mixed verdict still has one `findings[]` and produces one report:
 - `dense_block` (optional, column-relation / equal-pair findings): `true` means this finding comes from a sheet that floods with pairwise column relations (a dense / correlated matrix — correlation tables, normalized replicate panels). Such findings are auto-demoted to `low` severity because identical/linear columns there are expected by construction, not a duplication red flag — don't treat them as high-severity signal
 - `value_sample` (optional, within-column findings): small sample of distinct values from the column. Use it for repeated-value explanation, last-two-decimal checks, and fixed-denominator triage.
 - `col_a_sample` / `col_b_sample` (optional, pairwise relation findings): small value samples from the relevant column(s), used as an evidence peek when the full table is large. These samples help explain cross-column transforms and relation prefilters, but they do not replace opening the original table when making a serious claim.
+
+## block_value_duplication fields (`relations_blocks[].block_dups`)
+
+Block-level distributed exact-repeat signal — lives in its own `block_dups`
+group, not `within_col` (so the within-col flood demotion never touches it):
+
+```json
+{
+  "kind": "block_value_duplication",
+  "scope": "block",
+  "n": 32,                       // high-precision (>=2-decimal) cells judged
+  "n_repeated_values": 7,        // distinct values that recur >=2x
+  "pairs": 7,                    // observed exact-collision pairs
+  "excess_copies": 7,            // cells beyond the first occurrence of each repeated value
+  "lambda_": 0.0001,             // Poisson expectation of coincidental pairs (birthday model)
+  "p_value": 0.0,                // Poisson upper tail; the detector fired because p < 1e-4
+  "dup_fraction": 0.438,         // repeated cells / n — drives severity (>=0.5 high, >=0.2 medium, else low)
+  "n_distinct": 25,
+  "all_integer": false,
+  "value_sample": [...],
+  "repeated_values_sample": [[4.2156, 2], ...],   // [value, count] pairs
+  "example_cells": [[2, 5], ...],                 // 1-based (row, col) of repeated cells
+  "severity": "medium",
+  "rule": "block has 7 distinct high-precision values each recurring >=2x (...)"
+}
+```
+
+A tiny `dup_fraction` with a near-zero `p_value` is still a reportable signal
+(a few pasted values inside a big block) — it arrives at `severity: "low"`, not
+dropped.
 
 ## row_pair_digit_coupling fields
 
@@ -284,3 +360,7 @@ Treat this as a local row-pair anomaly. Confirm row independence and exclude for
   - `column_duplicate` — a full column repeats value-for-value across two panels (`cross_sheet_column_duplicate`; carries `col_a`/`col_b`)
   - `fraction_reuse` — two matrix blocks in ONE sheet share decimal fractions while integer parts differ (`within_table_fraction_reuse`; `same_file=true`, `figure_a/b=null`)
   - `recurring_row_vector` — a fixed row tuple recurs across ≥2 figures (`recurring_row_vector`; carries `vector`, `n_occurrences`, `n_figures`)
+  - `within_row_repeat` — the same segment repeats at ≥2 non-overlapping positions of ONE row (`within_row_repeated_segment`; carries `vector`, `row`, `occurrences[]` with Excel column `range`s)
+  - `identical_row` / `scaled_row` — a row reused verbatim / at a constant ratio across blocks or sheets (`identical_row_reuse` / `scaled_row_reuse`)
+  - `shared_fraction` — same decimal tail, different integer parts, within one row (`within_row_shared_fraction`; `n_groups` shared-tail families) or across an aligned row pair (`shared_fraction_row_pair`; carries `run_length`, `row_a`/`row_b`)
+- `cross_sheet_decimal_tail_reuse` keeps the generic `delta` of its sheet pair but is its own `kind`: changed values whose long fractional tails still align at one (row, col) offset. Carries `tail_match_count`, `offset_rows`/`offset_cols`, `min_tail_digits`, `examples[]` (`value_a`/`value_b`/`decimal_tail`), and optional `tail_benign_reason` (e.g. `constant_transform`, `fixed_denominator:1/7`, `per_column_constant` — those arrive demoted to `low`; `axis_progression` / `constant_fraction_tail` / `log_or_dilution_integer_shift_candidate` are notes only)

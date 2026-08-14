@@ -1,7 +1,20 @@
 {
   "tool": "paperconan",
-  "tool_version": "0.8.3",
-  "scanned_at": "2026-07-13T06:00:40+00:00",
+  "tool_version": "0.8.4",
+  "schema_version": 2,
+  "scan_status": "complete",
+  "coverage": {
+    "files_discovered": 2,
+    "files_succeeded": 2,
+    "files_failed": 0,
+    "sheets_succeeded": 3,
+    "sheets_skipped": 0,
+    "blocks_analyzed": 3,
+    "blocks_skipped": 0,
+    "truncated": false,
+    "limitations": []
+  },
+  "scanned_at": null,
   "profile": "review",
   "input_dir": "examples/demo_paper",
   "paper": null,
@@ -16,14 +29,18 @@
       {
         "file": "ED_Fig2_tumor_volume.xlsx",
         "path": "examples/demo_paper/ED_Fig2_tumor_volume.xlsx",
+        "size": 5214,
+        "mtime_ns": 1780022004502668963,
         "n_sheets": 1,
-        "elapsed_ms": 9.532
+        "elapsed_ms": null
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
         "path": "examples/demo_paper/ED_Fig4_qPCR.xlsx",
+        "size": 6300,
+        "mtime_ns": 1780022004504584518,
         "n_sheets": 2,
-        "elapsed_ms": 0.361
+        "elapsed_ms": null
       }
     ],
     "sheets": [
@@ -34,7 +51,7 @@
         "n_cols": 6,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.125
+        "elapsed_ms": null
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
@@ -43,7 +60,7 @@
         "n_cols": 5,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.086
+        "elapsed_ms": null
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
@@ -52,10 +69,10 @@
         "n_cols": 5,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.079
+        "elapsed_ms": null
       }
     ],
-    "elapsed_ms": 18.541
+    "elapsed_ms": null
   },
   "relations_blocks": [
     {
@@ -73,6 +90,7 @@
           "tumor_width"
         ]
       },
+      "findings_omitted": 0,
       "relations": [
         {
           "kind": "constant_offset",
@@ -230,6 +248,7 @@
               }
             ]
           },
+          "raw_severity": "high",
           "profile_action": "kept",
           "false_positive_context": []
         },
@@ -388,6 +407,7 @@
               }
             ]
           },
+          "raw_severity": "high",
           "profile_action": "kept",
           "false_positive_context": []
         },
@@ -547,6 +567,7 @@
               }
             ]
           },
+          "raw_severity": "high",
           "profile_action": "kept",
           "false_positive_context": []
         },
@@ -709,151 +730,9 @@
               }
             ]
           },
+          "raw_severity": "medium",
           "profile_action": "kept",
           "false_positive_context": []
-        }
-      ],
-      "progressions": [
-        {
-          "kind": "arithmetic_progression",
-          "col": "day",
-          "col_idx": 0,
-          "block_c0": 0,
-          "n": 8,
-          "step": 3.0,
-          "first": 0.0,
-          "severity": "low",
-          "rule": "col[0] = arithmetic progression, step=3",
-          "evidence": {
-            "headers": [
-              "day",
-              "ctrl_volume",
-              "treat_volume",
-              "ctrl_replicate",
-              "tumor_length",
-              "tumor_width"
-            ],
-            "col_offset": 0,
-            "highlight_cols": [
-              0
-            ],
-            "highlight_rows": [],
-            "rows": [
-              {
-                "row_idx": 1,
-                "is_context": true,
-                "values": [
-                  "day",
-                  "ctrl_volume",
-                  "treat_volume",
-                  "ctrl_replicate",
-                  "tumor_length",
-                  "tumor_width"
-                ]
-              },
-              {
-                "row_idx": 2,
-                "is_context": false,
-                "values": [
-                  0,
-                  98.2156,
-                  218.2156,
-                  98.2156,
-                  4.2156,
-                  4.2156
-                ]
-              },
-              {
-                "row_idx": 3,
-                "is_context": false,
-                "values": [
-                  3,
-                  142.8923,
-                  262.8923,
-                  142.8923,
-                  5.8923,
-                  5.8923
-                ]
-              },
-              {
-                "row_idx": 4,
-                "is_context": false,
-                "values": [
-                  6,
-                  201.5347,
-                  321.5347,
-                  201.5347,
-                  6.5347,
-                  6.5347
-                ]
-              },
-              {
-                "row_idx": 5,
-                "is_context": false,
-                "values": [
-                  9,
-                  268.7412,
-                  388.7412,
-                  268.7412,
-                  7.1412,
-                  7.1412
-                ]
-              },
-              {
-                "row_idx": 6,
-                "is_context": false,
-                "values": [
-                  12,
-                  339.2588,
-                  459.2588,
-                  339.2588,
-                  7.9588,
-                  7.9588
-                ]
-              },
-              {
-                "row_idx": 7,
-                "is_context": false,
-                "values": [
-                  15,
-                  418.6071,
-                  538.6071,
-                  418.6071,
-                  8.6071,
-                  8.8171
-                ]
-              },
-              {
-                "row_idx": 8,
-                "is_context": false,
-                "values": [
-                  18,
-                  502.4419,
-                  622.4419,
-                  502.4419,
-                  9.4419,
-                  9.4419
-                ]
-              },
-              {
-                "row_idx": 9,
-                "is_context": false,
-                "values": [
-                  21,
-                  591.8364,
-                  711.8364,
-                  591.8364,
-                  10.1364,
-                  10.1364
-                ]
-              }
-            ]
-          },
-          "likely_benign": "an integer-step progression is usually an axis (day / dose / timepoint), not measured data",
-          "profile_action": "demoted",
-          "false_positive_context": [
-            "axis_or_scan_column"
-          ]
         }
       ],
       "equal_pairs": [
@@ -1013,8 +892,153 @@
               }
             ]
           },
+          "raw_severity": "medium",
           "profile_action": "kept",
           "false_positive_context": []
+        }
+      ],
+      "progressions": [
+        {
+          "kind": "arithmetic_progression",
+          "col": "day",
+          "col_idx": 0,
+          "block_c0": 0,
+          "n": 8,
+          "step": 3.0,
+          "first": 0.0,
+          "severity": "low",
+          "rule": "col[0] = arithmetic progression, step=3",
+          "evidence": {
+            "headers": [
+              "day",
+              "ctrl_volume",
+              "treat_volume",
+              "ctrl_replicate",
+              "tumor_length",
+              "tumor_width"
+            ],
+            "col_offset": 0,
+            "highlight_cols": [
+              0
+            ],
+            "highlight_rows": [],
+            "rows": [
+              {
+                "row_idx": 1,
+                "is_context": true,
+                "values": [
+                  "day",
+                  "ctrl_volume",
+                  "treat_volume",
+                  "ctrl_replicate",
+                  "tumor_length",
+                  "tumor_width"
+                ]
+              },
+              {
+                "row_idx": 2,
+                "is_context": false,
+                "values": [
+                  0,
+                  98.2156,
+                  218.2156,
+                  98.2156,
+                  4.2156,
+                  4.2156
+                ]
+              },
+              {
+                "row_idx": 3,
+                "is_context": false,
+                "values": [
+                  3,
+                  142.8923,
+                  262.8923,
+                  142.8923,
+                  5.8923,
+                  5.8923
+                ]
+              },
+              {
+                "row_idx": 4,
+                "is_context": false,
+                "values": [
+                  6,
+                  201.5347,
+                  321.5347,
+                  201.5347,
+                  6.5347,
+                  6.5347
+                ]
+              },
+              {
+                "row_idx": 5,
+                "is_context": false,
+                "values": [
+                  9,
+                  268.7412,
+                  388.7412,
+                  268.7412,
+                  7.1412,
+                  7.1412
+                ]
+              },
+              {
+                "row_idx": 6,
+                "is_context": false,
+                "values": [
+                  12,
+                  339.2588,
+                  459.2588,
+                  339.2588,
+                  7.9588,
+                  7.9588
+                ]
+              },
+              {
+                "row_idx": 7,
+                "is_context": false,
+                "values": [
+                  15,
+                  418.6071,
+                  538.6071,
+                  418.6071,
+                  8.6071,
+                  8.8171
+                ]
+              },
+              {
+                "row_idx": 8,
+                "is_context": false,
+                "values": [
+                  18,
+                  502.4419,
+                  622.4419,
+                  502.4419,
+                  9.4419,
+                  9.4419
+                ]
+              },
+              {
+                "row_idx": 9,
+                "is_context": false,
+                "values": [
+                  21,
+                  591.8364,
+                  711.8364,
+                  591.8364,
+                  10.1364,
+                  10.1364
+                ]
+              }
+            ]
+          },
+          "likely_benign": "an integer-step progression is usually an axis (day / dose / timepoint), not measured data",
+          "raw_severity": "medium",
+          "profile_action": "demoted",
+          "false_positive_context": [
+            "axis_or_scan_column"
+          ]
         }
       ],
       "row_pairs": [],
@@ -1022,7 +1046,248 @@
       "within_col": [],
       "identical_after_rounding": [],
       "grim": [],
-      "findings_omitted": 0
+      "block_dups": [
+        {
+          "kind": "block_value_duplication",
+          "scope": "block",
+          "n": 32,
+          "n_repeated_values": 7,
+          "pairs": 7,
+          "excess_copies": 7,
+          "lambda_": 0.0001,
+          "p_value": 0.0,
+          "dup_fraction": 0.438,
+          "n_distinct": 25,
+          "all_integer": false,
+          "value_sample": [
+            4.2156,
+            5.8923,
+            6.5347,
+            7.1412,
+            7.9588,
+            9.4419,
+            10.1364
+          ],
+          "repeated_values_sample": [
+            [
+              4.2156,
+              2
+            ],
+            [
+              5.8923,
+              2
+            ],
+            [
+              6.5347,
+              2
+            ],
+            [
+              7.1412,
+              2
+            ],
+            [
+              7.9588,
+              2
+            ],
+            [
+              9.4419,
+              2
+            ],
+            [
+              10.1364,
+              2
+            ]
+          ],
+          "example_cells": [
+            [
+              2,
+              5
+            ],
+            [
+              2,
+              6
+            ],
+            [
+              3,
+              5
+            ],
+            [
+              3,
+              6
+            ],
+            [
+              4,
+              5
+            ],
+            [
+              4,
+              6
+            ],
+            [
+              5,
+              5
+            ],
+            [
+              5,
+              6
+            ],
+            [
+              6,
+              5
+            ],
+            [
+              6,
+              6
+            ],
+            [
+              8,
+              5
+            ],
+            [
+              8,
+              6
+            ]
+          ],
+          "severity": "medium",
+          "rule": "block has 7 distinct high-precision values each recurring >=2x (7 exact-collision pairs vs Poisson expectation lambda=7.01e-05, p=0.0e+00) \u2014 far above the near-zero birthday expectation for independent continuous measurements",
+          "evidence": {
+            "headers": [
+              "day",
+              "ctrl_volume",
+              "treat_volume",
+              "ctrl_replicate",
+              "tumor_length",
+              "tumor_width"
+            ],
+            "col_offset": 0,
+            "highlight_cols": [
+              4,
+              5
+            ],
+            "highlight_rows": [
+              2,
+              3,
+              4,
+              5,
+              6,
+              8
+            ],
+            "rows": [
+              {
+                "row_idx": 1,
+                "is_context": true,
+                "values": [
+                  "day",
+                  "ctrl_volume",
+                  "treat_volume",
+                  "ctrl_replicate",
+                  "tumor_length",
+                  "tumor_width"
+                ]
+              },
+              {
+                "row_idx": 2,
+                "is_context": false,
+                "values": [
+                  0,
+                  98.2156,
+                  218.2156,
+                  98.2156,
+                  4.2156,
+                  4.2156
+                ]
+              },
+              {
+                "row_idx": 3,
+                "is_context": false,
+                "values": [
+                  3,
+                  142.8923,
+                  262.8923,
+                  142.8923,
+                  5.8923,
+                  5.8923
+                ]
+              },
+              {
+                "row_idx": 4,
+                "is_context": false,
+                "values": [
+                  6,
+                  201.5347,
+                  321.5347,
+                  201.5347,
+                  6.5347,
+                  6.5347
+                ]
+              },
+              {
+                "row_idx": 5,
+                "is_context": false,
+                "values": [
+                  9,
+                  268.7412,
+                  388.7412,
+                  268.7412,
+                  7.1412,
+                  7.1412
+                ]
+              },
+              {
+                "row_idx": 6,
+                "is_context": false,
+                "values": [
+                  12,
+                  339.2588,
+                  459.2588,
+                  339.2588,
+                  7.9588,
+                  7.9588
+                ]
+              },
+              {
+                "row_idx": 7,
+                "is_context": false,
+                "values": [
+                  15,
+                  418.6071,
+                  538.6071,
+                  418.6071,
+                  8.6071,
+                  8.8171
+                ]
+              },
+              {
+                "row_idx": 8,
+                "is_context": false,
+                "values": [
+                  18,
+                  502.4419,
+                  622.4419,
+                  502.4419,
+                  9.4419,
+                  9.4419
+                ]
+              },
+              {
+                "row_idx": 9,
+                "is_context": false,
+                "values": [
+                  21,
+                  591.8364,
+                  711.8364,
+                  591.8364,
+                  10.1364,
+                  10.1364
+                ]
+              }
+            ]
+          },
+          "raw_severity": "medium",
+          "profile_action": "kept",
+          "false_positive_context": []
+        }
+      ]
     },
     {
       "file": "ED_Fig4_qPCR.xlsx",
@@ -1037,9 +1302,10 @@
           "input_ng"
         ]
       },
+      "findings_omitted": 0,
       "relations": [],
-      "progressions": [],
       "equal_pairs": [],
+      "progressions": [],
       "row_pairs": [],
       "row_relations": [],
       "within_col": [
@@ -1207,6 +1473,7 @@
               }
             ]
           },
+          "raw_severity": "high",
           "profile_action": "demoted",
           "false_positive_context": [
             "within_col_structural_filter"
@@ -1379,6 +1646,7 @@
               }
             ]
           },
+          "raw_severity": "high",
           "profile_action": "kept",
           "false_positive_context": []
         },
@@ -1536,6 +1804,7 @@
             ]
           },
           "likely_benign": "values ending in .0/.5 are common for derived or instrument-rounded quantities (cell counts, scores, calibrated readouts)",
+          "raw_severity": "medium",
           "profile_action": "kept",
           "false_positive_context": []
         }
@@ -1735,12 +2004,13 @@
             ]
           },
           "likely_benign": "cells share a rounded value but differ at full precision \u2014 usually display rounding, not duplication",
+          "raw_severity": "medium",
           "profile_action": "kept",
           "false_positive_context": []
         }
       ],
       "grim": [],
-      "findings_omitted": 0
+      "block_dups": []
     },
     {
       "file": "ED_Fig4_qPCR.xlsx",
@@ -1755,9 +2025,10 @@
           "input_ng"
         ]
       },
+      "findings_omitted": 0,
       "relations": [],
-      "progressions": [],
       "equal_pairs": [],
+      "progressions": [],
       "row_pairs": [],
       "row_relations": [],
       "within_col": [],
@@ -1957,12 +2228,13 @@
             ]
           },
           "likely_benign": "cells share a rounded value but differ at full precision \u2014 usually display rounding, not duplication",
+          "raw_severity": "medium",
           "profile_action": "kept",
           "false_positive_context": []
         }
       ],
       "grim": [],
-      "findings_omitted": 0
+      "block_dups": []
     }
   ],
   "digit_distribution": [
@@ -2180,6 +2452,7 @@
         "only_in_b": 14
       },
       "rule": "donor_A and donor_B share 22/36 (61%) decimal values at SAME (row,col) across 2 sheets",
+      "raw_severity": "high",
       "profile_action": "kept",
       "false_positive_context": []
     }

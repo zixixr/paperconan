@@ -1,6 +1,6 @@
 ---
 name: paperconan
-version: 0.8.2
+version: 0.8.4
 description: Use when auditing paper source-data tables and registered image assets for statistical signals or data inconsistencies, interpreting paperconan scan.json/report.html, preparing cautious PubPeer or research-integrity notes, or finding open supplementary data from a DOI/title. Trigger on 论文数据检查, source data audit, paper data audit, suspicious numeric tables, figure review, multimodal image review, PubPeer prep, research integrity, DOI/title data fetch. Covers .xlsx/.csv/.tsv, tables in .pdf/.docx, and adaptive image review by an external multimodal Agent; not chart digitization or autonomous semantic judgment.
 ---
 
@@ -16,7 +16,7 @@ Tool repository: https://github.com/zixixr/paperconan
 
 ## Core Workflow
 
-0. Ensure the CLI is available before scanning: run `paperconan --version`. If it is missing and pip works, install once with `pip install "paperconan[all]"` (ask first if a virtualenv or non-global install is preferred). If Python/pip is unavailable, ask the user to install and run locally — never invent output.
+0. Ensure the CLI is available before scanning: run `paperconan --version`. If it is missing and pip works, install once with `pip install "paperconan[all]"` (ask first if a virtualenv or non-global install is preferred; if pip refuses with a PEP 668 `externally-managed-environment` error, use `uv tool install "paperconan[all]"` or `pipx install "paperconan[all]"` instead — see Install And Run). If Python/pip is unavailable, ask the user to install and run locally — never invent output.
 1. Confirm what the user supplied:
    - Local source-data directory: run `paperconan <input-dir>`.
    - DOI or title: run `paperconan fetch "<DOI or title>"`, choose a matched tabular dataset, download it, then scan the downloaded directory.
@@ -228,6 +228,16 @@ pip install "paperconan[image]" # image assets, PDF page rendering, optional hin
 pip install "paperconan[all]"   # includes PDF / Word table extraction
 paperconan --version
 paperconan <input-dir>
+```
+
+On systems where `pip install` is rejected with an `externally-managed-environment`
+error (PEP 668 — e.g. Homebrew or Debian Python), install into an isolated
+environment instead of forcing `--break-system-packages`:
+
+```bash
+uv tool install "paperconan[all]"   # or: pipx install "paperconan[all]"
+# or a plain virtualenv:
+python3 -m venv ~/.venvs/paperconan && ~/.venvs/paperconan/bin/pip install "paperconan[all]"
 ```
 
 Default output:

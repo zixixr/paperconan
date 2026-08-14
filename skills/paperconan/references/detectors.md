@@ -115,6 +115,16 @@
 
 ---
 
+## 整块模式类 (block-level pattern detectors)
+
+### `block_value_duplication`
+- **原理**：把一个 block 内**所有** ≥2 位小数的高精度 cell 汇聚起来（不分行列），统计"多个不同值各自精确重复"的碰撞对数，用**泊松 birthday 显著性**判定（λ = C(m,2)/N_eff，p < 1e-4 才报）而非硬样本量门槛。列级检测器对"重复散布在不同行**和**不同列"的指纹结构性失明（如 5×10 replicate 面板，每行 10 个"独立重复"其实是 5 个值各出现 2 次——没有任何单列在重复）。闸门：≥12 个高精度 cell、≥2 种不同重复值且 ≥2 个碰撞对、N_eff ≥ 20m（粗精度/窄区间/聚簇数据的天然碰撞超出均匀模型，拒判而非误报）；整列结构性拷贝先剔除（归 `identical_column`）、占比 >25% 的主导边界/删失值先剥离（归 `within_col_value_duplication`）、>50 万 cell 的巨块跳过。
+- **典型命中**：整个面板打乱重排后复用（dup_fraction 高 → high）；或大表里只粘贴了几个高精度值——dup_fraction 很小但 p 近零，severity=low 仍报出（"只复制几个数"不漏）。
+- **常见误报**：2 位小数窄区间数据的自然碰撞（support 闸门排除）、检出限 floor / 填充值（剥离）、全整数块（不参与）。合成连续块 Monte-Carlo FP 0/600。
+- **解读时**：看 `n_repeated_values` / `pairs` / `p_value` / `dup_fraction`（≥0.5 high、≥0.2 medium、否则 low）、`repeated_values_sample`（各值及次数）、`example_cells`。finding 在 `relations_blocks[].block_dups` 组里，不受 within_col flood 降级影响；仍需确认这些 cell 确是独立测量而非共享对照/技术重复。
+
+---
+
 ## 整 sheet 末位/末两位类 (sheet-level digit detectors)
 
 ### `last_digit_chi_square`
@@ -168,6 +178,12 @@
 - **典型命中**：池化 + 重新洗牌后作为独立实验呈现。
 - **常见误报**：共享样本量集合 / 同一仪器输出范围。
 
+### `cross_sheet_decimal_tail_reuse`
+- **原理**：两张表（同文件 sheet 或跨文件）在**同一个 (row, col) 平移偏移**下，大量 cell 的**数值已不同**、但跳过第 1 位小数后的 **≥5 位小数尾完全相同**（copy-then-edit 只改高位、留长尾的指纹，如 `0.808902488 → 0.908902488` 保留 `08902488`）。按 offset 分组对齐，所以整块被粘到低几行/几列也能对上；同一 offset 的尾巴匹配数 ≥ max(8, min(20, 小表 3%)) 才报。全表出现 >20 次的同一尾巴（量化伪影）不参与匹配；单一数字重复的填充尾（00000 / 99999 等）排除。
+- **典型命中**：B 表复制 A 表后整体上移两行、逐格只改第 1 位小数——精确值重叠为零，但 36 个长尾在同一 offset 全部对齐。
+- **常见误报**：两表间恒定加/乘变换、固定分母比率（k/n）、逐列恒定 offset/ratio——这三类在检测器内直接降 low 并写 `tail_benign_reason`（constant_transform / fixed_denominator:1/n / per_column_constant）；axis 数列、单一尾巴主导、log/稀释整数位移只加注记**不降级**（同字段）。同图号 (`same_figure`) 降 low。
+- **解读时**：看 `tail_match_count` / `offset_rows` / `offset_cols` / `examples`（value_a、value_b、decimal_tail）和 `tail_benign_reason`。tail_match ≥12 或占小表 ≥10% 为 high，否则 medium。下游 packet 里它保留 `cross_sheet:decimal_tail_reuse` 身份、受 prefilter 保护——共享长小数尾是近零概率的数据不一致，不会被当成普通 partial overlap 淡化。
+
 ### `cross_sheet_column_duplicate`
 - **原理**：两个 panel（跨 sheet / 跨文件）某列**逐值顺序完全一致**（对齐到 6 位小数），列长 ≥ 12。补齐 `cross_sheet_position_identical` 因只 grid ≥3 位小数而漏掉的**整数 / 一位小数列**。
 - **典型命中**：一张图的"No IR"基线列在另一张声称独立的图里 60 个值全同。
@@ -179,11 +195,29 @@
 - **典型命中**：两个剂量-反应矩阵（如 PDO#4 / PDO#5）48/49 格小数位相同、只整数偏移。
 - **常见误报**：`.0` / `.5` / 三分之一网格等低精度共享（已排除）；派生 / 归一化后的矩阵。
 
+### `within_row_shared_fraction`
+- **原理**：**同一行**内 ≥2 个 cell 共享一条长高精度小数尾、整数部分不同（`20.316768` vs `102.316768`）——copy-then-integer-shift 落在单行的列间时，列对（`integer_diff_shared_fraction`）和块对（`within_table_fraction_reuse`）检测器都看不到。尾长门槛 `PAPERCONAN_WITHIN_ROW_FRAC_MIN_DIGITS`（默认 6 位，~1e-6 巧合率）；尾巴按数值量级截断取位（float64 只有 ~15 位有效数字，大整数部分下的低位是表示噪声）、|v| ≥ 1e7 直接跳过；共享小数是 p/q（q ≤ 128）的**小分母值**不算（三复孔均值 .333/.667、k/13、1/128 dyadic 都是除法伪影）。
+- **典型命中**：一行 15 个测量里 `20.316768/102.316768`、`162.14990133/163.14990133`、`132.81763667/138.81763667` 三组尾巴各自成对——一段 3 格片段被改整数位后在同行复用。
+- **常见误报**：固定分母派生值（已排除）；同整数+同尾=同值重复（归 within_col / identical 类，这里要求整数不同）；剩余面较小，但仍需确认两处 cell 声称是独立测量。
+- **解读时**：`n_groups`（= `n` / `same_position_count`）是共享尾**家族**数，不是 cell 数；看 `examples[].tail` / `values` 与 `row`。severity=high，进 `cross_sheet_findings`（`delta.pattern = shared_fraction`、`same_sheet=true`）。
+
+### `shared_fraction_row_pair`
+- **原理**：**两行**在 ≥3 个（`PAPERCONAN_ROW_PAIR_MIN_RUN`）对齐列的**连续段**上逐列共享同一小数尾（≥4 位，`PAPERCONAN_ROW_PAIR_FRAC_MIN_DIGITS`）、整数部分不同——`integer_diff_shared_fraction` 的行向孪生（那条只比两列）。段内还要求 ≥3 种**非小分母**的不同尾巴、且整数差 ≥2 种（恒定整数差 B = A + k 留给 `constant_offset` 家族）；所有 maximal run 逐一判定，最长的良性 run 不会掩盖更短的真信号。3 个独立尾巴同时对齐的巧合率约 (1e-4)³。
+- **典型命中**：20 nM 与 100 nM 两个浓度行在 3 列上共享 `.27037/.85351/.86076`，整数 95/85、90/88、91/87——一行改整数位后当另一浓度复用。
+- **常见误报**：小分母尾（已排除）、恒定整数偏移（已排除）、两行完全相同（归 identical 类——这里要求整数不同）。
+- **解读时**：看 `run_length`、`row_a`/`row_b`、`examples`。候选行数有每 sheet 上限（`PAPERCONAN_ROW_PAIR_MAX_ROWS`）、比较预算 `PAPERCONAN_ROW_PAIR_FRAC_BUDGET`——超限记入 `coverage.limitations` 并把 `scan_status` 翻成 partial，不静默截断。severity=high。
+
 ### `recurring_row_vector`
 - **原理**：一个固定的高信息数值元组（长 4-12）作为**连续行片段**在 **≥3 处、跨 ≥2 个图命名空间**反复出现。**这是最易误报的一类，护栏最严。**
 - **典型命中**：同一个 6 值向量 `[220,188,122,166,128,166]` 出现在 Fig 4b/4c 和 ED 2a——6 只独立小鼠不可能在多组给出同一向量。
 - **常见误报**：等差 / 等比 / round-number 阶梯（已排除）；**合法复用的标准曲线 / 参考向量跨图展示**（这是本类固有的误报面）；同一图内复发（预期的 replicate 结构，已要求跨 ≥2 图）。
 - **解读时**：看 `vector`、`n_occurrences`、`n_figures` 和各出现位置；因固有误报面较大，**优先确认这几张图之间是否有正当理由共享同一向量**，别当复用铁证那样直接下结论。
+
+### `within_row_repeated_segment`
+- **原理**：`recurring_row_vector` 的**行内**成员：同一段 4–8 个值的高信息数值片段（round-6 量化）在**一行**的 ≥2 个**不重叠**列位置上完全重复。逐行直接扫描而不经 block 索引，所以 grid 分块从不覆盖的稀疏子面板也看得到。同族闸门：≥3 种不同值、非等差/等比阶梯、全整数段要求更长；另有**量化池闸门**——段内某值在整行的出现次数超过拷贝数 2 倍时不报（k/19 网格、剂量平台的重复值不是复制指纹）。扫描量受 `PAPERCONAN_WITHIN_ROW_VEC_BUDGET` / `PAPERCONAN_WR_MAX_ROW_CELLS` 约束，超限记入 `coverage.limitations`。
+- **典型命中**：一行里同一个 5 值 tuple（`3.238866, 1.724138, 3.418803, …`）同时出现在两个声称独立 cohort 的列段下——两组独立个体不可能给出同一高精度片段。
+- **常见误报**：量化网格 / 平台期值（闸门排除）、低信息整数段（排除）；同一组数据在同行的合法重复排版需人工确认。
+- **解读时**：看 `vector`、`row`、`occurrences[]`（每次出现的 Excel 列区间 `range`，含非连续列）、`n_occurrences`。severity=high，进 `cross_sheet_findings`（`delta.pattern = within_row_repeat`、`same_sheet=true`）。
 
 ### `scaled_row_reuse` / `identical_row_reuse`
 - **原理**：`constant_ratio_row` / `identical_row` 的**跨块 / 跨 sheet** 版。把每张表按连续数据行切成 band（cohort 块），比较**不同 band 或不同 sheet** 的行对（只比不同 band，避免与同块的 `constant_ratio_row` 重复），找 `row_b = row_a × k`（k≠1，`scaled`）或逐值完全相同（k=1，`identical`）的最长连续列段。带候选/预算上限，超限走 stderr、不静默截断。
