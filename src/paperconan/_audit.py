@@ -2316,7 +2316,22 @@ import re as _re
 
 # Matches a figure id inside a sheet name: an optional "extended/ED/ex" marker
 # followed by a figure number, e.g. "Figure 5o", "exFig.6b-e", "ED_Fig8b", " exFig.6i".
-_FIG_RE = _re.compile(r"(ext(?:ended)?|ed|ex)?\s*\.?\s*fig(?:ure)?\s*\.?\s*0*(\d+)", _re.I)
+# Three namespaces, because a supplementary or extended-data figure is a DIFFERENT
+# display item from the main figure of the same number. Reading them as one is not a
+# cosmetic mislabel: `figure_key` equality is what annotates an overlap as expected and
+# downgrades its severity, so collapsing them suppresses real cross-figure duplication.
+# Separators are permissive (`SourceData_ED_Fig6`, `Extended Data Figure 6`) and the
+# marker may follow "fig" as well as precede it (`Fig S2b`).
+_FIG_RE = _re.compile(
+    r"(?:(?P<lead>ext(?:ended)?(?:[\s._-]*data)?|ed|ex|supp(?:l(?:ementary|emental)?)?)"
+    r"[\s._-]*)?"
+    r"fig(?:ure)?[\s._-]*"
+    r"(?:(?P<trail>s|e)(?=[\s._-]*\d))?[\s._-]*"
+    r"0*(?P<number>\d+)",
+    _re.I,
+)
+_FIG_EXTENDED_RE = _re.compile(r"^(?:ext|ed|ex)", _re.I)
+_FIG_SUPPLEMENTARY_RE = _re.compile(r"^(?:supp|s$)", _re.I)
 _CONTROL_BASELINE_LABEL_RE = _re.compile(
     r"\b(?:control|ctrl|baseline|vehicle|untreated|wt|wild[- ]?type|reference|mock|"
     r"naive|sham|pbs|dmso)\b|参照|对照|基线",
@@ -2342,9 +2357,14 @@ def figure_key(sheet_name):
     m = _FIG_RE.search(str(sheet_name))
     if not m:
         return None
-    prefix = (m.group(1) or "").lower()
-    namespace = "ext" if prefix else "main"
-    return f"{namespace}:{m.group(2)}"
+    marker = (m.group("lead") or m.group("trail") or "").lower()
+    if _FIG_EXTENDED_RE.match(marker):
+        namespace = "ext"
+    elif _FIG_SUPPLEMENTARY_RE.match(marker):
+        namespace = "supp"
+    else:
+        namespace = "main"
+    return f"{namespace}:{m.group('number')}"
 
 
 def _value_delta(ga, gb):
