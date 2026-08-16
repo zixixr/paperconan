@@ -768,7 +768,7 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
             cj, aj = cols[j]
             mask = ~np.isnan(ai) & ~np.isnan(aj)
             n = int(mask.sum())
-            if n < 4:
+            if n < _COLUMN_PAIR_MIN_ROWS:
                 continue
             x, y = ai[mask], aj[mask]
             # Compact value peek for downstream LLM triage (bounded <=8 each, ~tiny).
@@ -1000,6 +1000,11 @@ _ROW_REL_MIN_COLS = int(os.environ.get("PAPERCONAN_ROW_REL_MIN_COLS", "12"))
 # between this bar and `_can_pin_a_ratio` that had to come with it.
 _SHORT_ROW_MIN_COLS = int(os.environ.get("PAPERCONAN_SHORT_ROW_MIN_COLS", "3"))
 _SHORT_ROW_MIN_FRAC_DIGITS = int(os.environ.get("PAPERCONAN_SHORT_ROW_MIN_FRAC_DIGITS", "3"))
+# How many rows two columns must share before their relation is worth stating. A
+# floor rather than a significance test: with three points almost any pair fits
+# something. Named and overridable like its siblings so its cost can be swept on the
+# false-positive bench -- as a bare literal it never was.
+_COLUMN_PAIR_MIN_ROWS = int(os.environ.get("PAPERCONAN_COLUMN_PAIR_MIN_ROWS", "4"))
 # Tighter than _ROW_REL_RTOL: a short ratio run has fewer cells to corroborate the
 # constant, so the constancy must be crisp to stay clear of chance.
 _SHORT_ROW_RTOL = float(os.environ.get("PAPERCONAN_SHORT_ROW_RTOL", "1e-4"))
