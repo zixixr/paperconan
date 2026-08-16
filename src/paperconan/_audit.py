@@ -5380,6 +5380,11 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
                 same_file=True, same_sheet=True,
                 sheet_a=sname, sheet_b=sname,
                 row_a=a_label, row_b=b_label,
+                # Where, not only what it is called. Rows in a matrix export are
+                # routinely unnamed, and a finding that can only be addressed by label
+                # cannot be placed by anything downstream -- not a location matcher, not
+                # a reviewer opening the workbook. The index is in hand here already.
+                row_a_idx=a_row, row_b_idx=b_row,
                 size_a=run_len, size_b=run_len, same_position_count=run_len,
                 fraction_of_smaller=1.0, run_length=run_len,
                 ratio=(k if kind == "scaled_row_reuse" else None),
