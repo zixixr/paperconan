@@ -4511,6 +4511,17 @@ def _invert_ratio_interval(lo, hi):
     return min(values), max(values)
 
 
+def _spans_blocks(relation, row_blocks):
+    """Do this relation's two rows sit in different blocks?"""
+    try:
+        row_a, row_b = int(relation["row_a"]), int(relation["row_b"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not (0 <= row_a < len(row_blocks) and 0 <= row_b < len(row_blocks)):
+        return False
+    return row_blocks[row_a] != row_blocks[row_b]
+
+
 def _classify_ratio_blocks(rows, relations, row_blocks):
     """Apply within-block context without allowing separators to disappear."""
     block_rows = {}
@@ -4895,6 +4906,47 @@ def _classify_ratio_table_context(rows, relations, *, row_blocks=None,
             "context_class": "quantized_common_pool",
         })
 
+    # A separator row can split one repeated pattern across panels, and every pair
+    # crossing the split would otherwise be called isolated because no single block
+    # contains both of its rows. Build a graph over what the passes above could not
+    # explain and let repetition speak: a component holding two or more distinct row
+    # pairs is one cross-panel signal, reported once with the counts a reader needs.
+    # A lone edge is not a repeated pattern and stays the plain cross-block signal.
+    #
+    # The edges exclude relations already folded above. They are not merely
+    # redundant with the branch order below: an edge that a table transform has
+    # already accounted for would otherwise join components and let an explained row
+    # pull an unexplained pair in with it.
+    spanning_edges = [
+        (index, int(item["row_a"]), int(item["row_b"]))
+        for index, item in enumerate(result["relations"])
+        if item["context_class"] == "isolated_ratio"
+        and index not in folded_indexes
+        and index not in common_pool_details
+        and _spans_blocks(item, row_blocks)
+    ]
+    cross_panel_contexts = []
+    cross_panel_indexes = set()
+    for members in _ratio_edge_components(len(rows), spanning_edges):
+        member_set = set(members)
+        edges = [edge for edge in spanning_edges
+                 if edge[1] in member_set and edge[2] in member_set]
+        pairs = {(min(row_a, row_b), max(row_a, row_b))
+                 for _index, row_a, row_b in edges}
+        if len(pairs) < 2:
+            continue
+        cross_panel_indexes.update(index for index, _a, _b in edges)
+        member_blocks = sorted({row_blocks[row] for row in members})
+        cross_panel_contexts.append({
+            "scope": "cross_panel",
+            "blocks": member_blocks,
+            "block_count": len(member_blocks),
+            "rows": sorted(members),
+            "edge_count": len(pairs),
+            "relation_count": len(edges),
+            "context_class": "cross_panel_ratio_context",
+        })
+
     classified = []
     isolated = []
     for index, relation in enumerate(result["relations"]):
@@ -4911,6 +4963,9 @@ def _classify_ratio_table_context(rows, relations, *, row_blocks=None,
             item["common_pool_columns_b"] = list(common_b)
             item["bits_without_common_pool"] = residual_bits
             item.pop("exceptional_within_context", None)
+        elif index in cross_panel_indexes:
+            item["context_class"] = "cross_panel_ratio_context"
+            item.pop("exceptional_within_context", None)
         elif (index in cross_block_indexes
               and item["context_class"] == "isolated_ratio"):
             item["context_class"] = "isolated_cross_block_ratio"
@@ -4921,6 +4976,7 @@ def _classify_ratio_table_context(rows, relations, *, row_blocks=None,
     result["relations"] = classified
     result["table_transforms"] = table_transforms
     result["quantized_common_pools"] = quantized_common_pools
+    result["cross_panel_contexts"] = cross_panel_contexts
     result["isolated_relations"] = isolated
     return result
 

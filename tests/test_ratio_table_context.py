@@ -355,3 +355,126 @@ def test_common_bins_do_not_hide_enough_distinctive_confirmation_columns():
 
     assert got["quantized_common_pools"] == []
     assert len(got["isolated_relations"]) == 1
+
+
+def test_a_pattern_split_by_a_separator_is_no_longer_reported_as_isolated():
+    """A separator row is a layout artifact, not evidence that a pair stands alone.
+
+    Rows sampled along one response are near-multiples of each other by construction.
+    Splitting them into panels does not stop that being one repeated pattern, but the
+    classifier used to hand every pair spanning the split straight to `isolated_ratio`
+    without examining it, which is the largest measured false-positive source on
+    panelled supplementary layouts. The blocks are not merged: the pairs are aggregated
+    into one cross-panel signal, which `cross_panel_contexts` records.
+    """
+    base = _profile(5)
+    rows = [_scaled(base, constant) for constant in (1.0, 1.31, 1.77, 2.13, 2.56, 3.04)]
+    relations = _qualifying_relations(rows)
+    blocks = [0, 0, 0, 1, 1, 1]
+    spanning = {
+        pair for pair in _pairs(relations)
+        if blocks[pair[0]] != blocks[pair[1]]
+    }
+
+    assert spanning, "no relation spans the separator, so the fixture proves nothing"
+    got = _classify_ratio_table_context(rows, relations, row_blocks=blocks)
+
+    assert _pairs(got["isolated_relations"]) & spanning == set()
+
+
+def test_a_rescaled_segment_across_a_separator_is_not_explained_away():
+    """The separator-spanning recheck must not fold what the neighbours cannot explain.
+
+    Only one pair shares a rescaled window here, and the rows around it have unrelated
+    profiles. Asking the whole row set is supposed to answer "these neighbours do not
+    account for this pair", so the pair has to stay isolated.
+    """
+    window = [21.43, 73.91, 34.27, 112.61, 52.89]
+    rows = [
+        [*_profile(11, columns=2), *window, *_profile(13, columns=2)],
+        _profile(17, columns=9),
+        _profile(19, columns=9),
+        [*_profile(23, columns=2), *_scaled(window, 1.37), *_profile(29, columns=2)],
+        _profile(31, columns=9),
+        _profile(37, columns=9),
+    ]
+    relations = _qualifying_relations(rows)
+    blocks = [0, 0, 0, 1, 1, 1]
+
+    assert (0, 3) in _pairs(relations), "the rescaled window never reached the context layer"
+    got = _classify_ratio_table_context(rows, relations, row_blocks=blocks)
+
+    assert (0, 3) in _pairs(got["isolated_relations"])
+
+
+def test_a_cross_panel_component_folds_into_one_recorded_signal():
+    """Folding must leave a trace: the spec keeps block, row and edge counts.
+
+    A component of cross-block edges is aggregated into one cross-panel signal rather
+    than reported edge by edge. Dropping it from `isolated_relations` without recording
+    anything would remove the pairs from every output the reader has.
+    """
+    base = _profile(5)
+    rows = [_scaled(base, constant) for constant in (1.0, 1.31, 1.77, 2.13, 2.56, 3.04)]
+    relations = _qualifying_relations(rows)
+    blocks = [0, 0, 0, 1, 1, 1]
+
+    got = _classify_ratio_table_context(rows, relations, row_blocks=blocks)
+
+    assert len(got["cross_panel_contexts"]) == 1
+    summary = got["cross_panel_contexts"][0]
+    assert summary["context_class"] == "cross_panel_ratio_context"
+    assert summary["block_count"] == 2
+    assert summary["edge_count"] >= 2
+    assert set(summary["rows"]) <= set(range(len(rows)))
+    assert {relation["context_class"] for relation in got["relations"]
+            if _spans(relation, blocks)} == {"cross_panel_ratio_context"}
+
+
+def _spans(relation, blocks):
+    return blocks[int(relation["row_a"])] != blocks[int(relation["row_b"])]
+
+
+def test_a_lone_cross_block_edge_is_reported_not_aggregated():
+    """One edge is not a repeated pattern, so it stays the plain cross-block signal."""
+    window = [21.43, 73.91, 34.27, 112.61, 52.89]
+    rows = [
+        [*_profile(11, columns=2), *window, *_profile(13, columns=2)],
+        _profile(17, columns=9),
+        _profile(19, columns=9),
+        [*_profile(23, columns=2), *_scaled(window, 1.37), *_profile(29, columns=2)],
+        _profile(31, columns=9),
+        _profile(37, columns=9),
+    ]
+    relations = _qualifying_relations(rows)
+    blocks = [0, 0, 0, 1, 1, 1]
+
+    got = _classify_ratio_table_context(rows, relations, row_blocks=blocks)
+
+    assert got["cross_panel_contexts"] == []
+    assert (0, 3) in _pairs(got["isolated_relations"])
+    assert {relation["context_class"] for relation in got["isolated_relations"]} == {
+        "isolated_cross_block_ratio"
+    }
+
+
+def test_an_already_folded_edge_cannot_pull_a_lone_pair_into_a_component():
+    """Edges the passes above explained are not available to build components with.
+
+    Three aligned pairs fold into a table transform. One further cross-block pair is
+    not part of that repeat. If the folded edges stayed in the graph they would share a
+    row with it, make a two-pair component, and aggregate away a pair that nothing has
+    accounted for.
+    """
+    panel_a = [_profile(seed) for seed in (11, 13, 17, 19)]
+    rows = list(panel_a)
+    rows += [_scaled(row, 0.84) for row in panel_a[:3]]
+    rows.append(_scaled(panel_a[0], 2.31))
+    blocks = [0, 0, 0, 0, 1, 1, 1, 1]
+    relations = _qualifying_relations(rows)
+
+    assert (0, 7) in _pairs(relations), "the lone cross-block pair never reached context"
+    got = _classify_ratio_table_context(rows, relations, row_blocks=blocks)
+
+    assert got["table_transforms"], "the aligned repeat should still fold as a transform"
+    assert (0, 7) in _pairs(got["isolated_relations"])
