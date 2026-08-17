@@ -6404,23 +6404,15 @@ def write_markdown_report(out, path):
                    kind=r["kind"], rule=r.get("rule", ""), n=r.get("n", r.get("n_cells", "?")))
         (high if sev == "high" else medium).append(row)
 
+    # Driven by the canonical registry rather than a literal list. The literal that
+    # stood here had gone stale: `row_relations` -- every "row B = row A * k" signal --
+    # was absent, so `--md` reported none of them while scan.json and the HTML report
+    # both carried them. This is the failure the registry's docstring describes, and a
+    # second hand-maintained list is how it recurs.
     for b in out["relations_blocks"]:
-        for r in b["relations"]:
-            push(b, r)
-        for r in b["equal_pairs"]:
-            push(b, r)
-        for r in b.get("row_pairs", []):
-            push(b, r)
-        for r in b["progressions"]:
-            push(b, r)
-        for r in b.get("within_col", []):
-            push(b, r)
-        for r in b.get("identical_after_rounding", []):
-            push(b, r)
-        for r in b.get("grim", []):
-            push(b, r)
-        for r in b.get("block_dups", []):
-            push(b, r)
+        for group in BLOCK_FINDING_GROUPS:
+            for r in b.get(group, []) or []:
+                push(b, r)
 
     csf = out.get("cross_sheet_findings", [])
     if csf:

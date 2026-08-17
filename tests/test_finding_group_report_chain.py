@@ -14,6 +14,7 @@ import pytest
 
 from paperconan import BLOCK_FINDING_GROUPS
 from paperconan._adjudicated_html import render_adjudicated_report
+from paperconan._audit import write_markdown_report
 from paperconan._html import write_html_report
 
 
@@ -28,6 +29,7 @@ def _scan_with_group(group: str) -> dict:
         "profile": "review",
         "input_dir": "synthetic",
         "n_files": 1,
+        "n_blocks_with_findings": 1,
         "relations_blocks": [{
             "file": "synthetic.xlsx",
             "sheet": "Panel",
@@ -70,6 +72,22 @@ def test_adjudicated_report_resolves_a_ref_into_every_canonical_block_group(grou
 
     assert _rule_for(group) in html
     assert "无匹配证据（finding_ref 未命中扫描结果）" not in html
+
+
+@pytest.mark.parametrize("group", BLOCK_FINDING_GROUPS)
+def test_the_markdown_summary_surfaces_every_canonical_block_group(group, tmp_path):
+    """The third consumer, which had gone stale unnoticed.
+
+    `write_markdown_report` kept its own hand-maintained list of groups, and
+    `row_relations` was never added to it -- so `paperconan --md` reported no
+    "row B = row A * k" signal at all while scan.json and the HTML report both
+    carried them. Parametrising over the registry is what stops a fourth list.
+    """
+    report = tmp_path / "REPORT.md"
+
+    write_markdown_report(_scan_with_group(group), str(report))
+
+    assert _rule_for(group) in report.read_text(encoding="utf-8")
 
 
 def test_the_scanner_emits_exactly_the_registered_groups(tmp_path):

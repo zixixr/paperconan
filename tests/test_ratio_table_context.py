@@ -424,11 +424,35 @@ def test_a_cross_panel_component_folds_into_one_recorded_signal():
     assert len(got["cross_panel_contexts"]) == 1
     summary = got["cross_panel_contexts"][0]
     assert summary["context_class"] == "cross_panel_ratio_context"
+    # Pinned exactly. A subset check over every row of the fixture holds for the empty
+    # list too, so it cannot tell a recorded component from a dropped one; `>= 2` leaves
+    # the count free to drift by sevenfold without a test noticing.
     assert summary["block_count"] == 2
-    assert summary["edge_count"] >= 2
-    assert set(summary["rows"]) <= set(range(len(rows)))
+    assert summary["edge_count"] == 9
+    assert summary["relation_count"] == 19
+    assert summary["rows"] == [0, 1, 2, 3, 4, 5]
     assert {relation["context_class"] for relation in got["relations"]
             if _spans(relation, blocks)} == {"cross_panel_ratio_context"}
+
+
+def test_the_recorded_block_count_follows_how_many_panels_the_component_spans():
+    """A second block layout, so `block_count` is measured rather than assumed.
+
+    With only one fixture, and that one holding two panels, hardcoding the field to
+    the literal 2 passes every test -- the count would be free to stop tracking the
+    component at all.
+    """
+    base = _profile(5)
+    rows = [_scaled(base, constant) for constant in (1.0, 1.31, 1.77, 2.13, 2.56, 3.04)]
+    relations = _qualifying_relations(rows)
+
+    got = _classify_ratio_table_context(rows, relations, row_blocks=[0, 0, 1, 1, 2, 2])
+
+    assert len(got["cross_panel_contexts"]) == 1
+    summary = got["cross_panel_contexts"][0]
+    assert summary["block_count"] == 3
+    assert summary["blocks"] == [0, 1, 2]
+    assert summary["edge_count"] == 12
 
 
 def _spans(relation, blocks):
