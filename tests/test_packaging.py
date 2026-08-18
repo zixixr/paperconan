@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 try:
     import tomllib
@@ -46,3 +47,21 @@ def test_image_extra_is_optional_but_included_in_all_and_test():
         assert "pillow" in joined
         assert "pypdfium2" in joined
         assert "opencv-python-headless" in joined
+
+
+def test_the_shipped_skill_declares_the_package_version():
+    """The skill carries its own `version:` field, guarded by nothing until now.
+
+    A release bumps four files. Two of them were already pinned to each other; the
+    skill's frontmatter and the schema reference were not, so a release could ship a
+    skill announcing a version the engine had left behind -- and the skill is the
+    recommended way to drive this tool, so that number is what an adjudicating agent
+    records as provenance.
+    """
+    root = Path(__file__).resolve().parents[1]
+    skill = (root / "skills" / "paperconan" / "SKILL.md").read_text(encoding="utf-8")
+    schema = (root / "skills" / "paperconan" / "references"
+              / "output-schema.md").read_text(encoding="utf-8")
+
+    assert f"\nversion: {__version__}\n" in skill
+    assert f'"tool_version": "{__version__}"' in schema

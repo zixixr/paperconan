@@ -1,6 +1,6 @@
 ---
 name: paperconan
-version: 0.8.4
+version: 0.8.5
 description: Use when auditing paper source-data tables and registered image assets for statistical signals or data inconsistencies, interpreting paperconan scan.json/report.html, preparing cautious PubPeer or research-integrity notes, or finding open supplementary data from a DOI/title. Trigger on 论文数据检查, source data audit, paper data audit, suspicious numeric tables, figure review, multimodal image review, PubPeer prep, research integrity, DOI/title data fetch. Covers .xlsx/.csv/.tsv, tables in .pdf/.docx, and adaptive image review by an external multimodal Agent; not chart digitization or autonomous semantic judgment.
 ---
 

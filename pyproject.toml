@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paperconan"
-version = "0.8.4"
+version = "0.8.5"
 description = "Numeric forensics for paper supplementary source-data: surfaces statistical signals and data inconsistencies."
 readme = "README.md"
 requires-python = ">=3.10"

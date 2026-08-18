@@ -8,7 +8,7 @@ essentials; this file is the complete reference (it travels in the skill bundle)
 ```json
 {
   "tool": "paperconan",
-  "tool_version": "0.8.4",        // matches the pyproject version; provenance for archived reports
+  "tool_version": "0.8.5",        // matches the pyproject version; provenance for archived reports
   "schema_version": 2,            // scan.json shape version; sidecar packets carry it too
   "scan_status": "complete",      // "complete" | "partial" | "failed" — check BEFORE adjudicating (see below)
   "coverage": {...},              // explicit scan-coverage accounting (see below)
