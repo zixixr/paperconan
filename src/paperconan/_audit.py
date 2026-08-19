@@ -5240,10 +5240,15 @@ def _longest_hp_offset_run(a, b):
     if best_len == 0 or best_c is None:
         return None
     x_run = a[best_start:best_start + best_len].astype(float)
-    c = float(np.mean(b[best_start:best_start + best_len].astype(float) - x_run))
+    y_run = b[best_start:best_start + best_len].astype(float)
+    c = float(np.mean(y_run - x_run))
     if abs(c) <= 1e-9:
         return None
-    return c, best_len, x_run
+    # `y_run` so a caller that trims the run can recompute the constant over the cells
+    # it will actually show. The mean here is over the whole run, and the membership
+    # tolerance scales per cell, so one large cell can join a run of small ones with a
+    # very different difference and drag this number away from all of them.
+    return c, best_len, x_run, y_run
 
 
 def _short_row_candidates(grid_sheets, coverage=None):
@@ -5325,6 +5330,40 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
 
         def _rare(run):
             return all(freq.get(_freq_key(v), 0) <= _SHORT_ROW_MAX_VALUE_FREQ for v in run)
+
+        def _rare_span_slice(run):
+            """Just the values, for the arm whose relation carries no constant."""
+            start, length = _rare_span(run)
+            return run[start:start + length]
+
+        def _rare_span(run):
+            """Start and length of the longest stretch of `run` whose values are all
+            uncommon.
+
+            The gate used to be all-or-nothing: one common value anywhere rejected the
+            whole run. That made the detector non-monotone in its own admission floor.
+            Lowering `_SHORT_ROW_MIN_FRAC_DIGITS` lets a coarser cell -- an ordinary
+            round number like 0.25 -- join a matched run it had previously broken in
+            two; being ordinary it is common, and the whole run died, including the
+            rare part the narrower floor had reported on its own. Admitting more
+            evidence removed a finding.
+
+            Admission decides which cells are looked at. It must not decide what a run
+            has to clear once it is looked at, and trimming to the rare stretch is what
+            separates the two: whatever the wider floor makes of the extra cell, the
+            narrower floor's evidence is still there.
+            """
+            best_start = best_len = cur_start = cur_len = 0
+            for index, value in enumerate(run):
+                if freq.get(_freq_key(value), 0) <= _SHORT_ROW_MAX_VALUE_FREQ:
+                    if cur_len == 0:
+                        cur_start = index
+                    cur_len += 1
+                    if cur_len > best_len:
+                        best_start, best_len = cur_start, cur_len
+                else:
+                    cur_len = 0
+            return best_start, best_len
 
         # A smooth fitted curve (dose-response, binding) sampled along an axis makes every
         # consecutive row an approximate scalar multiple of the next — a benign ~1.01 step,
@@ -5412,32 +5451,82 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60,
                 ident = _longest_hp_identical_run(a[:m], b[:m])
                 ratio = _longest_hp_ratio_run(a[:m], b[:m])
                 offset = _longest_hp_offset_run(a[:m], b[:m])
+                # Trimmed to its rare stretch rather than rejected whole. The UPPER
+                # bound stays on the full run: a run of >=_ROW_REL_MIN_COLS columns is
+                # the row-relation detector's subject, and letting a trim bring a long
+                # run back under that bound would report it in both places.
+                # Trimmed to the rare stretch -- and the trimmed stretch is then put
+                # back through the same scan that accepted the run, rather than
+                # inheriting that run's verdict.
+                #
+                # Both run helpers anchor on their FIRST cell: the offset scan holds a
+                # per-cell tolerance and a non-triviality floor against the magnitude
+                # there, and the ratio scan holds every cell within `_SHORT_ROW_RTOL` of
+                # the ratio there. Trimming moves the slice off that anchor, so the
+                # slice keeps neither guarantee. Recomputing the constant over the
+                # trimmed cells is not enough on its own: the mean of the shown cells
+                # always describes the shown cells, which is why "the constant matches
+                # what is shown" was too weak a test. Differences of +12.5, +50, -40,
+                # +60 with the first cell trimmed away leave three cells whose mean is
+                # +23.3333 and whose actual differences are none of those -- a slice the
+                # scan refuses outright when it is handed it on its own.
+                #
+                # Re-scanning also re-applies the guards that read the constant: the
+                # ratio arm's "a ratio of 1 is not a scaling" and its power-of-ten
+                # check were reading the full run's k while the finding reported the
+                # trimmed one, so a relation could be reported whose own stated ratio
+                # the detector defines as not a scaling.
+                def _trim_and_revalidate(values, partner, rescan):
+                    start, length = _rare_span(values)
+                    if length < _SHORT_ROW_MIN_COLS:
+                        return (), None
+                    a_trim = np.asarray(values[start:start + length], dtype=float)
+                    b_trim = np.asarray(partner[start:start + length], dtype=float)
+                    again = rescan(a_trim, b_trim)
+                    # The whole slice has to survive on its own terms, not a piece of it:
+                    # a shorter accepted run inside it is a different finding, and the
+                    # cells this one would show are the slice.
+                    if again is None or again[1] != length:
+                        return (), None
+                    return a_trim, again[0]
+
+                ident_run = _rare_span_slice(ident[1]) if ident is not None else ()
+                ratio_run, ratio_k = (
+                    _trim_and_revalidate(ratio[2], ratio[3], _longest_hp_ratio_run)
+                    if ratio is not None else ((), None))
+                offset_run, offset_c = (
+                    _trim_and_revalidate(offset[2], offset[3], _longest_hp_offset_run)
+                    if offset is not None else ((), None))
                 ident_ok = (ident is not None
-                            and _SHORT_ROW_MIN_COLS <= ident[0] < _ROW_REL_MIN_COLS
-                            and len(np.unique(ident[1])) >= 3
-                            and _rare(ident[1]))
+                            and ident[0] < _ROW_REL_MIN_COLS
+                            and len(ident_run) >= _SHORT_ROW_MIN_COLS
+                            and len(np.unique(ident_run)) >= 3)
                 ratio_ok = (ratio is not None
-                            and _SHORT_ROW_MIN_COLS <= ratio[1] < _ROW_REL_MIN_COLS
-                            and len(np.unique(ratio[2])) >= 3
-                            and _rare(ratio[2])
+                            and ratio[1] < _ROW_REL_MIN_COLS
+                            and len(ratio_run) >= _SHORT_ROW_MIN_COLS
+                            and len(np.unique(ratio_run)) >= 3
                             and not _same_band(A["row"], B["row"])
                             and not _near_power_of_ten(ratio[0]))
                 # Constant additive offset (B = A + c) — the row twin of constant_offset. Like
                 # the scaled case, an adjacent same-band offset is a smooth-curve step (a linear
                 # stretch of a curve), so it is suppressed.
                 offset_ok = (offset is not None
-                             and _SHORT_ROW_MIN_COLS <= offset[1] < _ROW_REL_MIN_COLS
-                             and len(np.unique(offset[2])) >= 3
-                             and _rare(offset[2])
+                             and offset[1] < _ROW_REL_MIN_COLS
+                             and len(offset_run) >= _SHORT_ROW_MIN_COLS
+                             and len(np.unique(offset_run)) >= 3
                              and not _same_band(A["row"], B["row"]))
                 # Prefer identical; among the two one-parameter relations pick the longer run.
-                if ident_ok and ident[0] >= max(ratio[1] if ratio_ok else 0,
-                                                offset[1] if offset_ok else 0):
-                    kind, k, run_len, x_run = "identical_row_reuse", 1.0, ident[0], ident[1]
-                elif offset_ok and (not ratio_ok or offset[1] >= ratio[1]):
-                    kind, k, run_len, x_run = "offset_row_reuse", offset[0], offset[1], offset[2]
+                # Compared on the trimmed lengths, which are what is actually reported.
+                if ident_ok and len(ident_run) >= max(len(ratio_run) if ratio_ok else 0,
+                                                      len(offset_run) if offset_ok else 0):
+                    kind, k, run_len, x_run = ("identical_row_reuse", 1.0,
+                                               len(ident_run), ident_run)
+                elif offset_ok and (not ratio_ok or len(offset_run) >= len(ratio_run)):
+                    kind, k, run_len, x_run = ("offset_row_reuse", offset_c,
+                                               len(offset_run), offset_run)
                 elif ratio_ok:
-                    kind, k, run_len, x_run = "scaled_row_reuse", ratio[0], ratio[1], ratio[2]
+                    kind, k, run_len, x_run = ("scaled_row_reuse", ratio_k,
+                                               len(ratio_run), ratio_run)
                 else:
                     continue
                 _add_finding(A["label"], B["label"], A["row"], B["row"],
