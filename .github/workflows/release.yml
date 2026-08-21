@@ -1,0 +1,91 @@
+# A pushed tag creates the GitHub Release entry.
+#
+# Tags and Releases are separate things, and treating "tag and upload to PyPI" as the
+# whole of a release is how v0.8.4 and v0.8.5 shipped to PyPI while the Releases page
+# still showed v0.8.3 from the month before. Anyone judging the project from that page
+# saw a month of silence across two releases. Both entries were created by hand
+# afterwards; this exists so the next one is not.
+#
+# The tag pattern is exact: vMAJOR.MINOR.PATCH and nothing else. A tag that does not
+# match produces no run, no failure and no notification -- the same silence this exists
+# to remove -- so AGENTS.md states the format as part of the release steps.
+#
+# It does not publish to PyPI. That step still runs from a workstation with the
+# credential, and moving it into CI is a separate decision about where that credential
+# lives. If it is ever added here and keyed on `release: published`, note that a release
+# created with GITHUB_TOKEN does not trigger other workflows.
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  github-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the tag against everything that records a version
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet ".[test]"
+          # The suite pins the five places a version is written to each other. It cannot
+          # compare any of them to the tag, which is the pair this step adds.
+          python -m pytest tests/test_packaging.py -q
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          text = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          match = re.search(r'^version = "([^"]+)"', text, re.M)
+          if match is None:
+              raise SystemExit("pyproject.toml has no `version = \"...\"` line to check")
+          if match.group(1) != tag:
+              raise SystemExit(
+                  f"tag v{tag} does not match pyproject version {match.group(1)}")
+          print(f"tag and pyproject agree on {tag}")
+          PY
+
+      - name: Create or update the release entry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Notes are GitHub's own: it resolves the previous tag with its own semantics.
+          # A hand-rolled `git tag --sort=-creatordate | head -1` is wrong on a repo that
+          # mixes annotated and lightweight tags -- their sort keys are taggerdate and
+          # committerdate -- and picking a descendant makes `git log` print nothing and
+          # exit 0, publishing an empty changelog. That misfires exactly when two tags
+          # land together, which is the case this workflow was written for.
+          printf 'Install from PyPI: `pip install paperconan==%s`\n' \
+            "${GITHUB_REF_NAME#v}" > notes.md
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            # A hand-made entry, or a re-pushed tag. Neither is a failure.
+            gh release edit "${GITHUB_REF_NAME}" --notes-file notes.md
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --verify-tag \
+              --generate-notes \
+              --notes-file notes.md
+          fi

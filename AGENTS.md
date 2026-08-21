@@ -94,6 +94,43 @@ recheck/  batches/         LOCAL-ONLY audit working dirs — GITIGNORED, see bel
 - Keep changes deterministic — detectors and reports must produce identical output for identical
   input (golden tests depend on it).
 
+## Releasing
+
+The version is written in five places and `tests/test_packaging.py` pins all five to
+`__version__`, so pytest is the check for them:
+
+`pyproject.toml`, `src/paperconan/__init__.py`, `skills/paperconan/SKILL.md`
+frontmatter, the sample in `skills/paperconan/references/output-schema.md`, and
+`examples/demo_paper/audit/scan.json`.
+
+What pytest cannot check is any of them against the git tag — the tag does not exist
+when the suite runs. That pair is what `.github/workflows/release.yml` adds.
+
+1. Move all five. For the demo scan, edit the version string; regenerate it only if
+   detector output actually moved, because a regeneration writes an absolute `input_dir`
+   into `examples/demo_paper/audit/scan.json` (`_audit.py` calls `os.path.abspath`) and
+   the committed file holds a relative path.
+2. `uv run pytest`, then `uv build`, then install the wheel into a fresh venv and run the
+   CLI there. Verifying from the working tree does not prove the artifact works.
+3. Push the tag, formatted exactly `vMAJOR.MINOR.PATCH` — the workflow's trigger matches
+   nothing else, and a tag that does not match produces no run, no failure and no
+   notification, which is the silence this whole arrangement exists to remove. The
+   workflow re-runs the packaging tests, fails if the tag and `pyproject.toml` disagree,
+   and creates the Release entry with generated notes.
+4. Only then upload to PyPI (`uvx twine upload dist/*`; credentials from `~/.pypirc`).
+   Tag first because PyPI forbids re-uploading a version: if the tag check is going to
+   fail, it has to fail while the mistake is still fixable. This step is not automated —
+   `.github/workflows/release.yml` says why.
+
+Commit subjects reach the Releases page verbatim through the generated notes, so the
+neutral-language rule and the no-DOIs rule apply to them the same as to anything else
+published.
+
+Tags and Releases are separate things. v0.8.4 and v0.8.5 both reached PyPI while the
+Releases page still showed v0.8.3 from the month before, because "tag and upload" was
+treated as the whole of a release. Anyone reading the project from that page saw a month
+of silence across two releases. That is what step 3 exists to prevent.
+
 ## The local audit pipeline (`recheck/`, local-only)
 
 A separate, **gitignored** backfill/audit pipeline lives under `recheck/codex_task/batch2/`. It runs
