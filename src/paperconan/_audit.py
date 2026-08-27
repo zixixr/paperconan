@@ -778,7 +778,8 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
             # pair falsely reads as identical/linear. Tie the tolerance to the data magnitude so
             # these are tests of RELATIVE precision at any scale (and large-magnitude columns
             # aren't held to an unreasonably tight absolute bound either).
-            tol = 1e-9 * max(float(np.max(np.abs(x))), float(np.max(np.abs(y))), 1e-300)
+            tol = _COLUMN_PAIR_RTOL * max(float(np.max(np.abs(x))),
+                                          float(np.max(np.abs(y))), 1e-300)
             # identical
             if _allclose_rowwise(x, y):
                 findings.append(dict(kind="identical_column", col_a=header[ci - c0], col_b=header[cj - c0],
@@ -823,12 +824,19 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                 xr, yr = x[keep], y[keep]
                 ratio = yr / xr
                 mean_ratio = float(np.mean(ratio))
-                ratio_tol = 1e-9 * max(abs(mean_ratio), 1e-300)
+                ratio_tol = _COLUMN_PAIR_RATIO_RTOL * max(abs(mean_ratio), 1e-300)
                 if (
                     np.std(ratio) < ratio_tol
-                    and abs(mean_ratio - 1) > 1e-9
+                    # Held to the tolerance the ratio is JUDGED at, not to 1e-9: a pair
+                    # agreeing to just inside the constancy test -- one measurement
+                    # re-exported at another precision -- would otherwise clear a 1e-9
+                    # identity guard and the constancy test at once, and get stated as
+                    # "col = col * 1". identical_column, still at _COLUMN_PAIR_RTOL, does
+                    # not catch it either, so it would fall between the two.
+                    and abs(mean_ratio - 1) > _COLUMN_PAIR_RATIO_RTOL
                     and abs(mean_ratio) > 1e-9
-                    and _allclose_rowwise(yr, mean_ratio * xr)
+                    and _allclose_rowwise(yr, mean_ratio * xr,
+                                          rtol=_COLUMN_PAIR_RATIO_RTOL)
                 ):
                     # `n` stays the pair's row count, as the four sibling branches report it.
                     # Narrowing it to the informative rows silently changed a downstream
@@ -868,7 +876,13 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                     # count — suppress it. exact_linear is reserved for a genuine non-zero
                     # intercept (an affine offset constant_ratio cannot express), and still fires
                     # when no constant_ratio covered the pair (e.g. a zero in x skips its guard).
-                    intercept_is_zero = abs(intercept) < tol
+                    # As loose as the arm it defers to. `tol` is _COLUMN_PAIR_RTOL-scaled;
+                    # a pair the ratio arm admitted at _COLUMN_PAIR_RATIO_RTOL can carry an
+                    # intercept above that and be reported twice, once under each kind, for
+                    # one relationship.
+                    intercept_is_zero = abs(intercept) < max(
+                        tol, _COLUMN_PAIR_RATIO_RTOL * max(float(np.max(np.abs(x))),
+                                                           float(np.max(np.abs(y))), 1e-300))
                     is_identity = abs(slope - 1) < 1e-9 and intercept_is_zero
                     redundant_scaling = intercept_is_zero and ratio_emitted
                     if not (is_identity or redundant_scaling):
@@ -1034,6 +1048,31 @@ _SHORT_ROW_MIN_FRAC_DIGITS = int(os.environ.get("PAPERCONAN_SHORT_ROW_MIN_FRAC_D
 # something. Named and overridable like its siblings so its cost can be swept on the
 # false-positive bench -- as a bare literal it never was.
 _COLUMN_PAIR_MIN_ROWS = int(os.environ.get("PAPERCONAN_COLUMN_PAIR_MIN_ROWS", "4"))
+# Exact equality in binary, which is what the identical/offset/sum/linear branches ask for.
+# Named so its cost can be swept on the bench; unchanged in value.
+_COLUMN_PAIR_RTOL = float(os.environ.get("PAPERCONAN_COLUMN_PAIR_RTOL", "1e-9"))
+# ...but a RATIO cannot be asked for that. A measurement exported at a fixed number of
+# significant figures leaves the recovered b/a scattered by roughly a decade per figure
+# short of full precision, so an exact relation between two columns of ordinary stored
+# precision was unreportable rather than merely rare.
+#
+# Flat, after a per-cell derivation was tried, measured and deleted. That version read each
+# cell's decimals and allowed b/a the room its rounding implies. It was checked at fixed
+# DECIMALS, where it is conservative, and used on fixed SIGNIFICANT FIGURES, where it is
+# not: a value carried at four figures as 98770 has step 10, its decimals read 0, and the
+# bound lands a decade tight -- one more decade per trailing zero, and that information is
+# already gone at parse, the hazard `_can_pin_a_ratio` documents at length. End to end it
+# found one synthetic exact scaling at three magnitudes and MISSED it at the largest, which
+# is worse in the regime that matters than the constant it was meant to improve on.
+# Inferring precision per cell cannot fix that; the step has to be resolved across the
+# column, which is a larger change than the evidence supports.
+#
+# What this value is held by: tests/test_column_pair_ratio_precision.py refuses a pair
+# drifting inside 1e-5 and outside 1e-6, so a regression by a decade reddens; and
+# tests/test_column_pair_bench_baseline.py freezes what moving it costs on thirteen benign
+# families across a precision ladder, which is the instrument the earlier attempt lacked.
+_COLUMN_PAIR_RATIO_RTOL = float(
+    os.environ.get("PAPERCONAN_COLUMN_PAIR_RATIO_RTOL", "1e-6"))
 # Tighter than _ROW_REL_RTOL: a short ratio run has fewer cells to corroborate the
 # constant, so the constancy must be crisp to stay clear of chance.
 _SHORT_ROW_RTOL = float(os.environ.get("PAPERCONAN_SHORT_ROW_RTOL", "1e-4"))

@@ -76,11 +76,12 @@ SCOPE, and what these numbers do NOT bound:
   * This measures the DETECTOR. Some of _prefilter's suppression is label-driven and cannot
     be exercised here, and some is not -- `_common_unit_scale` takes only (kind, samples).
     Treat every verdict as an upper bound on report volume, not as report volume.
-  * The ratio arm has TWO tolerances and the second is a default argument:
-    `np.std(ratio) < ratio_tol` and `_allclose_rowwise(y, mean_ratio * x)`, whose rtol is
-    not the constant beside it. Widening only the visible one moves nothing here. Anyone
-    sweeping "the ratio tolerance" has to move both or will conclude, wrongly, that this
-    bench is insensitive.
+  * The ratio arm has TWO tolerances -- `np.std(ratio) < ratio_tol` and the rtol
+    `_allclose_rowwise(y, mean_ratio * x)` is held to. They now read one named constant,
+    but they did not when this bench was written: the second was a default argument, so
+    widening the visible one alone moved nothing here, and a sweep of "the ratio
+    tolerance" concluded, wrongly, that this bench was insensitive. Kept as a note because
+    the shape recurs: a gate whose second half is a default is a gate that cannot be swept.
   * Every block is two columns and one height, so the quadratic cost in block width and
     every row-count gate are unmeasured. Six of nine finding kinds are exercised; of the
     three absent, one needs more rows than these blocks have and two are reachable and
@@ -101,8 +102,9 @@ green while the detector moves, which is the condition it was written to end.
 
 Regenerate both tables with `python tests/test_column_pair_bench_baseline.py`.
 
-Baseline measured on: paperconan main, then moved once for the ratio arm's
-zero-row handling -- see that commit for what moved and why.
+Baseline measured on: paperconan main, then moved twice -- once for the ratio arm's
+zero-row handling and once for its tolerance. Each of those commits says what moved and
+what it bought.
 
 Signal, not verdict: the benign strata are benign by construction, which is the point --
 they bound what the detector says about data that has an ordinary explanation.
@@ -430,9 +432,9 @@ BENIGN_BASELINE = {
     ("complementary_percentages", 10): ('pervasive', {'exact_linear': 'pervasive', 'sum_constant': 'pervasive'}),
     ("control_normalised", 4): ('silent', {}),
     ("control_normalised", 6): ('silent', {}),
-    ("control_normalised", 7): ('silent', {}),
-    ("control_normalised", 8): ('pervasive', {'exact_linear': 'pervasive'}),
-    ("control_normalised", 9): ('pervasive', {'exact_linear': 'pervasive'}),
+    ("control_normalised", 7): ('pervasive', {'constant_ratio': 'pervasive'}),
+    ("control_normalised", 8): ('pervasive', {'constant_ratio': 'pervasive'}),
+    ("control_normalised", 9): ('pervasive', {'constant_ratio': 'pervasive'}),
     ("control_normalised", 10): ('pervasive', {'constant_ratio': 'pervasive'}),
     ("duplicated_measurement", 4): ('pervasive', {'identical_column': 'pervasive'}),
     ("duplicated_measurement", 6): ('pervasive', {'identical_column': 'pervasive'}),
@@ -448,27 +450,27 @@ BENIGN_BASELINE = {
     ("null_independent", 10): ('silent', {}),
     ("percent_of_total", 4): ('silent', {}),
     ("percent_of_total", 6): ('silent', {}),
-    ("percent_of_total", 7): ('silent', {}),
-    ("percent_of_total", 8): ('partial', {'exact_linear': 'partial'}),
-    ("percent_of_total", 9): ('pervasive', {'exact_linear': 'pervasive'}),
+    ("percent_of_total", 7): ('pervasive', {'constant_ratio': 'pervasive'}),
+    ("percent_of_total", 8): ('pervasive', {'constant_ratio': 'pervasive'}),
+    ("percent_of_total", 9): ('pervasive', {'constant_ratio': 'pervasive'}),
     ("percent_of_total", 10): ('pervasive', {'constant_ratio': 'pervasive'}),
     ("rate_per_thousand", 4): ('silent', {}),
     ("rate_per_thousand", 6): ('silent', {}),
-    ("rate_per_thousand", 7): ('silent', {}),
-    ("rate_per_thousand", 8): ('pervasive', {'exact_linear': 'pervasive'}),
-    ("rate_per_thousand", 9): ('pervasive', {'exact_linear': 'pervasive'}),
+    ("rate_per_thousand", 7): ('pervasive', {'constant_ratio': 'pervasive'}),
+    ("rate_per_thousand", 8): ('pervasive', {'constant_ratio': 'pervasive'}),
+    ("rate_per_thousand", 9): ('pervasive', {'constant_ratio': 'pervasive'}),
     ("rate_per_thousand", 10): ('pervasive', {'constant_ratio': 'pervasive'}),
     ("sd_sem", 4): ('silent', {}),
     ("sd_sem", 6): ('silent', {}),
-    ("sd_sem", 7): ('silent', {}),
-    ("sd_sem", 8): ('pervasive', {'exact_linear': 'pervasive'}),
-    ("sd_sem", 9): ('pervasive', {'exact_linear': 'pervasive'}),
+    ("sd_sem", 7): ('pervasive', {'constant_ratio': 'pervasive'}),
+    ("sd_sem", 8): ('pervasive', {'constant_ratio': 'pervasive'}),
+    ("sd_sem", 9): ('pervasive', {'constant_ratio': 'pervasive'}),
     ("sd_sem", 10): ('pervasive', {'constant_ratio': 'pervasive'}),
     ("sparse_shared_support", 4): ('silent', {}),
-    ("sparse_shared_support", 6): ('silent', {}),
-    ("sparse_shared_support", 7): ('silent', {}),
-    ("sparse_shared_support", 8): ('silent', {}),
-    ("sparse_shared_support", 9): ('partial', {'constant_ratio': 'partial'}),
+    ("sparse_shared_support", 6): ('partial', {'constant_ratio': 'partial'}),
+    ("sparse_shared_support", 7): ('pervasive', {'constant_ratio': 'pervasive'}),
+    ("sparse_shared_support", 8): ('pervasive', {'constant_ratio': 'pervasive'}),
+    ("sparse_shared_support", 9): ('pervasive', {'constant_ratio': 'pervasive'}),
     ("sparse_shared_support", 10): ('pervasive', {'constant_ratio': 'pervasive'}),
     ("two_level_coded", 4): ('pervasive', {'constant_ratio': 'partial', 'small_diff_set': 'pervasive'}),
     ("two_level_coded", 6): ('pervasive', {'constant_ratio': 'partial', 'small_diff_set': 'pervasive'}),
@@ -484,9 +486,9 @@ BENIGN_BASELINE = {
     ("unit_decadic", 10): ('pervasive', {'constant_ratio': 'pervasive'}),
     ("unit_non_decadic", 4): ('silent', {}),
     ("unit_non_decadic", 6): ('silent', {}),
-    ("unit_non_decadic", 7): ('silent', {}),
-    ("unit_non_decadic", 8): ('pervasive', {'exact_linear': 'pervasive'}),
-    ("unit_non_decadic", 9): ('pervasive', {'exact_linear': 'pervasive'}),
+    ("unit_non_decadic", 7): ('pervasive', {'constant_ratio': 'pervasive'}),
+    ("unit_non_decadic", 8): ('pervasive', {'constant_ratio': 'pervasive'}),
+    ("unit_non_decadic", 9): ('pervasive', {'constant_ratio': 'pervasive'}),
     ("unit_non_decadic", 10): ('pervasive', {'constant_ratio': 'pervasive'}),
     ("varying_fold_change", 4): ('silent', {}),
     ("varying_fold_change", 6): ('silent', {}),
@@ -502,36 +504,45 @@ BENIGN_BASELINE = {
 # this table and move the benign verdicts above in the same commit, so the trade is argued
 # once rather than assumed twice.
 #
-# Two gates are visible here, with different causes. The precision one is a ladder:
-# `exact_linear` fits to rtol 1e-7 and an exact relation's residual spread is about one
-# decade per significant figure, so detection switches on between rungs rather than
-# everywhere at once. The other is not a precision effect at all -- an all-zero baseline
-# row silenced rungs that are otherwise found. The intuitive culprit, the ratio arm's
-# non-zero-divisor guard, was measured NOT to be the whole of it: deleting that guard alone
-# changed nothing here, because `_isclose_rowwise` scales each row's tolerance by that row's
-# own magnitude, so for a zero row the scale is zero, the tolerance collapses to an absolute
-# floor near 1e-13, and the fitted intercept clears it by orders. Both arms were blind, for
-# two different reasons, and unblinding one shows up only where the other was not also
-# binding -- which is why the ratio arm's zero handling moves the top rung of this table and
-# not the rest. Per-rung margin figures are deliberately not quoted -- they span two orders
-# across the ladder, and two earlier drafts quoted single numbers that were not any rung's.
+# Two gates were visible here, with different causes, and both have since been moved --
+# which is the history this table exists to keep, so it is recorded rather than deleted.
+#
+# The precision one is a ladder: an exact relation's residual spread is about one decade
+# per significant figure short of full precision, so whichever arm judges the pair switches
+# on between rungs rather than everywhere at once. It was `exact_linear`, fitting at rtol
+# 1e-7, because the ratio arm asked for float-exact equality; it is now the ratio arm at
+# _COLUMN_PAIR_RATIO_RTOL, which is why the coarse rungs stayed put and the middle ones did
+# not. The remaining silence at the coarse end is a recorded gap, not a target.
+#
+# The other was not a precision effect at all: an all-zero baseline row silenced rungs that
+# were otherwise found, and BOTH arms were blind to it for different reasons. The ratio
+# arm's non-zero-divisor guard was measured not to be the whole of it -- deleting it alone
+# changed only the finest rung -- because `_isclose_rowwise` scales each row's tolerance by
+# that row's own magnitude, so for a zero row the scale is zero, the tolerance collapses to
+# the absolute term the function adds -- `eps * typical_scale * 64`, stated rather than
+# evaluated because it moves with the block -- and the fitted intercept clears it by orders. Splitting the
+# zeros unblinded the ratio arm; the linear arm is still blind to a zero row, and nothing
+# here asks it not to be. Per-rung margin figures are deliberately not quoted -- they span
+# two orders across the ladder, and two earlier drafts quoted single numbers that were not
+# any rung's.
 #
 # One family sits near a band edge and is named so its rows are not read as a change under
-# review: `two_level_coded`'s reported kinds run inside `partial` near its edges. Rates are
-# not quoted -- measure them if it matters, because a quoted rate here has been wrong twice.
-# The seed is fixed so they cannot flake, but they are the rows most likely to move for
-# reasons unrelated to whatever is being reviewed.
+# review: `two_level_coded`'s `constant_ratio` and `exact_linear` run inside `partial`, near
+# its edges, and which of the two is above RARE varies by rung. Rates are not quoted --
+# measure them if it matters, because a quoted rate here has been wrong twice. The seed is
+# fixed so they cannot flake, but they are the rows most likely to move for reasons
+# unrelated to whatever is being reviewed.
 TRUE_BASELINE = {
     (4, False): ('silent', {}),
     (4, True): ('silent', {}),
     (6, False): ('silent', {}),
     (6, True): ('silent', {}),
-    (7, False): ('silent', {}),
-    (7, True): ('silent', {}),
-    (8, False): ('pervasive', {'exact_linear': 'pervasive'}),
-    (8, True): ('silent', {}),
-    (9, False): ('pervasive', {'exact_linear': 'pervasive'}),
-    (9, True): ('silent', {}),
+    (7, False): ('pervasive', {'constant_ratio': 'pervasive'}),
+    (7, True): ('pervasive', {'constant_ratio': 'pervasive'}),
+    (8, False): ('pervasive', {'constant_ratio': 'pervasive'}),
+    (8, True): ('pervasive', {'constant_ratio': 'pervasive'}),
+    (9, False): ('pervasive', {'constant_ratio': 'pervasive'}),
+    (9, True): ('pervasive', {'constant_ratio': 'pervasive'}),
     (10, False): ('pervasive', {'constant_ratio': 'pervasive'}),
     (10, True): ('pervasive', {'constant_ratio': 'pervasive'}),
 }
