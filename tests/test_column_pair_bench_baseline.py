@@ -21,32 +21,26 @@ WHAT THIRTEEN FAMILIES DOES AND DOES NOT BUY, because the count flatters the ins
 Measured on the statistic the ratio gate itself compares, std(ratio)/|mean(ratio)|, they fall
 into groups, and only one of them is on this arm's axis at all:
 
-  * FIVE actually reach the ratio arm and sit in the sensitive band, agreeing with each other to
-    within a factor of two at every rung: SD/SEM, percent-of-total, rate-per-thousand,
-    non-decadic unit conversion and control normalisation. They are all y = k*x, which is the
-    point (see the note over TRUE_BASELINE) but also means they are ONE cause sampled five ways.
-    A change costing one benign cause and a change costing five look alike here. (How many
-    STRATA that is worth depends on how many of theirs are already saturated at the committed
-    baseline, so do not read a stratum count as a count of causes -- an earlier draft here read
-    a clean multiple off one sweep and it does not survive a branch where the baseline differs.)
-  * `sparse_shared_support` measures the same statistic and belongs to that band by it, and is
-    NOT in the list above, which is the trap this note exists to flag. The arm's entry guard
-    requires every divisor cell non-zero, and this family's divisor column is zero with
-    probability 0.4 per row, so the arm runs on it in well under one draw in a hundred. Its
-    ratio spread is therefore almost never evaluated. Read that as: what the gate does not
-    compute cannot put a
-    family in a band, however the statistic reads. (On a branch that splits the zero handling
-    rather than voiding the pair, it does join the five -- which is the same point from the
-    other side.)
-  * `unit_decadic` is float-noise-constant and clears the gate on every draw; it is the one
-    family here whose entire output is `constant_ratio`, so it pins that the arm still fires,
-    not that it discriminates.
-  * `duplicated_measurement` and `two_level_coded` have zero ratio spread and grade nothing
-    about this tolerance. Not because they clear the gate -- `two_level_coded`'s divisor column
-    is half zeros, so like `sparse_shared_support` it reaches the arm only on the rare draw
-    with no zero in it; it reports
-    through `small_diff_set` and `exact_linear`, and `duplicated_measurement` through
-    `identical_column`.
+  * SIX reach the ratio arm and sit in the sensitive band, agreeing with each other to within a
+    factor of two at every rung: SD/SEM, percent-of-total, rate-per-thousand, non-decadic unit
+    conversion, control normalisation, and sparse counts against their normalised twin. They
+    are all y = k*x, which is the point (see the note over TRUE_BASELINE) but also means they
+    are ONE cause sampled six ways. A change costing one benign cause and a change costing six
+    look alike here. (How many STRATA that is worth depends on how many of theirs are already
+    saturated at the committed baseline, so do not read a stratum count as a count of causes.)
+    Before this commit the sixth was NOT among them, and why is worth keeping: it measures the
+    same statistic, but the arm's old entry guard demanded every divisor cell be non-zero and
+    its divisor column carries zeros, so the arm ran on it in well under one draw in a hundred
+    and its ratio spread went unevaluated. What the gate does not compute cannot put a family
+    in a band, however the statistic reads -- and splitting the zeros is what moved it in.
+  * `unit_decadic` is float-noise-constant and clears the gate on every draw; it is one of the
+    families whose entire ratio-arm output is `constant_ratio`, so it pins that the arm still
+    fires, not that it discriminates. `two_level_coded` now reaches the arm as well and behaves
+    the same way: its ratio spread is exactly zero, so it clears the gate whatever the
+    tolerance is, and it reports `constant_ratio` beside the `small_diff_set` it already had.
+  * `duplicated_measurement` never reaches the ratio arm, for a different reason: its columns
+    are identical, so `identical_column` fires and the pair is finished before the arm is
+    tried.
   * FOUR sit orders above any plausible tolerance and are inert to it.
 
 The resolution therefore comes from the LADDER, not from the family count: the rungs place the
@@ -107,7 +101,8 @@ green while the detector moves, which is the condition it was written to end.
 
 Regenerate both tables with `python tests/test_column_pair_bench_baseline.py`.
 
-Baseline measured on: eee615b (paperconan main)
+Baseline measured on: paperconan main, then moved once for the ratio arm's
+zero-row handling -- see that commit for what moved and why.
 
 Signal, not verdict: the benign strata are benign by construction, which is the point --
 they bound what the detector says about data that has an ordinary explanation.
@@ -473,14 +468,14 @@ BENIGN_BASELINE = {
     ("sparse_shared_support", 6): ('silent', {}),
     ("sparse_shared_support", 7): ('silent', {}),
     ("sparse_shared_support", 8): ('silent', {}),
-    ("sparse_shared_support", 9): ('silent', {}),
-    ("sparse_shared_support", 10): ('silent', {}),
-    ("two_level_coded", 4): ('pervasive', {'exact_linear': 'partial', 'small_diff_set': 'pervasive'}),
-    ("two_level_coded", 6): ('pervasive', {'exact_linear': 'partial', 'small_diff_set': 'pervasive'}),
-    ("two_level_coded", 7): ('pervasive', {'exact_linear': 'partial', 'small_diff_set': 'pervasive'}),
-    ("two_level_coded", 8): ('pervasive', {'exact_linear': 'partial', 'small_diff_set': 'pervasive'}),
-    ("two_level_coded", 9): ('pervasive', {'exact_linear': 'partial', 'small_diff_set': 'pervasive'}),
-    ("two_level_coded", 10): ('pervasive', {'exact_linear': 'partial', 'small_diff_set': 'pervasive'}),
+    ("sparse_shared_support", 9): ('partial', {'constant_ratio': 'partial'}),
+    ("sparse_shared_support", 10): ('pervasive', {'constant_ratio': 'pervasive'}),
+    ("two_level_coded", 4): ('pervasive', {'constant_ratio': 'partial', 'small_diff_set': 'pervasive'}),
+    ("two_level_coded", 6): ('pervasive', {'constant_ratio': 'partial', 'small_diff_set': 'pervasive'}),
+    ("two_level_coded", 7): ('pervasive', {'constant_ratio': 'partial', 'exact_linear': 'partial', 'small_diff_set': 'pervasive'}),
+    ("two_level_coded", 8): ('pervasive', {'constant_ratio': 'pervasive', 'small_diff_set': 'pervasive'}),
+    ("two_level_coded", 9): ('pervasive', {'constant_ratio': 'partial', 'small_diff_set': 'pervasive'}),
+    ("two_level_coded", 10): ('pervasive', {'constant_ratio': 'partial', 'exact_linear': 'partial', 'small_diff_set': 'pervasive'}),
     ("unit_decadic", 4): ('pervasive', {'constant_ratio': 'pervasive'}),
     ("unit_decadic", 6): ('pervasive', {'constant_ratio': 'pervasive'}),
     ("unit_decadic", 7): ('pervasive', {'constant_ratio': 'pervasive'}),
@@ -511,34 +506,21 @@ BENIGN_BASELINE = {
 # `exact_linear` fits to rtol 1e-7 and an exact relation's residual spread is about one
 # decade per significant figure, so detection switches on between rungs rather than
 # everywhere at once. The other is not a precision effect at all -- an all-zero baseline
-# row silences a rung that is otherwise found, and the intuitive culprit, the ratio arm's
-# non-zero-divisor guard, is the wrong one: deleting that guard changes nothing. The gate
-# is `_isclose_rowwise`, which scales each row's tolerance by that row's own magnitude. For
-# a zero row that scale is zero, the tolerance collapses to the absolute term the function
-# adds -- `eps * typical_scale * 64`, stated rather than evaluated because it moves with the
-# block -- and the fitted intercept clears it by orders. The effect is real but it is NOT
-# uniform across the ladder, and the qualitative split is the part that holds: at eight,
-# nine and ten figures every other row passes its own tolerance, so there the zero row
-# really is one uninformative row vetoing eleven informative ones; at four, six and seven
-# figures the other rows fail too, so the zero row is not what is holding those rungs
-# silent. Per-rung margin figures are deliberately not quoted: they span several orders across
-# the ladder, and three earlier drafts quoted single numbers that were not any rung's -- the
-# last of them said the intercept clears the floor "by three orders", which is true at the
-# finest rung and six orders out at the coarsest.
+# row silenced rungs that are otherwise found. The intuitive culprit, the ratio arm's
+# non-zero-divisor guard, was measured NOT to be the whole of it: deleting that guard alone
+# changed nothing here, because `_isclose_rowwise` scales each row's tolerance by that row's
+# own magnitude, so for a zero row the scale is zero, the tolerance collapses to an absolute
+# floor near 1e-13, and the fitted intercept clears it by orders. Both arms were blind, for
+# two different reasons, and unblinding one shows up only where the other was not also
+# binding -- which is why the ratio arm's zero handling moves the top rung of this table and
+# not the rest. Per-rung margin figures are deliberately not quoted -- they span two orders
+# across the ladder, and two earlier drafts quoted single numbers that were not any rung's.
 #
-# Some rows sit near a band edge, and an earlier draft named the wrong ones -- it said
-# `sparse_shared_support` runs "just under RARE on every rung" when most of its rungs are well
-# below the cut, and it named a count of missed strata that holds at no cut. Rather than carry a
-# list that decays with every reseed, the recipe -- and it is spelled out because the version
-# before this one pointed at `_measure_benign`, which returns BANDS and discards every rate, so
-# it could not be run:
-#
-#     rng = random.Random(_seed(family, digits))
-#     hits = sum(1 for _ in range(REPEATS) if _pair_findings(*BENIGN[family](rng, 1.0, digits)))
-#     fragile = min(abs(hits / REPEATS - RARE), abs(hits / REPEATS - (1 - RARE))) < 0.02
-#
-# Reseeding is the check the docstring already recommends, and it is what separates a fragile row
-# from a real move. Rates are not quoted -- a quoted rate here has been wrong twice.
+# One family sits near a band edge and is named so its rows are not read as a change under
+# review: `two_level_coded`'s reported kinds run inside `partial` near its edges. Rates are
+# not quoted -- measure them if it matters, because a quoted rate here has been wrong twice.
+# The seed is fixed so they cannot flake, but they are the rows most likely to move for
+# reasons unrelated to whatever is being reviewed.
 TRUE_BASELINE = {
     (4, False): ('silent', {}),
     (4, True): ('silent', {}),
@@ -551,7 +533,7 @@ TRUE_BASELINE = {
     (9, False): ('pervasive', {'exact_linear': 'pervasive'}),
     (9, True): ('silent', {}),
     (10, False): ('pervasive', {'constant_ratio': 'pervasive'}),
-    (10, True): ('silent', {}),
+    (10, True): ('pervasive', {'constant_ratio': 'pervasive'}),
 }
 
 @pytest.mark.parametrize("family,digits", sorted(BENIGN_BASELINE))

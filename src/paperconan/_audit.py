@@ -798,19 +798,48 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                 continue
             # constant ratio
             ratio_emitted = False
-            if np.all(np.abs(x) > 1e-12):
-                ratio = y / x
+            # A row zero on ONE side only refutes a constant non-zero ratio; a row zero on
+            # BOTH is consistent with every ratio and carries no information. Requiring
+            # every divisor cell to be non-zero conflated the two, so a single all-zero
+            # baseline row -- Day 0 of a growth curve, an ordinary thing to tabulate --
+            # disqualified the whole column pair before the ratio was ever computed.
+            #
+            # "Zero" is asked EXACTLY, and both alternatives were tried and are wrong.
+            # A fixed floor -- the 1e-12 the old guard carried -- calls a whole
+            # small-magnitude column zero, the mistake this module's docstring describes
+            # from the other side: MEG fields around 1e-14 T are every one of them under
+            # it, so the column would be dropped from its own ratio. A floor relative to
+            # the pair's magnitude is worse, because it throws away REFUTATIONS: in a
+            # column spanning decades, a small row that sits on a different ratio from
+            # the rest is exactly the evidence against a constant one, and calling it
+            # zero reports the pair instead of refusing it. Only a cell that IS zero
+            # constrains nothing, and that is what is asked. Dividing by a tiny non-zero
+            # divisor needs no guard of its own -- the quotient is finite or the
+            # constancy test below refuses it.
+            zero_x, zero_y = x == 0.0, y == 0.0
+            keep = ~zero_x
+            n_ratio = int(keep.sum())
+            if not np.any(zero_x != zero_y) and n_ratio >= _COLUMN_PAIR_MIN_ROWS:
+                xr, yr = x[keep], y[keep]
+                ratio = yr / xr
                 mean_ratio = float(np.mean(ratio))
                 ratio_tol = 1e-9 * max(abs(mean_ratio), 1e-300)
                 if (
                     np.std(ratio) < ratio_tol
                     and abs(mean_ratio - 1) > 1e-9
                     and abs(mean_ratio) > 1e-9
-                    and _allclose_rowwise(y, mean_ratio * x)
+                    and _allclose_rowwise(yr, mean_ratio * xr)
                 ):
+                    # `n` stays the pair's row count, as the four sibling branches report it.
+                    # Narrowing it to the informative rows silently changed a downstream
+                    # gate: _sem_sd_integer_n_scaling admits an unlabelled adjacent pair only
+                    # at n >= 100, and the rows dropped here -- replicates with zero variance
+                    # -- are ordinary in an SD/SEM table, so a handful of them decided whether
+                    # a textbook benign summary-statistic relation was suppressed at all.
+                    # `n_informative` carries how much of `n` the ratio actually rests on.
                     findings.append(dict(kind="constant_ratio", col_a=header[ci - c0], col_b=header[cj - c0],
-                                         col_a_idx=ci, col_b_idx=cj, n=n, ratio=mean_ratio,
-                                         severity="high",
+                                         col_a_idx=ci, col_b_idx=cj, n=n, n_informative=n_ratio,
+                                         ratio=mean_ratio, severity="high",
                                          col_a_sample=sa, col_b_sample=sb,
                                          rule=f"col[{cj}] = col[{ci}] * {mean_ratio:.6g}"))
                     ratio_emitted = True

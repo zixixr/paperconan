@@ -88,6 +88,37 @@ def test_review_profile_demotes_unit_conversion_relation(tmp_path):
                for f in relations)
 
 
+def test_review_profile_demotes_sparse_counts_against_their_normalised_twin(tmp_path):
+    """A count column beside its library-size-normalised twin, sharing a zero support.
+
+    The ratio arm reaches this pair only because a row that is zero on BOTH sides is
+    dropped as uninformative rather than voiding the pair -- before that it was reported,
+    if at all, as a line through the origin. It is exactly proportional for an ordinary
+    reason, so what keeps it out of the way is the profile, not the detector: the labels
+    say what the second column is, and the finding must arrive demoted and carrying that
+    explanation rather than as a high-severity relation.
+    """
+    data = tmp_path / "d"
+    data.mkdir()
+    counts = [0.0, 41.0, 0.0, 7.0, 128.0, 0.0, 19.0, 63.0, 0.0, 204.0]
+    per_million = 1e6 / sum(counts)
+    rows = ["gene,Read count,Normalized count"]
+    for i, c in enumerate(counts):
+        rows.append(f"g{i},{c!r},{c * per_million!r}")
+    (data / "counts.csv").write_text(_csv(rows), encoding="utf-8")
+
+    scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+    ratios = [f for f in _all_block_findings(scan) if f["kind"] == "constant_ratio"]
+
+    assert ratios, "the shared zero support must no longer void the pair"
+    assert all(f["n_informative"] == sum(1 for c in counts if c) for f in ratios), \
+        "the finding must say how many rows the ratio actually rests on"
+    assert all("derived_or_unit_conversion" in f.get("false_positive_context", [])
+               and f["severity"] == "low"
+               and f["profile_action"] == "demoted"
+               for f in ratios)
+
+
 def test_review_profile_demotes_explicit_formula_relation(tmp_path):
     data = tmp_path / "d"
     data.mkdir()
