@@ -81,7 +81,10 @@ SCOPE, and what these numbers do NOT bound:
     but they did not when this bench was written: the second was a default argument, so
     widening the visible one alone moved nothing here, and a sweep of "the ratio
     tolerance" concluded, wrongly, that this bench was insensitive. Kept as a note because
-    the shape recurs: a gate whose second half is a default is a gate that cannot be swept.
+    the shape recurs and DID recur -- the commit that removed it from the ratio arm
+    reintroduced it under a new name for the identical/offset branches, whose row-wise halves
+    kept the same default while a constant was written to look as though it governed them.
+    A gate whose second half is a default is a gate that cannot be swept.
   * Every block is two columns and one height, so the quadratic cost in block width and
     every row-count gate are unmeasured. Six of nine finding kinds are exercised; of the
     three absent, one needs more rows than these blocks have and two are reachable and
@@ -516,22 +519,37 @@ BENIGN_BASELINE = {
 #
 # The other was not a precision effect at all: an all-zero baseline row silenced rungs that
 # were otherwise found, and BOTH arms were blind to it for different reasons. The ratio
-# arm's non-zero-divisor guard was measured not to be the whole of it -- deleting it alone
-# changed only the finest rung -- because `_isclose_rowwise` scales each row's tolerance by
-# that row's own magnitude, so for a zero row the scale is zero, the tolerance collapses to
-# the absolute term the function adds -- `eps * typical_scale * 64`, stated rather than
-# evaluated because it moves with the block -- and the fitted intercept clears it by orders. Splitting the
-# zeros unblinded the ratio arm; the linear arm is still blind to a zero row, and nothing
-# here asks it not to be. Per-rung margin figures are deliberately not quoted -- they span
-# two orders across the ladder, and two earlier drafts quoted single numbers that were not
-# any rung's.
+# arm's non-zero-divisor guard was NOT the whole of it: merely deleting that guard moves no
+# row of either table -- verified, not inferred, and an earlier draft here said it moved the
+# finest rung, which is what the guard's REPLACEMENT does, not its deletion. The reason is
+# `_isclose_rowwise`, which scales each row's tolerance by that row's own magnitude, so for a
+# zero row the scale is zero, the tolerance collapses to the absolute term the function adds
+# -- `eps * typical_scale * 64`, stated rather than evaluated because it moves with the block
+# -- and the fitted intercept clears it by orders. Splitting the zeros unblinded the ratio
+# arm; the linear arm is still blind to a zero row, and nothing here asks it not to be.
+# Per-rung margin figures are deliberately not quoted -- they span two orders across the
+# ladder, and two earlier drafts quoted single numbers that were not any rung's.
 #
-# One family sits near a band edge and is named so its rows are not read as a change under
-# review: `two_level_coded`'s `constant_ratio` and `exact_linear` run inside `partial`, near
-# its edges, and which of the two is above RARE varies by rung. Rates are not quoted --
-# measure them if it matters, because a quoted rate here has been wrong twice. The seed is
-# fixed so they cannot flake, but they are the rows most likely to move for reasons
-# unrelated to whatever is being reviewed.
+# TWO rows sit near a band edge and are named so they are not read as a change under review,
+# and so nobody has to re-derive which they are:
+#   * `sparse_shared_support` at the COARSE end is the most fragile row in the table -- it
+#     sits a few draws above the RARE cut, and perturbing the seed flips it more often than
+#     any other stratum. It is frozen `partial` there, and `silent` is a plausible reading of
+#     the same detector.
+#   * `two_level_coded` reports three kinds at once. `small_diff_set` is pervasive at every
+#     rung, `constant_ratio` is high `partial` and crosses into `pervasive` at one rung, and
+#     `exact_linear` straddles the RARE cut, appearing at some rungs and not others. All
+#     three describe the same pairs, so the row moves as a unit.
+# Rates are not quoted -- a quoted rate here has been wrong twice -- so here is how to get
+# them, spelled out because an earlier draft pointed at `_measure_benign`, which returns BANDS
+# and discards every rate:
+#
+#     rng = random.Random(_seed(family, digits))
+#     hits = sum(1 for _ in range(REPEATS) if _pair_findings(*BENIGN[family](rng, 1.0, digits)))
+#     fragile = min(abs(hits / REPEATS - RARE), abs(hits / REPEATS - (1 - RARE))) < 0.02
+#
+# The seed is fixed so these cannot flake, but they are the rows most likely to move for
+# reasons unrelated to whatever is being reviewed.
 TRUE_BASELINE = {
     (4, False): ('silent', {}),
     (4, True): ('silent', {}),

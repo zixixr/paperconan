@@ -109,47 +109,125 @@ def test_independent_columns_are_not_reported() -> None:
 def test_coarse_columns_are_not_granted_the_room_their_rounding_allows() -> None:
     """Why the tolerance is flat rather than derived from the cells.
 
-    At one decimal and single-digit values the cells' own rounding permits the ratio a
-    couple of percent, and at that width almost any pair of columns reads as proportional.
-    These two are NOT related by a constant, and the assertion below states where their
-    spread sits relative to the cap rather than quoting a figure for it: it is far inside
-    what rounding alone would have excused and far outside what the flat tolerance allows.
+    At one decimal and single-digit values the cells' own rounding permits the ratio a couple
+    of percent, and at that width almost any pair of columns reads as proportional. Both
+    halves of that are asserted, because an earlier version asserted only the easy one -- that
+    the pair is far outside the flat tolerance -- while the claim that motivates the test is
+    that it is INSIDE what a per-cell derivation would have excused. Stating it costs one line
+    and it is the whole argument.
     """
     coarse = [4.8, 6.2, 5.1, 7.3, 5.9]
     near = [6.0, 7.8, 6.3, 9.2, 7.4]
-    spread = np.ptp(np.asarray(near) / np.asarray(coarse))
+    ratios = np.asarray(near) / np.asarray(coarse)
+    spread = float(np.std(ratios) / abs(ratios.mean()))
     assert spread > _COLUMN_PAIR_RATIO_RTOL * 100, "fixture is too close to constant"
+    # what a derivation from the cells would have allowed: half a step on each side, per row
+    room = max((0.5 * 10.0 ** -1 + abs(r) * 0.5 * 10.0 ** -1) / abs(a)
+               for a, r in zip(coarse, ratios))
+    assert spread < room, (
+        "the cells' own rounding does NOT excuse this spread, so the pair no longer shows "
+        "why a per-cell derivation is too permissive")
 
     assert not [f for f in _relations([coarse, near]) if f["kind"] == "constant_ratio"]
+
+
+@pytest.mark.parametrize("branch_kind,build", [
+    ("identical_column", lambda src: [v * (1 + 1e-5) for v in src]),
+    ("constant_offset", lambda src: [v + 3.0 + (i % 2) * 3e-5 for i, v in enumerate(src)]),
+])
+def test_the_exact_equality_constant_actually_governs_its_branches(monkeypatch, branch_kind,
+                                                                  build) -> None:
+    """A named constant that no branch reads is a knob that cannot be swept.
+
+    `_COLUMN_PAIR_RTOL` was introduced to name the exact-equality these branches ask for, but
+    reached only a scalar magnitude bound -- the row-wise half of each branch kept
+    `_allclose_rowwise`'s hardcoded default, so sweeping the constant across six orders moved
+    nothing. That is the same shape the sibling bench records for the ratio arm ("a gate whose
+    second half is a default is a gate that cannot be swept"), and it came back under a new
+    name in the commit that removed it there.
+
+    So: patch the constant loose and require the branch to notice. At its shipped value this
+    test would pass either way, which is exactly why it moves it.
+    """
+    import paperconan._audit as audit
+
+    src = list(_SOURCE)
+    other = build(src)
+    assert branch_kind not in {f["kind"] for f in _relations([src, other])}, (
+        "fixture already fires at the shipped tolerance; it cannot show the constant is read")
+
+    monkeypatch.setattr(audit, "_COLUMN_PAIR_RTOL", 1e-3)
+
+    assert branch_kind in {f["kind"] for f in _relations([src, other])}, (
+        f"{branch_kind} did not follow _COLUMN_PAIR_RTOL; it is reading a default instead")
 
 
 def test_the_ratio_arm_is_looser_than_exact_equality_but_not_by_much() -> None:
     assert _COLUMN_PAIR_RATIO_RTOL > _COLUMN_PAIR_RTOL
     assert _COLUMN_PAIR_RATIO_RTOL <= 1e-5, (
-        "this loose the tolerance stops discriminating; see the sweep in _audit.py")
+        "this loose the tolerance stops discriminating; the two tests below pin it tighter, "
+        "and tests/test_column_pair_bench_baseline.py prices moving it")
 
 
-# A ratio drifting between the cap and a decade above it -- the test below asserts that,
-# so the fixture cannot quietly stop straddling. Invented values; no corpus data.
-_PROBE_A = [1.03847, 2.61093, 1.47205, 3.08472, 2.19638]
-_PROBE_B = [0.8695, 2.18611, 1.23253, 2.58281, 1.83901]
+# A pair whose ratio is not constant: every row carries its own irregular multiplier, so no
+# single constant explains it, and the test below asserts it is not `round(a * k, d)` for any
+# d either -- an earlier fixture here WAS exactly that, an exact scaling stored at five
+# decimals, which froze a true positive as a required miss and would have told anyone closing
+# that gap that their fixture had broken. Invented values; no corpus data.
+_WOBBLY_A = [1.03847, 2.61093, 1.47205, 3.08472, 2.19638, 4.71026, 3.55914, 2.88301]
+_WOBBLY_B = [0.8695005463, 2.1861097333, 1.23253077245, 2.58281218237,
+             1.83900278048, 3.94385832802, 2.98002964857, 2.41392292604]
 
 
-def test_the_tolerance_is_load_bearing_at_its_current_value() -> None:
-    """Without this the tolerance is a number no test constrains.
+def test_the_constancy_gate_is_load_bearing_at_its_current_value() -> None:
+    """The first of the ratio arm's two tolerances: np.std(ratio) < rtol * |mean|.
 
-    Every other test here passes with it at 1e-5, so a regression by a decade used to be
-    invisible to the whole suite. This pair drifts between the two, which the assertion
-    below states rather than quotes. It pins the value from one side; what prices moving it
-    is tests/test_column_pair_bench_baseline.py, and neither substitutes for the other.
+    Measured with THE STATISTIC THAT GATE COMPARES. An earlier version of this test used
+    max|r - mean| / |mean| instead, which for this shape of data runs above std by enough to
+    misreport how tightly the cap is pinned -- and the sibling bench's docstring already warns
+    that mixing the two is how figures in this family of files went wrong.
+
+    Every other test here passes with the cap at 1e-5, so a regression by a decade used to be
+    invisible to the whole suite.
     """
-    ratios = np.asarray(_PROBE_B) / np.asarray(_PROBE_A)
-    drift = float(np.max(np.abs(ratios - ratios.mean())) / abs(ratios.mean()))
-    assert _COLUMN_PAIR_RATIO_RTOL < drift < 1e-5, (
-        f"fixture drift {drift:.2e} no longer straddles the cap; it constrains nothing")
+    ratios = np.asarray(_WOBBLY_B) / np.asarray(_WOBBLY_A)
+    k = float(ratios.mean())
+    spread = float(np.std(ratios) / abs(k))
 
-    assert not [f for f in _relations([_PROBE_A, _PROBE_B])
+    assert _COLUMN_PAIR_RATIO_RTOL < spread < 10 * _COLUMN_PAIR_RATIO_RTOL, (
+        f"fixture spread {spread:.2e} no longer straddles the cap; it constrains nothing")
+    # ...and it is not an exact scaling that was merely stored coarsely, which is the thing
+    # this arm is FOR and must never be frozen here as a required miss.
+    assert not any([round(a * k, d) for a in _WOBBLY_A] == _WOBBLY_B for d in range(2, 13)), (
+        "fixture is a copy-then-scale stored at d decimals; refusing it is a false negative")
+
+    assert not [f for f in _relations([_WOBBLY_A, _WOBBLY_B])
                 if f["kind"] == "constant_ratio"]
+
+
+def test_the_row_wise_gate_is_load_bearing_too() -> None:
+    """The second tolerance, which no test could see: the rtol inside _allclose_rowwise.
+
+    The two gates ask different questions -- one about the spread of the ratio, one about
+    every row's own deviation -- so a fixture straddling one says nothing about the other.
+    Unhooking this one from the constant and loosening it a hundredfold left every unit test
+    in this file green; only the bench noticed.
+
+    One row deviates by several times the cap while the rest are exact, so the standard
+    deviation stays under the first gate and only the row-wise check can refuse it.
+    """
+    rng = np.random.default_rng(7)
+    x = [round(float(v), 6) for v in rng.uniform(1.0, 9.9, 30)]
+    y = [v * 2.5 for v in x]
+    y[13] *= 1 + 3 * _COLUMN_PAIR_RATIO_RTOL
+
+    ratios = np.asarray(y) / np.asarray(x)
+    k = float(ratios.mean())
+    assert np.std(ratios) < _COLUMN_PAIR_RATIO_RTOL * abs(k), (
+        "fixture no longer passes the constancy gate, so it cannot isolate the row-wise one")
+    assert float(np.max(np.abs(ratios - k)) / abs(k)) > _COLUMN_PAIR_RATIO_RTOL
+
+    assert not [f for f in _relations([x, y]) if f["kind"] == "constant_ratio"]
 
 
 # One column scaled by a factor sitting in each band the two tolerances cut out. The
@@ -172,7 +250,7 @@ def test_every_band_between_the_two_tolerances_has_exactly_one_witness(scale, ex
     witness at all, which is silent in every other test here. The neighbouring failure --
     one relationship reported twice -- cannot be seen on this fixture, because a scaling
     done in exact binary fits with no intercept; that half is
-    test_a_ratio_held_only_to_seven_figures_is_reported_once.
+    test_a_ratio_held_to_finite_stored_precision_is_reported_once.
     """
     found = sorted({f["kind"] for f in _relations([_SOURCE, [v * scale for v in _SOURCE]])})
 
