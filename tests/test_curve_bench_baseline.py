@@ -75,6 +75,41 @@ BASELINE = {
 # RECORDED, NOT ENDORSED -- the zeros are the gap this arm has, written down so that a
 # change which closes any of them can be weighed against what it costs above, in the same
 # file, instead of being argued from a hope.
+#
+# WHAT HAS BEEN TRIED AGAINST THE ZEROS, so the next attempt starts here rather than at the
+# beginning. THREE gates hold these rows down, in different layouts, and only two are
+# tolerances. An earlier draft of this note named two and sent the reader to sweep them for
+# a zero neither of them causes, so the split is spelled out:
+#
+#   * `_is_short_hp` admits a cell by its ABSOLUTE decimal count, so at one and two decimals
+#     the cells never enter a run and nothing downstream can matter. Sweep
+#     PAPERCONAN_SHORT_ROW_MIN_FRAC_DIGITS and watch the coarse PANELLED rows move.
+#   * with that floor lowered, the flat `_SHORT_ROW_RTOL` blocks the same rows a second
+#     time, because two cells recorded to few decimals cannot pin a ratio that tightly.
+#     PAPERCONAN_SHORT_ROW_RTOL sweeps it.
+#   * neither touches the CONTIGUOUS rows, and that is the one worth knowing. `_same_band`
+#     suppresses the ratio arm whenever every row between the pair is also a candidate,
+#     which with no separator is every pair -- so contiguous recall stays at zero with both
+#     tolerances opened as far as they go. It is a THIRD gate, it is not a precision effect,
+#     and the design note this file cites plans to remove it.
+#
+# One correction worth carrying, because it was believed here on the strength of another
+# commit's prose rather than a measurement. Lowering the admission floor was said to make
+# previously reported findings VANISH, `_is_short_hp` feeding the frequency pool behind the
+# rarity gate. On this bench it does not: across the floor's settings the reported set only
+# grows, and no run gets shorter. That coupling was repaired by "trim a matched run to its
+# rare part instead of rejecting it whole", which is already in main -- so "admission and
+# the rarity baseline have to be separated first" is advice toward work already done.
+#
+# The rejected experiment, for the record. A version letting the tolerance follow each
+# cell's recorded precision was written and measured against this file: it raised none of
+# the coarse rows on its own, it LOWERED the one non-zero row here, and it invented a run
+# longer than anything in BASELINE. It also put findings on the contiguous layout -- which
+# is zero at the SHIPPED tolerances, not by construction, since a wide enough sweep makes
+# the contiguous rows fire too, so that on its own disqualifies nothing.
+#
+# Re-measure rather than trusting any of this -- `_measure` and `_measure_planted` are the
+# whole harness, and all three knobs above are read at import.
 PLANTED_BASELINE = {
     ("contiguous", 1): {},
     ("contiguous", 2): {},
@@ -118,6 +153,7 @@ def _planted_block(decimals: int, sheet: int):
     does and is the whole difficulty: the relation is exact and the stored numbers
     cannot say so.
     """
+    assert ROWS >= 3 * PANEL_SIZE, "need three panels to put the copy outside the source's"
     pristine = _curve_block(decimals, sheet)
     block = [list(r) for r in pristine]
     # Stride wider than SHEETS, as `_curve_block` uses, so neighbouring strata cannot share a
