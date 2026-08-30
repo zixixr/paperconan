@@ -13,14 +13,17 @@ acceptable and says so here.
 Two layouts, because they behave completely differently:
 
   contiguous   every row adjacent, so the band guard sees one band and suppresses
-               the ratio arm outright -- 0 at every precision
+               the ratio arm at every precision -- empty at the committed seed
   panelled     a separator every PANEL_SIZE rows, an ordinary supplementary layout,
                which the band guard cannot see across
 
 The panelled variant is why this file exists. At the shipped tolerances a
-contiguous-only bench reports 0 and would have certified most changes as harmless
--- not by construction, though: `_same_band` is what holds it there, and deleting
-that guard, or opening the precision knobs wide enough, makes contiguous fire.
+contiguous-only bench is empty at the committed seed and would have certified
+most changes as harmless. Not by construction, and not even as a property of the
+shipped tolerances: `_same_band` is what holds it down, but it does not gate the
+pass-2 adjacent-pair path, so a minority of neighbouring seeds produce a short
+finding there. Deleting the guard makes contiguous fire outright, and so does
+relaxing both precision knobs together (neither alone does it).
 
 And a bench of things that must not fire is passed perfectly by a detector that
 never fires, so there is a TRUE stratum too: the same curve data with one row
@@ -103,8 +106,10 @@ BASELINE = {
 #     through, so it is a strong filter rather than the block an earlier draft called it.
 #   * the flat `_SHORT_ROW_RTOL` is the second, and holds most of the rest.
 #     PAPERCONAN_SHORT_ROW_RTOL sweeps it.
-#   * neither moves contiguous RECALL, and that is the one worth knowing -- contiguous false
-#     positives do move under the same two knobs, so the quantity matters here. `_same_band`
+#   * neither moves contiguous RECALL, and that is the one worth knowing. (Contiguous false
+#     positives do move, but only when BOTH knobs are relaxed together -- neither alone moves
+#     them at any setting tried, so do not expect the single-knob sweeps above to show it.)
+#     `_same_band`
 #     suppresses the ratio arm whenever every row between the pair is also a candidate,
 #     which with no separator is every pair -- contiguous recall stays at zero across a full
 #     sweep of both tolerances, and deleting that guard alone turns contiguous/3dp recall
@@ -330,12 +335,18 @@ def test_the_bench_still_has_teeth():
 def test_the_contiguous_layout_cannot_certify_anything_on_its_own():
     """Why the panelled variant exists, asserted rather than left in a comment.
 
-    With every row adjacent the band guard treats the block as one band and the ratio arm
-    reports nothing at any precision -- at the SHIPPED tolerances. It is `_same_band` that
-    holds it there, not the layout itself: delete that guard and contiguous/3dp fires, and
-    a wide enough sweep of the precision knobs makes the coarse rows fire too. So a
-    contiguous-only bench would miss most changes rather than all of them, and the panelled
-    layout is what gives this file the rest of its teeth.
+    With every row adjacent the band guard treats the block as one band and suppresses the
+    ratio arm, and at the committed seed the stratum is empty at every precision. That is
+    what this test asserts: a frozen fact about this seed, NOT a property. `_same_band` is
+    what holds it down rather than the layout itself -- delete that guard and contiguous/3dp
+    fires, and relaxing both precision knobs together makes the coarse rows fire too. And
+    the guard does not cover everything: it gates the pass-1 same-band path, not the pass-2
+    adjacent-pair one, so reseeding puts a short finding here on a minority of neighbouring
+    seeds. Two earlier drafts of this docstring called the stratum zero "whatever happens"
+    and then zero "at the shipped tolerances"; both were universals, and the file's own
+    prescribed check breaks the second as it broke the first. So a contiguous-only bench
+    would miss most changes rather than all of them, and the panelled layout is what gives
+    this file the rest of its teeth.
     """
     contiguous = {d: _measure("contiguous", d) for d in _DECIMALS}
     panelled_planted = {d: _measure_planted("panelled", d) for d in _DECIMALS}
