@@ -103,7 +103,8 @@ BASELINE = {
 #     through, so it is a strong filter rather than the block an earlier draft called it.
 #   * the flat `_SHORT_ROW_RTOL` is the second, and holds most of the rest.
 #     PAPERCONAN_SHORT_ROW_RTOL sweeps it.
-#   * neither touches the CONTIGUOUS rows, and that is the one worth knowing. `_same_band`
+#   * neither moves contiguous RECALL, and that is the one worth knowing -- contiguous false
+#     positives do move under the same two knobs, so the quantity matters here. `_same_band`
 #     suppresses the ratio arm whenever every row between the pair is also a candidate,
 #     which with no separator is every pair -- contiguous recall stays at zero across a full
 #     sweep of both tolerances, and deleting that guard alone turns contiguous/3dp recall
@@ -351,11 +352,17 @@ def test_the_contiguous_layout_cannot_certify_anything_on_its_own():
 
 
 if __name__ == "__main__":       # pragma: no cover - regeneration helper, not a test
-    # Paste-ready tables. The strata are named ONCE, in _STRATA, and everything here and in
-    # the tests reads that -- an earlier draft hardcoded the layouts and the ladder in four
-    # places and claimed in a comment that doing so avoided dropping a stratum, which is
-    # backwards: a hardcoded pair is exactly what silently drops one. Adding a rung to
-    # _STRATA and regenerating now carries it into both tables.
+    # Paste-ready tables, over _STRATA. That is what this loop iterates and nothing more --
+    # an earlier draft of this comment said "everything here and in the tests" reads it,
+    # which is not true and is the overclaim this file keeps making. What IS true: a rung
+    # added to _DECIMALS lands in both regenerated tables, and the parametrized tests then
+    # pick it up because they iterate the tables' own keys. The layout test below names its
+    # two layouts on purpose -- it exists to contrast them -- so a new LAYOUT would reach the
+    # tables and those tests and still bypass it.
+    #
+    # The predecessor hardcoded the layouts and the ladder at each use site and claimed in a
+    # comment that doing so avoided dropping a stratum, which is backwards: a hardcoded pair
+    # is exactly what silently drops one.
     for _name, _fn in (("BASELINE", _measure), ("PLANTED_BASELINE", _measure_planted)):
         print(f"{_name} = {{")
         for _layout, _d in _STRATA:
