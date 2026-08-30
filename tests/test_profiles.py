@@ -88,6 +88,65 @@ def test_review_profile_demotes_unit_conversion_relation(tmp_path):
                for f in relations)
 
 
+def test_review_profile_demotes_a_summary_statistic_pair_stored_at_seven_figures(tmp_path):
+    """SEM = SD / sqrt(n): exactly proportional, and benign for a textbook reason.
+
+    The ratio arm reaches this pair only at a tolerance loose enough for values stored at
+    a finite number of significant figures, which is the ordinary case for an exported
+    table. Nothing about the numbers distinguishes it from a column copied and scaled --
+    the labels do, and this pins that the profile still acts on them once the arm reports
+    the pair directly instead of as a line through the origin.
+    """
+    data = tmp_path / "d"
+    data.mkdir()
+    sd = [4.183627, 9.520418, 2.746085, 7.318294, 5.902471, 8.164039,
+          3.475912, 6.038756, 1.927463, 9.114208]
+    root_n = 6.0 ** 0.5
+    rows = ["group,SD,SEM"]
+    for i, v in enumerate(sd):
+        rows.append(f"g{i},{v!r},{float(f'{v / root_n:.7g}')!r}")
+    (data / "summary.csv").write_text(_csv(rows), encoding="utf-8")
+
+    scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+    ratios = [f for f in _all_block_findings(scan) if f["kind"] == "constant_ratio"]
+
+    assert ratios, "seven stored figures must not put an exact ratio out of reach"
+    assert all(f["severity"] == "low" and f["profile_action"] == "demoted"
+               for f in ratios), \
+        "a labelled summary-statistic pair must not reach a report at high severity"
+
+
+def test_review_profile_demotes_sparse_counts_against_their_normalised_twin(tmp_path):
+    """A count column beside its library-size-normalised twin, sharing a zero support.
+
+    The ratio arm reaches this pair only because a row that is zero on BOTH sides is
+    dropped as uninformative rather than voiding the pair -- before that it was reported,
+    if at all, as a line through the origin. It is exactly proportional for an ordinary
+    reason, so what keeps it out of the way is the profile, not the detector: the labels
+    say what the second column is, and the finding must arrive demoted and carrying that
+    explanation rather than as a high-severity relation.
+    """
+    data = tmp_path / "d"
+    data.mkdir()
+    counts = [0.0, 41.0, 0.0, 7.0, 128.0, 0.0, 19.0, 63.0, 0.0, 204.0]
+    per_million = 1e6 / sum(counts)
+    rows = ["gene,Read count,Normalized count"]
+    for i, c in enumerate(counts):
+        rows.append(f"g{i},{c!r},{c * per_million!r}")
+    (data / "counts.csv").write_text(_csv(rows), encoding="utf-8")
+
+    scan = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+    ratios = [f for f in _all_block_findings(scan) if f["kind"] == "constant_ratio"]
+
+    assert ratios, "the shared zero support must no longer void the pair"
+    assert all(f["n_informative"] == sum(1 for c in counts if c) for f in ratios), \
+        "the finding must say how many rows the ratio actually rests on"
+    assert all("derived_or_unit_conversion" in f.get("false_positive_context", [])
+               and f["severity"] == "low"
+               and f["profile_action"] == "demoted"
+               for f in ratios)
+
+
 def test_review_profile_demotes_explicit_formula_relation(tmp_path):
     data = tmp_path / "d"
     data.mkdir()

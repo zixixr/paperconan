@@ -1,9 +1,11 @@
 """Scale-relative tolerances: a fixed absolute atol (1e-9) falsely flagged tiny-magnitude
 data (e.g. MEG fields ~1e-14 T) as identical/linear/arithmetic. The relation detectors must
 use relative precision so small-magnitude columns aren't trivially 'equal'."""
+import pytest
 import numpy as np
 from paperconan._sheet import Sheet
-from paperconan._audit import detect_relations, detect_arithmetic_progression, detect_equal_pairs
+from paperconan._audit import (_COLUMN_PAIR_MIN_ROWS, detect_relations,
+                              detect_arithmetic_progression, detect_equal_pairs)
 
 def _sheet(cols):
     rows = [[f"c{j}" for j in range(len(cols))]]
@@ -349,28 +351,92 @@ def test_genuine_nonzero_intercept_still_flags_exact_linear_at_normal_scale():
 
 
 def test_pure_scaling_with_zero_in_x_still_detected():
-    # edge case: constant_ratio's divide guard (all |x| > 1e-12) skips columns containing 0,
-    # so the b~=0 exact_linear is the SOLE witness of the proportional relationship — the
-    # dedupe must NOT drop it here (that would be a false negative).
+    # The relationship must be caught; which finding carries it changed. constant_ratio
+    # used to require EVERY divisor cell non-zero, so a single 0 sent the whole pair to the
+    # b~=0 exact_linear as its sole witness. A row zero on BOTH sides is consistent with
+    # every ratio and simply carries no information, so it is now dropped from the ratio
+    # rather than disqualifying the pair -- and the pair is named directly, with its
+    # constant, instead of being described as a line through the origin.
     x = [0.0, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0, 10.5, 12.0, 13.5]
     y = [2.5 * v for v in x]
     f = _kinds(x, y)
-    assert not any(k["kind"] == "constant_ratio" for k in f), \
-        "constant_ratio's zero-guard should skip this column"
-    assert any(k["kind"] == "exact_linear" for k in f), \
-        f"proportional relationship with a zero in x must still be caught: {f}"
+    ratio = [k for k in f if k["kind"] == "constant_ratio"]
+    assert ratio, f"proportional relationship with a zero in x must still be caught: {f}"
+    assert ratio[0]["ratio"] == pytest.approx(2.5)
+    # the zero-zero row informs nothing, and the finding says so separately -- `n` stays
+    # the pair's row count so downstream gates that read it keep their meaning
+    assert ratio[0]["n"] == len(x)
+    assert ratio[0]["n_informative"] == len(x) - 1
+
+
+def test_a_tiny_magnitude_column_is_not_all_zero_to_the_ratio_arm():
+    """A fixed floor would call this whole column zero.
+
+    The old divide guard's 1e-12 is the same mistake this file exists to catch from the
+    other side: MEG fields around 1e-14 T are every one of them below it, so the column
+    would be dropped as uninformative and the pair judged on nothing.
+    """
+    x = [1.5e-14, 3.0e-14, 4.5e-14, 6.0e-14, 7.5e-14, 9.0e-14, 1.05e-13, 1.2e-13]
+    y = [2.5 * v for v in x]
+
+    ratio = [k for k in _kinds(x, y) if k["kind"] == "constant_ratio"]
+    assert ratio, "a tiny-magnitude column pair must not be read as all zeros"
+    assert ratio[0]["ratio"] == pytest.approx(2.5)
+    assert ratio[0]["n_informative"] == len(x)
+
+
+def test_a_small_row_that_refutes_the_ratio_is_not_dropped_as_uninformative():
+    """...and a floor RELATIVE to the pair's magnitude is worse than a fixed one.
+
+    In a column spanning decades, the smallest row is below any relative floor while being
+    perfectly real. It is also where a refutation lives: this row sits on a different ratio
+    from the rest, which is the evidence against a constant one. Dropping it as "carries no
+    information" reports the pair instead of refusing it -- a false positive manufactured by
+    the very step meant to remove uninformative rows. Only a cell that IS zero constrains
+    nothing.
+    """
+    x = [1.0e6, 5.0e5, 3.0e5, 2.0e5, 4.0e5, 1.0e-4]
+    y = [2.5e6, 1.25e6, 7.5e5, 5.0e5, 1.0e6, 9.0e-4]      # last row's ratio is 9, not 2.5
+
+    assert not [k for k in _kinds(x, y) if k["kind"] == "constant_ratio"], \
+        "the refuting row was discarded as uninformative"
+
+    # the control: the same pair with a genuine all-zero row in that position IS reported
+    ratio = [k for k in _kinds(x[:-1] + [0.0], y[:-1] + [0.0])
+             if k["kind"] == "constant_ratio"]
+    assert ratio and ratio[0]["ratio"] == pytest.approx(2.5)
+    assert ratio[0]["n_informative"] == len(x) - 1
+
+
+def test_a_zero_on_one_side_only_refutes_a_constant_ratio():
+    # The other half of that distinction, which the old all-non-zero guard could not make:
+    # 0 -> 7.5 sits on no constant non-zero ratio at all, so the pair must not be reported
+    # however well the remaining rows agree.
+    x = [0.0, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0, 10.5, 12.0, 13.5]
+    y = [2.5 * v for v in x]
+    y[0] = 7.5
+
+    assert not any(k["kind"] == "constant_ratio" for k in _kinds(x, y))
 
 
 def test_ratio_emitted_flag_does_not_leak_across_column_pairs():
     # Guard: the per-pair `ratio_emitted` flag must be re-initialized for every column
     # pair. If it were hoisted outside the pair loop, a constant_ratio on an EARLIER pair
     # (c0,c1) would leave the flag True and wrongly suppress the b~=0 exact_linear on a
-    # LATER pair (c2,c3) whose constant_ratio was skipped by the divide-by-zero guard —
-    # a cross-pair false negative. c2 contains a 0; c2/c3 are independent of c0/c1.
+    # LATER pair (c2,c3) that emitted no constant_ratio of its own — a cross-pair false
+    # negative. c2/c3 are independent of c0/c1.
+    #
+    # c2 is mostly zero-zero rows, which the ratio arm drops as uninformative, leaving
+    # fewer than _COLUMN_PAIR_MIN_ROWS to judge — so that pair still reaches exact_linear
+    # with no constant_ratio of its own, which is the situation this guard needs. It used
+    # to be reached by a single zero disqualifying the pair outright.
     c0 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
     c1 = [2.0 * v for v in c0]                      # pair (c0,c1): pure scaling -> constant_ratio
-    c2 = [0.0, 3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0, 5.0]   # has a 0; irregular
-    c3 = [2.5 * v for v in c2]                      # pair (c2,c3): pure scaling with a 0 in x
+    c2 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 4.0, 16.0]  # too few non-zero rows to judge
+    c3 = [2.5 * v for v in c2]                      # pair (c2,c3): still a line through 0
+    # State the premise, so a swept _COLUMN_PAIR_MIN_ROWS breaks this loudly rather than
+    # turning it into a test of nothing: the ratio arm must DECLINE this pair.
+    assert sum(1 for v in c2 if v) < _COLUMN_PAIR_MIN_ROWS
     s = _sheet([c0, c1, c2, c3])
     f = detect_relations(s, 1, len(c0) + 1, 0, 4, ["c0", "c1", "c2", "c3"])
     cr = {(x["col_a"], x["col_b"]) for x in f if x["kind"] == "constant_ratio"}
