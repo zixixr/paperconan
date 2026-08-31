@@ -1,53 +1,66 @@
-"""A frozen false-positive baseline for short-row ratio findings on curve data.
+"""A frozen baseline for short-row ratio findings on curve data, both directions.
 
-Rows sampled along one smooth response are near-multiples of one another BY
-CONSTRUCTION -- that is what a dose-response family is, not an anomaly. It is also
-the largest false-positive driver measured for this detector, so any redesign of the
-ratio arm has to be held against a number rather than against a hope.
+Rows sampled along one smooth response are near-multiples of one another BY CONSTRUCTION --
+that is what a dose-response family is, not an anomaly -- and it is the largest false-positive
+driver measured for this detector. So a redesign of the ratio arm is held against a number
+here rather than against a hope.
 
-This file IS that number. It generates the bench itself, runs the shipped detector,
-and asserts the exact per-stratum counts. It is not a snapshot that regenerates:
-change the detector and this test fails until someone decides the new counts are
-acceptable and says so here.
+  BASELINE          what the detector invents on curve data. Everything it produces is a
+                    false positive by construction.
+  PLANTED_BASELINE  recall of one row replaced by an exact scaled copy of another, in a
+                    different panel, rounded to the stratum's precision the way an export
+                    does. Matched by row label, so the benign findings in the same stratum
+                    cannot be counted as having caught it, and by RUN LENGTH as well as by
+                    sheet, since the whole row is a copy and a short run is width the detector
+                    did not recover.
+
+A bench of only the first is passed perfectly by a detector that never fires, and until the
+second existed a change to this arm could only be argued on its cost -- half a decision. Its
+zeros are a RECORDED GAP, not a target.
 
 Two layouts, because they behave completely differently:
 
-  contiguous   every row adjacent, so the band guard sees one band and suppresses
-               the ratio arm at every precision -- empty at the committed seed
-  panelled     a separator every PANEL_SIZE rows, an ordinary supplementary layout,
-               which the band guard cannot see across
+  contiguous   every row adjacent, so the band guard sees one band and suppresses the ratio
+               arm at every precision -- empty at the committed seed
+  panelled     a separator every PANEL_SIZE rows, an ordinary supplementary layout, which the
+               band guard cannot see across
 
-The panelled variant is why this file exists. At the shipped tolerances a
-contiguous-only bench is empty at the committed seed and would have certified
-most changes as harmless. Not by construction, and not even as a property of the
-shipped tolerances: `_same_band` is what holds it down, but it does not gate the
-pass-2 adjacent-pair path, so a minority of neighbouring seeds produce a short
-finding there. Deleting the guard makes contiguous fire outright, and so does
-relaxing both precision knobs together (neither alone does it).
+HOW TO USE IT
+  * `python tests/test_curve_bench_baseline.py` reprints both tables paste-ready.
+  * `pytest -k "not bench_baseline"` deselects this file and its column-pair sibling.
+  * Reseed before reading a movement as a size. This file freezes COUNTS, and they are
+    seed-sensitive: the busiest stratum ranges over most of what it can produce and the
+    committed draw sits at the top of that range. The sibling bench freezes bands for that
+    reason; here the counts are kept because run length is the quantity that matters.
 
-And a bench of things that must not fire is passed perfectly by a detector that
-never fires, so there is a TRUE stratum too: the same curve data with one row
-replaced by an exact scaled copy of another row, in a different panel -- the
-relation this arm exists to catch, planted where the benign rows already sit. It
-is frozen as recall of the planted pair specifically, by row label, so the benign
-findings in the same stratum cannot be counted as having caught it, and by run
-length as well as by sheet, because the whole row is an exact copy and a short run
-is width the detector did not recover. Where that recall is currently zero, that
-is a RECORDED GAP and not a target: a change that raises it has earned the false
-positives it also brings, and a change that lowers it has to say so.
+WHAT IT DOES NOT BOUND
+  * The contiguous stratum is empty at the COMMITTED SEED, not as a property. `_same_band` is
+    what holds it down and does not gate the pass-2 adjacent-pair path, so a minority of
+    neighbouring seeds put a short finding there. Two earlier drafts called it zero
+    "whatever happens" and then zero "at the shipped tolerances"; both were universals, and
+    reseeding broke both.
+  * Recall counts the SCALED arm only. Plant an identical copy instead and it reads zero
+    while the pair is reported, through the identical arm.
 
-All data is generated from SEED below by `random.Random`, chosen over numpy's
-Generator because only the stdlib Mersenne Twister stream is stable across versions,
-and a gate that drifts with a dependency upgrade is not a gate. No real data.
+THREE GATES hold the coarse rows down, and only two are tolerances. `_is_short_hp` admits a
+cell by its ABSOLUTE decimal count (`PAPERCONAN_SHORT_ROW_MIN_FRAC_DIGITS`); the flat
+`_SHORT_ROW_RTOL` holds most of the rest (`PAPERCONAN_SHORT_ROW_RTOL`); and neither moves
+contiguous RECALL, because `_same_band` suppresses the ratio arm whenever every row between a
+pair is also a candidate -- which with no separator is every pair. That guard is FROZEN by a
+go/no-go in the design note this file cites, which forbids removing or rewriting it until the
+real corpus is widened or known candidates are supplied.
 
-Baselines measured on: eee615b. BASELINE was first frozen at 5e64dc7 and re-measured
-unchanged here; PLANTED_BASELINE was added at eee615b. Record a commit rather than "main",
-which moves -- the detector gained a rare-gate change between those two.
-Design: docs/superpowers/specs/2026-07-30-short-row-significance-gate.md section 7.5
+All data is generated from SEED by `random.Random` -- only the stdlib stream is stable across
+versions, and a gate that drifts with a dependency upgrade is not a gate. No real data.
 
-Signal, not verdict: everything this bench produces is a false positive by
-construction, which is the point -- it bounds what the detector says about data that
-has nothing to explain.
+Baselines measured on: eee615b. BASELINE was first frozen at 5e64dc7 and re-measured unchanged
+here; PLANTED_BASELINE was added at eee615b.
+Design: docs/superpowers/specs/2026-07-30-short-row-significance-gate.md
+
+Signal, not verdict: everything the benign side produces is a false positive by construction,
+which is the point -- it bounds what the detector says about data that has nothing to explain.
+
+What was tried against the zeros and rejected is in this file's commit messages, not here.
 """
 from __future__ import annotations
 
@@ -80,72 +93,15 @@ BASELINE = {
     ("panelled", 3): {3: 17, 4: 1},
 }
 
-# Recall of the planted copy-then-scale pair, per (layout, decimals), as {run length: sheets}
-# out of SHEETS. An empty dict means the plant is not found at all on that stratum.
+# Recall of the planted pair, per (layout, decimals), as {run length: sheets} out of SHEETS.
+# An empty dict means the plant is not found at all on that stratum. RECORDED, NOT ENDORSED:
+# the zeros are the gap this arm has. A change that raises this has earned the false positives
+# it also brings; one that lowers it has to say so even if every stratum above improves.
 #
-# Stratifying by run length costs seed stability, and the cost is real: across neighbouring
-# seeds the histogram reproduces markedly less often than a plain sheet count would. It is
-# paid deliberately -- the whole row is an exact copy, so a run shorter than the block is
-# width the detector did not recover, and a change halving every run while keeping the pair
-# reported would be invisible in an integer. But it means a movement here is a prompt to
-# re-measure over several seeds before it is read as a size. The same caution applies to
-# BASELINE above, whose busiest stratum swings across most of its range under reseeding with
-# the committed draw near the top of it.
-# RECORDED, NOT ENDORSED -- the zeros are the gap this arm has, written down so that a
-# change which closes any of them can be weighed against what it costs above, in the same
-# file, instead of being argued from a hope.
-#
-# WHAT HAS BEEN TRIED AGAINST THE ZEROS, so the next attempt starts here rather than at the
-# beginning. THREE gates hold these rows down, in different layouts, and only two are
-# tolerances. An earlier draft of this note named two and sent the reader to sweep them for
-# a zero neither of them causes, so the split is spelled out:
-#
-#   * `_is_short_hp` admits a cell by its ABSOLUTE decimal count, so at one and two decimals
-#     almost nothing enters a run. Sweep PAPERCONAN_SHORT_ROW_MIN_FRAC_DIGITS and the coarse
-#     PANELLED rows move -- a little: lowering that floor alone lets a couple of sheets
-#     through, so it is a strong filter rather than the block an earlier draft called it.
-#   * the flat `_SHORT_ROW_RTOL` is the second, and holds most of the rest.
-#     PAPERCONAN_SHORT_ROW_RTOL sweeps it.
-#   * neither moves contiguous RECALL, and that is the one worth knowing. (Contiguous false
-#     positives do move, but only when BOTH knobs are relaxed together -- neither alone moves
-#     them at any setting tried, so do not expect the single-knob sweeps above to show it.)
-#     `_same_band`
-#     suppresses the ratio arm whenever every row between the pair is also a candidate,
-#     which with no separator is every pair -- contiguous recall stays at zero across a full
-#     sweep of both tolerances, and deleting that guard alone turns contiguous/3dp recall
-#     into the panelled row exactly. It is a THIRD gate and not a precision effect.
-#
-# `_same_band` is FROZEN, not merely unimplemented, and the note this file cites says so:
-# docs/superpowers/specs/2026-07-30-short-row-significance-gate.md carries a migration plan
-# that would have removed it, and a later go/no-go that stopped that plan and forbids
-# removing or rewriting it. The stated reason is that no human-confirmed real ratio anchor
-# was established in the frozen corpus -- only synthetic fixtures -- and the stated condition
-# for reopening is a wider real corpus or supplied known candidates, re-run through the same
-# shadow and audit. An earlier draft of this note said the design "plans to remove it",
-# which points the next reader at a course that note forbids.
-#
-# One correction is carried explicitly, because it was believed here on the strength of
-# another commit's prose rather than a measurement -- the same failure the bench rules
-# describe for numbers. Lowering the admission floor was said to make previously reported
-# findings VANISH, `_is_short_hp` feeding the frequency pool behind the rarity gate. At the
-# shipped tolerance it does not: the reported set only grows and no run gets shorter. That
-# coupling was repaired by "trim a matched run to its rare part instead of rejecting it
-# whole", already in main. (At a much wider rtol the coarse strata hit the finding cap and
-# run lengths do shift, so the correction is scoped to the shipped tolerance.)
-#
-# The rejected experiment, and this is the part to READ BEFORE RE-RUNNING IT. A version
-# letting the tolerance follow each cell's recorded precision was measured against this file
-# twice and the two readings disagreed, because they were taken on different plant seeds and
-# one seed cannot decide it. Over a dozen seeds the honest picture is: recall is UNCHANGED
-# at the median, panelled false positives are materially LOWER, and contiguous false
-# positives are several times higher, including runs longer than anything in BASELINE. So it
-# is not the clear refusal an earlier draft here recorded -- "it LOWERED the one non-zero
-# row" was a single-seed artefact and is false at the median -- and it is not a clear
-# acceptance either. Whoever picks it up should re-measure across seeds first and argue the
-# contiguous cost, which is the only part that is unambiguous.
-#
-# Re-measure rather than trusting any of this -- `_measure` and `_measure_planted` are the
-# whole harness, and all three knobs above are read at import.
+# Stratifying by run length costs seed stability -- the histogram reproduces markedly less
+# often than a plain sheet count -- and is paid deliberately, because the whole row is a copy
+# and a change halving every run while keeping the pair reported would be invisible in an
+# integer. See the module docstring on reseeding before reading a movement as a size.
 PLANTED_BASELINE = {
     ("contiguous", 1): {},
     ("contiguous", 2): {},
@@ -183,11 +139,11 @@ def _as_sheet(block, panelled: bool):
 def _planted_block(decimals: int, sheet: int):
     """The same curve block with one row replaced by an exact scaled copy of another.
 
-    Source and destination sit in different panels, because a copy landing next to its
-    source is the case the band guard already covers and is not what this measures. The
-    copy is rounded to the stratum's precision after scaling, which is what an export
-    does and is the whole difficulty: the relation is exact and the stored numbers
-    cannot say so.
+    Source and destination sit in different panels: a copy landing next to its source is what
+    the band guard already covers. The copy is rounded to the stratum's precision AFTER
+    scaling, which is what an export does and is the whole difficulty -- the relation is exact
+    and the stored numbers cannot say so. Returns the pristine block too, so the control below
+    asserts on the same data this planted into.
     """
     assert ROWS >= 3 * PANEL_SIZE, "need three panels to put the copy outside the source's"
     pristine = _curve_block(decimals, sheet)
@@ -219,15 +175,7 @@ def _planted_block(decimals: int, sheet: int):
 def _measure_planted(layout: str, decimals: int):
     """{run_length: sheets} for the planted pair, matched by row label.
 
-    Counts the SCALED arm only. Planting an identical copy instead reads as zero here even
-    though the pair is reported, through the identical arm -- so a change that routes the
-    plant to another arm will look like a recall regression rather than a relocation.
-
-    Stratified by run length for the reason the false-positive table already is, which cuts
-    both ways: a longer run reads as stronger evidence to whoever opens the report. The whole
-    row is an exact scaled copy here, so a run shorter than the block is width the detector
-    did not recover -- and a change that kept every pair reported while halving its run would
-    be invisible in a plain count of sheets.
+    Counts the SCALED arm only -- see the module docstring for what that misses.
     """
     counts: collections.Counter = collections.Counter()
     for s in range(SHEETS):
@@ -297,12 +245,9 @@ def test_planted_scaled_copies_are_found_as_often_as_recorded(layout, decimals):
 def test_the_planted_pair_is_not_reported_without_planting():
     """The planted stratum measures the plant, not the curve underneath it.
 
-    Rows of one dose-response family are near-multiples of each other by construction, so
-    a stratum that counted findings on the planted pair could be counting the curve. It is
-    not: with the same seeds, the same two rows, and the plant removed, that pair is
-    reported nowhere. Asserted only where recall is non-zero -- elsewhere it would hold
-    for the uninteresting reason that nothing is reported at all -- and
-    test_the_bench_still_has_teeth is what keeps that set from quietly emptying.
+    Rows of one dose-response family are near-multiples of each other by construction, so a
+    stratum counting findings on the planted pair could be counting the curve. With the plant
+    removed, that pair is reported nowhere. Asserted only where recall is non-zero.
     """
     live = [k for k, v in PLANTED_BASELINE.items() if v]
     assert live, "no stratum with recall to check; see test_the_bench_still_has_teeth"
@@ -335,18 +280,11 @@ def test_the_bench_still_has_teeth():
 def test_the_contiguous_layout_cannot_certify_anything_on_its_own():
     """Why the panelled variant exists, asserted rather than left in a comment.
 
-    With every row adjacent the band guard treats the block as one band and suppresses the
-    ratio arm, and at the committed seed the stratum is empty at every precision. That is
-    what this test asserts: a frozen fact about this seed, NOT a property. `_same_band` is
-    what holds it down rather than the layout itself -- delete that guard and contiguous/3dp
-    fires, and relaxing both precision knobs together makes the coarse rows fire too. And
-    the guard does not cover everything: it gates the pass-1 same-band path, not the pass-2
-    adjacent-pair one, so reseeding puts a short finding here on a minority of neighbouring
-    seeds. Two earlier drafts of this docstring called the stratum zero "whatever happens"
-    and then zero "at the shipped tolerances"; both were universals, and the file's own
-    prescribed check breaks the second as it broke the first. So a contiguous-only bench
-    would miss most changes rather than all of them, and the panelled layout is what gives
-    this file the rest of its teeth.
+    The contiguous stratum is empty at THIS SEED -- a frozen fact, not a property; the module
+    docstring says what actually holds it down and how it breaks. The teeth clause is anchored
+    on the PLANTED side, because anchoring it on the benign counts reads the outcome this arm
+    is working towards -- the detector getting quieter about curve data -- as the bench
+    breaking.
     """
     contiguous = {d: _measure("contiguous", d) for d in _DECIMALS}
     panelled_planted = {d: _measure_planted("panelled", d) for d in _DECIMALS}
@@ -363,17 +301,9 @@ def test_the_contiguous_layout_cannot_certify_anything_on_its_own():
 
 
 if __name__ == "__main__":       # pragma: no cover - regeneration helper, not a test
-    # Paste-ready tables, over _STRATA. That is what this loop iterates and nothing more --
-    # an earlier draft of this comment said "everything here and in the tests" reads it,
-    # which is not true and is the overclaim this file keeps making. What IS true: a rung
-    # added to _DECIMALS lands in both regenerated tables, and the parametrized tests then
-    # pick it up because they iterate the tables' own keys. The layout test below names its
-    # two layouts on purpose -- it exists to contrast them -- so a new LAYOUT would reach the
-    # tables and those tests and still bypass it.
-    #
-    # The predecessor hardcoded the layouts and the ladder at each use site and claimed in a
-    # comment that doing so avoided dropping a stratum, which is backwards: a hardcoded pair
-    # is exactly what silently drops one.
+    # Paste-ready tables, over _STRATA. A rung added to _DECIMALS lands in both tables here
+    # and the parametrized tests pick it up from the tables' own keys; a new LAYOUT would
+    # reach both but still bypass the layout test, which names its two on purpose.
     for _name, _fn in (("BASELINE", _measure), ("PLANTED_BASELINE", _measure_planted)):
         print(f"{_name} = {{")
         for _layout, _d in _STRATA:
