@@ -27,6 +27,46 @@ def test_parse_nature_esm_links_extracts_and_classifies():
     assert by_ext["xlsx"]["download_url"].startswith("https://static-content.springer.com/esm/")
 
 
+def test_parse_nature_esm_links_keeps_the_link_text_as_a_label():
+    """The article page says which figure a file belongs to; keep it.
+
+    Without it a workbook is just `41467_2022_28338_MOESM4_ESM.xlsx`, and nothing downstream
+    can say which figure it holds -- the page knew, and the parser was throwing it away.
+    """
+    by_ext = {r["ext"]: r for r in nat.parse_nature_esm_links(FIXTURE_HTML)}
+
+    assert by_ext["xlsx"]["label"] == "Source Data Fig 1"
+    assert by_ext["csv"]["label"] == "Source Data Fig 2"
+    assert by_ext["pdf"]["label"] == "Supplementary Information"
+
+
+# A label is only taken when the anchor itself carries it. Guessing from surrounding text
+# would attach a figure number to a file that may not hold it, and a wrong label is worse
+# than none: it would let a finding be credited to a figure it never came from.
+UNLABELLED_ESM_HTML = '''
+<html><body>
+<p>Source Data Fig 3</p>
+<a href="https://static-content.springer.com/esm/art%3A10.1038%2Fs41467-022-28338-0/MediaObjects/41467_2022_28338_MOESM7_ESM.xlsx"><span class="icon"></span></a>
+</body></html>
+'''
+
+
+def test_parse_nature_esm_links_leaves_the_label_empty_rather_than_guessing():
+    refs = nat.parse_nature_esm_links(UNLABELLED_ESM_HTML)
+
+    assert len(refs) == 1
+    assert refs[0]["label"] is None
+
+
+def test_parse_nature_esm_links_strips_markup_from_the_label():
+    html = FIXTURE_HTML.replace(
+        ">Source Data Fig 1<", "><strong>Source Data</strong>\n  Fig 1<")
+
+    by_ext = {r["ext"]: r for r in nat.parse_nature_esm_links(html)}
+
+    assert by_ext["xlsx"]["label"] == "Source Data Fig 1"
+
+
 # Newer article pages serve ESM from the media.springernature.com CDN instead.
 MEDIA_ESM_HTML = '''
 <html><body>

@@ -106,4 +106,5 @@ def test_dryad_candidate_omits_files_without_valid_download_links(
         "ext": "csv",
         "size": 1,
         "download_url": "https://cdn.example.net/files/valid.csv",
+        "label": None,
     }]
