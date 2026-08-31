@@ -41,10 +41,89 @@ uv run pytest                 # or: .venv/bin/pytest
 uv run pytest tests/test_decimal_tail_gate.py -q     # a single file
 ```
 
-- 41 test files; golden fixtures in `tests/golden/` and `tests/fixtures/`.
+- Golden fixtures in `tests/golden/` and `tests/fixtures/`.
 - **Live-network** tests are skipped unless `PAPERCONAN_LIVE=1` (pytest marker `network`).
 - Detector correctness is guarded by golden + brute-force-oracle tests (e.g. GRIM/GRIMMER, FDR,
   decimal-tail gate). If you touch a detector, keep these green and add a fixture for the new case.
+
+### False-positive benches
+
+`tests/test_curve_bench_baseline.py` (short-row) and `tests/test_column_pair_bench_baseline.py`
+(column-pair) are not unit tests. Each generates its own data, so the answer is known by
+construction; runs the shipped detector over it; and freezes what came back. They exist so a
+change to a detector's tolerance is argued against a measurement rather than against a corpus
+sample, which is not an instrument: the same change measured over a small slice of the corpus and
+over a larger one gave opposite answers about part of itself.
+
+Practicalities: `pytest -k "not bench_baseline"` deselects both while iterating. Neither is marked
+for opt-in — a bench skipped by default is green while the detector moves, which is the condition
+they were written to end. Each carries a `__main__` block that reprints its frozen tables
+paste-ready; regenerate that way rather than hand-editing a table.
+
+Four rules, each of which cost review rounds to learn. Where a claim below has a size, the
+recipe for measuring it is given instead of the figure — see the fourth rule for why:
+
+- **A bench needs a true-positive stratum.** One made only of things that must not fire is passed
+  perfectly by a detector that never fires. Include the relation the arm exists to catch, and
+  freeze how much of it is currently found — including when that is "almost none", which is a
+  recorded gap and not a target. Until a bench has one, a change to that arm can only be argued
+  on its cost, and a cost with no measured benefit beside it is half a decision.
+- **Freeze a verdict, not a count**, wherever a stratum can sit on a gate — a verdict being a
+  band (silent / partial / pervasive, per finding kind) rather than the number of draws that
+  fired. Whether a draw fires *at* a gate is a coin flip that no number of repeats turns into a
+  constant, so re-deriving a count-based baseline at a neighbouring seed moves strata the
+  detector never touched: the same defect the corpus sampling had, arriving from a new source.
+  That is what killed the column-pair bench's first, count-based design; how much it bites
+  depends on how many of a bench's strata sit on a gate, so measure it on yours rather than
+  carrying a share from someone else's. Bands survive reseeding where counts do not — perturb `SEED` over a run of neighbouring
+  values and re-measure both to see the difference for yourself. The short-row bench still freezes
+  counts, and its own data shows the cost: reseed it and its busiest stratum ranges over most of
+  what it can produce, with the committed draw at the top of that range. Treat a movement there
+  as a prompt to re-measure across seeds, not as a size.
+- **Keep it small; add capabilities singly.** A bench's defects concentrate in the layers added
+  to make it "resolve" things rather than in its core — though nothing is exempt: a round spent
+  fixing a bench's own claims turned up a defect in the DETECTOR, a constant named for the
+  branches it was meant to govern that reached none of them. More than once
+  a test written to repair the previous round's defect was itself defective: a control calibrated
+  to the wrong gate stayed green through exactly the event its failure message described, and an
+  assertion about two gates went vacuous when the first was *tightened*. So whenever you add an
+  assertion to a bench, delete the thing it guards and confirm it goes red; if it stays green,
+  you added decoration. A simple bench that measures one thing correctly beats an elaborate one
+  making claims that do not hold.
+- **Do not put a number in prose that no test asserts.** A measurement quoted in a comment to
+  justify a design decision decays as the file changes, and one quoted without the configuration
+  it was taken on is not falsifiable at all — a claim about "thirty seeds" that never said which
+  thirty was false for the obvious choice and true only for an unstated one. Name what to measure
+  and how; carry a figure only where it is structural (a literal in the source, greppable) or
+  where a test checks it. This applies to non-numeric claims too, which decay the same way and
+  are harder to spot. Three that were committed in this repo and are all false, quoted as they
+  were written: a bench layout that "returns 0 no matter what the detector does"; a guard the
+  design note "plans to remove"; and one that "changed only the finest rung". Note the last:
+  what it replaced — "deleting that guard changes nothing" — was TRUE, and rewriting it to sound
+  more specific is what made it false. Precision added without re-measuring is not precision.
+  Re-measure before repeating a claim from another commit's prose, including your own.
+  Keep the record of what was tried and rejected — that is what stops the next person re-running
+  it — but as what happened, not as decimal places.
+
+  A CHEAP FIRST PASS, and only a first pass: before committing, grep your own added prose for
+  universal quantifiers — every, everything, none, all, always, never, only, whatever, "no matter
+  what", "by construction" — and verify each separately. That is worth doing because one
+  recurring class of false claim has exactly that shape: a sentence that would have been true
+  with a qualifier and was written without one.
+
+  It is NOT sufficient, and the first draft of this very paragraph claimed it was. Of the
+  examples above, the design-note one carries no word on that list, and neither do other
+  corrections made in these files — a comparative stated backwards, a mechanism attributed to
+  the wrong gate, a generator described as drawing data it does not draw. Nor is the list
+  stable: "no matter what" is on it only because writing this paragraph found it missing, and
+  adding it changed which of the examples above the check would have caught. That is the
+  argument for running the grep and against trusting it. Nothing replaces re-measuring; the
+  grep only makes the cheapest subset free. It is also line-oriented, so a phrase wrapped across
+  two lines slips through — including in this paragraph.
+
+  Whatever the check, run it on the REPAIR and not just the first draft. Every instance of this
+  found so far arrived in a sentence written to correct another sentence, because prose written
+  to fix something reads as though it has already been checked.
 
 ## Run the CLI
 
