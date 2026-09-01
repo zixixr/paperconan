@@ -24,13 +24,21 @@ def _rank(cand):
 
 def search_all(query, per_source=5):
     q = _resolve.normalize_query(query)
-    paper = {"doi": q["doi"], "title": q["title"], "authors": []}
+    doi, title, authors = q["doi"], q["title"], []
     if q["is_doi"]:
-        enriched = _resolve.enrich_via_crossref(q["doi"])
-        if enriched:
-            paper["title"] = paper["title"] or enriched.get("title")
-            paper["authors"] = enriched.get("authors") or []
-    search_term = q["doi"] or q["title"] or query
+        enriched = _resolve.enrich_via_crossref(doi) or {}
+        # A retraction, correction or expression of concern has its own DOI and no
+        # supplementary files. Searching one finds nothing, and that failure is
+        # indistinguishable from a paper that published none -- so follow it to the article
+        # it concerns and search for THAT. The link rides on the record just fetched.
+        original = enriched.get("original_doi")
+        if original:
+            doi = original
+            enriched = _resolve.enrich_via_crossref(doi) or {}
+        title = title or enriched.get("title")
+        authors = enriched.get("authors") or []
+    paper = {"doi": doi, "title": title, "authors": authors}
+    search_term = doi or q["title"] or query
 
     cands = []
     for fn in (_sources.search_nature_esm, _sources.search_zenodo, _sources.search_figshare,

@@ -75,3 +75,65 @@ def test_is_confident_match_requires_doi_or_strong_title():
         {"match_signals": {"doi_in_related": False, "title_overlap": 0.02}})
     assert not _resolve.is_confident_match({"match_signals": None})
     assert not _resolve.is_confident_match({})
+
+
+# --- a DOI that names a notice, not the paper the notice is about ----------------------
+
+def _crossref(monkeypatch, message):
+    """Stand in for the Crossref lookup so these stay offline."""
+    from paperconan.fetch import _http
+    monkeypatch.setattr(_http, "get_json", lambda *a, **k: {"message": message})
+
+
+def test_original_article_doi_reads_update_to(monkeypatch):
+    """A retraction or correction carries no source data of its own.
+
+    Its Crossref record points at the article it concerns, so the fetch should follow that
+    rather than searching for supplementary files attached to a one-page notice.
+    """
+    _crossref(monkeypatch, {
+        "title": ["Retraction Note: Something about cells"],
+        "type": "journal-article",
+        "update-to": [{"DOI": "10.1038/s41467-021-00000-1", "type": "retraction"}],
+    })
+
+    assert _resolve.original_article_doi("10.1038/s41467-026-00000-9") == \
+        "10.1038/s41467-021-00000-1"
+
+
+def test_original_article_doi_falls_back_to_relation(monkeypatch):
+    """Some publishers record the link only under `relation`, not `update-to`."""
+    _crossref(monkeypatch, {
+        "title": ["Author Correction: Something about cells"],
+        "relation": {"is-correction-of": [{"id": "10.1038/s41586-020-00000-2",
+                                           "id-type": "doi"}]},
+    })
+
+    assert _resolve.original_article_doi("10.1038/s41586-026-00000-8") == \
+        "10.1038/s41586-020-00000-2"
+
+
+def test_original_article_doi_is_none_for_an_ordinary_paper(monkeypatch):
+    """The common case must not be disturbed: a research article resolves to itself."""
+    _crossref(monkeypatch, {"title": ["Structure of a membrane protein"],
+                            "type": "journal-article"})
+
+    assert _resolve.original_article_doi("10.1038/s41586-020-00000-2") is None
+
+
+def test_original_article_doi_is_none_when_the_notice_names_no_original(monkeypatch):
+    """A notice with nothing to follow is not an error, and must not return itself."""
+    _crossref(monkeypatch, {"title": ["Editorial Expression of Concern"]})
+
+    assert _resolve.original_article_doi("10.1126/science.0000000") is None
+
+
+def test_original_article_doi_survives_a_lookup_failure(monkeypatch):
+    from paperconan.fetch import _http
+
+    def boom(*a, **k):
+        raise OSError("network down")
+
+    monkeypatch.setattr(_http, "get_json", boom)
+
+    assert _resolve.original_article_doi("10.1038/s41467-026-00000-9") is None

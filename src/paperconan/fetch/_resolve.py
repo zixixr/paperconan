@@ -17,7 +17,12 @@ def normalize_query(text):
 
 
 def enrich_via_crossref(doi):
-    """Best-effort title/authors/year for a paper DOI. Returns None on any failure."""
+    """Best-effort title/authors/year for a paper DOI. Returns None on any failure.
+
+    Also carries `original_doi`: the article a retraction or correction concerns, when this
+    DOI names one. It comes from the same record, so asking costs no extra request -- and a
+    separate lookup would double the round-trips on every fetch.
+    """
     try:
         m = _http.get_json(
             f"https://api.crossref.org/works/{urllib.parse.quote(doi, safe='')}"
@@ -31,7 +36,55 @@ def enrich_via_crossref(doi):
     dp = m.get("issued", {}).get("date-parts", [[None]])
     if dp and dp[0]:
         year = str(dp[0][0])
-    return {"doi": doi, "title": title, "authors": authors, "year": year}
+    return {"doi": doi, "title": title, "authors": authors, "year": year,
+            "original_doi": _original_from_record(m)}
+
+
+# A retraction, correction or expression of concern is a page of its own, with its own DOI
+# and no supplementary files. Searching one for source data finds nothing, and the failure
+# looks exactly like a paper that published none. Crossref records what the notice is about,
+# so the DOI of the article itself is recoverable.
+_NOTICE_TITLE = re.compile(
+    r"^\s*(retraction|retracted|withdrawn|author correction|publisher correction|correction"
+    r"|corrigendum|erratum|editorial expression of concern|expression of concern"
+    r"|editor'?s note|matters arising)\b",
+    re.I,
+)
+# Where a publisher records the link. `update-to` is the standard place; some use `relation`
+# instead, and a few use both.
+_ORIGINAL_RELATIONS = ("is-correction-of", "is-retraction-of", "is-comment-on")
+
+
+def _original_from_record(message):
+    """The DOI of the article this Crossref record is a notice about, or None.
+
+    None also covers "it is a notice but names nothing to follow" -- an expression of concern
+    that lists no original is not an error, and returning the notice's own DOI would send the
+    search straight back where it started.
+    """
+    title = (message.get("title") or [""])[0]
+    if not _NOTICE_TITLE.match(title or ""):
+        return None
+    for update in (message.get("update-to") or []):
+        if update.get("DOI"):
+            return update["DOI"]
+    relation = message.get("relation") or {}
+    for key in _ORIGINAL_RELATIONS:
+        for entry in relation.get(key, []):
+            if entry.get("id-type") == "doi" and entry.get("id"):
+                return entry["id"]
+    return None
+
+
+def original_article_doi(doi):
+    """`_original_from_record` for a DOI, fetching the record. One request."""
+    try:
+        message = _http.get_json(
+            f"https://api.crossref.org/works/{urllib.parse.quote(doi, safe='')}"
+        ).get("message", {})
+    except Exception:
+        return None
+    return _original_from_record(message)
 
 
 # DOI registrant prefix -> publisher, for pointing users at the article page when the

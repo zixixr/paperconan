@@ -39,3 +39,67 @@ def test_search_all_includes_europepmc_supplementary(monkeypatch):
 
     cands = fetch.search_all("10.1038/paper", per_source=5)
     assert any(c["source"] == "europepmc" and c.get("supplementary_archive") for c in cands)
+
+
+def _no_sources(monkeypatch, seen):
+    """Record the term each source is searched with; return nothing."""
+    def spy(q, size=5):
+        seen.append(q)
+        return []
+    for name in ("search_nature_esm", "search_zenodo", "search_figshare",
+                 "search_dryad", "search_europepmc"):
+        monkeypatch.setattr(fetch._sources, name, spy)
+
+
+def test_search_all_follows_a_notice_to_the_article_it_concerns(monkeypatch):
+    """A retraction or correction has its own DOI and no supplementary files of its own.
+
+    Searching one finds nothing, and that failure is indistinguishable from a paper that
+    published no source data -- so the DOI is followed to the article first.
+    """
+    seen = []
+    _no_sources(monkeypatch, seen)
+    records = {"10.1038/notice-9": {"title": "Retraction Note: x",
+                                    "original_doi": "10.1038/original-1"},
+               "10.1038/original-1": {"title": "x", "original_doi": None}}
+    monkeypatch.setattr(fetch._resolve, "enrich_via_crossref", records.get)
+
+    fetch.search_all("10.1038/notice-9", per_source=5)
+
+    assert seen and set(seen) == {"10.1038/original-1"}
+
+
+def test_search_all_leaves_an_ordinary_paper_alone(monkeypatch):
+    """The common path must not change: a research article is searched as itself."""
+    seen = []
+    _no_sources(monkeypatch, seen)
+    calls = []
+
+    def enrich(doi):
+        calls.append(doi)
+        return {"title": "A research article", "original_doi": None}
+
+    monkeypatch.setattr(fetch._resolve, "enrich_via_crossref", enrich)
+
+    fetch.search_all("10.1038/paper-2", per_source=5)
+
+    assert seen and set(seen) == {"10.1038/paper-2"}
+    # and it costs no extra round-trip: the notice link rides on the record already fetched
+    assert calls == ["10.1038/paper-2"]
+
+
+def test_search_all_does_not_follow_a_notice_for_a_title_query(monkeypatch):
+    """Only a DOI can be a notice. A title query has nothing to resolve."""
+    seen = []
+    _no_sources(monkeypatch, seen)
+    called = []
+
+    def enrich(doi):
+        called.append(doi)
+        return None
+
+    monkeypatch.setattr(fetch._resolve, "enrich_via_crossref", enrich)
+
+    fetch.search_all("Structure of a membrane protein", per_source=5)
+
+    assert not called
