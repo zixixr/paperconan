@@ -19,8 +19,14 @@ def test_nature_esm_links_carry_their_labels_live():
     """The label capture against a real article page, not a fixture.
 
     A fixture proves the parser reads an anchor; it cannot prove the pages this parser is
-    aimed at put text there at all. What is asserted is only what holds for every article:
-    each ESM link carries SOME label.
+    aimed at put text there at all. What is asserted is that every ESM link on THIS article
+    carries some label.
+
+    Not "every article": that would be a claim about a publisher's markup habit, and the
+    parser does not enforce it -- an anchor whose only content is an icon yields None, and
+    a unit test in this suite builds exactly that page. One article cannot establish the
+    habit either way. An earlier draft of this docstring said "what holds for every
+    article" and was wrong on both counts.
 
     Deliberately NOT asserted: that a label names a figure. A first draft of this test did,
     and live data refused it -- the labels on this article are all of the "Supplementary
