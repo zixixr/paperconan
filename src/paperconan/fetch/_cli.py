@@ -52,24 +52,34 @@ def fetch_main(argv):
     ap.add_argument("--per-source", type=int, default=5, help="max results per repository (default: 5)")
     args = ap.parse_args(argv)
 
-    cands = search_all(args.query, per_source=args.per_source)
+    cands, resolution = search_all(args.query, per_source=args.per_source,
+                                   with_resolution=True)
 
     # `search_all` may have followed a retraction or correction to the article it concerns.
     # Every path below that points the user somewhere must point at THAT, not at the notice
     # they typed -- guidance sending them back to a one-page notice is guidance to nowhere.
+    # The resolution comes back beside the list, not on its members: a notice DOI usually
+    # finds NOTHING, and that empty search is the case this whole feature exists for.
     q = _resolve.normalize_query(args.query)
-    resolved_doi = (cands[0].get("resolved_doi") if cands else None) or q.get("doi")
+    resolved_doi = resolution.get("resolved_doi") or q.get("doi")
     guidance_paper = {"doi": resolved_doi, "title": q.get("title")}
-    if resolved_doi and q.get("doi") and resolved_doi != q["doi"]:
-        print(f"{q['doi']} names a retraction or correction; searching the article it "
-              f"concerns instead: {resolved_doi}\n")
-    several = (cands[0].get("notice_names_several_articles") if cands else None)
-    if several:
-        print(f"{q['doi']} is a notice naming {len(several)} articles, so none was followed "
-              f"-- fetch whichever you mean by its own DOI:")
-        for one in several:
-            print(f"    {one}")
-        print()
+    # `--json` promises parseable stdout, so these notes are held back there. They are not
+    # lost: `resolved_doi` rides on every candidate, and a caller reading JSON is a program
+    # that can compare it to the DOI it asked for.
+    if not args.json:
+        if resolution.get("followed_a_notice"):
+            print(f"{q['doi']} names a retraction or correction; searching the article it "
+                  f"concerns instead: {resolved_doi}\n")
+        several = resolution.get("notice_names_several_articles") or []
+        if several:
+            # The DOI that names several may be an intermediate notice reached by a hop,
+            # not the one typed.
+            named_by = resolution.get("ambiguous_notice_doi") or q.get("doi")
+            print(f"{named_by} is a notice naming {len(several)} articles, so none was "
+                  f"followed -- fetch whichever you mean by its own DOI:")
+            for one in several:
+                print(f"    {one}")
+            print()
 
     target = None
     if args.download:

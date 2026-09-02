@@ -109,25 +109,28 @@ def test_search_all_will_not_pick_between_the_articles_a_notice_names(monkeypatc
     check would then endorse a stranger's data as this paper's. It searches the notice
     instead, and says what it declined to choose between."""
     seen = []
-    monkeypatch.setattr(fetch._sources, "search_nature_esm",
-                        lambda q, size=5: [{"cand_id": "x:1", "source": "x", "id": "1",
-                                            "doi": None, "title": "", "authors": [],
-                                            "published": None, "tabular_files": [],
-                                            "all_files_count": 0, "related_dois": [],
-                                            "match_signals": None}])
-    for name in ("search_zenodo", "search_figshare", "search_dryad", "search_europepmc"):
+    # EVERY source returns nothing, which is what searching a notice actually does. An
+    # earlier version of this test invented one candidate so that `cands[0]` would exist
+    # to read the answer off -- that invented candidate was the only reason it passed, and
+    # the zero-candidate case it could not express was the one that was broken.
+    for name in ("search_nature_esm", "search_zenodo", "search_figshare",
+                 "search_dryad", "search_europepmc"):
         monkeypatch.setattr(fetch._sources, name, lambda q, size=5: seen.append(q) or [])
     _records(monkeypatch, {
         "10.1038/bulk-notice": {"title": "Expression of Concern: three articles",
                                 "original_dois": ["10.1038/a-1", "10.1038/b-2", "10.1038/c-3"]},
     })
 
-    cands = fetch.search_all("10.1038/bulk-notice", per_source=5)
+    cands, resolution = fetch.search_all("10.1038/bulk-notice", per_source=5,
+                                         with_resolution=True)
 
     assert set(seen) == {"10.1038/bulk-notice"}, "must not follow any one of them"
-    assert cands[0]["notice_names_several_articles"] == \
+    assert cands == []
+    assert resolution["notice_names_several_articles"] == \
         ["10.1038/a-1", "10.1038/b-2", "10.1038/c-3"]
-    assert cands[0]["resolved_doi"] == "10.1038/bulk-notice"
+    assert resolution["ambiguous_notice_doi"] == "10.1038/bulk-notice"
+    assert resolution["resolved_doi"] == "10.1038/bulk-notice"
+    assert resolution["followed_a_notice"] is False
 
 
 def test_search_all_leaves_an_ordinary_paper_alone(monkeypatch):

@@ -44,9 +44,13 @@ def enrich_via_crossref(doi):
 # and no supplementary files. Searching one for source data finds nothing, and the failure
 # looks exactly like a paper that published none. Crossref records what the notice is about,
 # so the DOI of the article itself is recoverable.
+# `editorial` is an optional prefix rather than one spelled-out phrase: Science files its
+# retractions as "Editorial retraction", which the spelled-out list missed while matching
+# "Editorial expression of concern" -- the same word in front of a different noun.
 _NOTICE_TITLE = re.compile(
-    r"^\s*(retraction|retracted|withdrawn|author correction|publisher correction|correction"
-    r"|corrigendum|erratum|editorial expression of concern|expression of concern"
+    r"^\s*(?:editorial\s+)?"
+    r"(retraction|retracted|withdrawn|author correction|publisher correction|correction"
+    r"|corrigendum|erratum|expression of concern"
     r"|editor'?s note|matters arising)\b",
     re.I,
 )
