@@ -16,12 +16,31 @@ def _minimal_xlsx_bytes():
     return payload.getvalue()
 
 
+
+def _stub_search(cands, **resolution):
+    """Stand in for `search_all` exactly as `_cli` calls it -- resolution BESIDE the list.
+
+    A stub returning a bare list raises TypeError against the keyword rather than quietly
+    handing back something the CLI then misreads, which is the point: the defect this
+    replaces was resolution carried ON the candidates, invisible whenever there were none.
+    """
+    base = {"query_doi": None, "resolved_doi": None, "followed_a_notice": False,
+            "ambiguous_notice_doi": None, "notice_names_several_articles": [],
+            "title": None}
+    base.update(resolution)
+
+    def _search(query, per_source=5, *, with_resolution=False):
+        return (list(cands), dict(base)) if with_resolution else list(cands)
+
+    return _search
+
+
 def test_fetch_list_prints_candidates_json(monkeypatch, capsys):
     cands = [{"cand_id": "zenodo:1", "source": "zenodo", "doi": "10.x/z",
               "title": "T", "tabular_files": [{"name": "a.xlsx"}],
               "all_files_count": 1, "match_signals": {"doi_in_related": True,
               "title_overlap": None, "author_overlap": None}}]
-    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: cands)
+    monkeypatch.setattr(_cli, "search_all", _stub_search(cands))
     rc = _cli.fetch_main(["10.15761/JTS.1000455", "--json"])
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
@@ -33,7 +52,7 @@ def test_fetch_download_selected_candidate(monkeypatch, tmp_path):
               "tabular_files": [{"name": "a.csv", "ext": "csv", "size": 3,
               "download_url": "u"}], "all_files_count": 1,
               "match_signals": {"doi_in_related": True}}]
-    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: cands)
+    monkeypatch.setattr(_cli, "search_all", _stub_search(cands))
     captured = {}
     monkeypatch.setattr(_cli, "download_candidate",
                         lambda c, out_dir, **kw: captured.update(cid=c["cand_id"], out=out_dir)
@@ -44,13 +63,13 @@ def test_fetch_download_selected_candidate(monkeypatch, tmp_path):
 
 
 def test_fetch_download_missing_candidate_returns_2(monkeypatch):
-    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: [])
+    monkeypatch.setattr(_cli, "search_all", _stub_search([]))
     rc = _cli.fetch_main(["10.x/paper", "--download", "zenodo:999"])
     assert rc == 2
 
 
 def test_fetch_auto_empty_returns_1(monkeypatch):
-    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: [])
+    monkeypatch.setattr(_cli, "search_all", _stub_search([]))
     rc = _cli.fetch_main(["10.x/paper", "--auto", "--out", "/tmp/pc_auto_empty"])
     assert rc == 1
 
@@ -60,7 +79,7 @@ def test_fetch_auto_downloads_top_candidate(monkeypatch, tmp_path):
               "all_files_count": 1, "match_signals": {"doi_in_related": True},
               "tabular_files": [{"name": "a.csv", "ext": "csv", "size": 3,
               "download_url": "u"}]}]
-    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: cands)
+    monkeypatch.setattr(_cli, "search_all", _stub_search(cands))
     captured = {}
     monkeypatch.setattr(_cli, "download_candidate",
                         lambda c, out_dir, **kw: captured.update(cid=c["cand_id"])
@@ -78,7 +97,7 @@ def test_fetch_auto_refuses_unmatched_candidate(monkeypatch, capsys):
               "all_files_count": 147, "match_signals": {"doi_in_related": False,
               "title_overlap": 0.02, "author_overlap": 0.0},
               "tabular_files": [{"name": "x.csv", "ext": "csv", "size": 3, "download_url": "u"}]}]
-    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: cands)
+    monkeypatch.setattr(_cli, "search_all", _stub_search(cands))
     called = {"n": 0}
     monkeypatch.setattr(_cli, "download_candidate",
                         lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {})
@@ -96,7 +115,7 @@ def test_fetch_download_unmatched_requires_force(monkeypatch, capsys):
               "all_files_count": 1, "match_signals": {"doi_in_related": False,
               "title_overlap": 0.02}, "tabular_files": [{"name": "x.csv", "ext": "csv",
               "size": 3, "download_url": "u"}]}]
-    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: cands)
+    monkeypatch.setattr(_cli, "search_all", _stub_search(cands))
     called = {"n": 0}
     monkeypatch.setattr(_cli, "download_candidate",
                         lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {})
@@ -111,7 +130,7 @@ def test_fetch_download_unmatched_with_force_proceeds(monkeypatch, tmp_path):
               "all_files_count": 1, "match_signals": {"doi_in_related": False,
               "title_overlap": 0.02}, "tabular_files": [{"name": "x.csv", "ext": "csv",
               "size": 3, "download_url": "u"}]}]
-    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: cands)
+    monkeypatch.setattr(_cli, "search_all", _stub_search(cands))
     captured = {}
     monkeypatch.setattr(_cli, "download_candidate",
                         lambda c, out_dir, **kw: captured.update(cid=c["cand_id"])
@@ -128,7 +147,7 @@ def test_fetch_list_flags_unmatched_candidate(monkeypatch, capsys):
               "all_files_count": 5, "match_signals": {"doi_in_related": False,
               "title_overlap": 0.02, "author_overlap": 0.0},
               "tabular_files": [{"name": "x.csv"}]}]
-    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: cands)
+    monkeypatch.setattr(_cli, "search_all", _stub_search(cands))
     rc = _cli.fetch_main(["10.x/paper"])
     assert rc == 0
     assert "no DOI/title match" in capsys.readouterr().out
@@ -143,7 +162,7 @@ def test_fetch_download_and_auto_mutually_exclusive():
 def test_fetch_empty_prints_journal_guidance(monkeypatch, capsys):
     """No open-repo hit on a Nature DOI: point the user to the article's Source Data
     section instead of leaving them with a dead end."""
-    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: [])
+    monkeypatch.setattr(_cli, "search_all", _stub_search([]))
     rc = _cli.fetch_main(["10.1038/s41590-026-02471-0"])
     assert rc == 0
     out = capsys.readouterr().out
@@ -153,7 +172,7 @@ def test_fetch_empty_prints_journal_guidance(monkeypatch, capsys):
 
 def test_fetch_empty_json_mode_stays_clean(monkeypatch, capsys):
     """--json must remain machine-parseable (empty list), no guidance prose mixed in."""
-    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: [])
+    monkeypatch.setattr(_cli, "search_all", _stub_search([]))
     rc = _cli.fetch_main(["10.1038/x", "--json"])
     assert rc == 0
     assert json.loads(capsys.readouterr().out) == []
@@ -169,7 +188,7 @@ def test_fetch_images_passes_additive_option(monkeypatch, tmp_path):
         "tabular_files": [{"name": "data.csv"}],
         "image_files": [{"name": "Fig1.png"}],
     }]
-    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: cands)
+    monkeypatch.setattr(_cli, "search_all", _stub_search(cands))
     captured = {}
 
     def stub_download(candidate, out_dir, **kwargs):
@@ -202,7 +221,7 @@ def test_fetch_auto_uses_jci_fallback_after_archive_failure(
             "name": "PMC1_supplementary.zip",
         },
     }
-    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: [candidate])
+    monkeypatch.setattr(_cli, "search_all", _stub_search([candidate]))
     monkeypatch.setattr(
         _http,
         "get_text",
@@ -244,3 +263,110 @@ def test_fetch_auto_uses_jci_fallback_after_archive_failure(
     assert rc == 0
     assert "downloaded 1 file(s)" in capsys.readouterr().out
     assert (tmp_path / "table.xlsx").exists()
+
+
+def test_fetch_zero_candidates_still_points_at_the_resolved_article(monkeypatch, capsys):
+    """The empty search IS the notice case, so it is the one the guidance must get right.
+
+    A notice has no supplementary files of its own; searching it finds nothing. That is not
+    an edge case to tidy up later, it is the ordinary outcome -- and it is where the
+    substitution used to be thrown away, sending the reader back to the one-page notice
+    they had just been moved off.
+    """
+    monkeypatch.setattr(_cli, "search_all", _stub_search(
+        [], query_doi="10.1038/notice-9", resolved_doi="10.1038/orig-1",
+        followed_a_notice=True))
+
+    rc = _cli.fetch_main(["10.1038/notice-9"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "names a retraction or correction" in captured.err
+    assert "10.1038/orig-1" in captured.err
+    # The guidance link must be the article's, not the notice's.
+    assert "https://doi.org/10.1038/orig-1" in captured.out
+
+
+def test_fetch_zero_candidates_still_lists_a_multi_article_notice(monkeypatch, capsys):
+    """Naming the articles is the entire remedy offered when none can be followed."""
+    monkeypatch.setattr(_cli, "search_all", _stub_search(
+        [], query_doi="10.1038/bulk", resolved_doi="10.1038/bulk",
+        ambiguous_notice_doi="10.1038/bulk",
+        notice_names_several_articles=["10.1038/a-1", "10.1038/b-2", "10.1038/c-3"]))
+
+    rc = _cli.fetch_main(["10.1038/bulk"])
+
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "naming 3 articles" in err
+    for one in ("10.1038/a-1", "10.1038/b-2", "10.1038/c-3"):
+        assert one in err
+
+
+def test_fetch_json_stays_parseable_when_a_notice_resolves(monkeypatch, capsys):
+    """`--json` promises machine-readable stdout, and a resolving notice must not break it."""
+    cands = [{"cand_id": "zenodo:1", "source": "zenodo", "doi": "10.x/z", "title": "T",
+              "tabular_files": [], "all_files_count": 1, "resolved_doi": "10.1038/orig-1",
+              "match_signals": {"doi_in_related": True}}]
+    monkeypatch.setattr(_cli, "search_all", _stub_search(
+        cands, query_doi="10.1038/notice-9", resolved_doi="10.1038/orig-1",
+        followed_a_notice=True))
+
+    rc = _cli.fetch_main(["10.1038/notice-9", "--json"])
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    parsed = json.loads(captured.out)
+    assert parsed[0]["resolved_doi"] == "10.1038/orig-1"
+    # And the substitution is stated, not merely inferable from the payload.
+    assert "10.1038/orig-1" in captured.err
+
+
+def test_fetch_names_the_notice_that_actually_lists_several(monkeypatch, capsys):
+    """After a hop the ambiguity belongs to an intermediate notice, not the typed DOI."""
+    monkeypatch.setattr(_cli, "search_all", _stub_search(
+        [], query_doi="10.1038/notice-1", resolved_doi="10.1038/notice-2",
+        followed_a_notice=True, ambiguous_notice_doi="10.1038/notice-2",
+        notice_names_several_articles=["10.1038/a-1", "10.1038/b-2"]))
+
+    _cli.fetch_main(["10.1038/notice-1"])
+
+    err = capsys.readouterr().err
+    assert "10.1038/notice-2 is a notice naming 2 articles" in err
+    assert "10.1038/notice-1 is a notice naming" not in err
+
+
+def test_fetch_json_with_no_candidates_still_says_it_followed_a_notice(monkeypatch, capsys):
+    """A notice DOI usually finds nothing, so this is the ordinary `--json` result for one.
+
+    stdout stays the array a caller parses. What must not happen is that the array is the
+    WHOLE story: a bare `[]` reads as "this paper published no source data", which is the
+    ambiguity the notice-following exists to remove. Holding the note back whenever
+    `--json` was set put that silence right back.
+    """
+    monkeypatch.setattr(_cli, "search_all", _stub_search(
+        [], query_doi="10.1038/notice-9", resolved_doi="10.1038/orig-1",
+        followed_a_notice=True))
+
+    rc = _cli.fetch_main(["10.1038/notice-9", "--json"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert json.loads(captured.out) == []
+    assert "10.1038/orig-1" in captured.err
+
+
+def test_fetch_json_with_no_candidates_still_lists_a_multi_article_notice(monkeypatch, capsys):
+    """Same for the ambiguous case: naming the articles is the only remedy on offer."""
+    monkeypatch.setattr(_cli, "search_all", _stub_search(
+        [], query_doi="10.1038/bulk", resolved_doi="10.1038/bulk",
+        ambiguous_notice_doi="10.1038/bulk",
+        notice_names_several_articles=["10.1038/a-1", "10.1038/b-2"]))
+
+    rc = _cli.fetch_main(["10.1038/bulk", "--json"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert json.loads(captured.out) == []
+    for one in ("10.1038/a-1", "10.1038/b-2"):
+        assert one in captured.err

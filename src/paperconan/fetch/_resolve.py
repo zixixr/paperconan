@@ -17,7 +17,12 @@ def normalize_query(text):
 
 
 def enrich_via_crossref(doi):
-    """Best-effort title/authors/year for a paper DOI. Returns None on any failure."""
+    """Best-effort title/authors/year for a paper DOI. Returns None on any failure.
+
+    Also carries `original_dois`: the articles a retraction or correction concerns, when this
+    DOI names any. They come from the same record, so asking costs no extra request -- and a
+    separate lookup would double the round-trips on every fetch.
+    """
     try:
         m = _http.get_json(
             f"https://api.crossref.org/works/{urllib.parse.quote(doi, safe='')}"
@@ -31,7 +36,57 @@ def enrich_via_crossref(doi):
     dp = m.get("issued", {}).get("date-parts", [[None]])
     if dp and dp[0]:
         year = str(dp[0][0])
-    return {"doi": doi, "title": title, "authors": authors, "year": year}
+    return {"doi": doi, "title": title, "authors": authors, "year": year,
+            "original_dois": _originals_from_record(m)}
+
+
+# A retraction, correction or expression of concern is a page of its own, with its own DOI
+# and no supplementary files. Searching one for source data finds nothing, and the failure
+# looks exactly like a paper that published none. Crossref records what the notice is about,
+# so the DOI of the article itself is recoverable.
+# `editorial` is an optional prefix rather than one spelled-out phrase: Science files its
+# retractions as "Editorial retraction", which the spelled-out list missed while matching
+# "Editorial expression of concern" -- the same word in front of a different noun.
+_NOTICE_TITLE = re.compile(
+    r"^\s*(?:editorial\s+)?"
+    r"(retraction|retracted|withdrawn|author correction|publisher correction|correction"
+    r"|corrigendum|erratum|expression of concern"
+    r"|editor'?s note|matters arising)\b",
+    re.I,
+)
+# Where a publisher records the link. `update-to` is the standard place; some use `relation`
+# instead, and a few use both.
+_ORIGINAL_RELATIONS = ("is-correction-of", "is-retraction-of", "is-comment-on")
+
+
+def _originals_from_record(message):
+    """Every article DOI this Crossref record is a notice about, in the order recorded.
+
+    A LIST, not one DOI, because one notice routinely concerns several papers -- a bulk
+    correction, or an expression of concern covering an author's output. Returning the first
+    would pick one silently, and since the picked DOI then decides `match_signals`, the
+    confidence check would go on to endorse a stranger's data as this paper's. For a tool
+    whose whole job is telling one paper's numbers from another's, that is the worst
+    available failure.
+
+    Empty covers both "not a notice" and "a notice that names nothing to follow"; the latter
+    is not an error, and returning the notice's own DOI would send a search straight back
+    where it started.
+    """
+    title = (message.get("title") or [""])[0]
+    if not _NOTICE_TITLE.match(title or ""):
+        return []
+    out = []
+    for update in (message.get("update-to") or []):
+        doi = update.get("DOI")
+        if doi and doi not in out:
+            out.append(doi)
+    relation = message.get("relation") or {}
+    for key in _ORIGINAL_RELATIONS:
+        for entry in relation.get(key, []):
+            if entry.get("id-type") == "doi" and entry.get("id") and entry["id"] not in out:
+                out.append(entry["id"])
+    return out
 
 
 # DOI registrant prefix -> publisher, for pointing users at the article page when the
