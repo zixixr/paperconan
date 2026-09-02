@@ -28,7 +28,11 @@ _ESM_HREF = re.compile(
 _ESM_ANCHOR = re.compile(
     r'<a\b[^>]*\bhref="(https://(?:static-content\.springer\.com/esm'
     r'|media\.springernature\.com/[a-z0-9_-]+/springer-static/esm)'
-    r'/[^"]+)"[^>]*>(.*?)</a\s*>',
+    # The text may not run across another `<a`: a page can nest anchors or leave one
+    # unclosed, and a plain `.*?` then pairs this URL with the NEXT link's caption while
+    # swallowing that link whole, so it loses its own. Refusing to cross the boundary lets
+    # each anchor match on its own.
+    r'/[^"]+)"[^>]*>((?:(?!<a\b).)*?)</a\s*>',
     re.I | re.S,
 )
 _TAGS = re.compile(r"<[^>]*>")
@@ -50,7 +54,12 @@ _MAX_NATURE_HTML_BYTES = 5 * 1024 * 1024
 
 
 def _anchor_labels(html: str) -> dict:
-    """{esm url: the anchor's own visible text}, for anchors that have any."""
+    """{esm url: the anchor's own visible text}, for anchors that have any.
+
+    First occurrence wins, matching the URL dedupe in `parse_nature_esm_links` -- a page that
+    links one file twice is described by whichever mention comes first, which is a policy
+    rather than a judgement about which text is better.
+    """
     out = {}
     for url, inner in _ESM_ANCHOR.findall(html or ""):
         url = url.replace("&amp;", "&")
