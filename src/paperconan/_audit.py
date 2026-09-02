@@ -3165,6 +3165,50 @@ def _vector_is_patterned(vec):
 # row (a wide genomics matrix) cannot balloon memory before the budget check fires.
 _WR_MAX_ROW_CELLS = int(os.environ.get("PAPERCONAN_WR_MAX_ROW_CELLS", "20000"))
 
+# How wide a repeated within-row segment must be. The floor here is ALREADY graded by what
+# the values are and not only by how many there are: an all-integer tuple needs k>=5 with
+# >=4 distinct values where anything else needs k>=4. The grading dimension was integer-ness
+# alone, and at the short end that orders the evidence backwards -- three values recorded to
+# several decimals, repeated exactly at two places, is far more agreement than four values
+# recorded to two decimals, which the same floor waves through. So precision is a second
+# dimension: a segment may be one column shorter when every cell in it was written finely
+# enough that the match cannot be read as coarse-grid coincidence.
+#
+# WITHIN-ROW ONLY. The cross-figure pass in the same function keeps `min_k`; its docstring
+# calls it the most false-positive-prone pass in the engine and it is not what any recorded
+# gap asks for.
+_WR_SEGMENT_MIN_COLS = int(os.environ.get("PAPERCONAN_WR_SEGMENT_MIN_COLS", "4"))
+# The shorter length a finely-recorded segment may use.
+_WR_SEGMENT_FINE_MIN_COLS = int(os.environ.get("PAPERCONAN_WR_SEGMENT_FINE_MIN_COLS", "3"))
+# Decimals every cell of a short segment must carry. Counted on the round-6 key the window
+# index is built from, so 6 is the most this can ask for; asking for more would reject
+# everything in silence.
+_WR_SEGMENT_FINE_MIN_FRAC_DIGITS = int(
+    os.environ.get("PAPERCONAN_WR_SEGMENT_FINE_MIN_FRAC_DIGITS", "5"))
+# Short windows get their OWN budget, and cannot spend the one the existing widths spend.
+# Sharing it meant each start position cost one window more, the shared budget ran out
+# sooner on a large sheet, and the pass reported LESS than before this capability existed --
+# measured, as a four-wide finding that vanished from a corpus file whose scan already
+# prints "within-row coverage bounded". A capability that subtracts coverage elsewhere is
+# not a capability. With a separate counter the wider widths deplete exactly as they did,
+# so their reach is unchanged whatever the short pass does.
+_WR_SHORT_SEGMENT_BUDGET = int(
+    os.environ.get("PAPERCONAN_WR_SHORT_SEGMENT_BUDGET", str(_WITHIN_ROW_VEC_BUDGET // 4)))
+
+
+def _wr_frac_digits(v):
+    """Decimals in `v` as the window index stores it (already rounded to 6)."""
+    text = f"{float(v):.6f}".rstrip("0")
+    return len(text.split(".")[1]) if "." in text else 0
+
+
+def _wr_segment_is_long_enough(vec):
+    """Is this repeated segment wide enough, given how finely its cells were recorded?"""
+    if len(vec) >= _WR_SEGMENT_MIN_COLS:
+        return True
+    return (len(vec) >= _WR_SEGMENT_FINE_MIN_COLS
+            and all(_wr_frac_digits(v) >= _WR_SEGMENT_FINE_MIN_FRAC_DIGITS for v in vec))
+
 
 def detect_recurring_row_vectors(grid_sheets, profile="review",
                                  min_k=4, max_k=8, max_rows=300, max_findings=20,
@@ -3282,6 +3326,7 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
     # be invisible. Same gates as the cross-figure path; the repeat corroborates itself, so one
     # figure namespace is enough.
     wr_budget = _WITHIN_ROW_VEC_BUDGET
+    wr_short_budget = _WR_SHORT_SEGMENT_BUDGET
     wr_cands = []
     for (fname, sname), sheet in grid_sheets.items():
         fk = figure_key(sname)
@@ -3293,24 +3338,46 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
                     seq.append((c, float(v)))
                     if len(seq) >= _WR_MAX_ROW_CELLS:  # cap width so one huge row can't OOM
                         break
-            if len(seq) < 2 * min_k:
+            # The within-row pass has its own shortest segment, so this precondition
+            # must use THAT: keeping `min_k` here would drop every row too narrow for
+            # two four-wide copies before a three-wide pair was ever considered.
+            if len(seq) < 2 * min(min_k, _WR_SEGMENT_FINE_MIN_COLS):
                 continue
             # per-row value frequency, keyed with the SAME quantization as the window (round-6)
             # so bucket and key agree at every magnitude: a value from a small quantized pool
             # (k/19 grid, dose plateau) recurs far more than the copies, unlike a copied segment.
             row_freq = Counter(round(v, 6) for _c, v in seq)
             wins = {}
+            wr_min_k = min(min_k, _WR_SEGMENT_FINE_MIN_COLS)
+            # Which cells were recorded finely enough for a SHORT segment to be allowed.
+            # Computed once per row so the check below costs a lookup, and consulted before
+            # a short window is indexed at all: widening the width range without this made
+            # every start position cost an extra window, the within-row budget ran out
+            # sooner on a large sheet, and the pass reported LESS than before the capability
+            # was added. Measured -- a four-wide finding disappeared from a corpus file that
+            # prints "within-row coverage bounded". A short window that cannot pass the
+            # precision gate later is work that buys nothing, so it is never indexed.
+            fine = [_wr_frac_digits(v) >= _WR_SEGMENT_FINE_MIN_FRAC_DIGITS for _c, v in seq]
             for start in range(len(seq)):
-                for k in range(min_k, max_k + 1):
+                for k in range(wr_min_k, max_k + 1):
                     if start + k > len(seq):
                         break
+                    if k < _WR_SEGMENT_MIN_COLS:
+                        # A short window that cannot clear the precision gate later is work
+                        # that buys nothing, so it is not indexed at all.
+                        if wr_short_budget <= 0 or not all(fine[start:start + k]):
+                            continue
+                        wr_short_budget -= 1
+                    else:
+                        wr_budget -= 1
                     wins.setdefault(tuple(round(seq[start + o][1], 6) for o in range(k)),
                                     []).append(start)
-                    wr_budget -= 1
                 if wr_budget <= 0:                     # gate INSIDE the loop, not per-row
                     break
             for vec, starts in wins.items():
                 if len(starts) < 2 or _vector_is_patterned(list(vec)) or len(set(vec)) < 3:
+                    continue
+                if not _wr_segment_is_long_enough(vec):
                     continue
                 all_int = all(abs(v - round(v)) < 1e-9 for v in vec)
                 if all_int and (len(vec) < 5 or len(set(vec)) < 4):
@@ -3342,9 +3409,22 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
               file=sys.stderr)
         _note_detector_cap(coverage, "detect_recurring_row_vectors",
                            "detector_within_row_budget_limit")
+    if wr_short_budget <= 0:
+        # Reported separately: this one bounds only the short-segment widths, and reading it
+        # as the line above would overstate what was left unscanned.
+        _note_detector_cap(coverage, "detect_recurring_row_vectors",
+                           "detector_within_row_short_budget_limit")
     # One physical repeat yields many overlapping windows (k=4..8) — keep the strongest (most
     # copies, then longest) per row, dropping >=50%-cell-overlap duplicates.
-    wr_cands.sort(key=lambda x: (-len(x[5]), -len(x[0])))
+    # Short candidates are ranked AFTER every wider one, then by the existing key. A
+    # three-wide window sitting inside a genuine four-wide repeat can occur at a third
+    # place the fourth column does not agree on, which gives it more copies -- so under
+    # the copies-first key alone it won the pool and the four-wide finding was dropped
+    # against it as an overlapping duplicate. The reader then lost the fourth column's
+    # agreement entirely: a shorter, weaker statement REPLACING a longer one rather than
+    # being added beside it. The leading term is constant False for every candidate at or
+    # above the ordinary width, so their order among themselves is untouched.
+    wr_cands.sort(key=lambda x: (len(x[0]) < _WR_SEGMENT_MIN_COLS, -len(x[5]), -len(x[0])))
     wr_kept = []
     for c in wr_cands:
         if any(c[1:5] == kc[1:5] and len(c[6] & kc[6]) >= 0.5 * min(len(c[6]), len(kc[6]))

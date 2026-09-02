@@ -397,6 +397,8 @@ _BUDGETS = (
      "detector_cross_figure_budget_limit"),
     ("detect_recurring_row_vectors", "_WITHIN_ROW_VEC_BUDGET",
      "detector_within_row_budget_limit"),
+    ("detect_recurring_row_vectors", "_WR_SHORT_SEGMENT_BUDGET",
+     "detector_within_row_short_budget_limit"),
     ("detect_scaled_row_reuse", "_SCALED_ROW_BUDGET", "detector_compute_budget_limit"),
     ("detect_short_row_reuse", "_SHORT_ROW_BUDGET", "detector_compute_budget_limit"),
     ("detect_within_row_shared_fraction", "_WITHIN_ROW_FRAC_BUDGET", "detector_compute_budget_limit"),
@@ -915,6 +917,9 @@ _SCAN_REASONS_NOT_IN_SKILL = {
     # bullet without teaching the agent anything new.
     "detector_cross_figure_budget_limit",
     "detector_within_row_budget_limit",
+    # The third: the short-segment widths carry their own counter so they cannot take
+    # reach from the widths above. Same class, same rendering, nothing new to instruct.
+    "detector_within_row_short_budget_limit",
 }
 
 
