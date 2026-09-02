@@ -167,3 +167,31 @@ def test_search_all_does_not_follow_a_notice_for_a_title_query(monkeypatch):
     fetch.search_all("Structure of a membrane protein", per_source=5)
 
     assert not called
+
+
+def test_search_all_names_the_hopped_to_notice_that_lists_several(monkeypatch):
+    """After a hop, the DOI naming several articles is not the one the user typed.
+
+    Reported at the CLI with a hand-written resolution dict, which can only check the
+    printing. This checks the computation: `ambiguous_notice_doi` must be the DOI the loop
+    was HOLDING when it found several, not the query it started from.
+    """
+    seen = []
+    for name in ("search_nature_esm", "search_zenodo", "search_figshare",
+                 "search_dryad", "search_europepmc"):
+        monkeypatch.setattr(fetch._sources, name, lambda q, size=5: seen.append(q) or [])
+    _records(monkeypatch, {
+        "10.1038/notice-1": {"title": "Correction: a correction",
+                             "original_dois": ["10.1038/notice-2"]},
+        "10.1038/notice-2": {"title": "Expression of Concern: two articles",
+                             "original_dois": ["10.1038/a-1", "10.1038/b-2"]},
+    })
+
+    cands, resolution = fetch.search_all("10.1038/notice-1", per_source=5,
+                                         with_resolution=True)
+
+    assert cands == []
+    assert set(seen) == {"10.1038/notice-2"}, "the hop happened, then stopped"
+    assert resolution["query_doi"] == "10.1038/notice-1"
+    assert resolution["ambiguous_notice_doi"] == "10.1038/notice-2"
+    assert resolution["notice_names_several_articles"] == ["10.1038/a-1", "10.1038/b-2"]

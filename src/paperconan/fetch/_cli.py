@@ -63,23 +63,25 @@ def fetch_main(argv):
     q = _resolve.normalize_query(args.query)
     resolved_doi = resolution.get("resolved_doi") or q.get("doi")
     guidance_paper = {"doi": resolved_doi, "title": q.get("title")}
-    # `--json` promises parseable stdout, so these notes are held back there. They are not
-    # lost: `resolved_doi` rides on every candidate, and a caller reading JSON is a program
-    # that can compare it to the DOI it asked for.
-    if not args.json:
-        if resolution.get("followed_a_notice"):
-            print(f"{q['doi']} names a retraction or correction; searching the article it "
-                  f"concerns instead: {resolved_doi}\n")
-        several = resolution.get("notice_names_several_articles") or []
-        if several:
-            # The DOI that names several may be an intermediate notice reached by a hop,
-            # not the one typed.
-            named_by = resolution.get("ambiguous_notice_doi") or q.get("doi")
-            print(f"{named_by} is a notice naming {len(several)} articles, so none was "
-                  f"followed -- fetch whichever you mean by its own DOI:")
-            for one in several:
-                print(f"    {one}")
-            print()
+    # STDERR, in both modes. `--json` promises parseable stdout, so the first attempt held
+    # these back whenever it was set -- which put the silence straight back for the case
+    # that matters most: a notice DOI usually finds nothing, and a bare `[]` on stdout is
+    # indistinguishable from "this paper published no source data", the exact ambiguity
+    # this feature exists to remove. Diagnostics about the QUERY are not results; stdout
+    # keeps its shape and stderr carries why it looks like that.
+    if resolution.get("followed_a_notice"):
+        print(f"{q['doi']} names a retraction or correction; searching the article it "
+              f"concerns instead: {resolved_doi}\n", file=sys.stderr)
+    several = resolution.get("notice_names_several_articles") or []
+    if several:
+        # The DOI that names several may be an intermediate notice reached by a hop,
+        # not the one typed.
+        named_by = resolution.get("ambiguous_notice_doi") or q.get("doi")
+        print(f"{named_by} is a notice naming {len(several)} articles, so none was "
+              f"followed -- fetch whichever you mean by its own DOI:", file=sys.stderr)
+        for one in several:
+            print(f"    {one}", file=sys.stderr)
+        print(file=sys.stderr)
 
     target = None
     if args.download:

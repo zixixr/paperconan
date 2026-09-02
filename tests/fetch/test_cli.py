@@ -279,12 +279,12 @@ def test_fetch_zero_candidates_still_points_at_the_resolved_article(monkeypatch,
 
     rc = _cli.fetch_main(["10.1038/notice-9"])
 
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
     assert rc == 0
-    assert "10.1038/orig-1" in out
-    assert "names a retraction or correction" in out
+    assert "names a retraction or correction" in captured.err
+    assert "10.1038/orig-1" in captured.err
     # The guidance link must be the article's, not the notice's.
-    assert "https://doi.org/10.1038/orig-1" in out
+    assert "https://doi.org/10.1038/orig-1" in captured.out
 
 
 def test_fetch_zero_candidates_still_lists_a_multi_article_notice(monkeypatch, capsys):
@@ -296,11 +296,11 @@ def test_fetch_zero_candidates_still_lists_a_multi_article_notice(monkeypatch, c
 
     rc = _cli.fetch_main(["10.1038/bulk"])
 
-    out = capsys.readouterr().out
+    err = capsys.readouterr().err
     assert rc == 0
-    assert "naming 3 articles" in out
+    assert "naming 3 articles" in err
     for one in ("10.1038/a-1", "10.1038/b-2", "10.1038/c-3"):
-        assert one in out
+        assert one in err
 
 
 def test_fetch_json_stays_parseable_when_a_notice_resolves(monkeypatch, capsys):
@@ -315,9 +315,11 @@ def test_fetch_json_stays_parseable_when_a_notice_resolves(monkeypatch, capsys):
     rc = _cli.fetch_main(["10.1038/notice-9", "--json"])
 
     assert rc == 0
-    parsed = json.loads(capsys.readouterr().out)
-    # The substitution is still legible to a program: it rides on the candidates.
+    captured = capsys.readouterr()
+    parsed = json.loads(captured.out)
     assert parsed[0]["resolved_doi"] == "10.1038/orig-1"
+    # And the substitution is stated, not merely inferable from the payload.
+    assert "10.1038/orig-1" in captured.err
 
 
 def test_fetch_names_the_notice_that_actually_lists_several(monkeypatch, capsys):
@@ -329,6 +331,42 @@ def test_fetch_names_the_notice_that_actually_lists_several(monkeypatch, capsys)
 
     _cli.fetch_main(["10.1038/notice-1"])
 
-    out = capsys.readouterr().out
-    assert "10.1038/notice-2 is a notice naming 2 articles" in out
-    assert "10.1038/notice-1 is a notice naming" not in out
+    err = capsys.readouterr().err
+    assert "10.1038/notice-2 is a notice naming 2 articles" in err
+    assert "10.1038/notice-1 is a notice naming" not in err
+
+
+def test_fetch_json_with_no_candidates_still_says_it_followed_a_notice(monkeypatch, capsys):
+    """A notice DOI usually finds nothing, so this is the ordinary `--json` result for one.
+
+    stdout stays the array a caller parses. What must not happen is that the array is the
+    WHOLE story: a bare `[]` reads as "this paper published no source data", which is the
+    ambiguity the notice-following exists to remove. Holding the note back whenever
+    `--json` was set put that silence right back.
+    """
+    monkeypatch.setattr(_cli, "search_all", _stub_search(
+        [], query_doi="10.1038/notice-9", resolved_doi="10.1038/orig-1",
+        followed_a_notice=True))
+
+    rc = _cli.fetch_main(["10.1038/notice-9", "--json"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert json.loads(captured.out) == []
+    assert "10.1038/orig-1" in captured.err
+
+
+def test_fetch_json_with_no_candidates_still_lists_a_multi_article_notice(monkeypatch, capsys):
+    """Same for the ambiguous case: naming the articles is the only remedy on offer."""
+    monkeypatch.setattr(_cli, "search_all", _stub_search(
+        [], query_doi="10.1038/bulk", resolved_doi="10.1038/bulk",
+        ambiguous_notice_doi="10.1038/bulk",
+        notice_names_several_articles=["10.1038/a-1", "10.1038/b-2"]))
+
+    rc = _cli.fetch_main(["10.1038/bulk", "--json"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert json.loads(captured.out) == []
+    for one in ("10.1038/a-1", "10.1038/b-2"):
+        assert one in captured.err

@@ -139,3 +139,29 @@ def test_enrich_carries_the_originals_and_survives_failure(monkeypatch):
 
     monkeypatch.setattr(_http, "get_json", boom)
     assert _resolve.enrich_via_crossref("10.1038/notice-9") is None
+
+
+def test_notice_title_matches_an_editorial_retraction():
+    """Science files its retractions as "Editorial retraction".
+
+    The pattern once spelled out "editorial expression of concern" as one fixed phrase, so
+    the same word in front of a different noun fell through and the notice was searched as
+    if it were the paper. `editorial` is a prefix on any of the terms, not part of one.
+    """
+    from paperconan.fetch._resolve import _originals_from_record
+
+    record = {"title": ["Editorial retraction"],
+              "update-to": [{"DOI": "10.1126/science.orig-1"}]}
+
+    assert _originals_from_record(record) == ["10.1126/science.orig-1"]
+
+
+def test_notice_title_still_matches_the_forms_it_always_did():
+    """The widening must not have cost a title that used to match."""
+    from paperconan.fetch._resolve import _NOTICE_TITLE
+
+    for title in ("Retraction Note: a study", "Expression of concern: a study",
+                  "Editorial Expression of Concern", "Author Correction: a study",
+                  "Corrigendum: a study", "Erratum", "Matters Arising: a study",
+                  "Editor's Note"):
+        assert _NOTICE_TITLE.match(title), title
