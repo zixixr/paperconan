@@ -66,19 +66,26 @@ recipe for measuring it is given instead of the figure — see the last rule for
 - **Cost is what the AGENT sees, not what the detector emits.** The narrowing in this tool is
   deliberately in the reading, not the detecting: SKILL.md's "Reading A Scan In Layers" has the
   agent go `overview` -> `drill <n>` -> `drill --kind` -> `explain <id>`, and `overview` shows at
-  most `DEFAULT_MAX_LOCATIONS` panels. Between a detector's return value and that page sit
-  `_MAX_FINDINGS_PER_BLOCK` and `_MAX_TOTAL_FINDINGS`, which DROP findings and record how many;
-  the prefilter and the profile; clustering into panels; and `_interleave_by_family`, which gives
-  each family a slot near the top. Measured on one corpus paper, what a direct detector call
-  counts, what survives into `scan.json`, and how many locations `overview` lists were three
-  numbers an order of magnitude or more apart.
+  most `DEFAULT_MAX_LOCATIONS` panels. Between a detector's return value and that page sit the
+  prefilter and the profile, clustering into panels, `_interleave_by_family`, which gives each
+  family a slot near the top, and -- for the block-level findings only -- `_MAX_FINDINGS_PER_BLOCK`
+  and `_MAX_TOTAL_FINDINGS`, which DROP findings and record how many. `cross_sheet_findings` pass
+  through neither of those two; the sheet- and corpus-level detectors bound themselves with their
+  own `max_findings` arguments instead.
+  To see the size of the gap for yourself, take the densest paper you have, and count three
+  things: what a direct call to one detector returns, what survives into `scan.json`, and how
+  many locations `overview` lists. They are not the same number, and the reader meets the third.
   So measure: does the ranked location list change, does a known true signal stay in the shown
   set and at what rank, and how many steps reach it. Not the count a detector returned -- a probe
   calling one directly skips the stages that come after it, so its totals are not a cost any
   reader pays. How much it skips depends on which detector: the block-level ones return findings
   raw, while the sheet- and corpus-level ones call `apply_profile_to_findings` themselves before
   returning, so a probe over those has already had the profile applied and one over the others
-  has not. Check which you are calling rather than assuming a probe is uniformly upstream.
+  has not. Some fit neither description: the digit and decimal-tail passes take a column of
+  values rather than a block, and their families are listed in `_UNSEEDED_FAMILIES`, meaning the
+  seeding layer never routes them to a panel -- so no probe over them says anything about a page,
+  whatever it counts. Check what you are calling rather than assuming a probe is uniformly
+  upstream.
   Both halves of a trade have to be quoted at the same layer. `_interleave_by_family`'s docstring
   is the model: it says what a change did to a true signal's RANK against the default page.
   Two traps, both of which caught the first draft of this rule. **Severity demotion is not one of
@@ -92,9 +99,12 @@ recipe for measuring it is given instead of the figure — see the last rule for
   test asserts that more than one family is shown, which is a weaker guarantee than it sounds
   like. Both traps are the "mechanism attributed to the wrong component" failure the last rule
   warns about, reached by reasoning from a function's name instead of reading it.
-  Separately, compare per paper rather than on totals. One paper timed out under some settings
-  of a sweep and not others, which swung the sum by an order of magnitude for a reason that had
-  nothing to do with any setting, hiding a real and much smaller change underneath.
+  Separately, compare per paper, over the papers that completed under every setting, rather than
+  on totals. Corpus papers differ enormously in size, so a sum over them is mostly a statement
+  about the largest one: here a single paper timed out under some settings of a sweep and not
+  others, and its presence or absence in the total moved that total further than any setting did,
+  hiding a smaller real change underneath. To check whether your own sweep has this problem, sort
+  the per-paper counts and see how much of the sum the top one carries.
 - **A bench needs a true-positive stratum.** One made only of things that must not fire is passed
   perfectly by a detector that never fires. Include the relation the arm exists to catch, and
   freeze how much of it is currently found — including when that is "almost none", which is a
