@@ -5404,6 +5404,7 @@ def test_jci_resolver_filters_unsafe_and_non_tabular_links(monkeypatch):
         "download_url": (
             "https://www.jci.org/supporting/table.xlsx"
         ),
+        "label": None,
         "validate_tabular_content": True,
     }]
 

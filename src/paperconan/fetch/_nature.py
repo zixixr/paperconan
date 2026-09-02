@@ -20,6 +20,22 @@ _ESM_HREF = re.compile(
     r'/[^"]+)"',
     re.I,
 )
+# The same link WITH the anchor it sits in, so the text the page put on it survives. That
+# text is what says which figure a file holds -- the filename is an accession string and
+# says nothing. Only the anchor's own text is taken: a label guessed from nearby markup
+# could attach a figure number to a file that does not hold it, and a wrong label is worse
+# than none here, because it would let a finding be credited to a figure it never came from.
+_ESM_ANCHOR = re.compile(
+    r'<a\b[^>]*\bhref="(https://(?:static-content\.springer\.com/esm'
+    r'|media\.springernature\.com/[a-z0-9_-]+/springer-static/esm)'
+    # The text may not run across another `<a`: a page can nest anchors or leave one
+    # unclosed, and a plain `.*?` then pairs this URL with the NEXT link's caption while
+    # swallowing that link whole, so it loses its own. Refusing to cross the boundary lets
+    # each anchor match on its own.
+    r'/[^"]+)"[^>]*>((?:(?!<a\b).)*?)</a\s*>',
+    re.I | re.S,
+)
+_TAGS = re.compile(r"<[^>]*>")
 _HREF = re.compile(r"""\bhref\s*=\s*(["'])(.*?)\1""", re.I | re.S)
 _FULL_IMAGE_SRC = re.compile(
     r'(https://media\.springernature\.com/full/[^"\']+\.(?:png|jpe?g|tiff?))',
@@ -37,9 +53,28 @@ _MAX_FIGURE_PAGES = 100
 _MAX_NATURE_HTML_BYTES = 5 * 1024 * 1024
 
 
+def _anchor_labels(html: str) -> dict:
+    """{esm url: the anchor's own visible text}, for anchors that have any.
+
+    First occurrence wins, matching the URL dedupe in `parse_nature_esm_links` -- a page that
+    links one file twice is described by whichever mention comes first, which is a policy
+    rather than a judgement about which text is better.
+    """
+    out = {}
+    for url, inner in _ESM_ANCHOR.findall(html or ""):
+        url = url.replace("&amp;", "&")
+        text = html_lib.unescape(_TAGS.sub(" ", inner))
+        text = " ".join(text.split())
+        if text and url not in out:
+            out[url] = text
+    return out
+
+
 def parse_nature_esm_links(html: str) -> list[dict]:
     """Extract ESM file refs from a Nature article page. Returns make_fileref dicts,
-    deduped by URL, with ext derived from the URL path."""
+    deduped by URL, with ext derived from the URL path and `label` carrying the anchor's
+    own text where it has one -- see `_ESM_ANCHOR` for why only the anchor's."""
+    labels = _anchor_labels(html)
     seen, refs = set(), []
     for url in _ESM_HREF.findall(html or ""):
         url = url.replace("&amp;", "&")
@@ -47,7 +82,7 @@ def parse_nature_esm_links(html: str) -> list[dict]:
             continue
         seen.add(url)
         name = urllib.parse.unquote(url.rsplit("/", 1)[-1])
-        refs.append(make_fileref(name, None, url))
+        refs.append(make_fileref(name, None, url, label=labels.get(url)))
     return refs
 
 

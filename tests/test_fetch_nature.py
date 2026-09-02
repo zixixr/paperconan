@@ -27,6 +27,78 @@ def test_parse_nature_esm_links_extracts_and_classifies():
     assert by_ext["xlsx"]["download_url"].startswith("https://static-content.springer.com/esm/")
 
 
+def test_parse_nature_esm_links_keeps_the_link_text_as_a_label():
+    """The article page says which figure a file belongs to; keep it.
+
+    Without it a workbook is just `41467_2022_28338_MOESM4_ESM.xlsx`, and nothing downstream
+    can say which figure it holds -- the page knew, and the parser was throwing it away.
+    """
+    by_ext = {r["ext"]: r for r in nat.parse_nature_esm_links(FIXTURE_HTML)}
+
+    assert by_ext["xlsx"]["label"] == "Source Data Fig 1"
+    assert by_ext["csv"]["label"] == "Source Data Fig 2"
+    assert by_ext["pdf"]["label"] == "Supplementary Information"
+
+
+# A label is only taken when the anchor itself carries it. Guessing from surrounding text
+# would attach a figure number to a file that may not hold it, and a wrong label is worse
+# than none: it would let a finding be credited to a figure it never came from.
+UNLABELLED_ESM_HTML = '''
+<html><body>
+<p>Source Data Fig 3</p>
+<a href="https://static-content.springer.com/esm/art%3A10.1038%2Fs41467-022-28338-0/MediaObjects/41467_2022_28338_MOESM7_ESM.xlsx"><span class="icon"></span></a>
+</body></html>
+'''
+
+
+def test_parse_nature_esm_links_leaves_the_label_empty_rather_than_guessing():
+    refs = nat.parse_nature_esm_links(UNLABELLED_ESM_HTML)
+
+    assert len(refs) == 1
+    assert refs[0]["label"] is None
+
+
+def test_parse_nature_esm_links_strips_markup_from_the_label():
+    html = FIXTURE_HTML.replace(
+        ">Source Data Fig 1<", "><strong>Source Data</strong>\n  Fig 1<")
+
+    by_ext = {r["ext"]: r for r in nat.parse_nature_esm_links(html)}
+
+    assert by_ext["xlsx"]["label"] == "Source Data Fig 1"
+
+
+# Two ESM anchors where the first is nested inside, or left unclosed before, the second.
+# Browsers auto-close these; a lazy `.*?` up to `</a>` does not, and pairs one file's URL
+# with the OTHER file's caption.
+_U1 = ("https://static-content.springer.com/esm/art%3A10.1038%2Fs41467-022-28338-0"
+       "/MediaObjects/41467_2022_28338_MOESM1_ESM.pdf")
+_U2 = ("https://static-content.springer.com/esm/art%3A10.1038%2Fs41467-022-28338-0"
+       "/MediaObjects/41467_2022_28338_MOESM4_ESM.xlsx")
+
+
+def test_parse_nature_esm_links_refuses_a_label_from_a_neighbouring_anchor():
+    """The failure this feature's own rule says is worse than no label at all.
+
+    A wrong label would let a finding be credited to a figure it never came from, so an
+    anchor whose text has swallowed another anchor yields None rather than that text.
+    """
+    nested = f'<a href="{_U1}"><a href="{_U2}">Belongs to MOESM4</a></a>'
+
+    by_name = {r["name"]: r for r in nat.parse_nature_esm_links(nested)}
+
+    assert by_name["41467_2022_28338_MOESM1_ESM.pdf"]["label"] is None
+    assert by_name["41467_2022_28338_MOESM4_ESM.xlsx"]["label"] == "Belongs to MOESM4"
+
+
+def test_parse_nature_esm_links_refuses_a_label_merged_across_an_unclosed_anchor():
+    unclosed = f'<a href="{_U1}">Label one\n<a href="{_U2}">Label two</a>'
+
+    by_name = {r["name"]: r for r in nat.parse_nature_esm_links(unclosed)}
+
+    assert by_name["41467_2022_28338_MOESM1_ESM.pdf"]["label"] is None
+    assert by_name["41467_2022_28338_MOESM4_ESM.xlsx"]["label"] == "Label two"
+
+
 # Newer article pages serve ESM from the media.springernature.com CDN instead.
 MEDIA_ESM_HTML = '''
 <html><body>

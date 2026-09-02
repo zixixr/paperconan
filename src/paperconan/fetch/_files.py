@@ -30,7 +30,13 @@ def asset_type(name: str) -> str:
     return "other"
 
 
-def make_fileref(name: str, size, download_url: str) -> dict:
+def make_fileref(name: str, size, download_url: str, label: str | None = None) -> dict:
+    """`label` is whatever the source page called this file, verbatim and unparsed.
+
+    A supplementary file's own name is usually an accession string, so the only thing that
+    says WHICH figure it holds is the text the publisher put beside the link. Sources that
+    have it should pass it through; interpreting it belongs to whoever consumes it.
+    """
     return {"name": name, "ext": ext_of(name),
             "size": int(size) if isinstance(size, (int, float)) else None,
-            "download_url": download_url}
+            "download_url": download_url, "label": label}
