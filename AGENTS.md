@@ -63,48 +63,27 @@ paste-ready; regenerate that way rather than hand-editing a table.
 Five rules, each of which cost review rounds to learn. Where a claim below has a size, the
 recipe for measuring it is given instead of the figure — see the last rule for why:
 
-- **Cost is what the AGENT sees, not what the detector emits.** The narrowing in this tool is
-  deliberately in the reading, not the detecting: SKILL.md's "Reading A Scan In Layers" has the
-  agent go `overview` -> `drill <n>` -> `drill --kind` -> `explain <id>`, and `overview` shows at
-  most `DEFAULT_MAX_LOCATIONS` panels. Between a detector's return value and that page sit the
-  prefilter and the profile, clustering into panels, `_interleave_by_family`, which gives each
-  family a slot near the top, and -- for the block-level findings only -- `_MAX_FINDINGS_PER_BLOCK`
-  and `_MAX_TOTAL_FINDINGS`, which DROP findings and record how many. `cross_sheet_findings` pass
-  through neither of those two; the sheet- and corpus-level detectors bound themselves with their
-  own `max_findings` arguments instead.
-  To see the size of the gap for yourself, take the densest paper you have, and count three
-  things: what a direct call to one detector returns, what survives into `scan.json`, and how
-  many locations `overview` lists. They are not the same number, and the reader meets the third.
-  So measure: does the ranked location list change, does a known true signal stay in the shown
-  set and at what rank, and how many steps reach it. Not the count a detector returned -- a probe
-  calling one directly skips the stages that come after it, so its totals are not a cost any
-  reader pays. How much it skips depends on which detector: the block-level ones return findings
-  raw, while the sheet- and corpus-level ones call `apply_profile_to_findings` themselves before
-  returning, so a probe over those has already had the profile applied and one over the others
-  has not. Some fit neither description: the digit and decimal-tail passes take a column of
-  values rather than a block, and their families are listed in `_UNSEEDED_FAMILIES`, meaning the
-  seeding layer never routes them to a panel -- so no probe over them says anything about a page,
-  whatever it counts. Check what you are calling rather than assuming a probe is uniformly
-  upstream.
-  Both halves of a trade have to be quoted at the same layer. `_interleave_by_family`'s docstring
-  is the model: it says what a change did to a true signal's RANK against the default page.
-  Two traps, both of which caught the first draft of this rule. **Severity demotion is not one of
-  those stages.** `_demote_dense_relations` rewrites `severity` to low for a flooded sheet, but
-  `raw_severity` is frozen before it runs, and `_raw_severity_of` exists to say that the
-  rewritten field "must not drive routing" -- `overview`'s ordering, `strongest` and `high` all
-  read the raw one. A flood-demoted panel sits on the page looking like any other. The demotion
-  is real and it changes `report.html` and the packet; it does not change what the agent opens.
-  **And interleaving bounds domination rather than preventing it.** Given one saturated family
-  and two small ones it hands the saturated family most of a twenty-slot page; the repo's own
-  test asserts that more than one family is shown, which is a weaker guarantee than it sounds
-  like. Both traps are the "mechanism attributed to the wrong component" failure the last rule
-  warns about, reached by reasoning from a function's name instead of reading it.
-  Separately, compare per paper, over the papers that completed under every setting, rather than
-  on totals. Corpus papers differ enormously in size, so a sum over them is mostly a statement
-  about the largest one: here a single paper timed out under some settings of a sweep and not
-  others, and its presence or absence in the total moved that total further than any setting did,
-  hiding a smaller real change underneath. To check whether your own sweep has this problem, sort
-  the per-paper counts and see how much of the sum the top one carries.
+- **Cost is what the AGENT sees, not what the detector emits.** The narrowing here is
+  deliberately in the reading: SKILL.md's "Reading A Scan In Layers" has the agent go
+  `overview` -> `drill <n>` -> `drill --kind` -> `explain <id>`, and `overview` shows at most
+  `DEFAULT_MAX_LOCATIONS` panels. So measure a change by what that page does: whether the ranked
+  location list moves, whether a known true signal is on it and at what rank, how many steps
+  reach it. Both halves of a trade have to be quoted at that same layer.
+  A count taken by calling a detector directly is not that. To see the size of the gap, take the
+  densest paper you have and count three things -- what one detector returns, what survives into
+  `scan.json`, what `overview` lists. Also compare per paper, over papers that completed under
+  every setting: corpus papers differ enormously in size, so a sum over them is largely a
+  statement about the biggest, and one paper timing out under some settings and not others can
+  move a total further than the settings do. Sort the per-paper counts and see how much of the
+  sum the top one carries.
+  Read the stage you want to credit before crediting it. Every draft of this rule so far has
+  credited a component that does not do the thing. Severity demotion does not gate the reading
+  layer: `raw_severity` is frozen before `_demote_dense_relations` runs, and `_raw_severity_of`
+  says in as many words that the rewritten field "must not drive routing". Family interleaving
+  bounds one family's share of the page rather than preventing it. And what a probe skips
+  depends on which detector it calls -- some apply the profile themselves before returning, and
+  some are never routed to a panel at all. Each was reached by reasoning from a name, and each
+  cost a review round.
 - **A bench needs a true-positive stratum.** One made only of things that must not fire is passed
   perfectly by a detector that never fires. Include the relation the arm exists to catch, and
   freeze how much of it is currently found — including when that is "almost none", which is a
