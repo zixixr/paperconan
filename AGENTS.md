@@ -60,9 +60,36 @@ for opt-in — a bench skipped by default is green while the detector moves, whi
 they were written to end. Each carries a `__main__` block that reprints its frozen tables
 paste-ready; regenerate that way rather than hand-editing a table.
 
-Four rules, each of which cost review rounds to learn. Where a claim below has a size, the
-recipe for measuring it is given instead of the figure — see the fourth rule for why:
+Five rules, each of which cost review rounds to learn. Where a claim below has a size, the
+recipe for measuring it is given instead of the figure — see the last rule for why:
 
+- **Cost is what the AGENT sees, not what the detector emits.** The narrowing in this tool is
+  deliberately in the reading, not the detecting: SKILL.md's "Reading A Scan In Layers" has the
+  agent go `overview` -> `drill <n>` -> `drill --kind` -> `explain <id>`, and `overview` shows at
+  most `DEFAULT_MAX_LOCATIONS` panels, interleaved by family so one dense family cannot take the
+  list. `_demote_dense_relations` already exists for exactly this: a flood of column relations in
+  one sheet is kept but dropped to low severity, because a correlated matrix is dense by
+  construction rather than by anything worth reporting. So a change that adds findings which
+  collapse into panels the agent already had, or into one new low-severity dense panel, has cost
+  the agent close to nothing, however large the raw delta reads.
+  Measure, therefore: does the ranked location list change, does a known true signal stay in the
+  shown set and at what rank, and how many steps reach it. Not the size of `scan.json`, and not
+  the count a detector returned. A probe that calls a detector directly bypasses the prefilter,
+  the profile, the per-block caps and the dense-sheet demotion, so its totals are not a cost the
+  reader would ever pay: a raw sweep here put one corpus paper tens of thousands of relations
+  above every other paper in its sample -- a number the READING layers exist to keep off the
+  page, though `scan.json` may well hold it, since the dense-sheet rule demotes rather than
+  drops. Worse, that one paper's presence or absence swamped the sweep's own totals: it timed
+  out under some settings and not others, so the sum swung by an order of magnitude for a
+  reason that had nothing to do with the setting, on top of a real and much smaller change
+  underneath. A per-paper comparison over papers that completed under every setting showed
+  the actual movement; the totals never would have.
+  Both halves of the trade have to be quoted at the same layer; a recall figure counted at the
+  detector against a cost figure counted at the detector is at least self-consistent, but
+  neither is the decision.
+  `_interleave_by_family` already argues this way in its own docstring, and is the model to
+  copy: it names what the change did to a true signal's RANK against the default page, not how
+  many findings existed.
 - **A bench needs a true-positive stratum.** One made only of things that must not fire is passed
   perfectly by a detector that never fires. Include the relation the arm exists to catch, and
   freeze how much of it is currently found — including when that is "almost none", which is a
