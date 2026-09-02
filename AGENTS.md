@@ -66,30 +66,35 @@ recipe for measuring it is given instead of the figure — see the last rule for
 - **Cost is what the AGENT sees, not what the detector emits.** The narrowing in this tool is
   deliberately in the reading, not the detecting: SKILL.md's "Reading A Scan In Layers" has the
   agent go `overview` -> `drill <n>` -> `drill --kind` -> `explain <id>`, and `overview` shows at
-  most `DEFAULT_MAX_LOCATIONS` panels, interleaved by family so one dense family cannot take the
-  list. `_demote_dense_relations` already exists for exactly this: a flood of column relations in
-  one sheet is kept but dropped to low severity, because a correlated matrix is dense by
-  construction rather than by anything worth reporting. So a change that adds findings which
-  collapse into panels the agent already had, or into one new low-severity dense panel, has cost
-  the agent close to nothing, however large the raw delta reads.
-  Measure, therefore: does the ranked location list change, does a known true signal stay in the
-  shown set and at what rank, and how many steps reach it. Not the size of `scan.json`, and not
-  the count a detector returned. A probe that calls a detector directly bypasses the prefilter,
-  the profile, the per-block caps and the dense-sheet demotion, so its totals are not a cost the
-  reader would ever pay: a raw sweep here put one corpus paper tens of thousands of relations
-  above every other paper in its sample -- a number the READING layers exist to keep off the
-  page, though `scan.json` may well hold it, since the dense-sheet rule demotes rather than
-  drops. Worse, that one paper's presence or absence swamped the sweep's own totals: it timed
-  out under some settings and not others, so the sum swung by an order of magnitude for a
-  reason that had nothing to do with the setting, on top of a real and much smaller change
-  underneath. A per-paper comparison over papers that completed under every setting showed
-  the actual movement; the totals never would have.
-  Both halves of the trade have to be quoted at the same layer; a recall figure counted at the
-  detector against a cost figure counted at the detector is at least self-consistent, but
-  neither is the decision.
-  `_interleave_by_family` already argues this way in its own docstring, and is the model to
-  copy: it names what the change did to a true signal's RANK against the default page, not how
-  many findings existed.
+  most `DEFAULT_MAX_LOCATIONS` panels. Between a detector's return value and that page sit
+  `_MAX_FINDINGS_PER_BLOCK` and `_MAX_TOTAL_FINDINGS`, which DROP findings and record how many;
+  the prefilter and the profile; clustering into panels; and `_interleave_by_family`, which gives
+  each family a slot near the top. Measured on one corpus paper, what a direct detector call
+  counts, what survives into `scan.json`, and how many locations `overview` lists were three
+  numbers an order of magnitude or more apart.
+  So measure: does the ranked location list change, does a known true signal stay in the shown
+  set and at what rank, and how many steps reach it. Not the count a detector returned -- a probe
+  calling one directly skips the stages that come after it, so its totals are not a cost any
+  reader pays. How much it skips depends on which detector: the block-level ones return findings
+  raw, while the sheet- and corpus-level ones call `apply_profile_to_findings` themselves before
+  returning, so a probe over those has already had the profile applied and one over the others
+  has not. Check which you are calling rather than assuming a probe is uniformly upstream.
+  Both halves of a trade have to be quoted at the same layer. `_interleave_by_family`'s docstring
+  is the model: it says what a change did to a true signal's RANK against the default page.
+  Two traps, both of which caught the first draft of this rule. **Severity demotion is not one of
+  those stages.** `_demote_dense_relations` rewrites `severity` to low for a flooded sheet, but
+  `raw_severity` is frozen before it runs, and `_raw_severity_of` exists to say that the
+  rewritten field "must not drive routing" -- `overview`'s ordering, `strongest` and `high` all
+  read the raw one. A flood-demoted panel sits on the page looking like any other. The demotion
+  is real and it changes `report.html` and the packet; it does not change what the agent opens.
+  **And interleaving bounds domination rather than preventing it.** Given one saturated family
+  and two small ones it hands the saturated family most of a twenty-slot page; the repo's own
+  test asserts that more than one family is shown, which is a weaker guarantee than it sounds
+  like. Both traps are the "mechanism attributed to the wrong component" failure the last rule
+  warns about, reached by reasoning from a function's name instead of reading it.
+  Separately, compare per paper rather than on totals. One paper timed out under some settings
+  of a sweep and not others, which swung the sum by an order of magnitude for a reason that had
+  nothing to do with any setting, hiding a real and much smaller change underneath.
 - **A bench needs a true-positive stratum.** One made only of things that must not fire is passed
   perfectly by a detector that never fires. Include the relation the arm exists to catch, and
   freeze how much of it is currently found — including when that is "almost none", which is a
