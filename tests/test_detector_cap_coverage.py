@@ -915,6 +915,9 @@ _SCAN_REASONS_NOT_IN_SKILL = {
     # bullet without teaching the agent anything new.
     "detector_cross_figure_budget_limit",
     "detector_within_row_budget_limit",
+    # The third: the short-segment widths carry their own counter so they cannot take
+    # reach from the widths above. Same class, same rendering, nothing new to instruct.
+    "detector_within_row_short_budget_limit",
 }
 
 
