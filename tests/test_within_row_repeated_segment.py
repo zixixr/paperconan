@@ -314,3 +314,84 @@ def test_the_short_pass_cannot_spend_the_budget_the_wider_widths_use():
     )
 
     assert json.loads(out.strip()) == [4], out
+
+
+def test_a_short_candidate_does_not_replace_the_wider_repeat_it_sits_inside():
+    """A shorter statement must be added beside a longer one, never put in its place.
+
+    The candidate pool is ranked by copy count first. A three-wide window inside a genuine
+    four-wide repeat can also match at a third place where the fourth column disagrees, so
+    it has MORE copies than the four-wide vector, sorted ahead of it, and the four-wide
+    finding was then dropped against it as an overlapping duplicate. What reached the
+    reader was three values at three places -- with the fourth column's agreement, the
+    stronger half of the evidence, nowhere in the output.
+    """
+    wide = [4.176382, 9.028415, 1.593047, 6.702914]
+    row = (_fill(10, 3) + wide + _fill(6, 5) + wide + _fill(6, 7)
+           + wide[:3] + _fill(6, 9))
+
+    findings = detect_recurring_row_vectors({
+        ("synthetic.xlsx", "Figure 1"): _row_sheet(row),
+    })
+
+    wr = [f for f in findings if f["kind"] == "within_row_repeated_segment"]
+    assert wr, f"expected the four-wide repeat, got {findings}"
+    assert wr[0]["vector"] == wide, wr[0]["vector"]
+
+
+def test_a_coarse_row_does_not_spend_the_short_budget_before_a_fine_repeat_in_it():
+    """The precision check at window generation, not the one after it.
+
+    Both gates reject a coarse short segment, so removing either alone leaves the coarse
+    control test green -- but only the generation-time one keeps a doomed window from being
+    INDEXED, and therefore from spending the short budget. Without it a row of coarse
+    filler burns that budget before the scan reaches a genuine fine repeat late in the same
+    row, and the finding disappears: the capability subtracting coverage again, one layer
+    below where that was first found.
+    """
+    import os
+    import subprocess
+    import sys
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    coarse = [round(3.0 + i * 0.37, 2) for i in range(60)]
+    segment = [7.104391, 3.882057, 9.240118]
+    row = coarse + segment + [8.15, 2.94] + segment
+    code = (
+        "import json, sys;"
+        "sys.path.insert(0, 'src');"
+        "from paperconan._audit import detect_recurring_row_vectors;"
+        "from paperconan._sheet import Sheet;"
+        f"row = {row!r};"
+        "rows = [['h'] + ['c%d' % i for i in range(len(row))], ['b'] + row];"
+        "out = detect_recurring_row_vectors({('s.xlsx', 'Fig. 1'): Sheet.from_rows(rows)});"
+        "print(json.dumps(sorted(len(f['vector']) for f in out"
+        " if f['kind'] == 'within_row_repeated_segment')))"
+    )
+    out = subprocess.check_output(
+        [sys.executable, "-c", code],
+        env={**os.environ, "PAPERCONAN_WR_SHORT_SEGMENT_BUDGET": "50"},
+        text=True,
+        cwd=root,
+    )
+
+    assert 3 in json.loads(out.strip()), out
+
+
+def test_a_row_too_narrow_for_two_wide_copies_still_reaches_the_short_pass():
+    """The row-level precondition has to use the shortest width the pass will consider.
+
+    It asked for room for two copies at the ORDINARY width, so a row with just enough cells
+    for two three-wide copies was dropped before any short window was built -- the floor
+    change reaching the window loop but not the row that would have used it.
+    """
+    segment = [2.481937, 5.914026, 8.336571]
+    row = segment + segment   # six numeric cells: too narrow for two four-wide copies
+
+    findings = detect_recurring_row_vectors({
+        ("synthetic.xlsx", "Figure 1"): _row_sheet(row),
+    })
+
+    wr = [f for f in findings if f["kind"] == "within_row_repeated_segment"]
+    assert len(wr) == 1, f"expected the narrow-row repeat, got {findings}"
+    assert wr[0]["vector"] == segment

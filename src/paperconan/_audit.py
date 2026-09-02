@@ -3416,7 +3416,15 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
                            "detector_within_row_short_budget_limit")
     # One physical repeat yields many overlapping windows (k=4..8) — keep the strongest (most
     # copies, then longest) per row, dropping >=50%-cell-overlap duplicates.
-    wr_cands.sort(key=lambda x: (-len(x[5]), -len(x[0])))
+    # Short candidates are ranked AFTER every wider one, then by the existing key. A
+    # three-wide window sitting inside a genuine four-wide repeat can occur at a third
+    # place the fourth column does not agree on, which gives it more copies -- so under
+    # the copies-first key alone it won the pool and the four-wide finding was dropped
+    # against it as an overlapping duplicate. The reader then lost the fourth column's
+    # agreement entirely: a shorter, weaker statement REPLACING a longer one rather than
+    # being added beside it. The leading term is constant False for every candidate at or
+    # above the ordinary width, so their order among themselves is untouched.
+    wr_cands.sort(key=lambda x: (len(x[0]) < _WR_SEGMENT_MIN_COLS, -len(x[5]), -len(x[0])))
     wr_kept = []
     for c in wr_cands:
         if any(c[1:5] == kc[1:5] and len(c[6] & kc[6]) >= 0.5 * min(len(c[6]), len(kc[6]))
