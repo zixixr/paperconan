@@ -3202,6 +3202,29 @@ def _wr_frac_digits(v):
     return len(text.split(".")[1]) if "." in text else 0
 
 
+def _wr_has_occurrence_outside(cand, kept_cells):
+    """Does this candidate repeat somewhere the kept finding does not reach?
+
+    The dedup exists to fold the many overlapping windows ONE physical repeat produces into
+    a single finding, and it measures overlap against the smaller cell set. A short segment
+    that is part of a wider repeat and ALSO occurs a third time elsewhere overlaps on its
+    other places by more than enough to be dropped whole -- taking with it a place that
+    duplicates nothing. That place then reaches no report and no coverage note, which is
+    worse than reporting it and being wrong: a reader can dismiss a finding they can see.
+
+    An occurrence with no cell in common with the kept finding is not the same repeat, so a
+    candidate holding one is not that finding's duplicate. Occurrences that merely overlap
+    partially do not count -- those are the shifted windows the fold is for.
+    """
+    fname, sname, _fk, row = cand[1], cand[2], cand[3], cand[4]
+    vec_len, starts, seq_cols = len(cand[0]), cand[5], cand[7]
+    for columns in seq_cols:
+        cells = {(fname, sname, row, col) for col in columns}
+        if not (cells & kept_cells):
+            return True
+    return False
+
+
 def _wr_segment_is_long_enough(vec):
     """Is this repeated segment wide enough, given how finely its cells were recorded?"""
     if len(vec) >= _WR_SEGMENT_MIN_COLS:
@@ -3428,6 +3451,7 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
     wr_kept = []
     for c in wr_cands:
         if any(c[1:5] == kc[1:5] and len(c[6] & kc[6]) >= 0.5 * min(len(c[6]), len(kc[6]))
+               and not _wr_has_occurrence_outside(c, kc[6])
                for kc in wr_kept):
             continue
         wr_kept.append(c)

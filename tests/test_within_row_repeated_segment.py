@@ -395,3 +395,34 @@ def test_a_row_too_narrow_for_two_wide_copies_still_reaches_the_short_pass():
     wr = [f for f in findings if f["kind"] == "within_row_repeated_segment"]
     assert len(wr) == 1, f"expected the narrow-row repeat, got {findings}"
     assert wr[0]["vector"] == segment
+
+
+def test_a_wider_finding_does_not_swallow_an_occurrence_it_does_not_cover():
+    """Collapsing one physical repeat is right; dropping a second one is not.
+
+    The dedup folds the many overlapping windows a single long repeat produces into one
+    finding, and measures overlap against the SMALLER cell set. A short segment that is
+    part of a wider repeat AND occurs a third time somewhere the wider one does not reach
+    overlaps the wider finding on two of its three places -- enough to be dropped whole. The
+    third place goes with it, and it is not a duplicate of anything: it is a place the
+    reader is never told about, and no coverage note says so. A false positive an agent can
+    discard costs it a moment; evidence that never arrives cannot be judged at all.
+    """
+    s0, s1, s2 = 4.176382, 9.028415, 1.593047
+    wide = [6.702914, s0, s1, s2]
+    head = _fill(10, 3) + wide + _fill(20, 5)
+    row = head + [s0, s1, s2] + _fill(18, 7) + wide + _fill(6, 9)
+    # Derived, not written down: `_row_sheet` puts a label in column 0 and the finding
+    # reports 1-based columns, so a hand-counted literal here is two off-by-ones deep and
+    # would be wrong in a way that reads as a detector defect.
+    lone = {len(head) + 1 + offset + 1 for offset in range(3)}
+
+    findings = [f for f in detect_recurring_row_vectors({
+        ("synthetic.xlsx", "Figure 1"): _row_sheet(row),
+    }) if f["kind"] == "within_row_repeated_segment"]
+
+    covered = [set(o["columns"]) for f in findings for o in f["occurrences"]]
+    assert any(lone <= c for c in covered), (
+        f"the independent occurrence at columns {sorted(lone)} is in no finding; "
+        f"reported: {[(len(f['vector']), [o['range'] for o in f['occurrences']]) for f in findings]}"
+    )
