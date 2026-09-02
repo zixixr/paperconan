@@ -85,55 +85,57 @@ def _crossref(monkeypatch, message):
     monkeypatch.setattr(_http, "get_json", lambda *a, **k: {"message": message})
 
 
-def test_original_article_doi_reads_update_to(monkeypatch):
-    """A retraction or correction carries no source data of its own.
-
-    Its Crossref record points at the article it concerns, so the fetch should follow that
-    rather than searching for supplementary files attached to a one-page notice.
-    """
-    _crossref(monkeypatch, {
+def test_originals_reads_update_to():
+    """A retraction or correction carries no source data of its own; its record says what it
+    is about, so the fetch can follow that instead of searching a one-page notice."""
+    assert _resolve._originals_from_record({
         "title": ["Retraction Note: Something about cells"],
-        "type": "journal-article",
         "update-to": [{"DOI": "10.1038/s41467-021-00000-1", "type": "retraction"}],
-    })
-
-    assert _resolve.original_article_doi("10.1038/s41467-026-00000-9") == \
-        "10.1038/s41467-021-00000-1"
+    }) == ["10.1038/s41467-021-00000-1"]
 
 
-def test_original_article_doi_falls_back_to_relation(monkeypatch):
+def test_originals_falls_back_to_relation():
     """Some publishers record the link only under `relation`, not `update-to`."""
-    _crossref(monkeypatch, {
+    assert _resolve._originals_from_record({
         "title": ["Author Correction: Something about cells"],
         "relation": {"is-correction-of": [{"id": "10.1038/s41586-020-00000-2",
                                            "id-type": "doi"}]},
-    })
-
-    assert _resolve.original_article_doi("10.1038/s41586-026-00000-8") == \
-        "10.1038/s41586-020-00000-2"
+    }) == ["10.1038/s41586-020-00000-2"]
 
 
-def test_original_article_doi_is_none_for_an_ordinary_paper(monkeypatch):
-    """The common case must not be disturbed: a research article resolves to itself."""
-    _crossref(monkeypatch, {"title": ["Structure of a membrane protein"],
-                            "type": "journal-article"})
+def test_originals_returns_every_article_a_notice_names():
+    """One notice routinely concerns several papers -- a bulk correction, or an expression of
+    concern covering an author's output. Returning only the first would let a caller pick one
+    silently, and the picked DOI decides which candidates are judged confident, so a stranger's
+    data would be endorsed as this paper's."""
+    assert _resolve._originals_from_record({
+        "title": ["Expression of Concern: three articles"],
+        "update-to": [{"DOI": "10.1038/a-1"}, {"DOI": "10.1038/b-2"},
+                      {"DOI": "10.1038/a-1"}, {"DOI": "10.1038/c-3"}],
+    }) == ["10.1038/a-1", "10.1038/b-2", "10.1038/c-3"]
 
-    assert _resolve.original_article_doi("10.1038/s41586-020-00000-2") is None
+
+def test_originals_is_empty_for_an_ordinary_paper():
+    """The common case must not be disturbed: a research article names no original."""
+    assert _resolve._originals_from_record(
+        {"title": ["Structure of a membrane protein"], "type": "journal-article"}) == []
 
 
-def test_original_article_doi_is_none_when_the_notice_names_no_original(monkeypatch):
+def test_originals_is_empty_when_the_notice_names_nothing():
     """A notice with nothing to follow is not an error, and must not return itself."""
-    _crossref(monkeypatch, {"title": ["Editorial Expression of Concern"]})
-
-    assert _resolve.original_article_doi("10.1126/science.0000000") is None
+    assert _resolve._originals_from_record({"title": ["Editorial Expression of Concern"]}) == []
 
 
-def test_original_article_doi_survives_a_lookup_failure(monkeypatch):
+def test_enrich_carries_the_originals_and_survives_failure(monkeypatch):
     from paperconan.fetch import _http
+
+    _crossref(monkeypatch, {"title": ["Retraction Note: x"],
+                            "update-to": [{"DOI": "10.1038/orig-1"}]})
+    assert _resolve.enrich_via_crossref("10.1038/notice-9")["original_dois"] == \
+        ["10.1038/orig-1"]
 
     def boom(*a, **k):
         raise OSError("network down")
 
     monkeypatch.setattr(_http, "get_json", boom)
-
-    assert _resolve.original_article_doi("10.1038/s41467-026-00000-9") is None
+    assert _resolve.enrich_via_crossref("10.1038/notice-9") is None

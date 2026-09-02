@@ -19,8 +19,8 @@ def normalize_query(text):
 def enrich_via_crossref(doi):
     """Best-effort title/authors/year for a paper DOI. Returns None on any failure.
 
-    Also carries `original_doi`: the article a retraction or correction concerns, when this
-    DOI names one. It comes from the same record, so asking costs no extra request -- and a
+    Also carries `original_dois`: the articles a retraction or correction concerns, when this
+    DOI names any. They come from the same record, so asking costs no extra request -- and a
     separate lookup would double the round-trips on every fetch.
     """
     try:
@@ -37,7 +37,7 @@ def enrich_via_crossref(doi):
     if dp and dp[0]:
         year = str(dp[0][0])
     return {"doi": doi, "title": title, "authors": authors, "year": year,
-            "original_doi": _original_from_record(m)}
+            "original_dois": _originals_from_record(m)}
 
 
 # A retraction, correction or expression of concern is a page of its own, with its own DOI
@@ -55,36 +55,34 @@ _NOTICE_TITLE = re.compile(
 _ORIGINAL_RELATIONS = ("is-correction-of", "is-retraction-of", "is-comment-on")
 
 
-def _original_from_record(message):
-    """The DOI of the article this Crossref record is a notice about, or None.
+def _originals_from_record(message):
+    """Every article DOI this Crossref record is a notice about, in the order recorded.
 
-    None also covers "it is a notice but names nothing to follow" -- an expression of concern
-    that lists no original is not an error, and returning the notice's own DOI would send the
-    search straight back where it started.
+    A LIST, not one DOI, because one notice routinely concerns several papers -- a bulk
+    correction, or an expression of concern covering an author's output. Returning the first
+    would pick one silently, and since the picked DOI then decides `match_signals`, the
+    confidence check would go on to endorse a stranger's data as this paper's. For a tool
+    whose whole job is telling one paper's numbers from another's, that is the worst
+    available failure.
+
+    Empty covers both "not a notice" and "a notice that names nothing to follow"; the latter
+    is not an error, and returning the notice's own DOI would send a search straight back
+    where it started.
     """
     title = (message.get("title") or [""])[0]
     if not _NOTICE_TITLE.match(title or ""):
-        return None
+        return []
+    out = []
     for update in (message.get("update-to") or []):
-        if update.get("DOI"):
-            return update["DOI"]
+        doi = update.get("DOI")
+        if doi and doi not in out:
+            out.append(doi)
     relation = message.get("relation") or {}
     for key in _ORIGINAL_RELATIONS:
         for entry in relation.get(key, []):
-            if entry.get("id-type") == "doi" and entry.get("id"):
-                return entry["id"]
-    return None
-
-
-def original_article_doi(doi):
-    """`_original_from_record` for a DOI, fetching the record. One request."""
-    try:
-        message = _http.get_json(
-            f"https://api.crossref.org/works/{urllib.parse.quote(doi, safe='')}"
-        ).get("message", {})
-    except Exception:
-        return None
-    return _original_from_record(message)
+            if entry.get("id-type") == "doi" and entry.get("id") and entry["id"] not in out:
+                out.append(entry["id"])
+    return out
 
 
 # DOI registrant prefix -> publisher, for pointing users at the article page when the

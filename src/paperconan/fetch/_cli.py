@@ -54,6 +54,23 @@ def fetch_main(argv):
 
     cands = search_all(args.query, per_source=args.per_source)
 
+    # `search_all` may have followed a retraction or correction to the article it concerns.
+    # Every path below that points the user somewhere must point at THAT, not at the notice
+    # they typed -- guidance sending them back to a one-page notice is guidance to nowhere.
+    q = _resolve.normalize_query(args.query)
+    resolved_doi = (cands[0].get("resolved_doi") if cands else None) or q.get("doi")
+    guidance_paper = {"doi": resolved_doi, "title": q.get("title")}
+    if resolved_doi and q.get("doi") and resolved_doi != q["doi"]:
+        print(f"{q['doi']} names a retraction or correction; searching the article it "
+              f"concerns instead: {resolved_doi}\n")
+    several = (cands[0].get("notice_names_several_articles") if cands else None)
+    if several:
+        print(f"{q['doi']} is a notice naming {len(several)} articles, so none was followed "
+              f"-- fetch whichever you mean by its own DOI:")
+        for one in several:
+            print(f"    {one}")
+        print()
+
     target = None
     if args.download:
         target = next((c for c in cands if c["cand_id"] == args.download), None)
@@ -79,10 +96,9 @@ def fetch_main(argv):
         if _resolve.is_confident_match(cands[0]):
             target = cands[0]
         else:
-            q = _resolve.normalize_query(args.query)
             print("--auto: no candidate confidently matches this paper "
                   "(no DOI match, weak title overlap), so nothing was downloaded.\n")
-            print(_resolve.journal_guidance({"doi": q.get("doi"), "title": q.get("title")}))
+            print(_resolve.journal_guidance(guidance_paper))
             return 1
 
     if target is None:
@@ -93,9 +109,8 @@ def fetch_main(argv):
             # No usable tabular dataset in the open repos: point the user at where the
             # source data most likely lives (the journal article page).
             if not any(c.get("tabular_files") for c in cands):
-                q = _resolve.normalize_query(args.query)
                 print()
-                print(_resolve.journal_guidance({"doi": q.get("doi"), "title": q.get("title")}))
+                print(_resolve.journal_guidance(guidance_paper))
         return 0
 
     out_dir = args.out or "paperconan_data"

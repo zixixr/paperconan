@@ -51,6 +51,10 @@ def _no_sources(monkeypatch, seen):
         monkeypatch.setattr(fetch._sources, name, spy)
 
 
+def _records(monkeypatch, table):
+    monkeypatch.setattr(fetch._resolve, "enrich_via_crossref", table.get)
+
+
 def test_search_all_follows_a_notice_to_the_article_it_concerns(monkeypatch):
     """A retraction or correction has its own DOI and no supplementary files of its own.
 
@@ -59,14 +63,71 @@ def test_search_all_follows_a_notice_to_the_article_it_concerns(monkeypatch):
     """
     seen = []
     _no_sources(monkeypatch, seen)
-    records = {"10.1038/notice-9": {"title": "Retraction Note: x",
-                                    "original_doi": "10.1038/original-1"},
-               "10.1038/original-1": {"title": "x", "original_doi": None}}
-    monkeypatch.setattr(fetch._resolve, "enrich_via_crossref", records.get)
+    _records(monkeypatch, {
+        "10.1038/notice-9": {"title": "Retraction Note: x", "original_dois": ["10.1038/orig-1"]},
+        "10.1038/orig-1": {"title": "x", "original_dois": []},
+    })
 
     fetch.search_all("10.1038/notice-9", per_source=5)
 
-    assert seen and set(seen) == {"10.1038/original-1"}
+    assert seen and set(seen) == {"10.1038/orig-1"}
+
+
+def test_search_all_follows_a_correction_of_a_correction(monkeypatch):
+    """Corrections get corrected. Stopping after one hop lands on another bare notice --
+    the original bug, one link further down."""
+    seen = []
+    _no_sources(monkeypatch, seen)
+    _records(monkeypatch, {
+        "10.1038/notice-a": {"title": "Author Correction: x", "original_dois": ["10.1038/notice-b"]},
+        "10.1038/notice-b": {"title": "Author Correction: x", "original_dois": ["10.1038/article-c"]},
+        "10.1038/article-c": {"title": "x", "original_dois": []},
+    })
+
+    fetch.search_all("10.1038/notice-a", per_source=5)
+
+    assert seen and set(seen) == {"10.1038/article-c"}
+
+
+def test_search_all_stops_rather_than_looping_on_a_cycle(monkeypatch):
+    """A record that points back at something already visited must end the walk, not spin."""
+    seen = []
+    _no_sources(monkeypatch, seen)
+    _records(monkeypatch, {
+        "10.1038/notice-a": {"title": "Correction: x", "original_dois": ["10.1038/notice-b"]},
+        "10.1038/notice-b": {"title": "Correction: x", "original_dois": ["10.1038/notice-a"]},
+    })
+
+    fetch.search_all("10.1038/notice-a", per_source=5)
+
+    assert seen and set(seen) == {"10.1038/notice-b"}
+
+
+def test_search_all_will_not_pick_between_the_articles_a_notice_names(monkeypatch):
+    """A bulk notice names several papers. Following one would decide silently which paper's
+    data is downloaded -- and because the chosen DOI feeds `match_signals`, the confidence
+    check would then endorse a stranger's data as this paper's. It searches the notice
+    instead, and says what it declined to choose between."""
+    seen = []
+    monkeypatch.setattr(fetch._sources, "search_nature_esm",
+                        lambda q, size=5: [{"cand_id": "x:1", "source": "x", "id": "1",
+                                            "doi": None, "title": "", "authors": [],
+                                            "published": None, "tabular_files": [],
+                                            "all_files_count": 0, "related_dois": [],
+                                            "match_signals": None}])
+    for name in ("search_zenodo", "search_figshare", "search_dryad", "search_europepmc"):
+        monkeypatch.setattr(fetch._sources, name, lambda q, size=5: seen.append(q) or [])
+    _records(monkeypatch, {
+        "10.1038/bulk-notice": {"title": "Expression of Concern: three articles",
+                                "original_dois": ["10.1038/a-1", "10.1038/b-2", "10.1038/c-3"]},
+    })
+
+    cands = fetch.search_all("10.1038/bulk-notice", per_source=5)
+
+    assert set(seen) == {"10.1038/bulk-notice"}, "must not follow any one of them"
+    assert cands[0]["notice_names_several_articles"] == \
+        ["10.1038/a-1", "10.1038/b-2", "10.1038/c-3"]
+    assert cands[0]["resolved_doi"] == "10.1038/bulk-notice"
 
 
 def test_search_all_leaves_an_ordinary_paper_alone(monkeypatch):
@@ -77,7 +138,7 @@ def test_search_all_leaves_an_ordinary_paper_alone(monkeypatch):
 
     def enrich(doi):
         calls.append(doi)
-        return {"title": "A research article", "original_doi": None}
+        return {"title": "A research article", "original_dois": []}
 
     monkeypatch.setattr(fetch._resolve, "enrich_via_crossref", enrich)
 
