@@ -3426,7 +3426,7 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
     # above the ordinary width, so their order among themselves is untouched.
     wr_cands.sort(key=lambda x: (len(x[0]) < _WR_SEGMENT_MIN_COLS, -len(x[5]), -len(x[0])))
     wr_kept = []
-    folded_independent = 0
+    wr_folded = []
     for c in wr_cands:
         absorbed = next((kc for kc in wr_kept
                          if c[1:5] == kc[1:5]
@@ -3445,11 +3445,20 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
             # not be one. What is fixed here is the silence: the drop is recorded, so a
             # reader is told the pass held something back rather than being shown a page
             # that looks complete.
-            if any(not ({(c[1], c[2], c[4], col) for col in cols} & absorbed[6])
-                   for cols in c[7]):
-                folded_independent += 1
+            wr_folded.append(c)
             continue
         wr_kept.append(c)
+    # Against everything KEPT, and only once the keeping is finished. Testing against the
+    # one candidate that absorbed it answers a narrower question than the note asks: an
+    # occurrence can miss its absorber entirely and still sit inside a different finding
+    # that reached the page, and review measured that mistake on a third of the flagged
+    # occurrences in adversarial rows. "Somewhere the report does not cover" is a claim
+    # about the report, so it has to be asked of the whole of it.
+    kept_cells = set().union(*(kc[6] for kc in wr_kept)) if wr_kept else set()
+    folded_independent = sum(
+        1 for c in wr_folded
+        if any(not ({(c[1], c[2], c[4], col) for col in cols} & kept_cells)
+               for cols in c[7]))
     if folded_independent:
         _note_detector_cap(coverage, "detect_recurring_row_vectors",
                            "detector_within_row_folded_independent_repeat",

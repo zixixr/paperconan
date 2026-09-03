@@ -442,3 +442,31 @@ def test_a_plain_fold_records_nothing():
 
     reasons = [item.get("reason") for item in coverage.to_dict()["limitations"]]
     assert "detector_within_row_folded_independent_repeat" not in reasons, reasons
+
+
+def test_no_note_when_the_folded_repeat_is_covered_by_a_different_finding():
+    """"Somewhere the report does not cover" is a claim about the whole report.
+
+    A row can hold two kept findings that share a tail. The short tail candidate is
+    absorbed by whichever the fold reaches first, and its other occurrences sit inside the
+    OTHER one -- which is on the page. Asking only the absorber says those places are
+    covered nowhere, which is false, and it is the note's entire content. Measured on
+    adversarial rows, that phrasing of the question was wrong for a third of what it
+    flagged.
+    """
+    from paperconan._coverage import ScanCoverage
+
+    t0, t1, t2 = 4.176382, 9.028415, 1.593047
+    k1 = [6.702914, t0, t1, t2]
+    k2 = [3.314159, t0, t1, t2]
+    row = (_fill(8, 3) + k1 + _fill(6, 5) + k1 + _fill(6, 7)
+           + k2 + _fill(6, 9) + k2 + _fill(6, 11))
+    coverage = ScanCoverage(files_discovered=1)
+
+    findings = [f for f in detect_recurring_row_vectors(
+        {("synthetic.xlsx", "Figure 1"): _row_sheet(row)}, coverage=coverage,
+    ) if f["kind"] == "within_row_repeated_segment"]
+
+    assert [len(f["vector"]) for f in findings] == [4, 4], findings
+    reasons = [item.get("reason") for item in coverage.to_dict()["limitations"]]
+    assert "detector_within_row_folded_independent_repeat" not in reasons, reasons

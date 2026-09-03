@@ -128,12 +128,15 @@ Three things to hold onto while reading:
     — not a truncation but an omission:
     the within-row pass folds the overlapping windows one physical repeat
     produces into a single finding, and this many of the folded candidates also
-    repeated somewhere the surviving finding does not cover. That place is on no
-    page. The count is all the record holds; finding it means reading the row.
+    repeated at a place no finding on this page covers at all. The count is all
+    the record holds; finding the place means reading the row.
 
   Any of these means `scan_status` is not `complete` (`partial`, or `failed` when
-  nothing could be read at all) and the search was cut short, so a
-  quiet result on that input is not evidence of a clean one. Detector lines name
+  nothing could be read at all), so a quiet result on that input is not evidence
+  of a clean one. All but the last were cut short — the rest of this paragraph is
+  about those. The folded-repeat line is not a truncation: nothing was left
+  unexamined, so no cap governs it and no narrower input recovers anything. Its
+  remedy is the one its own bullet gives, reading the row. Detector lines name
   **no file or sheet**: the record does not carry one, so the line cannot tell you
   *where* the truncation bit — it may have been one block or many. Re-running
   unchanged proves nothing: the scan is deterministic, so it reproduces the same
