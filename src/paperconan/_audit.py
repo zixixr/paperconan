@@ -768,8 +768,13 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
             cj, aj = cols[j]
             mask = ~np.isnan(ai) & ~np.isnan(aj)
             n = int(mask.sum())
-            if n < _COLUMN_PAIR_MIN_ROWS:
+            # The lower of the two, so an equality can be reached; each branch then answers
+            # to its OWN floor. Entering on `min` alone let the equality floor lower the bar
+            # and never raise it -- set above the ordinary one it changed nothing at all,
+            # while being documented as a knob whose cost could be swept.
+            if n < min(_COLUMN_PAIR_MIN_ROWS, _COLUMN_PAIR_EXACT_MIN_ROWS):
                 continue
+            fits_a_parameter = n < _COLUMN_PAIR_MIN_ROWS
             x, y = ai[mask], aj[mask]
             # Compact value peek for downstream LLM triage (bounded <=8 each, ~tiny).
             sa, sb = _sample(x), _sample(y)
@@ -780,11 +785,29 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
             # aren't held to an unreasonably tight absolute bound either).
             tol = 1e-9 * max(float(np.max(np.abs(x))), float(np.max(np.abs(y))), 1e-300)
             # identical
+            if _allclose_rowwise(x, y) and n < _COLUMN_PAIR_EXACT_MIN_ROWS:
+                # An equality, below the floor set for equalities. Stop here rather than
+                # falling through: the fitted branches all decline an identity -- a slope
+                # of one with a zero intercept is this same relationship restated worse,
+                # and each suppresses it separately -- so the pair goes silent either way
+                # today. That silence would be accidental, resting on every one of those
+                # suppressions staying in place, and relaxing any of them would surface an
+                # equality its own floor had just excluded, dressed as a line. Only
+                # reachable when this floor is set ABOVE the ordinary one; the shipped
+                # default is below it, where `fits_a_parameter` has already stopped the
+                # pair.
+                continue
             if _allclose_rowwise(x, y):
                 findings.append(dict(kind="identical_column", col_a=header[ci - c0], col_b=header[cj - c0],
                                      col_a_idx=ci, col_b_idx=cj, n=n, severity="high",
                                      col_a_sample=sa, col_b_sample=sb,
                                      rule=f"col[{cj}] == col[{ci}]"))
+                continue
+            if fits_a_parameter:
+                # Below the ordinary floor and not an equality. Every branch past this point
+                # estimates a constant, a ratio or a line from the same points it then
+                # checks, which is what the ordinary floor is for; several ask for more
+                # still. They are not reached rather than each declining separately.
                 continue
             # constant offset
             diff = y - x
@@ -1004,7 +1027,28 @@ _SHORT_ROW_MIN_FRAC_DIGITS = int(os.environ.get("PAPERCONAN_SHORT_ROW_MIN_FRAC_D
 # floor rather than a significance test: with three points almost any pair fits
 # something. Named and overridable like its siblings so its cost can be swept on the
 # false-positive bench -- as a bare literal it never was.
+#
+# "Almost any pair fits something" is true of the relations that FIT A PARAMETER --
+# `exact_linear` estimates two from the data, so three points leave it one degree of
+# freedom and it will find a line. It is not true of equality, which estimates nothing:
+# three rows agreeing to the last recorded digit is three independent agreements, not a
+# curve drawn through three points. One floor for both grades the evidence by the weakest
+# member, and the review corpus put three-replicate panels under it -- a repeated column in
+# a three-mouse group is exactly the shape a reader wants flagged.
+#
+# So equality enters at its own floor. This one still governs entry for everything else --
+# and several branches ask for more on top of it: an offset takes this floor, a line and a
+# constant sum take five. Those differ from each other for the same reason, so what this
+# adds is a rung at the bottom of a ladder the engine already had, not a new principle.
 _COLUMN_PAIR_MIN_ROWS = int(os.environ.get("PAPERCONAN_COLUMN_PAIR_MIN_ROWS", "4"))
+# The floor for a relation with no fitted parameter. Nothing below three: two points agree
+# by coincidence far too readily. Lowering it further is PERMISSIVE, not inert -- `n` counts
+# the rows the two columns SHARE, and a block only has to be three rows tall while a column
+# only has to be 70% dense to join one, so a taller block can hold a pair whose gaps fall in
+# different rows and whose overlap is two. Review found that by construction; the guess that
+# the block floor made a lower value unreachable was wrong.
+_COLUMN_PAIR_EXACT_MIN_ROWS = int(
+    os.environ.get("PAPERCONAN_COLUMN_PAIR_EXACT_MIN_ROWS", "3"))
 # Tighter than _ROW_REL_RTOL: a short ratio run has fewer cells to corroborate the
 # constant, so the constancy must be crisp to stay clear of chance.
 _SHORT_ROW_RTOL = float(os.environ.get("PAPERCONAN_SHORT_ROW_RTOL", "1e-4"))
@@ -1317,13 +1361,42 @@ def _demote_within_col_flood(within_col, cap=WITHIN_COL_SHEET_CAP):
     return within_col
 
 
+def _relation_meets_ordinary_floor(r) -> bool:
+    """Could this relation have reached the pool before equality got its own floor?"""
+    n = r.get("n")
+    if n is None:            # `is None`, not falsy: a zero is a count, and `or` would read
+        return True          # it as "unknown" and put it in the wrong class
+    try:
+        return int(n) >= _COLUMN_PAIR_MIN_ROWS
+    except (TypeError, ValueError):
+        return True
+
+
 def _demote_dense_relations(relations, cap=RELATION_FLOOD_CAP):
     """Demote a flood of pairwise column relations to low severity (tagging them
     ``dense_block``) so a dense matrix stops dominating high-severity output. Findings
-    are kept, not dropped — just down-weighted. Returns the same list."""
-    if len(relations) <= cap:
-        return relations
-    for r in relations:
+    are kept, not dropped — just down-weighted. Returns the same list.
+
+    The two admission classes are weighed differently, and asymmetrically on purpose.
+    Whether the sheet is a dense matrix is decided on what could always reach this pool, so
+    that verdict is exactly the one it was before equality got a lower floor -- letting the
+    new short equalities vote turned a sheet dense on their evidence and demoted an
+    unrelated finding that had nothing to do with them, measured as a genuine four-row
+    offset dropping to low beside a block of forty-five three-row equalities.
+
+    But they are not exempt from the crowding they cause. Judging each class against the
+    full cap on its own left a sheet able to carry nearly twice it with nothing demoted at
+    all, which is the flood this cap exists for arriving by a side door. So the short ones
+    go low once the sheet is crowded by any measure, while the ordinary ones answer only to
+    their own count. The newcomers carry what they add."""
+    ordinary = [r for r in relations if _relation_meets_ordinary_floor(r)]
+    short = [r for r in relations if not _relation_meets_ordinary_floor(r)]
+    flooded = []
+    if len(ordinary) > cap:
+        flooded = relations                      # a dense matrix, judged as it always was
+    elif len(relations) > cap:
+        flooded = short                          # crowded, and the newcomers carry it
+    for r in flooded:
         r["severity"] = "low"
         r["dense_block"] = True
     return relations
