@@ -133,10 +133,13 @@ Three things to hold onto while reading:
 
   Any of these means `scan_status` is not `complete` (`partial`, or `failed` when
   nothing could be read at all), so a quiet result on that input is not evidence
-  of a clean one. All but the last were cut short — the rest of this paragraph is
-  about those. The folded-repeat line is not a truncation: nothing was left
-  unexamined, so no cap governs it and no narrower input recovers anything. Its
-  remedy is the one its own bullet gives, reading the row. Detector lines name
+  of a clean one. The rest of this paragraph is about the lines that were CUT
+  SHORT, which is every one above except `detector within row folded independent
+  repeat`. That one is not a truncation: nothing was left unexamined, so no cap
+  governs it and no narrower input recovers anything, and its remedy is the one
+  its own bullet gives — reading the row. (Named rather than positioned, so that
+  appending a bullet cannot make this sentence quietly wrong about two of them.)
+  Detector lines name
   **no file or sheet**: the record does not carry one, so the line cannot tell you
   *where* the truncation bit — it may have been one block or many. Re-running
   unchanged proves nothing: the scan is deterministic, so it reproduces the same

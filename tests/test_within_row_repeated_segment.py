@@ -470,3 +470,36 @@ def test_no_note_when_the_folded_repeat_is_covered_by_a_different_finding():
     assert [len(f["vector"]) for f in findings] == [4, 4], findings
     reasons = [item.get("reason") for item in coverage.to_dict()["limitations"]]
     assert "detector_within_row_folded_independent_repeat" not in reasons, reasons
+
+
+def test_the_note_still_fires_when_the_finding_cap_truncates_the_page():
+    """The question is about the page, and the page can be shorter than the selection.
+
+    The emission loop stops at `max_findings`. A candidate the fold selected but the cap
+    never emitted has cells, and counting those as coverage let the note stay silent about
+    a place nothing on the page covers -- a false all-clear, which is the direction
+    `_note_detector_cap` exists to avoid. Review found real papers hitting that cap on this
+    detector, so the precondition is not hypothetical.
+    """
+    from paperconan._coverage import ScanCoverage
+
+    t0, t1, t2 = 4.176382, 9.028415, 1.593047
+    other = [8.111213, 3.222324, 6.755435, 1.994546]
+    k2 = [2.717654, t0, t1, t2]
+    k3 = [5.313131, t0, t1, t2]
+    # `other` has the most copies, so it takes the single reported slot; k2 and k3 are
+    # selected and never emitted, and the shared tail is folded against one of them.
+    row = (_fill(6, 3) + other + _fill(5, 5) + other + _fill(5, 7) + other
+           + _fill(5, 9) + k2 + _fill(5, 11) + k2
+           + _fill(5, 13) + k3 + _fill(5, 15) + k3 + _fill(6, 17))
+    coverage = ScanCoverage(files_discovered=1)
+
+    findings = [f for f in detect_recurring_row_vectors(
+        {("synthetic.xlsx", "Figure 1"): _row_sheet(row)},
+        max_findings=1, coverage=coverage,
+    ) if f["kind"] == "within_row_repeated_segment"]
+
+    assert [f["vector"] for f in findings] == [other], findings
+    reasons = [item.get("reason") for item in coverage.to_dict()["limitations"]]
+    assert "detector_finding_limit" in reasons, reasons
+    assert "detector_within_row_folded_independent_repeat" in reasons, reasons
