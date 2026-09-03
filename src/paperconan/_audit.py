@@ -3426,11 +3426,34 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
     # above the ordinary width, so their order among themselves is untouched.
     wr_cands.sort(key=lambda x: (len(x[0]) < _WR_SEGMENT_MIN_COLS, -len(x[5]), -len(x[0])))
     wr_kept = []
+    folded_independent = 0
     for c in wr_cands:
-        if any(c[1:5] == kc[1:5] and len(c[6] & kc[6]) >= 0.5 * min(len(c[6]), len(kc[6]))
-               for kc in wr_kept):
+        absorbed = next((kc for kc in wr_kept
+                         if c[1:5] == kc[1:5]
+                         and len(c[6] & kc[6]) >= 0.5 * min(len(c[6]), len(kc[6]))), None)
+        if absorbed is not None:
+            # The fold is right for the shifted windows one physical repeat produces, and
+            # those are what it almost always sees. It is NOT right when the folded
+            # candidate also repeats somewhere the kept finding never reaches: that place
+            # corroborates nothing already on the page, and it leaves with the candidate.
+            #
+            # Selection is deliberately unchanged. Rescuing such a candidate whole was
+            # tried and withdrawn: it enters `wr_kept` carrying its overlapping
+            # occurrences too, becomes a suppressor for later candidates, and drops
+            # findings the fold used to keep -- silently, and without moving the finding
+            # count, so a count-based check cannot see it. A cure for a silent loss must
+            # not be one. What is fixed here is the silence: the drop is recorded, so a
+            # reader is told the pass held something back rather than being shown a page
+            # that looks complete.
+            if any(not ({(c[1], c[2], c[4], col) for col in cols} & absorbed[6])
+                   for cols in c[7]):
+                folded_independent += 1
             continue
         wr_kept.append(c)
+    if folded_independent:
+        _note_detector_cap(coverage, "detect_recurring_row_vectors",
+                           "detector_within_row_folded_independent_repeat",
+                           count=folded_independent)
     for vec, fn, sn, fk, r, chosen, _cells, source_columns in wr_kept:
         occurrences = []
         for zero_based_columns in source_columns:

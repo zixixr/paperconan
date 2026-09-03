@@ -395,3 +395,50 @@ def test_a_row_too_narrow_for_two_wide_copies_still_reaches_the_short_pass():
     wr = [f for f in findings if f["kind"] == "within_row_repeated_segment"]
     assert len(wr) == 1, f"expected the narrow-row repeat, got {findings}"
     assert wr[0]["vector"] == segment
+
+
+def test_folding_a_repeat_that_occurs_elsewhere_is_recorded():
+    """Selection is unchanged; the silence is what this fixes.
+
+    The fold collapses the overlapping windows one physical repeat produces, which is
+    right. It is not right when the folded candidate also repeats where the surviving
+    finding never reaches: that place corroborates nothing on the page and leaves with the
+    candidate. Rescuing the candidate whole was tried and withdrawn -- it then suppressed
+    later candidates and dropped findings the fold used to keep, without moving the finding
+    count, so the cure had the disease. What is recorded instead is that the pass held
+    something back, which is the difference between a page that is incomplete and a page
+    that looks complete.
+    """
+    from paperconan._coverage import ScanCoverage
+
+    s0, s1, s2 = 4.176382, 9.028415, 1.593047
+    wide = [6.702914, s0, s1, s2]
+    row = (_fill(10, 3) + wide + _fill(20, 5) + [s0, s1, s2]
+           + _fill(18, 7) + wide + _fill(6, 9))
+    coverage = ScanCoverage(files_discovered=1)
+
+    findings = [f for f in detect_recurring_row_vectors(
+        {("synthetic.xlsx", "Figure 1"): _row_sheet(row)}, coverage=coverage,
+    ) if f["kind"] == "within_row_repeated_segment"]
+
+    # Unchanged: one finding, the wider repeat, exactly as before this note existed.
+    assert [len(f["vector"]) for f in findings] == [4]
+    reasons = [item.get("reason") for item in coverage.to_dict()["limitations"]]
+    assert "detector_within_row_folded_independent_repeat" in reasons, reasons
+
+
+def test_a_plain_fold_records_nothing():
+    """The control. A long repeat yields many shifted windows over the SAME places, and
+    folding those is the pass working -- if that were recorded too, the note would appear
+    on ordinary input and mean nothing."""
+    from paperconan._coverage import ScanCoverage
+
+    segment = [7.104391, 3.882057, 9.240118, 2.665903, 5.417620]
+    row = _fill(8, 3) + segment + _fill(6, 5) + segment + _fill(8, 7)
+    coverage = ScanCoverage(files_discovered=1)
+
+    detect_recurring_row_vectors(
+        {("synthetic.xlsx", "Figure 1"): _row_sheet(row)}, coverage=coverage)
+
+    reasons = [item.get("reason") for item in coverage.to_dict()["limitations"]]
+    assert "detector_within_row_folded_independent_repeat" not in reasons, reasons

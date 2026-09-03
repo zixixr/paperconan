@@ -124,6 +124,12 @@ Three things to hold onto while reading:
     a detector stopped emitting at its cap.
   - `scan: detector compute budget limit in detect_row_relations` — a detector ran
     out of its work budget.
+  - `scan: detector within row folded independent repeat in detect_recurring_row_vectors (count=2)`
+    — not a truncation but an omission:
+    the within-row pass folds the overlapping windows one physical repeat
+    produces into a single finding, and this many of the folded candidates also
+    repeated somewhere the surviving finding does not cover. That place is on no
+    page. The count is all the record holds; finding it means reading the row.
 
   Any of these means `scan_status` is not `complete` (`partial`, or `failed` when
   nothing could be read at all) and the search was cut short, so a
