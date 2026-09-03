@@ -60,9 +60,30 @@ for opt-in — a bench skipped by default is green while the detector moves, whi
 they were written to end. Each carries a `__main__` block that reprints its frozen tables
 paste-ready; regenerate that way rather than hand-editing a table.
 
-Four rules, each of which cost review rounds to learn. Where a claim below has a size, the
-recipe for measuring it is given instead of the figure — see the fourth rule for why:
+Five rules, each of which cost review rounds to learn. Where a claim below has a size, the
+recipe for measuring it is given instead of the figure — see the last rule for why:
 
+- **Cost is what the AGENT sees, not what the detector emits.** The narrowing here is
+  deliberately in the reading: SKILL.md's "Reading A Scan In Layers" has the agent go
+  `overview` -> `drill <n>` -> `drill --kind` -> `explain <id>`, and `overview` shows at most
+  `DEFAULT_MAX_LOCATIONS` panels. So measure a change by what that page does: whether the ranked
+  location list moves, whether a known true signal is on it and at what rank, how many steps
+  reach it. Both halves of a trade have to be quoted at that same layer.
+  A count taken by calling a detector directly is not that. To see the size of the gap, take the
+  densest paper you have and count three things -- what one detector returns, what survives into
+  `scan.json`, what `overview` lists. Also compare per paper, over papers that completed under
+  every setting: corpus papers differ enormously in size, so a sum over them is largely a
+  statement about the biggest, and one paper timing out under some settings and not others can
+  move a total further than the settings do. Sort the per-paper counts and see how much of the
+  sum the top one carries.
+  Read the stage you want to credit before crediting it. Every draft of this rule so far has
+  credited a component that does not do the thing. Severity demotion does not gate the reading
+  layer: `raw_severity` is frozen before `_demote_dense_relations` runs, and `_raw_severity_of`
+  says in as many words that the rewritten field "must not drive routing". Family interleaving
+  bounds one family's share of the page rather than preventing it. And what a probe skips
+  depends on which detector it calls -- some apply the profile themselves before returning, and
+  some are never routed to a panel at all. Each was reached by reasoning from a name, and each
+  cost a review round.
 - **A bench needs a true-positive stratum.** One made only of things that must not fire is passed
   perfectly by a detector that never fires. Include the relation the arm exists to catch, and
   freeze how much of it is currently found — including when that is "almost none", which is a
