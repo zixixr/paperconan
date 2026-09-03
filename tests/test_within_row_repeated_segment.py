@@ -503,3 +503,43 @@ def test_the_note_still_fires_when_the_finding_cap_truncates_the_page():
     reasons = [item.get("reason") for item in coverage.to_dict()["limitations"]]
     assert "detector_finding_limit" in reasons, reasons
     assert "detector_within_row_folded_independent_repeat" in reasons, reasons
+
+
+def test_a_sibling_pass_on_the_same_page_counts_as_coverage():
+    """Both passes of this detector reach one page, so the note has to look at both.
+
+    `detect_recurring_row_vectors` emits two kinds into one list under one `max_findings`:
+    the cross-figure vector and its within-row sibling. Asking only what the within-row
+    pass reported called a place uncovered while the cross-figure finding was reporting it
+    -- the same "which set is the page" error as the two rounds before it, one set further
+    out. Here the folded three-tuple's independent occurrence lies inside the five-value
+    vector the cross-figure pass reports, so nothing is uncovered and nothing is noted.
+    """
+    from paperconan._coverage import ScanCoverage
+    from paperconan._sheet import Sheet
+
+    tail = [4.176382, 9.028415, 1.593047]
+    vector = tail + [7.334215, 2.481937]      # what the cross-figure pass reports
+    wide = [6.702914] + tail                  # the within-row repeat that absorbs the tail
+
+    def sheet(name, seed, carries_the_row=False):
+        body = (_fill(6, seed) + wide + _fill(8, seed + 1) + vector
+                + _fill(8, seed + 2) + wide + _fill(6, seed + 3)
+                if carries_the_row else
+                _fill(6, seed) + vector + _fill(6, seed + 1))
+        rows = [[name] + [f"c{i}" for i in range(len(body))], ["b"] + body]
+        rows.extend([f"x{k}"] + _fill(len(body), seed + 9 + k) for k in range(3))
+        return Sheet.from_rows(rows)
+
+    grid = {("f.xlsx", "Figure 1"): sheet("Figure 1", 10, carries_the_row=True),
+            ("f.xlsx", "Figure 2"): sheet("Figure 2", 20),
+            ("f.xlsx", "Figure 3"): sheet("Figure 3", 30)}
+    coverage = ScanCoverage(files_discovered=1)
+
+    findings = detect_recurring_row_vectors(grid, coverage=coverage)
+
+    kinds = {f["kind"] for f in findings}
+    assert "recurring_row_vector" in kinds, kinds
+    assert "within_row_repeated_segment" in kinds, kinds
+    reasons = [item.get("reason") for item in coverage.to_dict()["limitations"]]
+    assert "detector_within_row_folded_independent_repeat" not in reasons, reasons

@@ -3292,6 +3292,11 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
 
     findings = []
     _capped = False   # set only where a loop is actually abandoned
+    # Cells of every finding this call emits, from BOTH passes. The within-row note below
+    # asks what the reader can see, and the two kinds share this list, this `max_findings`
+    # and one page -- scoping it to the within-row pass alone called a place uncovered
+    # while its cross-figure sibling was reporting it.
+    reported_cells = set()
     for vec, places, namespaces, sites, _cells in kept:
         sheets_hit = sorted({p[1] for p in places})
         loc = "; ".join(sheets_hit[:6])
@@ -3315,6 +3320,7 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
             severity="high" if (len(vec) >= 5 and len(sites) >= 3) else "medium",
             rule=(f"the {len(vec)}-value vector {list(vec)} recurs at {len(sites)} places across "
                   f"{len(namespaces)} figures ({loc})")))
+        reported_cells |= _cells
         if len(findings) >= max_findings:
             _capped = True
             break
@@ -3448,13 +3454,6 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
             wr_folded.append(c)
             continue
         wr_kept.append(c)
-    # Against everything KEPT, and only once the keeping is finished. Testing against the
-    # one candidate that absorbed it answers a narrower question than the note asks: an
-    # occurrence can miss its absorber entirely and still sit inside a different finding
-    # that reached the page, and review measured that mistake on a third of the flagged
-    # occurrences in adversarial rows. "Somewhere the report does not cover" is a claim
-    # about the report, so it has to be asked of the whole of it.
-    reported_cells = set()
     for vec, fn, sn, fk, r, chosen, _cells, source_columns in wr_kept:
         occurrences = []
         for zero_based_columns in source_columns:

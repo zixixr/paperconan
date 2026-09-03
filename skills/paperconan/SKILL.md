@@ -135,10 +135,14 @@ Three things to hold onto while reading:
   nothing could be read at all), so a quiet result on that input is not evidence
   of a clean one. The rest of this paragraph is about the lines that were CUT
   SHORT, which is every one above except `detector within row folded independent
-  repeat`. That one is not a truncation: nothing was left unexamined, so no cap
-  governs it and no narrower input recovers anything, and its remedy is the one
-  its own bullet gives — reading the row. (Named rather than positioned, so that
-  appending a bullet cannot make this sentence quietly wrong about two of them.)
+  repeat`. (Named rather than positioned, so that appending a bullet cannot make
+  this sentence quietly wrong about two of them.) That one reports an omission
+  rather than a truncation: nothing was left unexamined, and reading the row is
+  its remedy. But it is not independent of the caps either — it compares against
+  the findings that were EMITTED, so when `detector finding limit` appears on the
+  same detector in the same scan, a narrower input can emit more and change
+  whether this line appears at all. Seen on a real supplement. Read the two
+  together when both are present.
   Detector lines name
   **no file or sheet**: the record does not carry one, so the line cannot tell you
   *where* the truncation bit — it may have been one block or many. Re-running
