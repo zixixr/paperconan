@@ -161,6 +161,14 @@ def _two_level_coded(rng, magnitude, digits):
     Does NOT grade the ratio tolerance: column A is half zeros, so the arm's non-zero-divisor
     guard holds it out, and its one distinct non-zero level would make y/x constant anyway.
     Read a move here as a change to `small_diff_set` or the linear arm.
+
+    Its `exact_linear` verdict moved partial -> pervasive when the linear arm regained an
+    absolute margin at the fit's own scale. `y = 2x` here is exactly affine, so the arm was
+    always right to report it; half the rows being zero left them with no row-relative
+    tolerance at all, so any residual in the fit rejected them and the family reported
+    only sometimes. Louder, and the same pairs -- not a new false positive but a
+    previously random one made consistent. The family's overall verdict did not move, no
+    silent family started speaking, and TRUE_BASELINE did not move at all.
     """
     hi = _sig(magnitude * 5.372681943, digits)
     x = [rng.choice((0.0, hi)) for _ in range(ROWS)]
@@ -367,12 +375,12 @@ BENIGN_BASELINE = {
     ("sparse_shared_support", 8): ('silent', {}),
     ("sparse_shared_support", 9): ('silent', {}),
     ("sparse_shared_support", 10): ('silent', {}),
-    ("two_level_coded", 4): ('pervasive', {'exact_linear': 'partial', 'small_diff_set': 'pervasive'}),
-    ("two_level_coded", 6): ('pervasive', {'exact_linear': 'partial', 'small_diff_set': 'pervasive'}),
-    ("two_level_coded", 7): ('pervasive', {'exact_linear': 'partial', 'small_diff_set': 'pervasive'}),
-    ("two_level_coded", 8): ('pervasive', {'exact_linear': 'partial', 'small_diff_set': 'pervasive'}),
-    ("two_level_coded", 9): ('pervasive', {'exact_linear': 'partial', 'small_diff_set': 'pervasive'}),
-    ("two_level_coded", 10): ('pervasive', {'exact_linear': 'partial', 'small_diff_set': 'pervasive'}),
+    ("two_level_coded", 4): ('pervasive', {'exact_linear': 'pervasive', 'small_diff_set': 'pervasive'}),
+    ("two_level_coded", 6): ('pervasive', {'exact_linear': 'pervasive', 'small_diff_set': 'pervasive'}),
+    ("two_level_coded", 7): ('pervasive', {'exact_linear': 'pervasive', 'small_diff_set': 'pervasive'}),
+    ("two_level_coded", 8): ('pervasive', {'exact_linear': 'pervasive', 'small_diff_set': 'pervasive'}),
+    ("two_level_coded", 9): ('pervasive', {'exact_linear': 'pervasive', 'small_diff_set': 'pervasive'}),
+    ("two_level_coded", 10): ('pervasive', {'exact_linear': 'pervasive', 'small_diff_set': 'pervasive'}),
     ("unit_decadic", 4): ('pervasive', {'constant_ratio': 'pervasive'}),
     ("unit_decadic", 6): ('pervasive', {'constant_ratio': 'pervasive'}),
     ("unit_decadic", 7): ('pervasive', {'constant_ratio': 'pervasive'}),

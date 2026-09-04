@@ -725,12 +725,33 @@ def _attach_evidence(findings, sheet, r0, r1, c0, c1, header):
 
 # ---------- detectors ----------
 
-def _isclose_rowwise(actual, expected, rtol=1e-9):
+def _isclose_rowwise(actual, expected, rtol=1e-9, *, noise_floor=None):
     """Return row-wise closeness at each row's own numeric scale.
 
     A single coordinate/metadata row can be orders of magnitude larger than
     the measurement rows. A block-wide absolute tolerance lets those small
     measurement rows drift substantially while still passing a relation check.
+
+    That is what this function is for, and it used to carry a second, block-wide
+    term anyway -- `eps * median(row_scale) * 64`, a float noise floor for the
+    whole comparison. It defeated the paragraph above whenever a MAJORITY of rows
+    were the large ones, because the median moved with them: the floor grew to
+    their scale and swallowed real differences on the small rows. Measured, it
+    reported two columns equal that differ by five per cent.
+
+    Removing it moved one test in the suite. That was not evidence nothing needed
+    it: review found a case the suite had a test for but did not stress -- a
+    least-squares fit whose intercept is estimated from block-wide sums. Where a
+    majority of rows are large, the fit's error is a fixed absolute quantity from
+    those rows, and it lands undiminished on the small ones, whose own scale
+    cannot cover it. A genuine `y = 3x + 11` over such a block was reported by the
+    old code and missed by the new, in most draws at wide magnitude spreads.
+
+    So the floor is not gone, it is `noise_floor`, passed only by the branch that
+    computes such an expectation and derived from the magnitude that drives its
+    error. Comparing two STORED columns takes none: there is no arithmetic to have
+    gone wrong, and carrying one there is what let a majority of outlier rows
+    license a real five per cent difference on the rest.
     """
     actual = np.asarray(actual, dtype=float)
     expected = np.asarray(expected, dtype=float)
@@ -739,13 +760,15 @@ def _isclose_rowwise(actual, expected, rtol=1e-9):
         np.abs(expected),
         np.full_like(actual, 1e-300, dtype=float),
     ])
-    typical_scale = max(float(np.median(row_scale)), 1e-300)
-    tol = rtol * row_scale + (np.finfo(float).eps * typical_scale * 64)
+    tol = rtol * row_scale
+    if noise_floor is not None:
+        tol = tol + (np.finfo(float).eps * max(float(noise_floor), 1e-300) * 64)
     return np.abs(actual - expected) <= tol
 
 
-def _allclose_rowwise(actual, expected, rtol=1e-9):
-    return bool(np.all(_isclose_rowwise(actual, expected, rtol=rtol)))
+def _allclose_rowwise(actual, expected, rtol=1e-9, *, noise_floor=None):
+    return bool(np.all(_isclose_rowwise(actual, expected, rtol=rtol,
+                                        noise_floor=noise_floor)))
 
 
 _GRIM_MEAN_RE = re.compile(r"\b(mean|average|avg)\b|均值|平均", re.I)
@@ -812,7 +835,18 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
             # constant offset
             diff = y - x
             mean_diff = float(np.mean(diff))
-            if abs(mean_diff) > tol and _allclose_rowwise(y, x + mean_diff):
+            # Also a computed expectation, and the same margin applies. `mean_diff` is a
+            # mean over subtractions, so on a block spanning magnitudes the large rows'
+            # cancellation sets its error, and `x + mean_diff` carries that error onto rows
+            # whose own scale cannot cover it. Review found a genuine `y = x + k` that this
+            # branch missed for want of it -- the pair was then picked up by `exact_linear`
+            # as a slope of one, WITH a spurious `small_diff_set` beside it, because the
+            # same float jitter reads as three discrete differences where there is one.
+            # Same statistic as the fit's, for the same reason: a tenth of the rows to
+            # move it, rather than one or a majority.
+            offset_scale = float(np.percentile(np.abs(np.concatenate([x, y])), 90))
+            if abs(mean_diff) > tol and _allclose_rowwise(y, x + mean_diff,
+                                                          noise_floor=offset_scale):
                 findings.append(dict(kind="constant_offset", col_a=header[ci - c0], col_b=header[cj - c0],
                                      col_a_idx=ci, col_b_idx=cj, n=n, offset=mean_diff,
                                      severity="high",
@@ -854,7 +888,30 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                 except ValueError:
                     continue
                 fitted = slope * x + intercept
-                if np.std(y) > 0 and _allclose_rowwise(y, fitted, rtol=1e-7) and abs(r) > 0.99:
+                # The fit's intercept is estimated from block-wide sums, so its error is
+                # set by the large magnitudes present -- and lands whole on the smallest
+                # rows, where the row-relative term cannot see it.
+                #
+                # Which large magnitude is the whole question, and two obvious answers are
+                # both wrong. The MEDIAN is what the old block-wide floor used, and an
+                # outlier majority moves it: that is how a five per cent difference came to
+                # be reported as an equality. The MAX is worse, not better -- one row moves
+                # it, and one row is also enough to hold `abs(r) > 0.99` on its own, so a
+                # single huge point on the line let a cloud with real deviations of five
+                # report as exact. Measured over both shapes, no coefficient on the max
+                # separates them: the legitimate case needs up to 1.8 of `eps * max` and
+                # the illegitimate one is admitted from 0.96.
+                #
+                # The 90th percentile takes a tenth of the rows to move, not one and not a
+                # majority. Over the same shapes the legitimate case needs at most ~2.2 of
+                # `eps * p90` and the illegitimate one would need ~1e14, so the two are
+                # separated by orders of magnitude rather than by a tuned constant.
+                fit_scale = float(np.percentile(
+                    np.abs(np.concatenate([x, y])), 90))
+                if (np.std(y) > 0
+                        and _allclose_rowwise(y, fitted, rtol=1e-7,
+                                              noise_floor=fit_scale)
+                        and abs(r) > 0.99):
                     # A scale-relatively zero intercept means the fit is y = slope*x: the
                     # identity (slope~=1, caught by identical_column) or a pure scaling. When a
                     # constant_ratio already captured that scaling, a second exact_linear finding

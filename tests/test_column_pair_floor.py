@@ -242,30 +242,125 @@ def test_an_equality_below_its_floor_is_stopped_rather_than_left_to_the_other_br
     assert above.strip() == "[]", above
 
 
-def test_recorded_gap_an_outlier_row_can_buy_an_equality_that_is_not_one() -> None:
-    """A RECORDED GAP, not a target. Frozen because this floor makes it cheaper to reach.
+def test_an_outlier_row_cannot_buy_an_equality_that_is_not_one() -> None:
+    """Was a recorded gap one commit ago; the measurement that freed it took one line.
 
-    `_isclose_rowwise` adds an absolute term built from the MEDIAN row scale, so that
-    differences below the data's own noise floor do not void a relation. With most rows at
-    an ordinary magnitude that term is negligible. With a majority of rows orders of
-    magnitude larger, the median is large, the term is large, and a real difference on the
-    remaining row is inside it -- the columns are reported equal when they are not.
+    `_isclose_rowwise` carried a block-wide absolute term built from the MEDIAN row scale.
+    With a majority of rows orders of magnitude larger than the rest, that median moved to
+    them, the term grew to their scale, and a real difference on the remaining row sat
+    inside it -- two columns differing by five per cent reported equal. The function's own
+    docstring says it exists to stop exactly that, and the guard against it was itself
+    computed across rows, so a majority turned it around.
 
-    This is the mechanism the function's own docstring says it exists to prevent ("a single
-    coordinate/metadata row can be orders of magnitude larger than the measurement rows"),
-    reappearing because the guard against it is itself computed across rows. It predates
-    this change and fires at four rows on `main`; what this change does is make three rows
-    enough -- the smallest majority a floor of three permits is two.
-
-    Not fixed here: `_isclose_rowwise` is shared by every relation detector and a golden
-    suite pins its behaviour, so narrowing it is its own change with its own measurement.
-    Frozen so the next person meets it as a known quantity, and so that narrowing it later
-    has something to move.
+    It was frozen rather than fixed on the ground that narrowing a shared tolerance needed
+    its own measurement. The measurement: deleting the term moves one test in the suite,
+    this one. Nothing needed the floor.
     """
     outliers = [1e20, 3.3e19]
     left = outliers + [100.0]
     right = [v * (1 + 1e-12) for v in outliers] + [105.0]   # the last row differs by 5%
 
+    assert _relations(left, right) == []
+
+
+def test_a_fit_dominated_by_large_rows_still_reaches_the_small_ones() -> None:
+    """The margin the equality path does not need, and this one does.
+
+    `exact_linear`'s intercept is estimated from block-wide sums, so a majority of
+    large-magnitude rows sets its error -- a fixed absolute quantity, which then lands
+    undiminished on the small rows, whose own scale cannot cover it. Deleting the absolute
+    term everywhere made a genuine `y = 3x + 11` unreportable over such a block in most
+    draws, while every existing test kept passing: the suite had a mixed-scale case, with
+    ONE outlier row, which is not enough leverage to skew the fit.
+    """
+    import random
+
+    for seed in range(6):
+        rnd = random.Random(seed)
+        left = [rnd.uniform(1e12, 1e13) for _ in range(30)] + [rnd.uniform(1, 10)
+                                                               for _ in range(3)]
+        right = [3 * v + 11 for v in left]
+
+        kinds = [f["kind"] for f in _relations(left, right)]
+
+        assert "exact_linear" in kinds, (seed, kinds)
+
+
+def test_one_far_row_cannot_buy_a_line_through_a_scattered_cloud() -> None:
+    """The other direction, and the reason the margin is not taken from the maximum.
+
+    A single row far out on the line holds `abs(r) > 0.99` by itself, whatever the rest of
+    the cloud does -- the correlation gate is no protection here. If the margin came from
+    the largest magnitude, that one row would also set it, and it would then cover real
+    deviations of several units among the ordinary rows. Measured over both shapes, no
+    coefficient on the maximum separates them: the legitimate case above needs up to about
+    1.8 of `eps * max` and this one is admitted from about 0.96. The 90th percentile takes
+    a tenth of the rows to move, and separates them by orders of magnitude instead.
+    """
+    import random
+
+    for seed in range(8):
+        rnd = random.Random(seed)
+        left = list(range(1, 21)) + [1e15]
+        right = ([3 * v + 11 + rnd.choice([-5, -3, 3, 5]) for v in range(1, 21)]
+                 + [3 * 1e15 + 11])
+
+        kinds = [f["kind"] for f in _relations(left, right)]
+
+        assert "exact_linear" not in kinds, (seed, kinds)
+
+
+def test_a_constant_offset_over_a_wide_span_is_still_an_offset() -> None:
+    """The offset branch computes an expectation too, and was left without the margin.
+
+    `mean_diff` is a mean over subtractions, so a block of large rows sets its error, and
+    `x + mean_diff` then carries that error onto the SMALL rows -- whose own scale is a few
+    units, so the row-relative term is worth about a hundred-millionth and cannot cover it.
+    Both halves are needed to see this: a block of large rows alone has a row-relative
+    tolerance in the thousands and never notices. The first version of this test had no
+    small rows and passed with the margin removed, which is to say it tested nothing.
+
+    Without the margin the branch misses a genuine `y = x + k` and the pair is reported by
+    `exact_linear` as a slope of one instead, with a spurious `small_diff_set` beside it --
+    the same float jitter read as several discrete differences where there is one.
+    """
+    import random
+
+    rnd = random.Random(0)
+    left = ([rnd.uniform(0.5e12, 1e12) for _ in range(2000)]
+            + [rnd.uniform(1, 10) for _ in range(3)])
+    # A value with a full mantissa, not a round one: `x + k` on a round offset is
+    # exact and leaves no jitter for the margin to be about.
+    offset = 18448.312114772714
+
+    kinds = [f["kind"] for f in _relations(left, [v + offset for v in left])]
+
+    assert "constant_offset" in kinds, kinds
+
+
+def test_a_real_deviation_on_one_row_still_defeats_an_offset() -> None:
+    """The control for that margin: it excuses float noise, not a difference on the sheet.
+
+    Same shape, with one small row moved by five thousand -- a difference a reader would
+    see. If the margin covered that, it would be the old block-wide floor again under a
+    new name.
+
+    What this does NOT discriminate: swapping the offset margin's statistic from the 90th
+    percentile to the maximum leaves it green, because at this block's spread even the
+    maximum does not reach five thousand. The argument for the percentile over the maximum
+    is made and pinned on the LINEAR arm, where one far row both sets the maximum and
+    holds the correlation gate by itself -- see
+    `test_one_far_row_cannot_buy_a_line_through_a_scattered_cloud`. Here the assertion is
+    only that the margin stays somewhere near float noise.
+    """
+    import random
+
+    rnd = random.Random(0)
+    left = ([rnd.uniform(0.5e12, 1e12) for _ in range(2000)]
+            + [rnd.uniform(1, 10) for _ in range(3)])
+    offset = 18448.312114772714
+    right = [v + offset for v in left[:-1]] + [left[-1] + offset + 5000.0]
+
     kinds = [f["kind"] for f in _relations(left, right)]
 
-    assert kinds == ["identical_column"], kinds
+    assert "constant_offset" not in kinds, kinds
