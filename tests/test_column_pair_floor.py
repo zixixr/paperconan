@@ -240,3 +240,32 @@ def test_an_equality_below_its_floor_is_stopped_rather_than_left_to_the_other_br
     assert default.strip() == "['identical_column']", default
     # Not "some other kind instead": nothing at all, and by this floor's decision.
     assert above.strip() == "[]", above
+
+
+def test_recorded_gap_an_outlier_row_can_buy_an_equality_that_is_not_one() -> None:
+    """A RECORDED GAP, not a target. Frozen because this floor makes it cheaper to reach.
+
+    `_isclose_rowwise` adds an absolute term built from the MEDIAN row scale, so that
+    differences below the data's own noise floor do not void a relation. With most rows at
+    an ordinary magnitude that term is negligible. With a majority of rows orders of
+    magnitude larger, the median is large, the term is large, and a real difference on the
+    remaining row is inside it -- the columns are reported equal when they are not.
+
+    This is the mechanism the function's own docstring says it exists to prevent ("a single
+    coordinate/metadata row can be orders of magnitude larger than the measurement rows"),
+    reappearing because the guard against it is itself computed across rows. It predates
+    this change and fires at four rows on `main`; what this change does is make three rows
+    enough -- the smallest majority a floor of three permits is two.
+
+    Not fixed here: `_isclose_rowwise` is shared by every relation detector and a golden
+    suite pins its behaviour, so narrowing it is its own change with its own measurement.
+    Frozen so the next person meets it as a known quantity, and so that narrowing it later
+    has something to move.
+    """
+    outliers = [1e20, 3.3e19]
+    left = outliers + [100.0]
+    right = [v * (1 + 1e-12) for v in outliers] + [105.0]   # the last row differs by 5%
+
+    kinds = [f["kind"] for f in _relations(left, right)]
+
+    assert kinds == ["identical_column"], kinds
