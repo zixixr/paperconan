@@ -124,10 +124,26 @@ Three things to hold onto while reading:
     a detector stopped emitting at its cap.
   - `scan: detector compute budget limit in detect_row_relations` — a detector ran
     out of its work budget.
+  - `scan: detector within row folded independent repeat in detect_recurring_row_vectors (count=2)`
+    — not a truncation but an omission:
+    the within-row pass folds the overlapping windows one physical repeat
+    produces into a single finding, and this many of the folded candidates also
+    repeated at a place no finding on this page covers at all. The count is all
+    the record holds; finding the place means reading the row.
 
   Any of these means `scan_status` is not `complete` (`partial`, or `failed` when
-  nothing could be read at all) and the search was cut short, so a
-  quiet result on that input is not evidence of a clean one. Detector lines name
+  nothing could be read at all), so a quiet result on that input is not evidence
+  of a clean one. The rest of this paragraph is about the lines that were CUT
+  SHORT, which is every one above except `detector within row folded independent
+  repeat`. (Named rather than positioned, so that appending a bullet cannot make
+  this sentence quietly wrong about two of them.) That one reports an omission
+  rather than a truncation: nothing was left unexamined, and reading the row is
+  its remedy. But it is not independent of the caps either — it compares against
+  the findings that were EMITTED, so when `detector finding limit` appears on the
+  same detector in the same scan, a narrower input can emit more and change
+  whether this line appears at all. Seen on a real supplement. Read the two
+  together when both are present.
+  Detector lines name
   **no file or sheet**: the record does not carry one, so the line cannot tell you
   *where* the truncation bit — it may have been one block or many. Re-running
   unchanged proves nothing: the scan is deterministic, so it reproduces the same

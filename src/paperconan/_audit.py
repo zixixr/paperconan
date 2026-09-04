@@ -3292,6 +3292,11 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
 
     findings = []
     _capped = False   # set only where a loop is actually abandoned
+    # Cells of every finding this call emits, from BOTH passes. The within-row note below
+    # asks what the reader can see, and the two kinds share this list, this `max_findings`
+    # and one page -- scoping it to the within-row pass alone called a place uncovered
+    # while its cross-figure sibling was reporting it.
+    reported_cells = set()
     for vec, places, namespaces, sites, _cells in kept:
         sheets_hit = sorted({p[1] for p in places})
         loc = "; ".join(sheets_hit[:6])
@@ -3315,6 +3320,7 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
             severity="high" if (len(vec) >= 5 and len(sites) >= 3) else "medium",
             rule=(f"the {len(vec)}-value vector {list(vec)} recurs at {len(sites)} places across "
                   f"{len(namespaces)} figures ({loc})")))
+        reported_cells |= _cells
         if len(findings) >= max_findings:
             _capped = True
             break
@@ -3426,9 +3432,26 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
     # above the ordinary width, so their order among themselves is untouched.
     wr_cands.sort(key=lambda x: (len(x[0]) < _WR_SEGMENT_MIN_COLS, -len(x[5]), -len(x[0])))
     wr_kept = []
+    wr_folded = []
     for c in wr_cands:
-        if any(c[1:5] == kc[1:5] and len(c[6] & kc[6]) >= 0.5 * min(len(c[6]), len(kc[6]))
-               for kc in wr_kept):
+        absorbed = next((kc for kc in wr_kept
+                         if c[1:5] == kc[1:5]
+                         and len(c[6] & kc[6]) >= 0.5 * min(len(c[6]), len(kc[6]))), None)
+        if absorbed is not None:
+            # The fold is right for the shifted windows one physical repeat produces, and
+            # those are what it almost always sees. It is NOT right when the folded
+            # candidate also repeats somewhere the kept finding never reaches: that place
+            # corroborates nothing already on the page, and it leaves with the candidate.
+            #
+            # Selection is deliberately unchanged. Rescuing such a candidate whole was
+            # tried and withdrawn: it enters `wr_kept` carrying its overlapping
+            # occurrences too, becomes a suppressor for later candidates, and drops
+            # findings the fold used to keep -- silently, and without moving the finding
+            # count, so a count-based check cannot see it. A cure for a silent loss must
+            # not be one. What is fixed here is the silence: the drop is recorded, so a
+            # reader is told the pass held something back rather than being shown a page
+            # that looks complete.
+            wr_folded.append(c)
             continue
         wr_kept.append(c)
     for vec, fn, sn, fk, r, chosen, _cells, source_columns in wr_kept:
@@ -3466,9 +3489,25 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
             rule=(f"the {len(vec)}-value segment {[round(float(v), 6) for v in vec]} repeats at "
                   f"{len(chosen)} non-overlapping positions within row {r + 1} of {sn} "
                   f"({coordinate_text})")))
+        reported_cells |= _cells
         if len(findings) >= max_findings:
             _capped = True
             break
+
+    # Asked of what REACHED the reader, and so only once that is settled. Asking it of
+    # everything the fold selected is a wider set: the loop above stops at `max_findings`,
+    # so a selected candidate can contribute cells to the answer and never appear on any
+    # page. The note then stays silent about a place nothing covers -- a false all-clear,
+    # which is the direction `_note_detector_cap` exists to avoid, and review found real
+    # papers hitting that cap on this detector.
+    folded_independent = sum(
+        1 for c in wr_folded
+        if any(not ({(c[1], c[2], c[4], col) for col in cols} & reported_cells)
+               for cols in c[7]))
+    if folded_independent:
+        _note_detector_cap(coverage, "detect_recurring_row_vectors",
+                           "detector_within_row_folded_independent_repeat",
+                           count=folded_independent)
 
     if _capped:
         _note_detector_cap(coverage, "detect_recurring_row_vectors", "detector_finding_limit",

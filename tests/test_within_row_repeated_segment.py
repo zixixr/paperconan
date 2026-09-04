@@ -395,3 +395,151 @@ def test_a_row_too_narrow_for_two_wide_copies_still_reaches_the_short_pass():
     wr = [f for f in findings if f["kind"] == "within_row_repeated_segment"]
     assert len(wr) == 1, f"expected the narrow-row repeat, got {findings}"
     assert wr[0]["vector"] == segment
+
+
+def test_folding_a_repeat_that_occurs_elsewhere_is_recorded():
+    """Selection is unchanged; the silence is what this fixes.
+
+    The fold collapses the overlapping windows one physical repeat produces, which is
+    right. It is not right when the folded candidate also repeats where the surviving
+    finding never reaches: that place corroborates nothing on the page and leaves with the
+    candidate. Rescuing the candidate whole was tried and withdrawn -- it then suppressed
+    later candidates and dropped findings the fold used to keep, without moving the finding
+    count, so the cure had the disease. What is recorded instead is that the pass held
+    something back, which is the difference between a page that is incomplete and a page
+    that looks complete.
+    """
+    from paperconan._coverage import ScanCoverage
+
+    s0, s1, s2 = 4.176382, 9.028415, 1.593047
+    wide = [6.702914, s0, s1, s2]
+    row = (_fill(10, 3) + wide + _fill(20, 5) + [s0, s1, s2]
+           + _fill(18, 7) + wide + _fill(6, 9))
+    coverage = ScanCoverage(files_discovered=1)
+
+    findings = [f for f in detect_recurring_row_vectors(
+        {("synthetic.xlsx", "Figure 1"): _row_sheet(row)}, coverage=coverage,
+    ) if f["kind"] == "within_row_repeated_segment"]
+
+    # Unchanged: one finding, the wider repeat, exactly as before this note existed.
+    assert [len(f["vector"]) for f in findings] == [4]
+    reasons = [item.get("reason") for item in coverage.to_dict()["limitations"]]
+    assert "detector_within_row_folded_independent_repeat" in reasons, reasons
+
+
+def test_a_plain_fold_records_nothing():
+    """The control. A long repeat yields many shifted windows over the SAME places, and
+    folding those is the pass working -- if that were recorded too, the note would appear
+    on ordinary input and mean nothing."""
+    from paperconan._coverage import ScanCoverage
+
+    segment = [7.104391, 3.882057, 9.240118, 2.665903, 5.417620]
+    row = _fill(8, 3) + segment + _fill(6, 5) + segment + _fill(8, 7)
+    coverage = ScanCoverage(files_discovered=1)
+
+    detect_recurring_row_vectors(
+        {("synthetic.xlsx", "Figure 1"): _row_sheet(row)}, coverage=coverage)
+
+    reasons = [item.get("reason") for item in coverage.to_dict()["limitations"]]
+    assert "detector_within_row_folded_independent_repeat" not in reasons, reasons
+
+
+def test_no_note_when_the_folded_repeat_is_covered_by_a_different_finding():
+    """"Somewhere the report does not cover" is a claim about the whole report.
+
+    A row can hold two kept findings that share a tail. The short tail candidate is
+    absorbed by whichever the fold reaches first, and its other occurrences sit inside the
+    OTHER one -- which is on the page. Asking only the absorber says those places are
+    covered nowhere, which is false, and it is the note's entire content. Measured on
+    adversarial rows, that phrasing of the question was wrong for a third of what it
+    flagged.
+    """
+    from paperconan._coverage import ScanCoverage
+
+    t0, t1, t2 = 4.176382, 9.028415, 1.593047
+    k1 = [6.702914, t0, t1, t2]
+    k2 = [3.314159, t0, t1, t2]
+    row = (_fill(8, 3) + k1 + _fill(6, 5) + k1 + _fill(6, 7)
+           + k2 + _fill(6, 9) + k2 + _fill(6, 11))
+    coverage = ScanCoverage(files_discovered=1)
+
+    findings = [f for f in detect_recurring_row_vectors(
+        {("synthetic.xlsx", "Figure 1"): _row_sheet(row)}, coverage=coverage,
+    ) if f["kind"] == "within_row_repeated_segment"]
+
+    assert [len(f["vector"]) for f in findings] == [4, 4], findings
+    reasons = [item.get("reason") for item in coverage.to_dict()["limitations"]]
+    assert "detector_within_row_folded_independent_repeat" not in reasons, reasons
+
+
+def test_the_note_still_fires_when_the_finding_cap_truncates_the_page():
+    """The question is about the page, and the page can be shorter than the selection.
+
+    The emission loop stops at `max_findings`. A candidate the fold selected but the cap
+    never emitted has cells, and counting those as coverage let the note stay silent about
+    a place nothing on the page covers -- a false all-clear, which is the direction
+    `_note_detector_cap` exists to avoid. Review found real papers hitting that cap on this
+    detector, so the precondition is not hypothetical.
+    """
+    from paperconan._coverage import ScanCoverage
+
+    t0, t1, t2 = 4.176382, 9.028415, 1.593047
+    other = [8.111213, 3.222324, 6.755435, 1.994546]
+    k2 = [2.717654, t0, t1, t2]
+    k3 = [5.313131, t0, t1, t2]
+    # `other` has the most copies, so it takes the single reported slot; k2 and k3 are
+    # selected and never emitted, and the shared tail is folded against one of them.
+    row = (_fill(6, 3) + other + _fill(5, 5) + other + _fill(5, 7) + other
+           + _fill(5, 9) + k2 + _fill(5, 11) + k2
+           + _fill(5, 13) + k3 + _fill(5, 15) + k3 + _fill(6, 17))
+    coverage = ScanCoverage(files_discovered=1)
+
+    findings = [f for f in detect_recurring_row_vectors(
+        {("synthetic.xlsx", "Figure 1"): _row_sheet(row)},
+        max_findings=1, coverage=coverage,
+    ) if f["kind"] == "within_row_repeated_segment"]
+
+    assert [f["vector"] for f in findings] == [other], findings
+    reasons = [item.get("reason") for item in coverage.to_dict()["limitations"]]
+    assert "detector_finding_limit" in reasons, reasons
+    assert "detector_within_row_folded_independent_repeat" in reasons, reasons
+
+
+def test_a_sibling_pass_on_the_same_page_counts_as_coverage():
+    """Both passes of this detector reach one page, so the note has to look at both.
+
+    `detect_recurring_row_vectors` emits two kinds into one list under one `max_findings`:
+    the cross-figure vector and its within-row sibling. Asking only what the within-row
+    pass reported called a place uncovered while the cross-figure finding was reporting it
+    -- the same "which set is the page" error as the two rounds before it, one set further
+    out. Here the folded three-tuple's independent occurrence lies inside the five-value
+    vector the cross-figure pass reports, so nothing is uncovered and nothing is noted.
+    """
+    from paperconan._coverage import ScanCoverage
+    from paperconan._sheet import Sheet
+
+    tail = [4.176382, 9.028415, 1.593047]
+    vector = tail + [7.334215, 2.481937]      # what the cross-figure pass reports
+    wide = [6.702914] + tail                  # the within-row repeat that absorbs the tail
+
+    def sheet(name, seed, carries_the_row=False):
+        body = (_fill(6, seed) + wide + _fill(8, seed + 1) + vector
+                + _fill(8, seed + 2) + wide + _fill(6, seed + 3)
+                if carries_the_row else
+                _fill(6, seed) + vector + _fill(6, seed + 1))
+        rows = [[name] + [f"c{i}" for i in range(len(body))], ["b"] + body]
+        rows.extend([f"x{k}"] + _fill(len(body), seed + 9 + k) for k in range(3))
+        return Sheet.from_rows(rows)
+
+    grid = {("f.xlsx", "Figure 1"): sheet("Figure 1", 10, carries_the_row=True),
+            ("f.xlsx", "Figure 2"): sheet("Figure 2", 20),
+            ("f.xlsx", "Figure 3"): sheet("Figure 3", 30)}
+    coverage = ScanCoverage(files_discovered=1)
+
+    findings = detect_recurring_row_vectors(grid, coverage=coverage)
+
+    kinds = {f["kind"] for f in findings}
+    assert "recurring_row_vector" in kinds, kinds
+    assert "within_row_repeated_segment" in kinds, kinds
+    reasons = [item.get("reason") for item in coverage.to_dict()["limitations"]]
+    assert "detector_within_row_folded_independent_repeat" not in reasons, reasons
