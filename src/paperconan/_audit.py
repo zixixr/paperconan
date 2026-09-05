@@ -212,6 +212,12 @@ def _fill_sheet_from_rows(rows_iter, mr, mc, loaded):
             pad = np.full((numeric.shape[0], width - numeric.shape[1]), np.nan)
             numeric = np.hstack([numeric, pad]) if numeric.shape[1] else pad
         for c, v in enumerate(row):
+            if isinstance(v, str):
+                # A workbook cell can hold a numeral as text. The CSV and PDF/DOCX
+                # paths have always parsed those; this path did not, so the same
+                # table was analysable as .csv and invisible as .xlsx. `_coerce_cell`
+                # is the same parser those paths use, so all three now agree.
+                v = _coerce_cell(v)
             if is_num(v):
                 numeric[r, c] = float(v)
                 if isinstance(v, int) and not isinstance(v, bool):
@@ -334,8 +340,13 @@ def load_workbook_rows(path):
 
 
 def _coerce_cell(s):
-    """Parse a CSV string cell into int / float / text. Empty -> None.
-    Deliberately conservative: no thousands separators, no percent, no currency."""
+    """Parse a string cell into int / float / text. Empty -> None.
+    Deliberately conservative: no thousands separators, no percent, no currency.
+
+    `float()` also accepts "NaN" / "Infinity" / "1e999", which a Sheet cannot hold
+    as a value: `numeric` spells "no number here" as NaN, `cell()` promises the
+    source value back, and json.dumps would emit a bare NaN literal that is not
+    JSON. Those stay text -- what cannot be represented is not parsed."""
     if s is None:
         return None
     s = s.strip()
@@ -346,9 +357,10 @@ def _coerce_cell(s):
     except ValueError:
         pass
     try:
-        return float(s)
+        v = float(s)
     except ValueError:
         return s
+    return v if math.isfinite(v) else s
 
 
 def load_csv_rows(path, delimiter):
