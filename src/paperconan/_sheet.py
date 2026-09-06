@@ -12,6 +12,30 @@ import math
 import numpy as np
 
 
+def _coerce_text_number(s):
+    """A numeral held as text -> int/float; anything else back unchanged.
+
+    Mirrors paperconan._audit._coerce_cell WITHOUT importing it (avoid a cycle),
+    including its refusal of non-finite values: `numeric` spells "no number here"
+    as NaN and `cell()` promises the source value back, so "NaN"/"Infinity" stay
+    text rather than becoming a value the Sheet cannot represent."""
+    t = s.strip()
+    if not t:
+        # `_coerce_cell` turns a blank cell into None, and these two have to agree:
+        # the loaders' parity tests compare them, so a split here would make that
+        # comparison pass while the readers disagree.
+        return None
+    try:
+        return int(t)
+    except ValueError:
+        pass
+    try:
+        v = float(t)
+    except ValueError:
+        return s
+    return v if math.isfinite(v) else s
+
+
 def _is_num(x):
     # mirror paperconan._audit.is_num WITHOUT importing it (avoid a cycle):
     # bool is NOT numeric; NaN/inf are NOT numeric.
@@ -42,6 +66,12 @@ class Sheet:
         ints = set()
         for r, row in enumerate(rows):
             for c, v in enumerate(row):
+                if isinstance(v, str):
+                    # Mirrors _audit._fill_sheet_from_rows: a numeral held as text is
+                    # a number. Kept in step deliberately -- the loaders' parity tests
+                    # compare these two implementations, so a split here would make
+                    # that comparison stop meaning anything.
+                    v = _coerce_text_number(v)
                 if _is_num(v):
                     numeric[r, c] = float(v)
                     if isinstance(v, int):
