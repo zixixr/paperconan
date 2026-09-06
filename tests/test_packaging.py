@@ -65,3 +65,26 @@ def test_the_shipped_skill_declares_the_package_version():
 
     assert f"\nversion: {__version__}\n" in skill
     assert f'"tool_version": "{__version__}"' in schema
+
+
+def test_lockfile_version_matches_package():
+    """`uv.lock` carries the version too, and nothing else here was checking it.
+
+    It is not hand-edited -- `uv run` rewrites it from pyproject when it next
+    resolves -- so the failure mode is not a stale string someone forgot, it is a
+    release branch pushed while the lockfile is still dirty in the working tree.
+    That is exactly what happened the release this test was written for.
+
+    Which is also why this one cannot catch anything under `uv run pytest`: that
+    command re-resolves and fixes the lockfile before pytest starts, so the check
+    passes on a tree that was wrong a moment earlier. It bites where it matters --
+    CI and a plain `pytest` run, neither of which rewrites the file first.
+    """
+    root = Path(__file__).resolve().parents[1]
+    lock = (root / "uv.lock").read_text(encoding="utf-8")
+    block = lock.split('name = "paperconan"', 1)
+    assert len(block) == 2, "uv.lock has no paperconan package entry"
+    line = block[1].split("\n", 2)[1]
+    assert line == f'version = "{__version__}"', (
+        f"uv.lock says {line!r}; run `uv run pytest` and commit the updated lockfile"
+    )
