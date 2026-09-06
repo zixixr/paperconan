@@ -84,6 +84,19 @@ recipe for measuring it is given instead of the figure — see the last rule for
   depends on which detector it calls -- some apply the profile themselves before returning, and
   some are never routed to a panel at all. Each was reached by reasoning from a name, and each
   cost a review round.
+  Two corollaries, both measured rather than argued:
+  *Many false positives of ONE recognisable kind cost less than their count.* A change that
+  fragmented a sparse table into thousands of blocks produced, at `overview`, two rows marked
+  medium at ranks 10 and 11 -- which an agent following the protocol skips without opening.
+  Price a false positive by the reading it costs, not by how many there are: the expensive kind
+  is the one that takes a first-page rank away from a real signal, and the cheap kind is the one
+  a reader dismisses in a glance. This cuts both ways, so say which kind you measured.
+  *Counting what a change pushes OFF the page is not the whole cost.* It says nothing about what
+  the change pushes ONTO it. One review found a new all-integer column making a detector's
+  near-integer test degenerate -- it asks whether `y - x` is near-integer, which stops depending
+  on `x` once `x` is a whole number -- and that arrived as new first-page findings, invisible to
+  an accounting that only watched for departures. Count both directions or say which one you
+  counted.
 - **A bench needs a true-positive stratum.** One made only of things that must not fire is passed
   perfectly by a detector that never fires. Include the relation the arm exists to catch, and
   freeze how much of it is currently found — including when that is "almost none", which is a
