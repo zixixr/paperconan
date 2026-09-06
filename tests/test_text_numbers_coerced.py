@@ -83,6 +83,22 @@ def test_coerce_cell_itself_never_returns_a_non_finite_float():
         assert isinstance(_coerce_cell(text), str), f"{text!r} parsed to a non-finite float"
 
 
+@pytest.mark.parametrize("blank", ["   ", "\t", "\n ", ""])
+def test_the_two_readers_agree_on_a_blank_cell(blank):
+    """A cell holding only whitespace is a blank cell on both paths.
+
+    The two implementations parse separately -- `_sheet` cannot import `_audit`
+    without a cycle -- so each new branch has to be checked against the other.
+    This one diverged when the parse was added: one returned None, the other the
+    unstripped string, and the parity tests could not see it because their
+    fixtures hold no such cell.
+    """
+    rows = [[blank, "x"]]
+    a, b = _sheet(rows), Sheet.from_rows(rows)
+    assert a.cell(0, 0) == b.cell(0, 0)
+    assert a.cell(0, 0) is None
+
+
 def test_the_two_readers_still_agree_on_text_numerals():
     """`_fill_sheet_from_rows` and `Sheet.from_rows` are separate implementations of
     the same split. The loaders' parity tests compare them, so the parse has to land

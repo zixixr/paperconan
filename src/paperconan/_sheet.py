@@ -21,7 +21,10 @@ def _coerce_text_number(s):
     text rather than becoming a value the Sheet cannot represent."""
     t = s.strip()
     if not t:
-        return s
+        # `_coerce_cell` turns a blank cell into None, and these two have to agree:
+        # the loaders' parity tests compare them, so a split here would make that
+        # comparison pass while the readers disagree.
+        return None
     try:
         return int(t)
     except ValueError:
