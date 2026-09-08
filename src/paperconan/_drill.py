@@ -180,23 +180,72 @@ def sheets(scan: dict[str, Any]) -> dict[str, Any]:
     made a claim about one look like data that could not be obtained.
     """
     stats = (scan.get("scan_stats") or {}).get("sheets") or []
-    rows = [{
-        "file": s.get("file"),
-        "sheet": s.get("sheet"),
-        "rows": s.get("n_rows"),
-        "cols": s.get("n_cols"),
-        "numeric_cells": s.get("numeric_cells"),
-        "blocks": s.get("n_blocks"),
-    } for s in stats]
-    with_findings = {(b.get("file"), b.get("sheet"))
-                     for b in (scan.get("relations_blocks") or [])}
-    for r in rows:
-        r["has_findings"] = (r["file"], r["sheet"]) in with_findings
+    # Which sheets carry signal comes from the same clustering `overview` ranks, not
+    # from `relations_blocks`. That list holds only the per-block families: a sheet
+    # whose sole finding is a cross-sheet duplicate -- among the most serious this
+    # tool reports -- appeared there as carrying nothing, which is worse than the
+    # gap this view exists to close.
+    clusters, seeding = _build_clusters(scan, max_clusters=10**9)
+    with_findings = set()
+
+    def _note(rec):
+        """Both sides of a cross-sheet finding, keyed by (file, sheet).
+
+        Keyed on the sheet name alone, two files that each hold a sheet called
+        "Fig. 1" would vouch for each other. Cross-sheet findings name their sides
+        as file_a/sheet_a and file_b/sheet_b, per-block ones as file/sheet.
+        """
+        for fk, sk in (("file", "sheet"), ("file_a", "sheet_a"), ("file_b", "sheet_b")):
+            sheet = rec.get(sk)
+            if sheet:
+                with_findings.add((rec.get(fk) or rec.get("file"), sheet))
+
+    for cluster in clusters:
+        _note(cluster)
+        for seed in cluster.get("seeds") or []:
+            _note(seed)
+    # A cross-sheet cluster names its two sides merged into one label -- "A + B" and
+    # "Fig. 1 <-> Fig. 9" -- so neither side matches a row in the listing. Take them
+    # from the findings themselves, where the sides are still separate.
+    for f in scan.get("cross_sheet_findings") or []:
+        _note(f)
+
+    rows = []
+    for s in stats:
+        row = {
+            "file": s.get("file"),
+            "sheet": s.get("sheet"),
+            "rows": s.get("n_rows"),
+            "cols": s.get("n_cols"),
+            "numeric_cells": s.get("numeric_cells"),
+            "blocks": s.get("n_blocks"),
+            # A sheet past the cell cap is recorded but never read. Rendering it
+            # like any other row said "read, nothing found" about data nothing
+            # looked at -- the same false all-clear in a new place.
+            "oversized": bool(s.get("oversized")),
+        }
+        row["has_findings"] = (not row["oversized"]) and \
+            (s.get("file"), s.get("sheet")) in with_findings
+        rows.append(row)
+
+    # Files that never yielded a sheet -- unreadable, or past the size cap -- are in
+    # `scan_stats.files` and in coverage, and nowhere in the list above. Saying so is
+    # the whole point: this view must not let "we could not read it" read as "it is
+    # not there".
+    listed = {r["file"] for r in rows}
+    unread = [f.get("file") for f in ((scan.get("scan_stats") or {}).get("files") or [])
+              if f.get("file") not in listed]
     return {
         "sheets": rows,
         "n_sheets": len(rows),
         "n_with_findings": sum(1 for r in rows if r["has_findings"]),
-        "n_files": len({r["file"] for r in rows}),
+        "n_oversized": sum(1 for r in rows if r["oversized"]),
+        "n_files": len(listed),
+        "files_with_no_sheet_read": unread,
+        "coverage": {
+            "scan_status": scan.get("scan_status"),
+            "limitations": list(seeding.get("limitations") or []),
+        },
     }
 
 

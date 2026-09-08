@@ -22,18 +22,42 @@ def _coverage_lines(coverage: dict[str, Any], indent: str = "") -> list[str]:
 
 
 def render_sheets(view: dict[str, Any]) -> str:
-    out = ["%d sheets in %d file(s); %d carry at least one finding"
-           % (view["n_sheets"], view["n_files"], view["n_with_findings"]), ""]
+    head = "%d sheets in %d file(s); %d carry at least one finding" % (
+        view["n_sheets"], view["n_files"], view["n_with_findings"])
+    if view.get("n_oversized"):
+        head += "; %d were too large to read" % view["n_oversized"]
+    out = [head, ""]
     out.append("  %-40s %-30s %7s %6s %8s  %s"
                % ("file", "sheet", "rows", "cols", "numeric", "signal"))
     out.append("  " + "-" * 104)
     for r in view["sheets"]:
-        out.append("  %-40s %-30s %7s %6s %8s  %s"
-                   % (str(r["file"])[-40:], str(r["sheet"])[:30], r["rows"], r["cols"],
-                      r["numeric_cells"], "yes" if r["has_findings"] else ""))
-    out += ["", "A sheet with no signal was still read. Which sheet a figure's data",
-            "sits in is a judgement about names -- make it yourself, then read that",
-            "sheet with `drill` if it is listed by `overview`, or open the file."]
+        if r.get("oversized"):
+            mark, size = "not read", ("%7s %6s %8s" % ("-", "-", "-"))
+        else:
+            mark = "yes" if r["has_findings"] else ""
+            size = "%7s %6s %8s" % (r["rows"], r["cols"], r["numeric_cells"])
+        out.append("  %-40s %-30s %s  %s"
+                   % (str(r["file"])[-40:], str(r["sheet"])[:30], size, mark))
+
+    unread = view.get("files_with_no_sheet_read") or []
+    if unread:
+        out += ["", "! %d file(s) yielded no sheet at all -- unreadable, or past the size"
+                    " cap. Nothing below speaks for them:" % len(unread)]
+        out += ["    %s" % f for f in unread[:10]]
+        if len(unread) > 10:
+            out.append("    ... and %d more" % (len(unread) - 10))
+    for line in (view.get("coverage") or {}).get("limitations") or []:
+        out.append("! %s" % line)
+    if (view.get("coverage") or {}).get("scan_status") not in (None, "complete"):
+        out.append("! the scan itself was not complete (scan_status=%r)"
+                   % view["coverage"]["scan_status"])
+
+    out += ["", "This list is long by design -- search it for the figure you want rather",
+            "than reading it through. Which sheet a figure's data sits in is a",
+            "judgement about names: make it yourself, and if more than one sheet could",
+            "be it, check each rather than picking one. A sheet marked neither `yes`",
+            "nor `not read` was read and nothing was found in it, which is an answer.",
+            "Read a sheet that does carry signal with `drill`."]
     return "\n".join(out)
 
 

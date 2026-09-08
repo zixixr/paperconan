@@ -172,12 +172,23 @@ spreads a few hundred sheets over a dozen files, named `Fig. 2j`, `Fig2J`,
 than number. No rule maps those to a figure reliably -- reading them is a
 judgement, which is why the tool lists and does not match.
 
-Having picked the sheet:
+Names repeat across files, so read the file column too, not just the sheet name.
 
-- if `overview` lists it, `drill` into it as usual;
-- if it does not, that is an answer worth reporting: the data is present and no
-  detector found anything at that location. Say that, rather than that the source
-  could not be obtained.
+Then:
+
+- **one sheet matches, and it carries signal** — `drill` into it as usual;
+- **one sheet matches and carries none** — that is an answer worth reporting: the
+  data is present and no detector found anything at that location. Say that, rather
+  than that the source could not be obtained;
+- **several could be it** — check each. Concluding "present, nothing found" from
+  the one you happened to pick is a more confident wrong answer than "unavailable"
+  was, and costs the reader more;
+- **none matches** — say the figure's data was not among what was fetched, and
+  which files were searched.
+
+The listing also reports what it could NOT read: files that yielded no sheet, and
+sheets past the size cap (marked `not read`). A figure whose data sits in one of
+those has not been checked, and must not be reported as clean.
 
 **Do not conclude "source data unavailable" without running `sheets` first.** On
 this project's own benchmark, 16 claims adjudicated as having no obtainable source
