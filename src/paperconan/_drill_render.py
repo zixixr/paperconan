@@ -21,6 +21,50 @@ def _coverage_lines(coverage: dict[str, Any], indent: str = "") -> list[str]:
     return [f"{indent}! {item}" for item in coverage.get("limitations") or []]
 
 
+def render_sheets(view: dict[str, Any]) -> str:
+    head = "%d sheets in %d file(s); %d carry at least one finding" % (
+        view["n_sheets"], view["n_files"], view["n_with_findings"])
+    if view.get("n_oversized"):
+        head += "; %d were too large to read" % view["n_oversized"]
+    out = [head, ""]
+    out.append("  %-40s %-30s %7s %6s %8s  %s"
+               % ("file", "sheet", "rows", "cols", "numeric", "signal"))
+    out.append("  " + "-" * 104)
+    for r in view["sheets"]:
+        if r.get("oversized"):
+            mark, size = "not read", ("%7s %6s %8s" % ("-", "-", "-"))
+        else:
+            mark = "yes" if r["has_findings"] else ""
+            size = "%7s %6s %8s" % (r["rows"], r["cols"], r["numeric_cells"])
+        out.append("  %-40s %-30s %s  %s"
+                   % (str(r["file"])[-40:], str(r["sheet"])[:30], size, mark))
+
+    unread = view.get("files_with_no_sheet_read") or []
+    if unread:
+        out += ["", "! %d file(s) yielded no sheet at all -- unreadable, or past the size"
+                    " cap. Nothing below speaks for them:" % len(unread)]
+        out += ["    %s" % f for f in unread[:10]]
+        if len(unread) > 10:
+            out.append("    ... and %d more" % (len(unread) - 10))
+    for line in (view.get("coverage") or {}).get("limitations") or []:
+        out.append("! %s" % line)
+    if (view.get("coverage") or {}).get("scan_status") not in (None, "complete"):
+        out.append("! the scan itself was not complete (scan_status=%r)"
+                   % view["coverage"]["scan_status"])
+
+    out += ["", "This list is long by design -- search it for the figure you want rather",
+            "than reading it through. Which sheet a figure's data sits in is a",
+            "judgement about names: make it yourself, and if more than one sheet could",
+            "be it, check each rather than picking one.",
+            "",
+            "A blank signal column means the families routed here found nothing --",
+            "not that the sheet is clean. Digit-distribution, decimal-ending and",
+            "image findings are not routed; the `!` lines above say when a scan holds",
+            "some, and they are read from scan.json. Check them before calling a",
+            "sheet clean. Read a sheet that does carry signal with `drill`."]
+    return "\n".join(out)
+
+
 def render_overview(view: dict[str, Any]) -> str:
     cov = view["coverage"]
     out = [

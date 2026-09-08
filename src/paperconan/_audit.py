@@ -6878,7 +6878,7 @@ def write_markdown_report(out, path):
 # Every command lives in one subparser tree. Dispatch has a single rule: a first
 # argument that is not one of these names is the scan target, which is what keeps
 # `paperconan <dir>` working without giving any command its own argv branch.
-SUBCOMMANDS = ("scan", "fetch", "report", "workflow", "overview", "drill", "explain")
+SUBCOMMANDS = ("scan", "fetch", "report", "workflow", "sheets", "overview", "drill", "explain")
 
 
 def _add_scan_arguments(ap: argparse.ArgumentParser) -> None:
@@ -7010,8 +7010,9 @@ def _scan_options_section(scan_p: argparse.ArgumentParser) -> str:
 def _run_drill_command(args: argparse.Namespace) -> None:
     import json
 
-    from ._drill import drill, explain, overview
-    from ._drill_render import render_drill, render_explain, render_overview
+    from ._drill import drill, explain, overview, sheets
+    from ._drill_render import (render_drill, render_explain, render_overview,
+                                render_sheets)
 
     try:
         with open(args.scan_json, encoding="utf-8") as fh:
@@ -7039,7 +7040,10 @@ def _run_drill_command(args: argparse.Namespace) -> None:
             sys.exit(f"{args.scan_json} is malformed: {key} is not a list")
 
     try:
-        if args.cmd == "overview":
+        if args.cmd == "sheets":
+            view = sheets(scan)
+            text = render_sheets(view)
+        elif args.cmd == "overview":
             view = overview(scan, max_locations=args.max_locations)
             text = render_overview(view)
         elif args.cmd == "drill":
@@ -7116,6 +7120,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # Layered read-only views: read a scan one screenful at a time instead of
     # loading all of it. See skills/paperconan/SKILL.md for the drill protocol.
+    sh = sub.add_parser("sheets", help="list every sheet read, to find the one a figure's data sits in")
+    sh.add_argument("scan_json", help="Path to paperconan scan.json")
+    sh.add_argument("--json", action="store_true", help="print the structure instead of the text")
+
     ov = sub.add_parser("overview", help="list the locations carrying signal (start here)")
     ov.add_argument("scan_json", help="Path to paperconan scan.json")
     ov.add_argument("--max-locations", type=int, default=20,
@@ -7171,7 +7179,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.cmd == "workflow":
         _run_workflow(args)
         return
-    if args.cmd in ("overview", "drill", "explain"):
+    if args.cmd in ("sheets", "overview", "drill", "explain"):
         _run_drill_command(args)
         return
     _run_scan(getattr(args, "_parser", ap), args)
