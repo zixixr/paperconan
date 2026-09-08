@@ -209,17 +209,22 @@ recheck/  batches/         LOCAL-ONLY audit working dirs — GITIGNORED, see bel
 
 ## Releasing
 
-The version is written in five places and `tests/test_packaging.py` pins all five to
+The version is written in six places and `tests/test_packaging.py` pins all six to
 `__version__`, so pytest is the check for them:
 
 `pyproject.toml`, `src/paperconan/__init__.py`, `skills/paperconan/SKILL.md`
-frontmatter, the sample in `skills/paperconan/references/output-schema.md`, and
-`examples/demo_paper/audit/scan.json`.
+frontmatter, the sample in `skills/paperconan/references/output-schema.md`,
+`examples/demo_paper/audit/scan.json`, and `uv.lock`.
+
+`uv.lock` is the one you do not edit: `uv run` rewrites it from `pyproject.toml`
+the next time it resolves, so bump the other five, run pytest, and commit the
+lockfile it updates. It went uncounted here until a release found it dirty in the
+working tree after the branch was already pushed.
 
 What pytest cannot check is any of them against the git tag — the tag does not exist
 when the suite runs. That pair is what `.github/workflows/release.yml` adds.
 
-1. Move all five. For the demo scan, edit the version string; regenerate it only if
+1. Move the five you edit by hand. For the demo scan, edit the version string; regenerate it only if
    detector output actually moved, because a regeneration writes an absolute `input_dir`
    into `examples/demo_paper/audit/scan.json` (`_audit.py` calls `os.path.abspath`) and
    the committed file holds a relative path.
