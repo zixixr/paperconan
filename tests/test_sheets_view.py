@@ -125,3 +125,25 @@ def test_an_incomplete_scan_says_so():
                                        "n_cols": 2, "numeric_cells": 4, "n_blocks": 1}]},
             "scan_status": "partial"}
     assert "partial" in render_sheets(sheets(scan))
+
+
+def test_the_text_does_not_let_a_blank_signal_column_read_as_clean():
+    """The families this layer routes are not all of them. A sheet whose only
+    finding is an FDR-significant digit distribution shows a blank signal column,
+    and the reader has to be told that is not a clean bill of health -- this view
+    exists to stop a false all-clear, and would otherwise licence one of its own.
+    """
+    scan = {"scan_stats": {"sheets": [{"file": "a.xlsx", "sheet": "Fig. 2j", "n_rows": 8,
+                                       "n_cols": 4, "numeric_cells": 30, "n_blocks": 1}]},
+            "digit_distribution": [{"label": "a.xlsx :: Fig. 2j", "p_adj": 0.002,
+                                    "fdr_significant": True, "n": 30}]}
+    view = sheets(scan)
+    assert view["sheets"][0]["has_findings"] is False, "the routed families found nothing"
+    text = render_sheets(view).lower()
+    # The whole caution, not a fragment of it: a reader has to learn both that a
+    # blank column is not a clean bill of health AND which families are missing,
+    # or the sentence does not do its job.
+    assert "blank signal column" in text
+    assert "not that the sheet is clean" in text
+    for family in ("digit", "decimal", "image"):
+        assert family in text, f"{family} findings are unrouted and must be named"

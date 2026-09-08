@@ -176,10 +176,18 @@ Names repeat across files, so read the file column too, not just the sheet name.
 
 Then:
 
-- **one sheet matches, and it carries signal** — `drill` into it as usual;
-- **one sheet matches and carries none** — that is an answer worth reporting: the
-  data is present and no detector found anything at that location. Say that, rather
-  than that the source could not be obtained;
+- **one sheet matches, and it carries signal** — `drill` into it as usual. `drill`
+  takes an `overview` ordinal, so a sheet ranked past the default page needs
+  `overview --max-locations` raised until it appears;
+- **one sheet matches and carries none** — the signal column covers only the
+  families this layer routes. `digit_distribution`, `decimal_endings`,
+  `decimal_tail_clusters` and `image_findings` are not among them, and the listing
+  says so in its own `!` lines without naming which sheet each belongs to. Read
+  those keys in `scan.json` for your sheet before calling it clean — an empty
+  signal column is not a clean bill of health, the same way an empty
+  `image_findings` list is not. Once you have, "the data is present and no detector
+  found anything at that location" is an answer worth reporting, and a better one
+  than "the source could not be obtained";
 - **several could be it** — check each. Concluding "present, nothing found" from
   the one you happened to pick is a more confident wrong answer than "unavailable"
   was, and costs the reader more;

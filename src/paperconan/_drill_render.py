@@ -55,9 +55,13 @@ def render_sheets(view: dict[str, Any]) -> str:
     out += ["", "This list is long by design -- search it for the figure you want rather",
             "than reading it through. Which sheet a figure's data sits in is a",
             "judgement about names: make it yourself, and if more than one sheet could",
-            "be it, check each rather than picking one. A sheet marked neither `yes`",
-            "nor `not read` was read and nothing was found in it, which is an answer.",
-            "Read a sheet that does carry signal with `drill`."]
+            "be it, check each rather than picking one.",
+            "",
+            "A blank signal column means the families routed here found nothing --",
+            "not that the sheet is clean. Digit-distribution, decimal-ending and",
+            "image findings are not routed; the `!` lines above say when a scan holds",
+            "some, and they are read from scan.json. Check them before calling a",
+            "sheet clean. Read a sheet that does carry signal with `drill`."]
     return "\n".join(out)
 
 
