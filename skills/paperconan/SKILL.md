@@ -155,6 +155,40 @@ Three things to hold onto while reading:
 - **A quiet overview is not a clean paper.** It means these detectors found
   nothing at these thresholds in the data that was supplied.
 
+## Starting From A Specific Claim
+
+`overview` answers "where is there signal", which is the right first question when
+nothing else is known. It is the wrong one when you already have a claim -- someone
+says figure 2j of this paper looks wrong -- because a sheet with no finding never
+appears there, and "no finding" is exactly what you were asked to check.
+
+```bash
+paperconan sheets audit/scan.json          # every sheet read, signal or not
+```
+
+Then decide, yourself, which sheet holds that figure. A supplement routinely
+spreads a few hundred sheets over a dozen files, named `Fig. 2j`, `Fig2J`,
+`ED_Fig.7b`, `Source Data Fig 2`, `Supplementary Figure 8e`, or by content rather
+than number. No rule maps those to a figure reliably -- reading them is a
+judgement, which is why the tool lists and does not match.
+
+Having picked the sheet:
+
+- if `overview` lists it, `drill` into it as usual;
+- if it does not, that is an answer worth reporting: the data is present and no
+  detector found anything at that location. Say that, rather than that the source
+  could not be obtained.
+
+**Do not conclude "source data unavailable" without running `sheets` first.** On
+this project's own benchmark, 16 claims adjudicated as having no obtainable source
+had their named figure sitting in a sheet already downloaded -- one of them a
+sheet in a file of 161 -- and 12 of those sheets carry a finding today. The data
+was there; nobody had matched the figure to it.
+
+When the sheet genuinely is absent, `paperconan fetch` may reach a copy the first
+download missed (see Fetching Data), and the publisher's own label for each
+supplementary file is recorded to help you tell which one to ask for.
+
 ## Adaptive Image Review
 
 Use this workflow when the user requests image review or the source directory

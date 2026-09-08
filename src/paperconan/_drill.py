@@ -165,6 +165,41 @@ def _ranked_panels(scan: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str
     return _interleave_by_family(_merge_panels(clusters)), seeding
 
 
+def sheets(scan: dict[str, Any]) -> dict[str, Any]:
+    """Every sheet the scan read, whether or not it carries a finding.
+
+    `overview` answers "where is there signal", which is the right question when
+    nothing else is known. Working from a specific report -- someone says figure 2j
+    of this paper looks wrong -- the first question is instead which sheet holds
+    figure 2j, and a supplement routinely spreads a few hundred sheets over a
+    dozen files under names no rule reliably maps to a figure number ("Fig. 2j",
+    "Fig2J", "ED_Fig.7b", "Source Data Fig 2"). Matching them is a judgement, so
+    this only lays out what is there and leaves the matching to the reader.
+
+    Sheets with no finding are the point: their absence from `overview` is what
+    made a claim about one look like data that could not be obtained.
+    """
+    stats = (scan.get("scan_stats") or {}).get("sheets") or []
+    rows = [{
+        "file": s.get("file"),
+        "sheet": s.get("sheet"),
+        "rows": s.get("n_rows"),
+        "cols": s.get("n_cols"),
+        "numeric_cells": s.get("numeric_cells"),
+        "blocks": s.get("n_blocks"),
+    } for s in stats]
+    with_findings = {(b.get("file"), b.get("sheet"))
+                     for b in (scan.get("relations_blocks") or [])}
+    for r in rows:
+        r["has_findings"] = (r["file"], r["sheet"]) in with_findings
+    return {
+        "sheets": rows,
+        "n_sheets": len(rows),
+        "n_with_findings": sum(1 for r in rows if r["has_findings"]),
+        "n_files": len({r["file"] for r in rows}),
+    }
+
+
 def overview(scan: dict[str, Any], *,
              max_locations: int = DEFAULT_MAX_LOCATIONS) -> dict[str, Any]:
     """Which locations carry signal, how strong, and of what kinds."""

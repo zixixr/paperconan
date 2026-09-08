@@ -21,6 +21,22 @@ def _coverage_lines(coverage: dict[str, Any], indent: str = "") -> list[str]:
     return [f"{indent}! {item}" for item in coverage.get("limitations") or []]
 
 
+def render_sheets(view: dict[str, Any]) -> str:
+    out = ["%d sheets in %d file(s); %d carry at least one finding"
+           % (view["n_sheets"], view["n_files"], view["n_with_findings"]), ""]
+    out.append("  %-40s %-30s %7s %6s %8s  %s"
+               % ("file", "sheet", "rows", "cols", "numeric", "signal"))
+    out.append("  " + "-" * 104)
+    for r in view["sheets"]:
+        out.append("  %-40s %-30s %7s %6s %8s  %s"
+                   % (str(r["file"])[-40:], str(r["sheet"])[:30], r["rows"], r["cols"],
+                      r["numeric_cells"], "yes" if r["has_findings"] else ""))
+    out += ["", "A sheet with no signal was still read. Which sheet a figure's data",
+            "sits in is a judgement about names -- make it yourself, then read that",
+            "sheet with `drill` if it is listed by `overview`, or open the file."]
+    return "\n".join(out)
+
+
 def render_overview(view: dict[str, Any]) -> str:
     cov = view["coverage"]
     out = [
