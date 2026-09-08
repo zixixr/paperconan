@@ -447,28 +447,42 @@ def find_numeric_blocks(sheet, min_rows=3, min_cols=1):
                     blocks.append((i0, i1, j, j1))
             else:
                 i += 1
-    # PROTOTYPE (measurement only, not for merge): also offer the whole numeric
-    # extent as one block, so sub-panels separated by a blank row or column are
-    # compared against each other. Blank rows inside are NaN, which every detector
-    # already masks per pair -- verified to give the same findings as physically
-    # dropping the blank rows and columns, while leaving coordinates pointing at
-    # real cells. Size-capped by where confirmed problems actually live.
-    if _WHOLE_SHEET_MAX_ROWS and _WHOLE_SHEET_MAX_COLS and len(blocks) > 1:
-        fr = np.flatnonzero(num.any(axis=1))
-        fc = np.flatnonzero(num.any(axis=0))
-        if len(fr) and len(fc):
-            nr, nc = int(num.any(axis=1).sum()), int(num.any(axis=0).sum())
-            if nr <= _WHOLE_SHEET_MAX_ROWS and nc <= _WHOLE_SHEET_MAX_COLS:
-                # The sub-blocks stay. Replacing them with this one instead was
-                # measured and rejected: widening every column pair over the other
-                # panels' rows dilutes relations that hold inside one panel, losing
-                # 43% of them corpus-wide. The duplicate that a relation visible
-                # both ways produces is removed downstream, not here -- this
-                # function only decides extents.
-                whole = (int(fr[0]), int(fr[-1]) + 1, int(fc[0]), int(fc[-1]) + 1)
-                if whole not in blocks:
-                    blocks.append(whole)
+    # Also offer the whole numeric extent as one block, so sub-panels a blank row
+    # or column separates are compared against each other. Blank rows inside are
+    # NaN, which every detector already masks per pair, so coordinates keep
+    # pointing at real cells.
+    #
+    # The sub-blocks stay. Replacing them with this one was measured and rejected:
+    # widening every column pair over the other panels' rows dilutes relations that
+    # hold inside one panel, losing 43% of them corpus-wide. The duplicate that a
+    # relation visible both ways produces is removed downstream, not here -- this
+    # function only decides extents.
+    if len(blocks) > 1:
+        whole_extent = _whole_sheet_extent(sheet)
+        if whole_extent is not None and whole_extent not in blocks:
+            blocks.append(whole_extent)
     return blocks
+
+
+def _whole_sheet_extent(sheet):
+    """The sheet's whole numeric extent, or None if it is not to be analysed whole.
+
+    One definition, used both where the extent is appended and where the reader
+    decides whether a block IS that extent. Re-deriving it from the shape of the
+    last block instead was wrong: `find_numeric_blocks` can emit an ordinary block
+    that happens to span every row, and treating that as the appended extent
+    deleted real findings on sheets this pass never even ran on.
+    """
+    if not (_WHOLE_SHEET_MAX_ROWS > 0 and _WHOLE_SHEET_MAX_COLS > 0):
+        return None
+    num = ~np.isnan(sheet.numeric)
+    rows_used, cols_used = num.any(axis=1), num.any(axis=0)
+    if not rows_used.any() or not cols_used.any():
+        return None
+    if int(rows_used.sum()) > _WHOLE_SHEET_MAX_ROWS or int(cols_used.sum()) > _WHOLE_SHEET_MAX_COLS:
+        return None
+    fr, fc = np.flatnonzero(rows_used), np.flatnonzero(cols_used)
+    return (int(fr[0]), int(fr[-1]) + 1, int(fc[0]), int(fc[-1]) + 1)
 
 
 def header_for(sheet, r0, c0, c1):
@@ -1456,59 +1470,57 @@ def _block_rows(block):
         return None
 
 
-def _dedup_overlapping_blocks(report_blocks, start):
-    """Drop a finding a CONTAINING block repeats from a narrower one, in place.
+def _dedup_overlapping_blocks(report_blocks, start, extent):
+    """Drop what the whole-sheet block re-reports from its sub-blocks, in place.
 
-    Only for the collapse mode that analyses a sheet both per sub-block and as a
-    whole. The same relation then arrives twice -- once from the sub-block, once
-    from the whole-sheet block that contains it -- and the reader gets two ranked
-    rows for one fact.
+    A sheet analysed both per sub-block and as a whole reports one relation twice,
+    and the reader gets two ranked rows for one fact. Returns how many were removed,
+    so the caller can give their budget back.
 
-    Dedup fires only where one block's row extent CONTAINS another's, which is the
-    relationship that makes two entries the same fact. `rule` alone will not do it:
-    for every column-pair kind the rule names only column indices, so two disjoint
-    row-groups that each independently relate the same two columns produce the same
-    rule text while being different facts about different cells. Keying on the rule
-    alone deleted the second of those -- verified on the corpus at 84 sheets, most
-    of them a handful of collisions rather than one dense outlier.
+    `extent` is the whole-sheet extent `find_numeric_blocks` appended, or None if it
+    appended none -- the same value from the same function, never re-derived here.
+    Two earlier versions inferred the container from the blocks themselves and both
+    deleted real findings: keying on `(kind, rule)` alone collides because for every
+    column-pair kind the rule names only columns, so two disjoint row-groups
+    relating the same pair look identical; and taking the last block as the
+    container collides because `find_numeric_blocks` can emit an ordinary block
+    spanning every row, which made this run on sheets the whole-sheet pass had
+    skipped for size. `identical_after_rounding` makes either one bite: its rule
+    ("N cells share rounded value V") carries no location at all.
 
-    The narrower block's copy is the one kept: its extent is the more precise
-    description of where to look, and it is what `explain` reports.
+    The sub-block's copy is the one kept: its extent is the more precise description
+    of where to look, and it is what `explain` reports.
     """
-    blocks = [b for b in report_blocks[start:] if _block_rows(b) is not None]
-    if len(blocks) < 2:
-        return
-    # ONLY the whole-sheet block is a container here. It is the extent this mode
-    # appends, it is appended last, and it spans every other block -- so it is the
-    # only block whose findings can be a re-report of another's.
-    #
-    # Comparing any two blocks by containment instead was wrong, and not only for
-    # relation kinds: `identical_after_rounding`'s rule carries neither column nor
-    # row ("N cells share rounded value V but have M distinct precise values"), so
-    # two unrelated regions collide on it. With ordinary sub-blocks free to nest --
-    # `find_numeric_blocks` can emit overlapping ones -- that deleted findings about
-    # genuinely different cells: six of them across two corpus papers.
-    whole = blocks[-1]
-    wr = _block_rows(whole)
-    others = blocks[:-1]
-    if not all(wr[0] <= _block_rows(b)[0] and _block_rows(b)[1] <= wr[1] for b in others):
-        return                               # last block is not the appended extent
+    if extent is None:
+        return 0                             # this sheet was not analysed whole
+    want_rows = "%d-%d" % (extent[0] + 1, extent[1])
+    blocks = report_blocks[start:]
+    whole = next((b for b in blocks
+                  if ((b.get("block") or {}).get("rows")) == want_rows
+                  and ((b.get("block") or {}).get("cols")) == "%d-%d" % (extent[2] + 1, extent[3])),
+                 None)
+    if whole is None:
+        return 0                             # the extent produced no findings
     inner_keys = set()
-    for narrower in others:
-        if _block_rows(narrower) == wr:
-            continue                         # same extent: not a re-report, the same block
+    for narrower in blocks:
+        if narrower is whole:
+            continue
         for group in BLOCK_FINDING_GROUPS:
             for f in narrower.get(group) or []:
                 if f.get("rule") is not None:
                     inner_keys.add((f.get("kind"), f.get("rule")))
     if not inner_keys:
-        return
+        return 0
+    removed = 0
     for group in BLOCK_FINDING_GROUPS:
         if group not in whole:
             continue
+        before = len(whole[group])
         whole[group] = [f for f in whole[group]
                         if f.get("rule") is None
                         or (f.get("kind"), f.get("rule")) not in inner_keys]
+        removed += before - len(whole[group])
+    return removed
 
 
 def _demote_dense_sheets(report_blocks, cap=RELATION_FLOOD_CAP):
@@ -6618,13 +6630,13 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                         findings_omitted=omitted,
                         **{group: groups[group] for group in BLOCK_FINDING_GROUPS},
                     ))
-            if _WHOLE_SHEET_MAX_ROWS and _WHOLE_SHEET_MAX_COLS:
-                # This sheet was analysed twice over: once per sub-block, once as a
-                # whole. A relation visible both ways is ONE fact, and reporting it
-                # from both extents put it on the reader's page as two ranked rows.
-                # The sub-block's copy is the one kept: its extent is the narrower
-                # description of where to look, which is what `explain` reports.
-                _dedup_overlapping_blocks(report_blocks, sheet_first_index)
+            # A relation this sheet showed both per sub-block and whole is ONE
+            # fact; reporting it from both extents put two ranked rows on the
+            # reader's page. Findings dropped here were already charged to the
+            # budget block by block, so give that back -- otherwise a later sheet
+            # hits the cap on re-reports that were thrown away.
+            findings_kept_total -= _dedup_overlapping_blocks(
+                report_blocks, sheet_first_index, _whole_sheet_extent(sheet))
             coverage.mark_sheet_succeeded()
             coverage.mark_block_analyzed(blocks_analyzed_here)
             if blocks_analyzed_here < len(blocks):
