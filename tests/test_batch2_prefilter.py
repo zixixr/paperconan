@@ -1519,3 +1519,94 @@ def test_prefilter_downweights_cross_sheet_enriched_axis_context():
 
     assert f["prefilter"] == "downweight"
     assert f["prefilter_reason"] == "shared_axis_overlap"
+
+
+def test_prefilter_does_not_call_a_short_identical_pair_sparse_when_its_rows_all_differ():
+    """Pooling two identical columns counts each value once, so a pair of three or four
+    rows below the precision gate had at most four distinct values and read as sparse
+    on that count alone."""
+    cp = _collector()
+    for values in ([18.2, 14.8, 6.4], [23.8, 26.7, 28.5, 32.2]):
+        f = cp.prefilter_relation_finding(
+            "identical_column", "Tnf", "Il6", len(values), 1.0, "col[5] == col[1]",
+            values, list(values),
+        )
+
+        assert f["flags"]["low_information_sparse"] is False, values
+        assert f["prefilter_reason"] != "low_information_sparse_transform", values
+
+
+def test_prefilter_still_calls_a_short_identical_pair_sparse_when_its_values_repeat():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "identical_column", "Tnf", "Il6", 4, 1.0, "col[5] == col[1]",
+        [49.0, 1.0, 49.0, 0.0], [49.0, 1.0, 49.0, 0.0],
+    )
+
+    assert f["flags"]["low_information_sparse"] is True
+
+
+def test_prefilter_leaves_longer_identical_pairs_as_they_were():
+    """Six rows with one repeat has five distinct values: not sparse before the change,
+    and the change must not make a single repeat enough."""
+    cp = _collector()
+    values = [3.1, 7.4, 2.2, 9.8, 5.6, 3.1]
+    f = cp.prefilter_relation_finding(
+        "identical_column", "Tnf", "Il6", 6, 1.0, "col[5] == col[1]",
+        values, list(values),
+    )
+
+    assert f["flags"]["low_information_sparse"] is False
+
+
+def test_prefilter_calls_a_half_zero_transform_sparse_even_with_many_distinct_values():
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "exact_linear", "", "", 6, 1.0, "col[2] = col[1] * 2",
+        [0.0, 0.0, 0.0, 1.5, 2.5, 3.5], [0.0, 0.0, 0.0, 3.0, 5.0, 7.0],
+    )
+
+    assert f["flags"]["low_information_sparse"] is True
+
+
+def test_prefilter_keeps_the_pooled_count_for_transforms_between_different_columns():
+    """The identical-pair exception is about two copies of one column. A transform
+    between two different columns still pools them, as before. Four rows, because the
+    scan does not emit a three-row constant_ratio by default."""
+    cp = _collector()
+    f = cp.prefilter_relation_finding(
+        "constant_ratio", "Tnf", "Il6", 4, 1.0, "col[5] = col[1] * -1",
+        [1.0, -1.0, 2.0, -2.0], [-1.0, 1.0, -2.0, 2.0],
+    )
+
+    assert f["flags"]["low_information_sparse"] is True
+
+
+def test_prefilter_still_calls_a_short_identical_pair_sparse_when_it_is_a_sequence():
+    """Distinct values are not enough: sorted into a constant step or ratio, three or
+    four of them say no more than a repeated value."""
+    cp = _collector()
+    for values in ([1.0, 2.0, 3.0], [0.0, 50.0, 100.0], [24.0, 48.0, 72.0],
+                   [1.0, 2.0, 4.0, 8.0], [0.1, 1.0, 10.0, 100.0], [2.0, 1.0, 4.0, 3.0]):
+        f = cp.prefilter_relation_finding(
+            "identical_column", "Tnf", "Il6", len(values), 1.0, "col[5] == col[1]",
+            values, list(values),
+        )
+
+        assert f["flags"]["low_information_sparse"] is True, values
+
+
+def test_prefilter_judges_an_identical_pair_the_same_whichever_column_comes_first():
+    """Samples are rounded, so two columns equal within the detector's tolerance can
+    sample differently; here one sample has a repeat and the other does not."""
+    cp = _collector()
+    distinct = [1000.0, 1000.000002, 2000.0]
+    repeated = [1000.000001, 1000.000001, 2000.0]
+    flags = [
+        cp.prefilter_relation_finding(
+            "identical_column", "Tnf", "Il6", 3, 1.0, "col[5] == col[1]", sa, sb,
+        )["flags"]["low_information_sparse"]
+        for sa, sb in ((distinct, repeated), (repeated, distinct))
+    ]
+
+    assert flags == [True, True], flags

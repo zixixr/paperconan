@@ -45,6 +45,25 @@ def _is_arith_axis(samples: list[Any] | None) -> bool:
     return len(set(diffs)) == 1 and diffs[0] != 0
 
 
+def _all_distinct(vals: list[float]) -> bool:
+    rounded = [round(v, 12) for v in vals]
+    return len(set(rounded)) == len(rounded)
+
+
+def _sorted_progression(vals: list[float]) -> bool:
+    """Sorted, the values step by one constant difference or one constant ratio."""
+    s = sorted(vals)
+    if len(s) < 3:
+        return False
+    diffs = {round(b - a, 9) for a, b in zip(s, s[1:])}
+    if len(diffs) == 1 and 0 not in diffs:
+        return True
+    if s[0] > 0:
+        ratios = {round(b / a, 9) for a, b in zip(s, s[1:])}
+        return len(ratios) == 1 and 1.0 not in ratios
+    return False
+
+
 _AGG = (
     "average", "mean", "median", "std", " sd", "sd ", "stdev", "stddev",
     "s.d", "sem", "s.e.m", "variance", " var", "error", "95%", " ci",
@@ -590,7 +609,21 @@ def _low_information_sparse(kind: str | None, n: int, sa: list[Any] | None,
         return False
     unique = len({round(v, 12) for v in vals})
     zeros = sum(1 for v in vals if abs(v) <= 1e-12)
-    return unique <= 4 or zeros >= len(vals) // 2
+    if zeros >= len(vals) // 2:
+        return True
+    if kind == "identical_column":
+        # Two copies of one column pool to that column's values, so a pair of three or
+        # four rows below the precision gate holds at most four distinct values when
+        # its samples agree, and the pooled count alone would flag it. Judge the
+        # sampled columns instead: the pair is not sparse when each column's sampled
+        # values all differ and, sorted, do not step by a constant difference or ratio
+        # -- a 1, 2, 3 or 1, 10, 100 column says no more at this length than a repeated
+        # value. Both columns are checked because samples are rounded, and two columns
+        # equal within the detector's tolerance can round differently.
+        col_a, col_b = _nums(sa), _nums(sb)
+        if all(_all_distinct(c) and not _sorted_progression(c) for c in (col_a, col_b)):
+            return False
+    return unique <= 4
 
 
 def _is_cross_sheet(kind: str | None) -> bool:
