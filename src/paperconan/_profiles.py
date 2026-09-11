@@ -98,10 +98,11 @@ def _demote_or_hide(f: dict, profile: Profile) -> None:
 # `prefilter="drop"` and can leave the finding kept by the profile.
 #
 # The other guards in `apply_profile_to_findings` demote with no such distinction, so
-# their tags say nothing about strength, and two of them (derived, omics) decide on
-# words in headers and sheet names, ahead of a prefilter that may have judged the same
-# finding differently. Only a prefilter's drop tag records the verdict "drop, not
-# merely downweight", so it is the only tag the reading layer acts on.
+# their tags do not say how strongly the filter meant it. A prefilter's drop tag is
+# the one place the filter says "drop, not merely downweight", and it is the only tag
+# the reading layer acts on. It is the filter's stated verdict, not stronger evidence:
+# some drop rules match on a header word alone. That is why the reading layer compares
+# it only after severity, adds a label, and removes nothing.
 _RELATION_DROP = "deterministic_relation_prefilter"
 _RELATION_DOWNWEIGHT = "deterministic_relation_downweight"
 _WITHIN_COL_DROP = "within_col_structural_filter"
@@ -113,13 +114,16 @@ def matched_drop_rule(f: dict) -> bool:
     """The profile demoted this finding because a prefilter's drop rule matched it.
 
     A downweight, a demotion by another guard, and a demotion with no recorded reason
-    do not count. Context entries that are not strings are ignored, so a hand-edited
-    or foreign scan cannot break the reading layer through this field.
+    do not count. A context that is not a list, and entries in it that are not
+    strings, are ignored, so a hand-edited or foreign scan cannot make this check raise
+    or be read as a drop rule.
     """
     if f.get("profile_action", "kept") == "kept":
         return False
-    return any(isinstance(c, str) and c in PREFILTER_DROP_CONTEXTS
-               for c in f.get("false_positive_context") or [])
+    contexts = f.get("false_positive_context")
+    if not isinstance(contexts, list):
+        return False
+    return any(isinstance(c, str) and c in PREFILTER_DROP_CONTEXTS for c in contexts)
 
 
 def _names_for(f: dict) -> str:

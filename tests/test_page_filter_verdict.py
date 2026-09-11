@@ -13,8 +13,8 @@ means worth less, not nothing, and a location holding one is left alone.
 Within its severity band a location that matched sorts after its band-mates, and
 severity is compared first because the filter can be wrong. Family interleaving then
 round-robins kinds, so most fixtures here use one kind and the page order is the sort
-order; `test_with_several_kinds_the_move_is_among_its_own_kind` pins what still holds
-when kinds differ.
+order; `test_with_several_kinds_the_move_is_among_its_leading_kind` pins what still
+holds when kinds differ.
 """
 from __future__ import annotations
 
@@ -22,8 +22,8 @@ import re
 
 import pytest
 
-from paperconan._drill import drill, overview
-from paperconan._drill_render import render_overview
+from paperconan._drill import drill, explain, overview
+from paperconan._drill_render import render_explain, render_overview
 
 DROP = "deterministic_relation_prefilter"
 WC_DROP = "within_col_structural_filter"
@@ -155,10 +155,11 @@ def test_a_merged_panel_is_judged_on_all_its_findings():
     )
 
 
-def test_with_several_kinds_the_move_is_among_its_own_kind():
-    """Interleaving round-robins kinds, so a location that matched can still print
-    ahead of a same-strength location of another kind, or behind a weaker one. What
-    holds is its place among its own kind."""
+def test_with_several_kinds_the_move_is_among_its_leading_kind():
+    """Interleaving files each location under the first kind it lists and round-robins
+    those, so a location that matched can still print ahead of a same-strength location
+    of another kind, or behind a weaker one. What holds is its place among the
+    locations filed under the same leading kind."""
     order = _order(_scan(
         _block("A flagged", _dropped(5)),
         _block("A kept", [_finding(0)]),
@@ -169,17 +170,34 @@ def test_with_several_kinds_the_move_is_among_its_own_kind():
     )
 
 
-def test_a_malformed_context_is_ignored_not_trusted_or_fatal():
+@pytest.mark.parametrize("value", [
+    [{"ctx": DROP}],            # an entry that is not a string
+    DOWNWEIGHT,                 # a bare string, not a list
+    {DROP: 1},                  # a mapping whose key is a drop tag
+    1, True, 2.5,               # scalars
+])
+def test_a_malformed_context_is_ignored_not_trusted_or_fatal(value):
     """Hand-edited or foreign scans: a context that is not a list of strings must
-    neither crash the reading layer nor be read as a drop rule."""
-    odd = _dropped(3)
-    odd[0]["false_positive_context"] = [{"ctx": DROP}]
-    odd[1]["false_positive_context"] = DOWNWEIGHT          # a bare string, not a list
+    neither make the check raise nor be read as a drop rule."""
+    odd = _dropped(2)
+    odd[0]["false_positive_context"] = value
     scan = _scan(_block("Odd", odd), _block("Kept", [_finding(0)]))
 
     loc = {_sheet(x): x for x in overview(scan)["locations"]}
-    assert loc["Odd"]["matched_drop_rule"] == 1, loc["Odd"]
-    assert _before(_order(scan), "Odd", "Kept")
+    assert loc["Odd"]["matched_drop_rule"] == 1, (value, loc["Odd"])
+    assert _before(_order(scan), "Odd", "Kept"), value
+
+
+def test_explain_shows_the_drop_tag_when_detector_severity_was_already_low():
+    """The page's filter line sends the reader to explain. A finding the detector
+    already rated low can still be demoted, and explain used to print its reasons
+    only when the displayed severity differed from the detector's."""
+    low = [_finding(i, severity="low", action="demoted", context=[DROP]) for i in range(2)]
+    scan = _scan(_block("Low", low))
+    fid = drill(scan, 1, kind="identical_column")["findings"][0]["finding_id"]
+
+    text = render_explain(explain(scan, fid))
+    assert DROP in text, text
 
 
 def _lines_under(text, n):
