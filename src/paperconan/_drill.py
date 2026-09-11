@@ -64,7 +64,7 @@ def _clusters_of(scan: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, 
     fails to reach the reader. Discarding it here made `overview` print an empty
     `limitations` list on a scan where thousands of findings had been dropped.
     """
-    return _build_clusters(scan, max_clusters=10**9)
+    return _build_clusters(scan, max_clusters=10**9, with_verdict=True)
 
 
 def _families(cluster: dict[str, Any]) -> list[str]:
@@ -73,6 +73,14 @@ def _families(cluster: dict[str, Any]) -> list[str]:
         if seed["kind"] and seed["kind"] not in seen:
             seen.append(seed["kind"])
     return seen
+
+
+def _all_demoted_outright(cluster: dict[str, Any]) -> bool:
+    """Every finding here was demoted outright (see `demoted_outright`). A single
+    finding that was not -- kept, only downweighted, or demoted with no recorded
+    reason -- leaves the location ranked on its detector severity alone."""
+    seeds = cluster["seeds"]
+    return bool(seeds) and all(s.get("demoted_outright") for s in seeds)
 
 
 # ---------- L1 ----------
@@ -111,6 +119,12 @@ def _merge_panels(clusters: list[dict[str, Any]]) -> list[dict[str, Any]]:
     panels = list(merged.values())
     panels.sort(key=lambda c: (
         _SEVERITY_RANK.get(c["strongest_raw_severity"], 3),
+        # Ranking is on the detector's severity, frozen before the profile ran, so
+        # a panel the filter had wholly demoted still took its slot on those
+        # findings. It now goes to the back of its band. The verdict is compared
+        # after severity, not before: the filter can be wrong, and a verdict that
+        # can be wrong must not outweigh the detector's severity.
+        _all_demoted_outright(c),
         -c["n_high_seeds"],
         -len(c["seeds"]),
         c["cluster_id"],
@@ -266,6 +280,8 @@ def overview(scan: dict[str, Any], *,
             "strongest": cluster["strongest_raw_severity"],
             "signals": len(cluster["seeds"]),
             "high": cluster["n_high_seeds"],
+            "demoted_outright": sum(1 for s in cluster["seeds"]
+                                    if s.get("demoted_outright")),
             "families": _families(cluster),
         })
 

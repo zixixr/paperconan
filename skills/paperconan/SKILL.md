@@ -86,6 +86,14 @@ Three things to hold onto while reading:
   a dense block or a repeated axis is often a fair call, but an exactly duplicated
   column can be demoted merely for sharing a block with many other relations.
   Do not skip a finding because its displayed severity is low.
+  `overview` ranks on the detector's severity, so a demoted finding still counts
+  toward its location's rank. One exception: a location whose every finding the
+  filter demoted outright -- for a recorded reason other than a downweight -- is
+  ranked after the other locations of the same strength (severity is still compared
+  first, so the verdict never outweighs it) and says so with a
+  `filter: all N demoted outright` line. That line is the filter's verdict, not a
+  conclusion. A location holding even one finding that was kept, only downweighted,
+  or demoted with no recorded reason is not treated this way and carries no such line.
 - **Read the `!` lines — every layer has them.** `overview` and both `drill`
   forms carry a `coverage` block; `explain` states its own limits inline (an
   evidence window the scan trimmed, structured parameters only `--json` shows).

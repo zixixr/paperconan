@@ -88,6 +88,11 @@ def render_overview(view: dict[str, Any]) -> str:
         more = len(loc["families"]) - len(families)
         suffix = f", … {more} more" if more > 0 else ""
         out.append(f"      {', '.join(families)}{suffix}")
+        # Said here because the page is where the choice to open a location is
+        # made. It reports the filter's verdict, which explain lets the reader judge.
+        if loc["signals"] and loc.get("demoted_outright") == loc["signals"]:
+            out.append(f"      filter: all {loc['signals']} demoted outright — "
+                       "explain gives the reason")
     # Branch on the scan, not on this page: with --max-locations 0 the page is
     # empty while the scan is not, and the all-clear text would contradict both
     # the header and the coverage line on the same screen.

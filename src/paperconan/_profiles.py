@@ -90,6 +90,32 @@ def _demote_or_hide(f: dict, profile: Profile) -> None:
         f["profile_action"] = "demoted"
 
 
+# The prefilters return one of two verdicts: "drop" (the pattern is usually derived
+# or structural) and "downweight" (worth less, not nothing). Both reach
+# `_demote_or_hide`, so neither `severity` nor `profile_action` can tell them apart.
+# The finding's `prefilter` field does, but it does not describe the profile's
+# decision: the within-column flood and reused-progression demoters in `_audit.py`
+# write `prefilter="drop"` and can leave the finding kept by the profile, and the
+# axis, boundary, derived, replot and omics guards demote without writing it. The
+# context tag is the profile's own record of why, so the reading layer decides
+# through `demoted_outright`, which reads the tag.
+_RELATION_DOWNWEIGHT = "deterministic_relation_downweight"
+_WITHIN_COL_DOWNWEIGHT = "within_col_downweight"
+DOWNWEIGHT_CONTEXTS = frozenset({_RELATION_DOWNWEIGHT, _WITHIN_COL_DOWNWEIGHT})
+
+
+def demoted_outright(f: dict) -> bool:
+    """The profile demoted this finding on a verdict stronger than a downweight.
+
+    A demotion with no recorded reason does not count. A finding shown as demoted
+    with nothing saying why is the shape a real signal disappears in, so it is not
+    moved on a verdict nobody can read.
+    """
+    if f.get("profile_action", "kept") == "kept":
+        return False
+    return bool(set(f.get("false_positive_context") or []) - DOWNWEIGHT_CONTEXTS)
+
+
 def _names_for(f: dict) -> str:
     return " ".join(str(f.get(k) or "") for k in (
         "col", "col_a", "col_b", "mean_col", "n_col", "sd_col",
@@ -268,7 +294,7 @@ def apply_profile_to_findings(findings: Iterable[dict], profile: str | None,
             ctx = (
                 "deterministic_relation_prefilter"
                 if action == "drop"
-                else "deterministic_relation_downweight"
+                else _RELATION_DOWNWEIGHT
             )
             _add_context(
                 f,
@@ -294,7 +320,7 @@ def apply_profile_to_findings(findings: Iterable[dict], profile: str | None,
             ctx = (
                 "within_col_structural_filter"
                 if action == "drop"
-                else "within_col_downweight"
+                else _WITHIN_COL_DOWNWEIGHT
             )
             _add_context(
                 f,
