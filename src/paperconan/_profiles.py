@@ -90,6 +90,42 @@ def _demote_or_hide(f: dict, profile: Profile) -> None:
         f["profile_action"] = "demoted"
 
 
+# The relation and within-column prefilters return "keep", "downweight" or "drop".
+# The profile demotes on both of the last two through `_demote_or_hide`, so neither
+# `severity` nor `profile_action` can tell them apart; the context tag written just
+# before the demotion can. The finding's `prefilter` field is not a substitute: the
+# within-column flood and reused-progression demoters in `_audit.py` write
+# `prefilter="drop"` and can leave the finding kept by the profile.
+#
+# The other guards in `apply_profile_to_findings` demote with no such distinction, so
+# their tags do not say how strongly the filter meant it. A prefilter's drop tag is
+# the one place the filter says "drop, not merely downweight", and it is the only tag
+# the reading layer acts on. It is the filter's stated verdict, not stronger evidence:
+# some drop rules match on a header word alone. That is why the reading layer compares
+# it only after severity, adds a label, and removes nothing.
+_RELATION_DROP = "deterministic_relation_prefilter"
+_RELATION_DOWNWEIGHT = "deterministic_relation_downweight"
+_WITHIN_COL_DROP = "within_col_structural_filter"
+_WITHIN_COL_DOWNWEIGHT = "within_col_downweight"
+PREFILTER_DROP_CONTEXTS = frozenset({_RELATION_DROP, _WITHIN_COL_DROP})
+
+
+def matched_drop_rule(f: dict) -> bool:
+    """The profile demoted this finding because a prefilter's drop rule matched it.
+
+    A downweight, a demotion by another guard, and a demotion with no recorded reason
+    do not count. A context that is not a list, and entries in it that are not
+    strings, are ignored, so a hand-edited or foreign scan cannot make this check raise
+    or be read as a drop rule.
+    """
+    if f.get("profile_action", "kept") == "kept":
+        return False
+    contexts = f.get("false_positive_context")
+    if not isinstance(contexts, list):
+        return False
+    return any(isinstance(c, str) and c in PREFILTER_DROP_CONTEXTS for c in contexts)
+
+
 def _names_for(f: dict) -> str:
     return " ".join(str(f.get(k) or "") for k in (
         "col", "col_a", "col_b", "mean_col", "n_col", "sd_col",
@@ -266,9 +302,9 @@ def apply_profile_to_findings(findings: Iterable[dict], profile: str | None,
         elif relation_decision := _relation_prefilter(f):
             action, reason = relation_decision
             ctx = (
-                "deterministic_relation_prefilter"
+                _RELATION_DROP
                 if action == "drop"
-                else "deterministic_relation_downweight"
+                else _RELATION_DOWNWEIGHT
             )
             _add_context(
                 f,
@@ -292,9 +328,9 @@ def apply_profile_to_findings(findings: Iterable[dict], profile: str | None,
         elif wc_decision := _within_col_prefilter(f, wc_high):
             action, reason = wc_decision
             ctx = (
-                "within_col_structural_filter"
+                _WITHIN_COL_DROP
                 if action == "drop"
-                else "within_col_downweight"
+                else _WITHIN_COL_DOWNWEIGHT
             )
             _add_context(
                 f,
