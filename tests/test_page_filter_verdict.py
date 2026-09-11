@@ -1,51 +1,59 @@
-"""The first page and the false-positive filter's verdict.
+"""The first page and the prefilter's drop verdict.
 
 `overview` ranks on the detector's severity, frozen before the profile runs, so a
 location whose every finding the filter had already demoted could take a first-page
 slot on the strength of findings the scan itself had marked as likely false positives.
 
-The filter returns two verdicts and they must not be treated alike. "drop" says the
-pattern is usually derived or structural; "downweight" says worth less, not nothing.
-Only the first is grounds for moving a location, and only to the back of its own
-severity band: the verdict is compared after severity, because the filter can be
-wrong and a verdict that can be wrong must not outweigh the detector's severity.
+Of the profile's demotions, only a prefilter's drop rule is acted on here. The
+prefilters distinguish "drop" from "downweight" and the profile then demotes both
+alike, so the context tag is the record of which it was; the other guards record no
+strength, and two of them decide on words in headers and sheet names. A downweight
+means worth less, not nothing, and a location holding one is left alone.
 
-Every fixture uses one finding kind, so family interleaving -- which round-robins
-across kinds -- cannot reorder what these tests look at.
+Within its severity band a location that matched sorts after its band-mates, and
+severity is compared first because the filter can be wrong. Family interleaving then
+round-robins kinds, so most fixtures here use one kind and the page order is the sort
+order; `test_with_several_kinds_the_move_is_among_its_own_kind` pins what still holds
+when kinds differ.
 """
 from __future__ import annotations
 
 import re
 
+import pytest
+
 from paperconan._drill import drill, overview
 from paperconan._drill_render import render_overview
 
 DROP = "deterministic_relation_prefilter"
+WC_DROP = "within_col_structural_filter"
 DOWNWEIGHT = "deterministic_relation_downweight"
+WC_DOWNWEIGHT = "within_col_downweight"
+GUARD = "derived_or_unit_conversion"
 
 
-def _finding(i, severity="high", action="kept", context=()):
+def _finding(i, severity="high", action="kept", context=(), kind="identical_column"):
     return {
-        "kind": "identical_column",
+        "kind": kind,
         "severity": severity if action == "kept" else "low",
-        "raw_severity": severity, "n": 6, "rule": f"col[{i}] == col[{i + 1}]",
+        "raw_severity": severity, "n": 6, "rule": f"{kind} col[{i}] == col[{i + 1}]",
         "profile_action": action, "false_positive_context": list(context),
     }
 
 
-def _outright(count):
-    return [_finding(i, action="demoted", context=[DROP]) for i in range(count)]
+def _dropped(count, tag=DROP, kind="identical_column", action="demoted"):
+    return [_finding(i, action=action, context=[tag], kind=kind) for i in range(count)]
 
 
-def _block(sheet, findings):
+def _block(sheet, findings, cols="1-12", group="relations"):
     return {"file": "s.xlsx", "sheet": sheet,
-            "block": {"rows": "2-9", "cols": "1-12", "header": []},
-            "relations": findings}
+            "block": {"rows": "2-9", "cols": cols, "header": []},
+            group: findings}
 
 
-def _scan(*blocks, cross=()):
+def _scan(*blocks):
     return {"tool": "paperconan", "schema_version": 1, "n_files": 1,
-            "relations_blocks": list(blocks), "cross_sheet_findings": list(cross)}
+            "relations_blocks": list(blocks), "cross_sheet_findings": []}
 
 
 def _sheet(loc):
@@ -56,72 +64,122 @@ def _order(scan):
     return [_sheet(loc) for loc in overview(scan)["locations"]]
 
 
-def test_a_location_demoted_outright_sorts_after_its_band_mates():
-    order = _order(_scan(_block("Flagged", _outright(5)),
-                         _block("Kept", [_finding(0)])))
+def _before(order, first, second):
+    return order.index(first) < order.index(second)
 
-    assert order.index("Kept") < order.index("Flagged"), (
-        f"five high findings the filter demoted outright outranked one it kept: {order}"
+
+def test_a_location_matching_a_drop_rule_sorts_after_its_band_mates():
+    order = _order(_scan(_block("Flagged", _dropped(5)), _block("Kept", [_finding(0)])))
+
+    assert _before(order, "Kept", "Flagged"), (
+        f"five high findings a drop rule matched outranked one the filter kept: {order}"
     )
 
 
-def test_the_verdict_is_compared_after_severity_not_before():
-    order = _order(_scan(_block("Flagged", _outright(5)),
+def test_the_within_column_drop_rule_counts_too():
+    kind = "within_col_value_duplication"
+    order = _order(_scan(
+        _block("Flagged", _dropped(5, tag=WC_DROP, kind=kind), group="within_col"),
+        _block("Kept", [_finding(0, kind=kind)], group="within_col")))
+
+    assert _before(order, "Kept", "Flagged"), (
+        f"the within-column drop rule was not acted on: {order}"
+    )
+
+
+def test_severity_is_compared_before_the_verdict():
+    order = _order(_scan(_block("Flagged", _dropped(5)),
                          _block("Weaker", [_finding(0, severity="medium")])))
 
-    assert order.index("Flagged") < order.index("Weaker"), (
-        f"the filter's verdict moved a high location behind a medium one: {order}"
+    assert _before(order, "Flagged", "Weaker"), (
+        f"the verdict outweighed severity in the sort: {order}"
     )
 
 
-def test_a_downweight_verdict_does_not_move_a_location():
-    downweighted = [_finding(i, action="demoted", context=[DOWNWEIGHT]) for i in range(5)]
-    order = _order(_scan(_block("Downweighted", downweighted),
+@pytest.mark.parametrize("tag", [DOWNWEIGHT, WC_DOWNWEIGHT])
+def test_a_downweight_does_not_move_a_location(tag):
+    order = _order(_scan(_block("Downweighted", _dropped(5, tag=tag)),
                          _block("Kept", [_finding(0)])))
 
-    assert order.index("Downweighted") < order.index("Kept"), (
-        f"a downweight was treated as a drop and moved the location back: {order}"
+    assert _before(order, "Downweighted", "Kept"), (
+        f"a downweight ({tag}) moved the location back as if it were a drop: {order}"
     )
 
 
-def test_one_finding_the_filter_left_alone_keeps_the_location_in_place():
-    order = _order(_scan(_block("Mixed", _outright(4) + [_finding(9)]),
+def test_a_demotion_by_another_guard_does_not_move_a_location():
+    order = _order(_scan(_block("Guarded", _dropped(5, tag=GUARD)),
                          _block("Kept", [_finding(0)])))
 
-    assert order.index("Mixed") < order.index("Kept"), (
-        f"a location with a kept finding was moved back as if wholly demoted: {order}"
+    assert _before(order, "Guarded", "Kept"), (
+        f"a guard that records no strength moved the location back: {order}"
+    )
+
+
+def test_one_finding_outside_the_rule_keeps_the_location_in_place():
+    order = _order(_scan(_block("Mixed", _dropped(4) + [_finding(9)]),
+                         _block("Kept", [_finding(0)])))
+
+    assert _before(order, "Mixed", "Kept"), (
+        f"a location with a kept finding was moved back as if every finding matched: {order}"
     )
 
 
 def test_a_demotion_with_no_recorded_reason_does_not_move_a_location():
     unexplained = [_finding(i, action="demoted") for i in range(5)]
-    order = _order(_scan(_block("Unexplained", unexplained),
-                         _block("Kept", [_finding(0)])))
+    order = _order(_scan(_block("Unexplained", unexplained), _block("Kept", [_finding(0)])))
 
-    assert order.index("Unexplained") < order.index("Kept"), (
+    assert _before(order, "Unexplained", "Kept"), (
         f"a demotion nobody can read the reason for moved the location back: {order}"
     )
 
 
-def _cross(a, b, i, action="kept", context=()):
-    return {
-        "kind": "cross_sheet_position_identical",
-        "severity": "high" if action == "kept" else "low", "raw_severity": "high",
-        "rule": f"{a} row {i} == {b} row {i}", "file_a": "s.xlsx", "file_b": "s.xlsx",
-        "sheet_a": a, "sheet_b": b, "row_a": i, "row_b": i, "same_position_count": 6,
-        "profile_action": action, "false_positive_context": list(context),
-    }
+def test_a_hidden_finding_counts_like_a_demoted_one():
+    order = _order(_scan(_block("Hidden", _dropped(5, action="hidden")),
+                         _block("Kept", [_finding(0)])))
 
-
-def test_a_cross_sheet_location_carries_the_verdict_too():
-    flagged = [_cross("F1", "F2", i, action="demoted",
-                      context=["same_data_replot_or_duplicate_upload"]) for i in range(5)]
-    view = overview(_scan(cross=flagged + [_cross("K1", "K2", 0)]))
-    order = [loc["location"] for loc in view["locations"]]
-
-    assert order.index("s.xlsx :: K1 ↔ K2") < order.index("s.xlsx :: F1 ↔ F2"), (
-        f"cross-sheet seeds do not carry the verdict: {order}"
+    assert _before(order, "Kept", "Hidden"), (
+        f"the triage profile's hidden findings were not acted on: {order}"
     )
+
+
+def test_a_merged_panel_is_judged_on_all_its_findings():
+    """One panel, two column spans. `_merge_panels` builds the panel from its first
+    member and appends the rest, so a verdict read off that member alone would miss
+    the kept finding in the second span."""
+    left = _block("Panel", _dropped(3), cols="1-6")
+    right = _block("Panel", [_finding(9)], cols="7-12")
+    order = _order(_scan(left, right, _block("Kept", [_finding(0)])))
+
+    assert _before(order, "Panel", "Kept"), (
+        f"a merged panel holding a kept finding was moved back on its first member: {order}"
+    )
+
+
+def test_with_several_kinds_the_move_is_among_its_own_kind():
+    """Interleaving round-robins kinds, so a location that matched can still print
+    ahead of a same-strength location of another kind, or behind a weaker one. What
+    holds is its place among its own kind."""
+    order = _order(_scan(
+        _block("A flagged", _dropped(5)),
+        _block("A kept", [_finding(0)]),
+        _block("B kept", [_finding(i, kind="constant_offset") for i in range(3)])))
+
+    assert _before(order, "A kept", "A flagged"), (
+        f"among its own kind, the location that matched was not moved back: {order}"
+    )
+
+
+def test_a_malformed_context_is_ignored_not_trusted_or_fatal():
+    """Hand-edited or foreign scans: a context that is not a list of strings must
+    neither crash the reading layer nor be read as a drop rule."""
+    odd = _dropped(3)
+    odd[0]["false_positive_context"] = [{"ctx": DROP}]
+    odd[1]["false_positive_context"] = DOWNWEIGHT          # a bare string, not a list
+    scan = _scan(_block("Odd", odd), _block("Kept", [_finding(0)]))
+
+    loc = {_sheet(x): x for x in overview(scan)["locations"]}
+    assert loc["Odd"]["matched_drop_rule"] == 1, loc["Odd"]
+    assert _before(_order(scan), "Odd", "Kept")
 
 
 def _lines_under(text, n):
@@ -135,21 +193,23 @@ def _lines_under(text, n):
     return "\n".join(under)
 
 
-def test_the_page_says_when_every_signal_at_a_location_was_demoted_outright():
+def test_the_page_says_when_every_signal_matched_a_drop_rule():
     mixed = [_finding(0, action="demoted", context=[DROP]), _finding(1)]
-    view = overview(_scan(_block("Flagged", _outright(3)), _block("Mixed", mixed)))
+    view = overview(_scan(_block("Flagged", _dropped(3)), _block("Mixed", mixed)))
     loc = {_sheet(x): x for x in view["locations"]}
 
-    assert loc["Flagged"]["demoted_outright"] == 3
-    assert loc["Mixed"]["demoted_outright"] == 1
+    assert loc["Flagged"]["matched_drop_rule"] == 3
+    assert loc["Mixed"]["matched_drop_rule"] == 1
 
     text = render_overview(view)
-    assert "filter: all 3 demoted outright" in _lines_under(text, loc["Flagged"]["n"]), text
+    assert ("filter: 3/3 matched a prefilter drop rule"
+            in _lines_under(text, loc["Flagged"]["n"])), text
     assert "filter:" not in _lines_under(text, loc["Mixed"]["n"]), text
 
 
 def test_drill_opens_the_location_overview_numbered():
-    scan = _scan(_block("Flagged", _outright(5)), _block("Kept", [_finding(0)]))
+    scan = _scan(_block("Flagged", _dropped(5)), _block("Kept", [_finding(0)]),
+                 _block("B kept", [_finding(i, kind="constant_offset") for i in range(3)]))
 
     for loc in overview(scan)["locations"]:
         assert drill(scan, loc["n"])["cluster_id"] == loc["cluster_id"], (

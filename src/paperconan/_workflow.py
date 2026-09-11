@@ -26,7 +26,7 @@ import shutil
 from typing import Any
 
 from ._finding_groups import BLOCK_FINDING_GROUPS
-from ._profiles import demoted_outright
+from ._profiles import matched_drop_rule
 
 # 2: envelope requires source_finding_refs; coverage replaced `omitted_reason`
 #    with `limitations` and gained scan_status / scan_incomplete / coverage_complete.
@@ -326,7 +326,8 @@ def _build_clusters(scan: dict[str, Any], max_clusters: int, *,
     """Seeds grouped into clusters, ranked.
 
     `with_verdict` is for the reading layer. It records on each seed whether the
-    display profile demoted that finding outright, which depends on the profile;
+    display profile demoted that finding on a prefilter drop rule, which depends on
+    the profile;
     workflow packets are built without it, so they stay independent of the display
     profile.
     """
@@ -334,7 +335,7 @@ def _build_clusters(scan: dict[str, Any], max_clusters: int, *,
     pairs += [(_cross_sheet_seed(f), f) for f in scan.get("cross_sheet_findings", []) or []]
     if with_verdict:
         for seed, f in pairs:
-            seed["demoted_outright"] = demoted_outright(f)
+            seed["matched_drop_rule"] = matched_drop_rule(f)
     seeds = [seed for seed, _f in pairs]
 
     # Disambiguate rather than refuse. Raising here was the wrong call: real

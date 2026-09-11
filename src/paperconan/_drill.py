@@ -75,12 +75,12 @@ def _families(cluster: dict[str, Any]) -> list[str]:
     return seen
 
 
-def _all_demoted_outright(cluster: dict[str, Any]) -> bool:
-    """Every finding here was demoted outright (see `demoted_outright`). A single
-    finding that was not -- kept, only downweighted, or demoted with no recorded
-    reason -- leaves the location ranked on its detector severity alone."""
+def _all_matched_drop_rule(cluster: dict[str, Any]) -> bool:
+    """Every finding here matched a prefilter drop rule (see `matched_drop_rule`).
+    One finding that did not -- kept, downweighted, demoted by another guard, or
+    demoted with no recorded reason -- keeps the panel out of this adjustment."""
     seeds = cluster["seeds"]
-    return bool(seeds) and all(s.get("demoted_outright") for s in seeds)
+    return bool(seeds) and all(s.get("matched_drop_rule") for s in seeds)
 
 
 # ---------- L1 ----------
@@ -119,12 +119,13 @@ def _merge_panels(clusters: list[dict[str, Any]]) -> list[dict[str, Any]]:
     panels = list(merged.values())
     panels.sort(key=lambda c: (
         _SEVERITY_RANK.get(c["strongest_raw_severity"], 3),
-        # Ranking is on the detector's severity, frozen before the profile ran, so
-        # a panel the filter had wholly demoted still took its slot on those
-        # findings. It now goes to the back of its band. The verdict is compared
-        # after severity, not before: the filter can be wrong, and a verdict that
-        # can be wrong must not outweigh the detector's severity.
-        _all_demoted_outright(c),
+        # Ranking is on the detector's severity, frozen before the profile ran, so a
+        # panel whose every finding a prefilter drop rule had matched still took its
+        # slot on those findings. It now sorts after the panels of its band that did
+        # not. Severity stays ahead of the verdict because the filter can be wrong.
+        # This is the order `_interleave_by_family` receives; it round-robins kinds,
+        # so the printed position also depends on which other kinds are present.
+        _all_matched_drop_rule(c),
         -c["n_high_seeds"],
         -len(c["seeds"]),
         c["cluster_id"],
@@ -280,8 +281,8 @@ def overview(scan: dict[str, Any], *,
             "strongest": cluster["strongest_raw_severity"],
             "signals": len(cluster["seeds"]),
             "high": cluster["n_high_seeds"],
-            "demoted_outright": sum(1 for s in cluster["seeds"]
-                                    if s.get("demoted_outright")),
+            "matched_drop_rule": sum(1 for s in cluster["seeds"]
+                                     if s.get("matched_drop_rule")),
             "families": _families(cluster),
         })
 

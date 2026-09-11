@@ -87,13 +87,15 @@ Three things to hold onto while reading:
   column can be demoted merely for sharing a block with many other relations.
   Do not skip a finding because its displayed severity is low.
   `overview` ranks on the detector's severity, so a demoted finding still counts
-  toward its location's rank. One exception: a location whose every finding the
-  filter demoted outright -- for a recorded reason other than a downweight -- is
-  ranked after the other locations of the same strength (severity is still compared
-  first, so the verdict never outweighs it) and says so with a
-  `filter: all N demoted outright` line. That line is the filter's verdict, not a
-  conclusion. A location holding even one finding that was kept, only downweighted,
-  or demoted with no recorded reason is not treated this way and carries no such line.
+  toward its location's rank. One adjustment: a location whose every finding matched
+  a prefilter drop rule (`explain` shows `deterministic_relation_prefilter` or
+  `within_col_structural_filter`) sorts after the locations of its strength that did
+  not, and carries a `filter: N/N matched a prefilter drop rule` line. Locations are
+  then interleaved by kind, which decides the printed order, so such a location can
+  still sit high on the page, or behind a weaker location of another kind. The line
+  reports the prefilter's verdict, not a conclusion. A location holding even one
+  finding that was kept, downweighted, demoted by another guard (for example
+  `derived_or_unit_conversion`), or demoted with no recorded reason carries no line.
 - **Read the `!` lines — every layer has them.** `overview` and both `drill`
   forms carry a `coverage` block; `explain` states its own limits inline (an
   evidence window the scan trimmed, structured parameters only `--json` shows).

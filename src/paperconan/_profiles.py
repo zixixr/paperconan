@@ -90,30 +90,36 @@ def _demote_or_hide(f: dict, profile: Profile) -> None:
         f["profile_action"] = "demoted"
 
 
-# The prefilters return one of two verdicts: "drop" (the pattern is usually derived
-# or structural) and "downweight" (worth less, not nothing). Both reach
-# `_demote_or_hide`, so neither `severity` nor `profile_action` can tell them apart.
-# The finding's `prefilter` field does, but it does not describe the profile's
-# decision: the within-column flood and reused-progression demoters in `_audit.py`
-# write `prefilter="drop"` and can leave the finding kept by the profile, and the
-# axis, boundary, derived, replot and omics guards demote without writing it. The
-# context tag is the profile's own record of why, so the reading layer decides
-# through `demoted_outright`, which reads the tag.
+# The relation and within-column prefilters return "keep", "downweight" or "drop".
+# The profile demotes on both of the last two through `_demote_or_hide`, so neither
+# `severity` nor `profile_action` can tell them apart; the context tag written just
+# before the demotion can. The finding's `prefilter` field is not a substitute: the
+# within-column flood and reused-progression demoters in `_audit.py` write
+# `prefilter="drop"` and can leave the finding kept by the profile.
+#
+# The other guards in `apply_profile_to_findings` demote with no such distinction, so
+# their tags say nothing about strength, and two of them (derived, omics) decide on
+# words in headers and sheet names, ahead of a prefilter that may have judged the same
+# finding differently. Only a prefilter's drop tag records the verdict "drop, not
+# merely downweight", so it is the only tag the reading layer acts on.
+_RELATION_DROP = "deterministic_relation_prefilter"
 _RELATION_DOWNWEIGHT = "deterministic_relation_downweight"
+_WITHIN_COL_DROP = "within_col_structural_filter"
 _WITHIN_COL_DOWNWEIGHT = "within_col_downweight"
-DOWNWEIGHT_CONTEXTS = frozenset({_RELATION_DOWNWEIGHT, _WITHIN_COL_DOWNWEIGHT})
+PREFILTER_DROP_CONTEXTS = frozenset({_RELATION_DROP, _WITHIN_COL_DROP})
 
 
-def demoted_outright(f: dict) -> bool:
-    """The profile demoted this finding on a verdict stronger than a downweight.
+def matched_drop_rule(f: dict) -> bool:
+    """The profile demoted this finding because a prefilter's drop rule matched it.
 
-    A demotion with no recorded reason does not count. A finding shown as demoted
-    with nothing saying why is the shape a real signal disappears in, so it is not
-    moved on a verdict nobody can read.
+    A downweight, a demotion by another guard, and a demotion with no recorded reason
+    do not count. Context entries that are not strings are ignored, so a hand-edited
+    or foreign scan cannot break the reading layer through this field.
     """
     if f.get("profile_action", "kept") == "kept":
         return False
-    return bool(set(f.get("false_positive_context") or []) - DOWNWEIGHT_CONTEXTS)
+    return any(isinstance(c, str) and c in PREFILTER_DROP_CONTEXTS
+               for c in f.get("false_positive_context") or [])
 
 
 def _names_for(f: dict) -> str:
@@ -292,7 +298,7 @@ def apply_profile_to_findings(findings: Iterable[dict], profile: str | None,
         elif relation_decision := _relation_prefilter(f):
             action, reason = relation_decision
             ctx = (
-                "deterministic_relation_prefilter"
+                _RELATION_DROP
                 if action == "drop"
                 else _RELATION_DOWNWEIGHT
             )
@@ -318,7 +324,7 @@ def apply_profile_to_findings(findings: Iterable[dict], profile: str | None,
         elif wc_decision := _within_col_prefilter(f, wc_high):
             action, reason = wc_decision
             ctx = (
-                "within_col_structural_filter"
+                _WITHIN_COL_DROP
                 if action == "drop"
                 else _WITHIN_COL_DOWNWEIGHT
             )
