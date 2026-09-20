@@ -503,7 +503,7 @@ def col_array(sheet, r0, r1, c):
 
 def _sample(arr, k=8):
     """A tiny value peek for downstream LLM triage: the first <=k finite numeric
-    values of `arr` as built-in floats rounded to 6 significant figures. Bounded to
+    values of `arr` as built-in floats rounded to 6 decimal places. Bounded to
     <=k elements so it CANNOT reintroduce the evidence-bloat OOM (~64 bytes here)."""
     out = []
     for v in arr[:k]:
