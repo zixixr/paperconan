@@ -133,6 +133,9 @@ def test_a_source_read_as_zero_is_written_only_by_a_large_enough_constant():
     assert _zero_source_miss(0.3, 0.1, 0.1, 2.0) == pytest.approx(0.25 - 0.1)
     assert _zero_source_miss(-0.2, 0.1, 0.1, 3.0) == pytest.approx(0.0)
     assert _zero_source_miss(0.04, 0.1, 0.1, 0.0) == pytest.approx(0.0)      # target box holds 0
+    assert _zero_source_miss(0.3, 0.1, 0.1, -2.0) == pytest.approx(0.15)     # either sign of k
+    for args in ((math.nan, 0.1, 0.1, 2.0), (0.3, math.nan, 0.1, 2.0), (0.3, 0.1, math.nan, 2.0), (0.3, 0.1, 0.1, math.nan)):
+        assert _zero_source_miss(*args) == math.inf
 
 
 def test_symmetric_offset_interval():

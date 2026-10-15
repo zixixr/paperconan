@@ -4360,8 +4360,7 @@ _LOCAL_RUN_MIN_BITS = float(os.environ.get(
 _LOCAL_RUN_OUT_DEV = float(os.environ.get("PAPERCONAN_LOCAL_RUN_OUT_DEV", "0.05"))
 # Cell operations per block; when spent the pass stops for that block and says so in coverage.
 _LOCAL_RUN_BUDGET = int(os.environ.get("PAPERCONAN_LOCAL_RUN_BUDGET", "4000000"))
-# A cell no constant writes (a zero source against a non-zero target) departs by an
-# unbounded amount; it is recorded at this cap so a median stays finite and JSON-safe.
+# Outside departures are capped here so a median stays finite and JSON-safe.
 _LOCAL_RUN_DEPARTURE_CAP = 1e3
 # Fewer distinct source values than this cannot tell one constant from a coincidence of rounding.
 _LOCAL_RUN_MIN_DISTINCT_SOURCE = 3
@@ -4496,10 +4495,15 @@ def _zero_source_miss(b, q_a, q_b, k):
     units of B, the constant k falls short of writing `b`: 0 once |k|*q_a/2 reaches B's own
     rounding interval. Such a pair is written by every k beyond a threshold in either
     direction, two rays rather than an interval, so `_symmetric_ratio_interval` returns None
-    for it and the decision asks this instead, against a constant already found."""
-    b_lo, b_hi = float(b) - q_b / 2.0, float(b) + q_b / 2.0
+    for it and the decision asks this instead, against a constant already found. A value,
+    step or constant that is not finite gives inf: a miss that cannot be measured never
+    reads as written."""
+    bv, qa, qb, kv = float(b), float(q_a), float(q_b), float(k)
+    if not all(math.isfinite(x) for x in (bv, qa, qb, kv)):
+        return math.inf
+    b_lo, b_hi = bv - qb / 2.0, bv + qb / 2.0
     distance = 0.0 if b_lo <= 0.0 <= b_hi else min(abs(b_lo), abs(b_hi))
-    return max(0.0, distance - abs(k) * q_a / 2.0)
+    return max(0.0, distance - abs(kv) * qa / 2.0)
 
 
 def _as_rectangular(matrix):
