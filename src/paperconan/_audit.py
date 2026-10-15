@@ -4774,6 +4774,84 @@ def _local_line_usable(values, label=None):
     return not _line_is_grid(values)
 
 
+def _local_group_bits(a_line, b_line, q_a, q_b, group, n_tests):
+    """A group's prediction bits: each side scored as the target, keeping the lower, since
+    neither side is privileged when both were rounded.
+
+    Each segment is scored against its own spread, the segments' bits summed and the search
+    penalty, log2(n_tests), taken once. Scored over the whole group at once, positions
+    scattered along a sorted or smooth line are credited with the whole group's spread -- up to
+    the line's whole range -- though
+    each is predictable from its neighbours to within the local spacing -- and two independently
+    sorted columns read as a stretch. Within a segment the spread is local, and a cell alone in
+    its segment only anchors it and earns nothing.
+    """
+    inside = set(group["informative"])
+    cells = [[i for i in range(s, e + 1) if i in inside] for s, e in group["segments"]]
+    penalty = math.log2(n_tests) if n_tests > 1 else 0.0
+
+    def side(line, q):
+        return sum(_ratio_prediction_bits([line[i] for i in c], [q[i] for i in c], 1)["raw_bits"]
+                   for c in cells if c) - penalty
+
+    return min(side(b_line, q_b), side(a_line, q_a))
+
+
+def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
+    """The highest-scoring group passing every test of the design's section 4, as
+    (relation, group, bits, departure), or None.
+
+    Each group costs a pass over the line, and a slowly drifting relation can hold many of
+    them. So when `budget` (a one-element list of remaining cell operations) is given, each
+    arm pays one line's length per run before grouping them -- the runs bound the groups --
+    and when it cannot, the pair is abandoned: None, with budget[0] below zero."""
+    best = None
+    for relation, interval in (("ratio", _symmetric_ratio_interval),
+                               ("offset", _symmetric_offset_interval)):
+        spans = [interval(a, b, x, y) for a, b, x, y in zip(a_line, b_line, q_a, q_b)]
+        admit = None
+        if relation == "ratio":
+            def admit(i, lo, hi):
+                a, b = float(a_line[i]), float(b_line[i])
+                return (math.isfinite(a) and math.isfinite(b)
+                        and _zero_source_miss(b, q_a[i], q_b[i], max(abs(lo), abs(hi))) == 0.0)
+        runs = _scan_interval_runs(spans, a_line)
+        if budget is not None:
+            budget[0] -= len(spans) * len(runs)
+            if budget[0] < 0:
+                return None
+        for g in _group_constant_runs(runs, spans, admit):
+            lo, hi = g["lo"], g["hi"]
+            if relation == "ratio" and (lo <= 1.0 <= hi or _interval_holds_a_power_of_ten(lo, hi)):
+                continue
+            if relation == "offset" and lo <= 0.0 <= hi:
+                continue
+            inf = g["informative"]
+            informing = set(inf)
+            if len({float(a_line[i]) for i in inf}) < _LOCAL_RUN_MIN_DISTINCT_SOURCE:
+                continue
+            # counted in informative cells: zeros against zeros, and sources read as zero that a
+            # large enough constant writes, neither lengthen a stretch nor add to what it accounts for
+            told = [sum(i in informing for i in range(s, e + 1)) for s, e in g["segments"]]
+            if max(told) < _LOCAL_RUN_MIN_CONTIGUOUS_SHARE * sum(told):
+                continue
+            if _identity_steps(spans, inf, (lo + hi) / 2.0, relation) < _LOCAL_RUN_MIN_IDENTITY_STEPS:
+                continue
+            bits = _local_group_bits(a_line, b_line, q_a, q_b, g, n_tests)
+            if bits < _LOCAL_RUN_MIN_BITS:
+                continue
+            departure = _outside_departure(a_line, b_line, q_a, q_b, g, spans, relation)
+            if departure is None or departure <= _LOCAL_RUN_OUT_DEV:
+                continue
+            if any(e < _LOCAL_RUN_MIN_EDGE_STEPS
+                   for e in _edge_steps(a_line, b_line, q_a, q_b, g, spans, relation)):
+                continue
+            key = (bits, len(g["positions"]), relation == "ratio")
+            if best is None or key > best[0]:
+                best = (key, relation, g, bits, departure)
+    return None if best is None else best[1:]
+
+
 def _as_rectangular(matrix):
     """A finite 2-D float array, or None. Ragged input is rejected, never raised on.
 
