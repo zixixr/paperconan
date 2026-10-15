@@ -15,7 +15,6 @@ def _arr(xs):
     return np.array(xs, dtype=float)
 
 
-
 # --- steps --------------------------------------------------------------------------------
 
 def test_fixed_decimals_line_reads_like_the_row_inference():
@@ -36,7 +35,30 @@ def test_a_cell_that_lost_trailing_zeros_keeps_the_lines_step():
     assert _effective_line_quantums(line)[0] == pytest.approx(1e-4)
 
 
-def test_zero_and_non_finite_cells_under_significant_figures():
+def test_a_zero_reads_at_the_lines_step_and_non_finite_cells_are_nan():
     q = _effective_line_quantums([0.0, 234.5678, 45.67891, 56.78912, 67.89123, math.nan])
-    assert q[0] == pytest.approx(1.0)
+    assert q[0] == pytest.approx(1e-5)
     assert math.isnan(q[-1])
+
+
+def test_a_cell_with_more_digits_than_the_mode_keeps_them():
+    q = _effective_line_quantums([123.4567, 234.5678, 45.67891, 56.78912, 67.89123, 1 / 3])
+    assert q[-1] == pytest.approx(1e-10)
+
+
+def test_a_tie_keeps_fixed_decimals_where_the_readings_differ():
+    assert _effective_line_quantums([12.34, 56.78, 1.234, 4.567, 8.91, 2.34]) == \
+        pytest.approx([1e-2, 1e-2, 1e-3, 1e-3, 1e-2, 1e-2])
+
+
+def test_whole_numbers_do_not_vote_for_significant_figures():
+    assert _effective_line_quantums([50.0, 25.0, 12.5, 6.3, 3.1, 1.6]) == pytest.approx([0.1] * 6)
+
+
+def test_zeros_do_not_vote():
+    assert _effective_line_quantums([0, 0, 0, 0, 123.4, 234.5678, 45.67891])[4] == pytest.approx(1e-4)
+
+
+def test_equally_common_figure_counts_take_the_finer_reading():
+    q = _effective_line_quantums([123.4567, 45.67891, 6.789123, 12.3456, 1.23456, 345.678])
+    assert q[3] == pytest.approx(1e-5)
