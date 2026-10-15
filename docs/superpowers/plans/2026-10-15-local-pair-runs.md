@@ -1327,6 +1327,21 @@ def test_an_offset_exactly_ten_steps_from_the_identity_is_reported():
         assert _best(a, b) is not None
 
 
+def test_an_offset_nine_and_a_half_steps_from_the_identity_is_not_reported():
+    rng = random.Random(20261021)
+    for _ in range(20):           # the tolerance only takes float error: 0.95 over 0.1 is not ten steps
+        a = [round(rng.uniform(20.0, 25.0), 1) for _ in range(10)]
+        b = [round(x + d, 1) for x, d in zip(a[:8], [1.0, 0.9] * 4)] + [round(a[8] + 3.7, 1), round(a[9] - 4.4, 1)]
+        assert _best(a, b) is None
+
+
+def test_prediction_bits_exactly_at_the_threshold_are_enough():
+    a = [13.6, 10.4, 11.5, 13.6, 10.4, 9.9, 19.6, 7.3, 9.4, 20.9]
+    b = [37.639, 28.783, 31.827, 37.639, 28.783, 23.289, 49.875, 10.533, 13.05, 43.372]
+    # a segment spreading over 32 of A's steps: four confirming cells at 5 bits each, exactly 20
+    assert _best(a, b, n_tests=1) is not None
+
+
 def test_an_edge_exactly_three_steps_off_is_abrupt_enough():
     rng = random.Random(20261019)
     for _ in range(20):           # 3.4 against 3.0 at 1 dp: 0.3 beyond rounding, in steps of 0.1
@@ -1435,9 +1450,11 @@ Expected: ImportError。
 - [ ] **Step 3: 实现**
 
 ```python
-# Fixed-decimal steps put the identity and edge counts on a lattice of halves and the outside
-# departure on round values; at a lattice point float error, not the data, decided which side
-# of a threshold a count fell. Thresholds are compared within this relative tolerance.
+# Fixed-decimal steps put counts on a lattice: in the offset arm the identity and edge steps fall
+# on halves when both sides share a step (on a finer rational lattice otherwise), the outside
+# departure on round values, and prediction bits on whole numbers when the steps are powers of
+# two apart. At a lattice point float error, not the data, decided which side of a threshold a
+# count fell, so thresholds are compared within this relative tolerance.
 _LOCAL_RUN_THRESHOLD_RTOL = 1e-9
 
 
@@ -1468,7 +1485,7 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
     (section 4; which lines take part, and which pairs are already reported, are the
     caller's), as (relation, group, bits, departure), or None. Highest by bits; a tie keeps
     the first found -- the ratio arm before the offset, and within an arm the group seeded by
-    the longest run.
+    the longest run, of equally long runs the earlier.
 
     Each group costs a pass over the line, and a slowly drifting relation can hold many of
     them. So when `budget` (a one-element list of remaining cell operations) is given, each
@@ -1481,7 +1498,8 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
         spans = [interval(a, b, x, y) for a, b, x, y in zip(a_line, b_line, q_a, q_b)]
         admit = None
         if relation == "ratio":
-            def admit(i, lo, hi):           # a non-finite value or step misses by inf
+            def admit(i, lo, hi):           # a non-finite b or step misses by inf; a non-finite a
+                # is read at a NaN step (`_effective_line_quantums`), so it misses too
                 return _zero_source_miss(b_line[i], q_a[i], q_b[i], max(abs(lo), abs(hi))) == 0.0
         runs = _scan_interval_runs(spans, a_line)
         if budget is not None:
@@ -1508,7 +1526,7 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
                     < _LOCAL_RUN_MIN_IDENTITY_STEPS * (1.0 - rtol)):
                 continue
             bits = _local_group_bits(a_line, b_line, q_a, q_b, g, n_tests)
-            if bits < _LOCAL_RUN_MIN_BITS:
+            if bits < _LOCAL_RUN_MIN_BITS * (1.0 - rtol):
                 continue
             departure = _outside_departure(a_line, b_line, q_a, q_b, g, spans, relation)
             if departure is None or departure <= _LOCAL_RUN_OUT_DEV * (1.0 + rtol):
@@ -1524,7 +1542,7 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 97 passed.
+Expected: 99 passed.
 
 - [ ] **Step 5: 逐条核对“关掉即变红”**
 
@@ -1559,7 +1577,8 @@ Expected: 六行都是 `1 failed`。任何一行 `1 passed`，说明那条测试
 | 分组前不扣预算，或扣不起时不放弃 | `test_a_pair_pays_a_pass_over_the_line_for_each_run_before_grouping` |
 | 分组之后才按组数扣预算 | `test_a_pair_that_cannot_pay_for_its_runs_is_abandoned_before_grouping` |
 | `_identity_steps` 传入组内全部位置，而不是有信息的格 | `test_a_source_read_as_zero_inside_a_stretch_joins_it_when_the_constant_writes_it` |
-| 离开恒等、组外偏离、边缘三处比较去掉 `_LOCAL_RUN_THRESHOLD_RTOL`（各一次） | `test_an_offset_exactly_ten_steps_from_the_identity_is_reported`、`test_an_outside_departing_by_exactly_the_threshold_is_not_local`、`test_an_edge_exactly_three_steps_off_is_abrupt_enough` |
+| 离开恒等、组外偏离、边缘、bits 四处比较去掉 `_LOCAL_RUN_THRESHOLD_RTOL`（各一次） | `test_an_offset_exactly_ten_steps_from_the_identity_is_reported`、`test_an_outside_departing_by_exactly_the_threshold_is_not_local`、`test_an_edge_exactly_three_steps_off_is_abrupt_enough`、`test_prediction_bits_exactly_at_the_threshold_are_enough` |
+| `_LOCAL_RUN_THRESHOLD_RTOL` 放大到 0.06 | `test_an_offset_nine_and_a_half_steps_from_the_identity_is_not_reported` |
 | 去掉差值臂“区间含 0”的拒绝 | `test_an_offset_interval_holding_zero_is_the_identity` |
 | 边缘判据 `any` 改成 `all` | `test_a_stretch_needs_an_abrupt_edge_at_both_ends` |
 | 合格组之间取第一个，或取得分较低的 | `test_the_group_with_the_most_bits_is_chosen_over_the_longest` |
@@ -1682,6 +1701,15 @@ def test_a_pair_that_spends_the_budget_exactly_keeps_its_finding(monkeypatch):
     monkeypatch.setattr(audit_module, "_LOCAL_RUN_BUDGET", 20)     # 10 for the scan, 10 for its one run
     cov = _Coverage()
     assert len(detect_local_pair_runs(sheet, 1, 11, 0, 2, header, coverage=cov)) == 1 and not cov.calls
+
+
+def test_a_pair_whose_scan_spends_the_budget_exactly_is_scanned(monkeypatch):
+    import paperconan._audit as audit_module
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    sheet, header = _block([A10, c])
+    monkeypatch.setattr(audit_module, "_LOCAL_RUN_BUDGET", 10)     # the scan, and no run to pay for
+    cov = _Coverage()
+    assert detect_local_pair_runs(sheet, 1, 11, 0, 2, header, coverage=cov) == [] and not cov.calls
 ```
 
 - [ ] **Step 2: 运行，确认失败**
@@ -1784,7 +1812,7 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 106 passed.
+Expected: 109 passed.
 
 - [ ] **Step 4b: 预算的“删掉即变红”**
 
@@ -1795,7 +1823,7 @@ Expected: 106 passed.
 | 调用 `_best_local_group` 时不传 `budget` | `test_the_run_work_of_a_pair_is_charged_to_the_blocks_budget` |
 | 调用后不检查 `budget[0] < 0`（中途放弃） | `test_an_exhausted_budget_is_recorded` |
 | 调用后的检查写成 `<= 0` | `test_a_pair_that_spends_the_budget_exactly_keeps_its_finding` |
-| 付扫描之后的检查写成 `<= 0` | `test_a_pair_that_spends_the_budget_exactly_keeps_its_finding` |
+| 付扫描之后的检查写成 `<= 0` | `test_a_pair_whose_scan_spends_the_budget_exactly_is_scanned` |
 | `n` 取组内全部位置数 | `test_a_findings_n_counts_the_cells_the_relation_was_tested_on` |
 
 - [ ] **Step 5: 提交**
@@ -1865,7 +1893,7 @@ Expected: FAIL，`assert len(found) == 1`（0 条：块循环还没调用新检�
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 107 passed.
+Expected: 110 passed.
 
 - [ ] **Step 5: 跑全套测试，看有没有别处被带动**
 
@@ -1995,7 +2023,7 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
 - [ ] **Step 6: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 111 passed.
+Expected: 114 passed.
 
 - [ ] **Step 7: 提交**
 
