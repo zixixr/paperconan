@@ -575,6 +575,16 @@ def test_a_stretch_is_reported_without_the_shared_zeros_beside_it():
     assert relation == "ratio" and group["positions"] == list(range(4, 10))
 
 
+def test_a_pair_pays_a_pass_over_the_line_for_each_run_before_grouping():
+    a, b = _arr(A10), _arr([round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2])
+    q_a, q_b = _effective_line_quantums(a), _effective_line_quantums(b)
+    budget = [100]
+    assert _best_local_group(a, b, q_a, q_b, 4, budget) is not None
+    assert budget == [100 - len(A10)]          # one ratio run, no offset run
+    budget = [len(A10) - 1]
+    assert _best_local_group(a, b, q_a, q_b, 4, budget) is None and budget[0] < 0     # abandoned
+
+
 def test_cells_that_confirm_nothing_inside_a_stretch_do_not_carry_scattered_consistency():
     a = [12.437, 8.912, 15.226, 9.871, 11.054, 13.388, 7.645, 10.902, 14.117, 9.333,
          10.051, 12.884, 9.4466, 13.1027, 11.7739]
@@ -596,16 +606,6 @@ def test_cells_that_confirm_nothing_set_neither_the_scale_nor_the_outside():
     assert relation == "ratio" and group["segments"] == [[0, 5]]
 
 
-def test_a_pair_pays_a_pass_over_the_line_for_each_run_before_grouping():
-    a, b = _arr(A10), _arr([round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2])
-    q_a, q_b = _effective_line_quantums(a), _effective_line_quantums(b)
-    budget = [100]
-    assert _best_local_group(a, b, q_a, q_b, 4, budget) is not None
-    assert budget == [100 - len(A10)]          # one ratio run, no offset run
-    budget = [len(A10) - 1]
-    assert _best_local_group(a, b, q_a, q_b, 4, budget) is None and budget[0] < 0     # abandoned
-
-
 def test_a_groups_bits_are_summed_over_its_segments_each_against_its_own_spread():
     a, b = _arr(A10), _arr([round(x * 1.137, 3) for x in A10])
     q_a, q_b = _effective_line_quantums(a), _effective_line_quantums(b)
@@ -613,6 +613,12 @@ def test_a_groups_bits_are_summed_over_its_segments_each_against_its_own_spread(
     split = {"segments": [[0, 4], [5, 9]], "informative": list(range(10))}
     lone = {"segments": [[0, 0], [4, 4], [9, 9]], "informative": [0, 4, 9]}
     assert _local_group_bits(a, b, q_a, q_b, lone, 1) == 0.0          # each cell only anchors
+
+    def by_segment(line, q):        # each segment against its own spread, as the docstring says
+        return sum(_ratio_prediction_bits([line[i] for i in range(s, e + 1)], [q[i] for i in range(s, e + 1)], 1)
+                   ["raw_bits"] for s, e in split["segments"])
+
+    assert _local_group_bits(a, b, q_a, q_b, split, 1) == pytest.approx(min(by_segment(b, q_b), by_segment(a, q_a)))
     assert _local_group_bits(a, b, q_a, q_b, split, 1) < _local_group_bits(a, b, q_a, q_b, whole, 1)
     assert _local_group_bits(a, b, q_a, q_b, split, 8) == pytest.approx(_local_group_bits(a, b, q_a, q_b, split, 1) - 3)
 
@@ -658,6 +664,92 @@ def test_a_pair_that_cannot_pay_for_its_runs_is_abandoned_before_grouping(monkey
     budget = [len(A10) - 1]
     assert _best_local_group(a, b, _effective_line_quantums(a), _effective_line_quantums(b), 4, budget) is None
     assert budget[0] < 0
+
+
+def test_an_offset_exactly_ten_steps_from_the_identity_is_reported():
+    rng = random.Random(20261018)
+    for _ in range(20):           # 1.0 over a half-width of 0.1: on the lattice, so float error must not decide
+        a = [round(rng.uniform(20.0, 25.0), 1) for _ in range(10)]
+        b = [round(x + 1.0, 1) for x in a[:8]] + [round(a[8] + 3.7, 1), round(a[9] - 4.4, 1)]
+        assert _best(a, b) is not None
+
+
+def test_an_edge_exactly_three_steps_off_is_abrupt_enough():
+    rng = random.Random(20261019)
+    for _ in range(20):           # 3.4 against 3.0 at 1 dp: 0.3 beyond rounding, in steps of 0.1
+        a = [round(rng.uniform(20.0, 25.0), 1) for _ in range(11)]
+        b = ([round(x + 3.0, 1) for x in a[:8]]
+             + [round(a[8] + 3.4, 1), round(a[9] + 9.7, 1), round(a[10] - 4.2, 1)])
+        assert _best(a, b) is not None
+
+
+def test_an_outside_departing_by_exactly_the_threshold_is_not_local():
+    rng = random.Random(20261020)
+    for _ in range(20):           # four of six outside cells off by 0.2 over |c| = 4: a median of exactly 0.05
+        a = [round(rng.uniform(20.0, 25.0), 1) for _ in range(14)]
+        b = [round(x + o, 1) for x, o in zip(a, [4.0] * 8 + [9.1] + [4.3] * 4 + [11.3])]
+        assert _best(a, b) is None
+
+
+def test_an_offset_interval_holding_zero_is_the_identity():
+    # integer cells pin the offset to [0, 1]; finer cells whose differences fall anywhere in it
+    # would otherwise be scored at their own step
+    a = [40.0, 48.0, 23.0, 60.0, 44.0, 34.0, 31.0, 71.0, 29.0, 34.788, 60.158, 68.552, 78.372, 80.404,
+         21.0, 18.0, 12.0, 61.0, 80.0, 47.0]
+    b = [17.0, 38.0, 76.0, 78.0, 44.0, 35.0, 32.0, 56.0, 45.0, 34.916, 60.753, 69.207, 78.877, 80.614,
+         32.0, 23.0, 43.0, 37.0, 13.0, 43.0]
+    assert _best(a, b) is None
+
+
+@pytest.mark.parametrize("mirrored", [False, True])
+def test_a_stretch_needs_an_abrupt_edge_at_both_ends(mirrored):
+    a = [10.0, 11.3, 12.5, 13.6, 14.9, 16.2, 17.4, 18.7, 19.9, 21.2, 22.6, 23.8]
+    d = [5.0, 9.1, 1.4, 1.4, 1.4, 1.4, 1.4, 1.4, 1.4, 1.5, 1.6, 1.7]      # abrupt on one side only
+    if mirrored:
+        a, d = a[::-1], d[::-1]
+    assert _best(a, [round(x + e, 1) for x, e in zip(a, d)]) is None
+
+
+def test_the_group_with_the_most_bits_is_chosen_over_the_longest():
+    a = [10.412, 10.087, 10.733, 10.291, 10.958, 10.164, 10.645, 10.379, 3.1, 47.0, 22.9, 8.8, 39.4, 15.2,
+         5.0, 42.0, 17.3]
+    b = [round(x * 2.0, 3) for x in a[:8]] + [round(x * 0.6, 3) for x in a[8:14]] + [33.3, 1.7, 40.2]
+    relation, group, _bits, _dep = _best(a, b)
+    # eight cells of k = 2 over a narrow range carry less than six of k = 0.6 over a wide one
+    assert relation == "ratio" and group["positions"] == list(range(8, 14))
+
+
+def test_a_tie_between_the_arms_goes_to_the_ratio():
+    a = [1000.067, 1000.424, 1000.382, 1000.128, 1000.248, 1000.225, 1000.326, 1000.394, 918.772, 905.669,
+         1067.153, 986.553, 1052.456, 900.421]
+    b = [1000.567, 1000.924, 1000.882, 1000.628, 1000.748, 1000.725, 1000.826, 1000.894, 989.077, 1044.308,
+         945.752, 1089.054, 1080.285, 906.118]
+    # both arms hold cells 0..7 and score the same cells, so the same bits
+    assert _best(a, b)[0] == "ratio"
+
+
+def test_a_pair_pays_once_for_every_run():
+    a = _arr(A10 + [10.051, 12.884, 9.447, 13.103, 11.774, 8.25])
+    b = _arr([round(x * 0.6, 3) for x in a[:5]] + [7.5, 4.0, 9.3, 7.1, 1.2, 15.0]
+             + [round(x * 0.6, 3) for x in a[11:]])
+    budget = [1000]
+    _best_local_group(a, b, _effective_line_quantums(a), _effective_line_quantums(b), 4, budget)
+    assert budget == [1000 - 2 * len(a)]          # two ratio runs, no offset run
+
+
+def test_a_stretch_holding_exactly_half_of_its_positions_is_contiguous_enough():
+    a = A10 + [10.051, 12.884, 9.447, 13.103, 11.774, 8.25]
+    b = [round(x * 0.6, 3) for x in a[:5]] + [7.5, 4.0, 9.3, 7.1, 1.2, 15.0] + [round(x * 0.6, 3) for x in a[11:]]
+    relation, group, _bits, _dep = _best(a, b)
+    assert relation == "ratio" and group["segments"] == [[0, 4], [11, 15]]
+
+
+def test_a_source_read_as_zero_is_admitted_by_any_constant_of_the_group():
+    a = [7.7, 7.6, 1.4, 1.6, 6.8, 6.2, 5.7, 0.0, 3.2, 5.2, 5.2]
+    b = [19.17, 18.92, 3.49, 3.98, 16.93, 15.44, 14.19, 0.13, 12.46, 4.85, 9.75]
+    # 0.13 needs |k| of at least 2.5; the group's interval reaches it, though not its middle
+    relation, group, _bits, _dep = _best(a, b, n_tests=1)
+    assert relation == "ratio" and group["positions"] == list(range(8))
 
 
 def test_two_independently_sorted_lines_are_not_a_stretch():

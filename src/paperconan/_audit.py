@@ -4774,17 +4774,22 @@ def _local_line_usable(values, label=None):
     return not _line_is_grid(values)
 
 
+# Fixed-decimal steps put the identity and edge counts on a lattice of halves and the outside
+# departure on round values; at a lattice point float error, not the data, decided which side
+# of a threshold a count fell. Thresholds are compared within this relative tolerance.
+_LOCAL_RUN_THRESHOLD_RTOL = 1e-9
+
+
 def _local_group_bits(a_line, b_line, q_a, q_b, group, n_tests):
     """A group's prediction bits: each side scored as the target, keeping the lower, since
-    neither side is privileged when both were rounded.
+    neither side is privileged when both were rounded. Only informative cells are scored.
 
     Each segment is scored against its own spread, the segments' bits summed and the search
     penalty, log2(n_tests), taken once. Scored over the whole group at once, positions
-    scattered along a sorted or smooth line are credited with the whole group's spread -- up to
-    the line's whole range -- though
-    each is predictable from its neighbours to within the local spacing -- and two independently
-    sorted columns read as a stretch. Within a segment the spread is local, and a cell alone in
-    its segment only anchors it and earns nothing.
+    scattered along a sorted or smooth line would be credited with the whole group's spread,
+    up to the line's whole range, though each is predictable from its neighbours to within the
+    local spacing; two independently sorted columns then read as a stretch. Within a segment
+    the spread is local, and a cell alone in its segment only anchors it and earns nothing.
     """
     inside = set(group["informative"])
     cells = [[i for i in range(s, e + 1) if i in inside] for s, e in group["segments"]]
@@ -4798,23 +4803,25 @@ def _local_group_bits(a_line, b_line, q_a, q_b, group, n_tests):
 
 
 def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
-    """The highest-scoring group passing every test of the design's section 4, as
-    (relation, group, bits, departure), or None.
+    """The highest-scoring group on one pair of lines that passes the design's pairwise tests
+    (section 4; which lines take part, and which pairs are already reported, are the
+    caller's), as (relation, group, bits, departure), or None. Highest by bits; a tie keeps
+    the first found -- the ratio arm before the offset, and within an arm the group seeded by
+    the longest run.
 
     Each group costs a pass over the line, and a slowly drifting relation can hold many of
     them. So when `budget` (a one-element list of remaining cell operations) is given, each
     arm pays one line's length per run before grouping them -- the runs bound the groups --
     and when it cannot, the pair is abandoned: None, with budget[0] below zero."""
+    rtol = _LOCAL_RUN_THRESHOLD_RTOL
     best = None
     for relation, interval in (("ratio", _symmetric_ratio_interval),
                                ("offset", _symmetric_offset_interval)):
         spans = [interval(a, b, x, y) for a, b, x, y in zip(a_line, b_line, q_a, q_b)]
         admit = None
         if relation == "ratio":
-            def admit(i, lo, hi):
-                a, b = float(a_line[i]), float(b_line[i])
-                return (math.isfinite(a) and math.isfinite(b)
-                        and _zero_source_miss(b, q_a[i], q_b[i], max(abs(lo), abs(hi))) == 0.0)
+            def admit(i, lo, hi):           # a non-finite value or step misses by inf
+                return _zero_source_miss(b_line[i], q_a[i], q_b[i], max(abs(lo), abs(hi))) == 0.0
         runs = _scan_interval_runs(spans, a_line)
         if budget is not None:
             budget[0] -= len(spans) * len(runs)
@@ -4822,33 +4829,34 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
                 return None
         for g in _group_constant_runs(runs, spans, admit):
             lo, hi = g["lo"], g["hi"]
-            if relation == "ratio" and (lo <= 1.0 <= hi or _interval_holds_a_power_of_ten(lo, hi)):
+            # an interval holding the identity 1 holds 10^0: a unit restatement or the same values
+            if relation == "ratio" and _interval_holds_a_power_of_ten(lo, hi):
                 continue
             if relation == "offset" and lo <= 0.0 <= hi:
                 continue
+            # every group holds a run, and `_scan_interval_runs` asked that run for
+            # `_LOCAL_RUN_MIN_DISTINCT_SOURCE` distinct source values among its informative cells
             inf = g["informative"]
             informing = set(inf)
-            if len({float(a_line[i]) for i in inf}) < _LOCAL_RUN_MIN_DISTINCT_SOURCE:
-                continue
             # counted in informative cells: zeros against zeros, and sources read as zero that a
             # large enough constant writes, neither lengthen a stretch nor add to what it accounts for
             told = [sum(i in informing for i in range(s, e + 1)) for s, e in g["segments"]]
             if max(told) < _LOCAL_RUN_MIN_CONTIGUOUS_SHARE * sum(told):
                 continue
-            if _identity_steps(spans, inf, (lo + hi) / 2.0, relation) < _LOCAL_RUN_MIN_IDENTITY_STEPS:
+            if (_identity_steps(spans, inf, (lo + hi) / 2.0, relation)
+                    < _LOCAL_RUN_MIN_IDENTITY_STEPS * (1.0 - rtol)):
                 continue
             bits = _local_group_bits(a_line, b_line, q_a, q_b, g, n_tests)
             if bits < _LOCAL_RUN_MIN_BITS:
                 continue
             departure = _outside_departure(a_line, b_line, q_a, q_b, g, spans, relation)
-            if departure is None or departure <= _LOCAL_RUN_OUT_DEV:
+            if departure is None or departure <= _LOCAL_RUN_OUT_DEV * (1.0 + rtol):
                 continue
-            if any(e < _LOCAL_RUN_MIN_EDGE_STEPS
+            if any(e < _LOCAL_RUN_MIN_EDGE_STEPS * (1.0 - rtol)
                    for e in _edge_steps(a_line, b_line, q_a, q_b, g, spans, relation)):
                 continue
-            key = (bits, len(g["positions"]), relation == "ratio")
-            if best is None or key > best[0]:
-                best = (key, relation, g, bits, departure)
+            if best is None or bits > best[0]:
+                best = (bits, relation, g, bits, departure)
     return None if best is None else best[1:]
 
 
