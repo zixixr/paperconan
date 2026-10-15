@@ -13,6 +13,7 @@ from paperconan._audit import (
     _local_line_usable, _outside_departure, _ratio_prediction_bits,
     _scan_interval_runs, _segments,
     _symmetric_offset_interval, _symmetric_ratio_interval, _zero_source_miss,
+    detect_local_pair_runs,
 )
 
 A10 = [12.437, 8.912, 15.226, 9.871, 11.054, 13.388, 7.645, 10.902, 14.117, 9.333]
@@ -787,3 +788,110 @@ def test_a_zero_target_inside_a_stretch_is_scored_without_dividing_by_it():
     a = [100.37, 2.11, 85.42, 1.73, 63.18, 97.55, 2.46, 71.09, 55.31, 40.12, 33.87, 12.64]
     b = [round(0.002 * x, 2) for x in a[:9]] + [0.35, 0.91, 0.47]
     _best(a, b)          # must not raise
+
+
+# --- the detector -------------------------------------------------------------------------
+
+def _block(cols, header=None):
+    header = header or [f"Group {chr(65 + j)}" for j in range(len(cols))]
+    rows = [header] + [[c[i] for c in cols] for i in range(len(cols[0]))]
+    return Sheet.from_rows(rows), header
+
+
+def test_detector_reports_a_column_pair_with_its_cells_and_orientation():
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    sheet, header = _block([A10, b])
+    (f,) = detect_local_pair_runs(sheet, 1, 11, 0, 2, header)
+    assert f["kind"] == "local_ratio_run" and f["orientation"] == "cols"
+    assert (f["col_a_idx"], f["col_b_idx"]) == (0, 1)
+    assert f["segments"] == [[2, 7]]                       # sheet rows, 1-based
+    assert sorted({r for r, _ in f["example_cells"]}) == [2, 3, 4, 5, 6, 7]
+    assert f["n"] == f["run_length"] == 6 and f["line_length"] == 10
+    assert f["severity"] == "high" and "Group B = Group A *" in f["rule"]
+
+
+def test_detector_reports_a_row_pair():
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    rows = [["", *[f"t{j}" for j in range(10)]], ["ctrl", *A10], ["drug", *b]]
+    sheet = Sheet.from_rows(rows)
+    (f,) = detect_local_pair_runs(sheet, 1, 3, 1, 11, [f"t{j}" for j in range(10)])
+    assert f["orientation"] == "rows" and (f["row_a_idx"], f["row_b_idx"]) == (1, 2)
+    assert f["segments"] == [[2, 7]]                       # sheet columns, 1-based
+    assert (f["row_a"], f["row_b"]) == ("ctrl", "drug")
+
+
+def test_a_pair_already_reported_is_skipped():
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    sheet, header = _block([A10, b])
+    assert detect_local_pair_runs(sheet, 1, 11, 0, 2, header, already={("cols", 0, 1)}) == []
+
+
+def test_skip_columns_leaves_only_rows():
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    sheet, header = _block([A10, b])
+    assert detect_local_pair_runs(sheet, 1, 11, 0, 2, header, skip_columns=True) == []
+
+
+def test_an_axis_row_is_not_compared():
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    rows = [["", *[f"t{j}" for j in range(10)]], ["Time (h)", *A10], ["drug", *b]]
+    sheet = Sheet.from_rows(rows)
+    assert detect_local_pair_runs(sheet, 1, 3, 1, 11, [f"t{j}" for j in range(10)]) == []
+
+
+def test_a_findings_n_counts_the_cells_the_relation_was_tested_on():
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    sheet, header = _block([A10[:3] + [0.0] * 3 + A10[3:], b[:3] + [0.0] * 3 + b[3:]])
+    (finding,) = detect_local_pair_runs(sheet, 1, 14, 0, 2, header)
+    # three zeros against zeros sit inside the stretch and confirm nothing
+    assert finding["run_length"] == 9 and finding["n"] == 6
+
+
+class _Coverage:
+    def __init__(self):
+        self.calls = []
+
+    def add_limitation(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+
+
+def test_an_exhausted_budget_is_recorded(monkeypatch):
+    import paperconan._audit as audit_module
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    sheet, header = _block([A10, b])
+    for budget in (5, 15):          # the scan cannot be paid for; the scan can, its one run cannot
+        monkeypatch.setattr(audit_module, "_LOCAL_RUN_BUDGET", budget)
+        cov = _Coverage()
+        assert detect_local_pair_runs(sheet, 1, 11, 0, 2, header, coverage=cov) == []
+        assert cov.calls and cov.calls[0][1]["detector"] == "detect_local_pair_runs"
+
+
+def test_the_run_work_of_a_pair_is_charged_to_the_blocks_budget(monkeypatch):
+    import paperconan._audit as audit_module
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    sheet, header = _block([A10, b, c])
+    # three column pairs pay 10 each for the scan; the first pair's one run pays 10 more
+    for budget, exhausted in ((41, False), (31, True)):
+        monkeypatch.setattr(audit_module, "_LOCAL_RUN_BUDGET", budget)
+        cov = _Coverage()
+        assert len(detect_local_pair_runs(sheet, 1, 11, 0, 3, header, coverage=cov)) == 1
+        assert bool(cov.calls) is exhausted
+
+
+def test_a_pair_that_spends_the_budget_exactly_keeps_its_finding(monkeypatch):
+    import paperconan._audit as audit_module
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    sheet, header = _block([A10, b])
+    monkeypatch.setattr(audit_module, "_LOCAL_RUN_BUDGET", 20)     # 10 for the scan, 10 for its one run
+    cov = _Coverage()
+    assert len(detect_local_pair_runs(sheet, 1, 11, 0, 2, header, coverage=cov)) == 1 and not cov.calls
+
+
+def test_a_pair_whose_scan_spends_the_budget_exactly_is_scanned(monkeypatch):
+    import paperconan._audit as audit_module
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    sheet, header = _block([A10, c])
+    monkeypatch.setattr(audit_module, "_LOCAL_RUN_BUDGET", 10)     # the scan, and no run to pay for
+    cov = _Coverage()
+    assert detect_local_pair_runs(sheet, 1, 11, 0, 2, header, coverage=cov) == [] and not cov.calls

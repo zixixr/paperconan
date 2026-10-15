@@ -4864,6 +4864,95 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
     return None if best is None else best[1:]
 
 
+def _local_run_finding(orientation, ia, ib, labels, first, a_line, b_line,
+                       relation, group, bits, departure):
+    positions = group["positions"]
+    shown = positions[:_LOCAL_RUN_MAX_EXAMPLE_POSITIONS]
+    value = (group["lo"] + group["hi"]) / 2.0
+    paired = int((np.isfinite(a_line) & np.isfinite(b_line)).sum())
+    segments = [[first + s + 1, first + e + 1] for s, e in group["segments"]]
+    if orientation == "cols":
+        cells = [[first + p + 1, i + 1] for p in shown for i in (ia, ib)]
+        pair = dict(col_a=labels[ia], col_b=labels[ib], col_a_idx=ia, col_b_idx=ib,
+                    col_a_sample=_sample(a_line[positions]), col_b_sample=_sample(b_line[positions]))
+        where = "rows"
+    else:
+        cells = [[i + 1, first + p + 1] for p in shown for i in (ia, ib)]
+        pair = dict(row_a=labels[ia], row_b=labels[ib], row_a_idx=ia, row_b_idx=ib,
+                    row_a_sample=_sample(a_line[positions]), row_b_sample=_sample(b_line[positions]))
+        where = "columns"
+    if relation == "ratio":
+        kind = "local_ratio_run"
+        op = "*"
+        constant = dict(k=value, k_lo=group["lo"], k_hi=group["hi"])
+    else:
+        kind = "local_offset_run"
+        op = "+"
+        constant = dict(offset=value, offset_lo=group["lo"], offset_hi=group["hi"])
+    stretch = ", ".join(f"{s}-{e}" if s != e else f"{s}" for s, e in segments)
+    return dict(
+        kind=kind, orientation=orientation, **pair, **constant,
+        segments=segments, run_length=len(positions), n=len(group["informative"]), line_length=paired,
+        outside_departure=round(departure, 6), prediction_bits=round(bits, 2),
+        example_cells=cells, example_cells_truncated=len(shown) < len(positions),
+        severity="high",
+        rule=(f"{labels[ib]} = {labels[ia]} {op} {value:.6g} on {where} {stretch} "
+              f"({len(positions)} of {paired}); elsewhere on the line it departs by a "
+              f"median {departure:.1%} beyond rounding"))
+
+
+def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
+                           coverage=None, skip_columns=False):
+    """Two rows or two columns of one block related as B = k*A or B = A + c over part of
+    the line only. docs/superpowers/specs/2026-10-15-local-pair-runs-design.md.
+
+    Signal, not verdict: a normalisation, a unit conversion or a shared control applied
+    to part of a line has the same shape. `already` holds (orientation, a, b) pairs the
+    whole-line detectors reported in this block; `skip_columns` follows the `wide` flag
+    the column detectors honour.
+    """
+    findings = []
+    budget = [_LOCAL_RUN_BUDGET]
+
+    def exhausted():
+        print(f"[paperconan] detect_local_pair_runs: budget exhausted on a "
+              f"{r1 - r0}x{c1 - c0} block — coverage bounded", file=sys.stderr)
+        _note_detector_cap(coverage, "detect_local_pair_runs", "detector_compute_budget_limit")
+        return findings
+
+    for orientation in (("rows",) if skip_columns else ("cols", "rows")):
+        if orientation == "cols":
+            idxs = list(range(c0, c1))
+            lines = {c: sheet.numeric[r0:r1, c].astype(float) for c in idxs}
+            labels = {c: str(header[c - c0]) if header[c - c0] not in (None, "") else f"col {c + 1}"
+                      for c in idxs}
+            first, length = r0, r1 - r0
+            usable = [c for c in idxs if _local_line_usable(lines[c])]
+        else:
+            idxs = list(range(r0, r1))
+            lines = {r: sheet.numeric[r, c0:c1].astype(float) for r in idxs}
+            labels = {r: _row_label(sheet, r, c0) for r in idxs}
+            first, length = c0, c1 - c0
+            usable = [r for r in idxs if _local_line_usable(lines[r], labels[r])]
+        n_tests = max(1, len(usable) * (len(usable) - 1) // 2 * 2 * length)
+        quantums = {i: _effective_line_quantums(lines[i]) for i in usable}
+        for x, ia in enumerate(usable):
+            for ib in usable[x + 1:]:
+                budget[0] -= length              # the scan; the call pays for its runs
+                if budget[0] < 0:
+                    return exhausted()
+                if (orientation, ia, ib) in already:
+                    continue
+                hit = _best_local_group(lines[ia], lines[ib], quantums[ia], quantums[ib],
+                                        n_tests, budget)
+                if budget[0] < 0:                # abandoned part-way
+                    return exhausted()
+                if hit is not None:
+                    findings.append(_local_run_finding(orientation, ia, ib, labels, first,
+                                                       lines[ia], lines[ib], *hit))
+    return findings
+
+
 def _as_rectangular(matrix):
     """A finite 2-D float array, or None. Ragged input is rejected, never raised on.
 
