@@ -2541,8 +2541,10 @@ git commit -m "test(detect): a frozen bench for local runs on the other benches'
 
 - [ ] **Step 3: 检查措辞**
 
-Run: `grep -n -E "fraud|fabricat|造假|伪造|不端" skills/paperconan/references/detectors.md skills/paperconan/references/output-schema.md`
-Expected: 无输出。
+用仓库自带的中性措辞检查（它扫描所有入库文件，词表在测试里，不要在文档里另抄一份）：
+
+Run: `.venv/bin/python -m pytest tests/test_skill_docs.py -q -p no:cacheprovider -k neutral_language`
+Expected: 汇总行无 failed。
 
 - [ ] **Step 4: 提交**
 
