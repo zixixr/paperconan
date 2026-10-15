@@ -1,6 +1,7 @@
 """Local pair runs: two lines of one block related as B = k*A or B = A + c over part of the
 line only (docs/superpowers/specs/2026-10-15-local-pair-runs-design.md). Synthetic data only."""
 import math
+import random
 
 import numpy as np
 import pytest
@@ -8,7 +9,7 @@ import pytest
 from paperconan._sheet import Sheet
 from paperconan._audit import (
     _effective_line_quantums, _effective_row_quantums,
-    _symmetric_offset_interval, _symmetric_ratio_interval,
+    _symmetric_offset_interval, _symmetric_ratio_interval, _zero_source_miss,
 )
 
 A10 = [12.437, 8.912, 15.226, 9.871, 11.054, 13.388, 7.645, 10.902, 14.117, 9.333]
@@ -103,10 +104,35 @@ def test_symmetric_ratio_interval_with_a_negative_source_is_ordered():
     assert lo <= hi < 0
 
 
-def test_zero_source_is_uninformative_against_zero_and_unwritable_otherwise():
+def test_zero_source_confirms_nothing_against_zero_and_breaks_a_run_otherwise():
     assert _symmetric_ratio_interval(0.0, 0.0, 0.1, 0.1) == (-math.inf, math.inf)
     assert _symmetric_ratio_interval(0.0, 1.0, 0.1, 0.1) is None
     assert _symmetric_ratio_interval(math.nan, 1.0, 0.1, 0.1) is None
+    assert _symmetric_ratio_interval(2.0, 3.0, math.nan, 0.1) is None
+
+
+def test_symmetric_ratio_interval_sign_cases():
+    assert _symmetric_ratio_interval(-2.0, 3.0, 0.1, 0.1) == pytest.approx((3.05 / -1.95, 2.95 / -2.05))
+    assert _symmetric_ratio_interval(-2.0, -3.0, 0.1, 0.1) == pytest.approx((2.95 / 2.05, 3.05 / 1.95))
+    assert _symmetric_ratio_interval(5.0, 0.0, 0.1, 0.1) == pytest.approx((-0.05 / 4.95, 0.05 / 4.95))
+
+
+def test_symmetric_ratio_interval_matches_a_brute_force_oracle():
+    rng = random.Random(20261016)
+    for _ in range(300):
+        a = rng.choice((-1.0, 1.0)) * rng.uniform(0.2, 9.0)
+        b = rng.uniform(-9.0, 9.0)
+        qa, qb = rng.choice((0.1, 0.01)), rng.choice((0.1, 0.01))
+        lo, hi = _symmetric_ratio_interval(a, b, qa, qb)
+        grid = [(b + qb * (j / 20 - 0.5)) / (a + qa * (i / 20 - 0.5)) for i in range(21) for j in range(21)]
+        assert lo == pytest.approx(min(grid), rel=1e-12) and hi == pytest.approx(max(grid), rel=1e-12)
+
+
+def test_a_source_read_as_zero_is_written_only_by_a_large_enough_constant():
+    assert _zero_source_miss(0.1, 0.1, 0.1, 2.0) == pytest.approx(0.0)
+    assert _zero_source_miss(0.3, 0.1, 0.1, 2.0) == pytest.approx(0.25 - 0.1)
+    assert _zero_source_miss(-0.2, 0.1, 0.1, 3.0) == pytest.approx(0.0)
+    assert _zero_source_miss(0.04, 0.1, 0.1, 0.0) == pytest.approx(0.0)      # target box holds 0
 
 
 def test_symmetric_offset_interval():

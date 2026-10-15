@@ -4465,9 +4465,10 @@ def _symmetric_ratio_interval(a, b, q_a, q_b):
     interval and k ranges over the ratios of the corners.
 
     Returns (lo, hi); (-inf, inf) when both cells are indistinguishable from zero --
-    compatible with every k, so it confirms nothing; None when no k writes the pair (a
-    source indistinguishable from zero against a target that is not) or a value is not
-    finite.
+    compatible with every k, so it confirms nothing; None when a value or a step is not
+    finite, or when the source is indistinguishable from zero and the target is not: then
+    only a large enough |k| writes the pair, two rays that no interval holds (see
+    `_zero_source_miss`). None breaks a run.
     """
     av, bv, qa, qb = float(a), float(b), float(q_a), float(q_b)
     if not all(math.isfinite(x) for x in (av, bv, qa, qb)):
@@ -4488,6 +4489,17 @@ def _symmetric_offset_interval(a, b, q_a, q_b):
         return None
     half = (qa + qb) / 2.0
     return (bv - av - half, bv - av + half)
+
+
+def _zero_source_miss(b, q_a, q_b, k):
+    """For a source that reads as zero -- its value lies in [-q_a/2, q_a/2] -- by how much, in
+    units of B, the constant k falls short of writing `b`: 0 once |k|*q_a/2 reaches B's own
+    rounding interval. Such a pair is written by every k beyond a threshold in either
+    direction, two rays rather than an interval, so `_symmetric_ratio_interval` returns None
+    for it and the decision asks this instead, against a constant already found."""
+    b_lo, b_hi = float(b) - q_b / 2.0, float(b) + q_b / 2.0
+    distance = 0.0 if b_lo <= 0.0 <= b_hi else min(abs(b_lo), abs(b_hi))
+    return max(0.0, distance - abs(k) * q_a / 2.0)
 
 
 def _as_rectangular(matrix):
