@@ -735,6 +735,18 @@ def test_outside_departure_is_capped_when_the_lines_scale_is_zero():
     assert _outside_departure(a, b, q, q, group, spans, "ratio") == _LOCAL_RUN_DEPARTURE_CAP
 
 
+def test_a_source_read_as_zero_departs_at_the_cap_when_the_pairs_scale_is_zero():
+    # inside the stretch k * a falls below half B's step more often than not: B reads 0 there,
+    # those cells are part of the pair, and the pair's median |b| is 0
+    a = _arr([20.0, 40.0, 60.0, 0.5, 0.6, 0.7, 0.8, 0.9, 0.0])
+    b = _arr([1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0])
+    q = [0.1] * 9
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    assert all(s is not None and s[0] <= 0.05 <= s[1] for s in spans[:8])     # k = 0.05 writes every inside cell
+    group = {"lo": 0.049, "hi": 0.051, "positions": list(range(8))}
+    assert _outside_departure(a, b, q, q, group, spans, "ratio") == _LOCAL_RUN_DEPARTURE_CAP
+
+
 def test_outside_departure_refuses_a_constant_of_zero():
     a, b = _arr([10.0, 20.0, 30.0, 5.0]), _arr([0.0, 0.0, 0.0, 13.0])
     q = [0.1] * 4
@@ -876,20 +888,21 @@ def _outside_departure(a_line, b_line, q_a, q_b, group, spans, relation):
     what each cell's own rounding explains.
 
     The gap is from the constant to the cell's interval, so rounding alone never counts.
-    Ratio: that gap as an amount of B (gap * |a|) over the line's median |b| -- measured
+    Ratio: that gap as an amount of B (gap * |a|) over the pair's median |b| -- measured
     against the line's scale, not the cell's, so additive noise on a near-zero cell is
     not read as a departure (curve families leak through their smallest cell otherwise).
     Offset: the gap over |c|. A source read as zero (no interval; ratio arm only, since offset
     intervals always exist) departs by what the constant falls short of writing it
-    (`_zero_source_miss`), over the line's median |b|. That median is read over the pair's
+    (`_zero_source_miss`), over the pair's median |b|. That median is read over the pair's
     cells: those where both lines have values and that confirm something -- B against a blank
     in A is not part of the pair, and zeros against zeros filling most of a line would
     otherwise make it 0. When the median is 0 all the same -- B zero against non-zero A
-    across most of the line -- every ratio departure is recorded at the cap. Departures are
-    capped at `_LOCAL_RUN_DEPARTURE_CAP`. None when nothing outside the group can be
-    measured -- the relation covers the whole line, or what lies outside confirms nothing --
-    and for a constant of 0 or one that is not finite: a stretch of zeros in B is not a
-    ratio this pass looks for, and an offset of 0 is the identity.
+    across most of the pair's cells, inside the stretch or out -- every ratio departure is
+    recorded at the cap. Departures are capped at `_LOCAL_RUN_DEPARTURE_CAP`. None when
+    nothing outside the group can be measured -- the relation covers the whole line, or what
+    lies outside confirms nothing -- and for a constant of 0 or one that is not finite: a
+    stretch of zeros in B is not a ratio this pass looks for, and an offset of 0 is the
+    identity.
     """
     k = (group["lo"] + group["hi"]) / 2.0
     if k == 0.0 or not math.isfinite(k):
@@ -1020,7 +1033,7 @@ def _local_line_usable(values, label=None):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 54 passed.
+Expected: 55 passed.
 
 - [ ] **Step 4b: 逐条核对“删掉即变红”**
 
@@ -1045,6 +1058,7 @@ Expected: 54 passed.
 | `_line_is_grid`：去掉差值或比例的读法之一；比例读法不去 0；差值读法也去 0 | `test_a_line_that_is_itself_a_grid_within_rounding_is_not_compared` |
 | `_line_is_grid`：不按首次出现再读一遍；每种读法的格数下限改成 2 | `test_a_line_that_is_itself_a_grid_within_rounding_is_not_compared` |
 | `_outside_departure`：尺度也取 A 为空的格 | `test_outside_departure_reads_its_scale_over_the_pair_only` |
+| `_outside_departure`：源读作 0 的格在尺度为 0 时记 0 而不记上限 | `test_a_source_read_as_zero_departs_at_the_cap_when_the_pairs_scale_is_zero` |
 | `_outside_departure`：只查 a 是否有值 | `test_a_cell_blank_on_one_side_is_neither_a_departure_nor_an_edge` |
 | `_outside_departure`：中位数换成均值 | `test_outside_departure_is_the_median_of_the_outside_not_its_mean` |
 | `_outside_departure`：尺度为 0 时记 0 而不记上限 | `test_outside_departure_is_capped_when_the_lines_scale_is_zero` |
@@ -1410,7 +1424,7 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 85 passed.
+Expected: 86 passed.
 
 - [ ] **Step 5: 逐条核对“关掉即变红”**
 
@@ -1654,7 +1668,7 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 93 passed.
+Expected: 94 passed.
 
 - [ ] **Step 4b: 预算的“删掉即变红”**
 
@@ -1733,7 +1747,7 @@ Expected: FAIL，`assert len(found) == 1`（0 条：块循环还没调用新检�
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 94 passed.
+Expected: 95 passed.
 
 - [ ] **Step 5: 跑全套测试，看有没有别处被带动**
 
@@ -1863,7 +1877,7 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
 - [ ] **Step 6: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 98 passed.
+Expected: 99 passed.
 
 - [ ] **Step 7: 提交**
 
@@ -1911,8 +1925,9 @@ imported rather than copied so the three benches stay about the same data -- plu
   PLANTED_MONOTONE  a 6-cell stretch copied into one of two MONOTONE lines: the cost side of
                scoring by segment, since within a sorted or smooth line a segment's spread is
                local and a copied stretch there carries less than among unrelated values.
-  PLANTED_STRAIGHT  8 cells of a line straight within rounding, shifted onto another: the cost
-               side of reading such a line as a grid, which leaves it out of the comparison.
+  PLANTED_STRAIGHT  8 cells of a straight line with noise under a rounding step, shifted onto
+               another: the cost side of reading a line straight within rounding as a grid,
+               which leaves it out of the comparison (only some draws come out that straight).
 
 Verdicts, not counts (CLAUDE.md "Freeze a verdict, not a count"): each stratum is the band
 of _verdict -- silent / partial / pervasive -- over its draws, using the column-pair bench's
