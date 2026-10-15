@@ -161,8 +161,7 @@ _LOCAL_RUN_MIN_BITS = float(os.environ.get(
 _LOCAL_RUN_OUT_DEV = float(os.environ.get("PAPERCONAN_LOCAL_RUN_OUT_DEV", "0.05"))
 # Cell operations per block; when spent the pass stops for that block and says so in coverage.
 _LOCAL_RUN_BUDGET = int(os.environ.get("PAPERCONAN_LOCAL_RUN_BUDGET", "4000000"))
-# A cell no constant writes (a zero source against a non-zero target) departs by an
-# unbounded amount; it is recorded at this cap so a median stays finite and JSON-safe.
+# Outside departures are capped here so a median stays finite and JSON-safe.
 _LOCAL_RUN_DEPARTURE_CAP = 1e3
 # Fewer distinct source values than this cannot tell one constant from a coincidence of rounding.
 _LOCAL_RUN_MIN_DISTINCT_SOURCE = 3
@@ -261,9 +260,9 @@ def _effective_line_quantums(values):
 
 ```python
 from paperconan._audit import (
-    _LOCAL_RUN_DEPARTURE_CAP, _best_local_group, _effective_line_quantums, _effective_row_quantums,
+    _best_local_group, _effective_line_quantums, _effective_row_quantums,
     _group_constant_runs, _outside_departure, _scan_interval_runs, _segments,
-    _symmetric_offset_interval, _symmetric_ratio_interval, detect_local_pair_runs,
+    _symmetric_offset_interval, _symmetric_ratio_interval, _zero_source_miss, detect_local_pair_runs,
 )
 ```
 
@@ -286,7 +285,7 @@ git commit -m "feat(detect): read a line's recorded step whether it was exported
 - Modify: `src/paperconan/_audit.py`（接在 `_effective_line_quantums` 之后）
 - Modify: `tests/test_local_pair_runs.py`
 
-- [ ] **Step 1: 写测试**（追加到测试文件；导入行加入 `_symmetric_ratio_interval, _symmetric_offset_interval`）
+- [ ] **Step 1: 写测试**（追加到测试文件；导入行加入 `_symmetric_ratio_interval, _symmetric_offset_interval, _zero_source_miss`；文件顶部 `import math` 之后加 `import random`）
 
 ```python
 # --- intervals ----------------------------------------------------------------------------
@@ -301,10 +300,38 @@ def test_symmetric_ratio_interval_with_a_negative_source_is_ordered():
     assert lo <= hi < 0
 
 
-def test_zero_source_is_uninformative_against_zero_and_unwritable_otherwise():
+def test_zero_source_confirms_nothing_against_zero_and_breaks_a_run_otherwise():
     assert _symmetric_ratio_interval(0.0, 0.0, 0.1, 0.1) == (-math.inf, math.inf)
     assert _symmetric_ratio_interval(0.0, 1.0, 0.1, 0.1) is None
     assert _symmetric_ratio_interval(math.nan, 1.0, 0.1, 0.1) is None
+    assert _symmetric_ratio_interval(2.0, 3.0, math.nan, 0.1) is None
+
+
+def test_symmetric_ratio_interval_sign_cases():
+    assert _symmetric_ratio_interval(-2.0, 3.0, 0.1, 0.1) == pytest.approx((3.05 / -1.95, 2.95 / -2.05))
+    assert _symmetric_ratio_interval(-2.0, -3.0, 0.1, 0.1) == pytest.approx((2.95 / 2.05, 3.05 / 1.95))
+    assert _symmetric_ratio_interval(5.0, 0.0, 0.1, 0.1) == pytest.approx((-0.05 / 4.95, 0.05 / 4.95))
+
+
+def test_symmetric_ratio_interval_matches_a_brute_force_oracle():
+    rng = random.Random(20261016)
+    for _ in range(300):
+        a = rng.choice((-1.0, 1.0)) * rng.uniform(0.2, 9.0)
+        b = rng.uniform(-9.0, 9.0)
+        qa, qb = rng.choice((0.1, 0.01)), rng.choice((0.1, 0.01))
+        lo, hi = _symmetric_ratio_interval(a, b, qa, qb)
+        grid = [(b + qb * (j / 20 - 0.5)) / (a + qa * (i / 20 - 0.5)) for i in range(21) for j in range(21)]
+        assert lo == pytest.approx(min(grid), rel=1e-12) and hi == pytest.approx(max(grid), rel=1e-12)
+
+
+def test_a_source_read_as_zero_is_written_only_by_a_large_enough_constant():
+    assert _zero_source_miss(0.1, 0.1, 0.1, 2.0) == pytest.approx(0.0)
+    assert _zero_source_miss(0.3, 0.1, 0.1, 2.0) == pytest.approx(0.25 - 0.1)
+    assert _zero_source_miss(-0.2, 0.1, 0.1, 3.0) == pytest.approx(0.0)
+    assert _zero_source_miss(0.04, 0.1, 0.1, 0.0) == pytest.approx(0.0)      # target box holds 0
+    assert _zero_source_miss(0.3, 0.1, 0.1, -2.0) == pytest.approx(0.15)     # either sign of k
+    for args in ((math.nan, 0.1, 0.1, 2.0), (0.3, math.nan, 0.1, 2.0), (0.3, 0.1, math.nan, 2.0), (0.3, 0.1, 0.1, math.nan)):
+        assert _zero_source_miss(*args) == math.inf
 
 
 def test_symmetric_offset_interval():
@@ -316,7 +343,7 @@ def test_symmetric_offset_interval():
 - [ ] **Step 2: 运行，确认失败**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: ImportError（两个函数未定义）。
+Expected: ImportError（区间函数尚未定义）。
 
 - [ ] **Step 3: 实现**
 
@@ -330,9 +357,10 @@ def _symmetric_ratio_interval(a, b, q_a, q_b):
     interval and k ranges over the ratios of the corners.
 
     Returns (lo, hi); (-inf, inf) when both cells are indistinguishable from zero --
-    compatible with every k, so it confirms nothing; None when no k writes the pair (a
-    source indistinguishable from zero against a target that is not) or a value is not
-    finite.
+    compatible with every k, so it confirms nothing; None when a value or a step is not
+    finite, or when the source is indistinguishable from zero and the target is not: then
+    only a large enough |k| writes the pair, two rays that no interval holds (see
+    `_zero_source_miss`). None breaks a run.
     """
     av, bv, qa, qb = float(a), float(b), float(q_a), float(q_b)
     if not all(math.isfinite(x) for x in (av, bv, qa, qb)):
@@ -353,12 +381,28 @@ def _symmetric_offset_interval(a, b, q_a, q_b):
         return None
     half = (qa + qb) / 2.0
     return (bv - av - half, bv - av + half)
+
+
+def _zero_source_miss(b, q_a, q_b, k):
+    """For a source that reads as zero -- its value lies in [-q_a/2, q_a/2] -- by how much, in
+    units of B, the constant k falls short of writing `b`: 0 once |k|*q_a/2 reaches B's own
+    rounding interval. Such a pair is written by every k beyond a threshold in either
+    direction, two rays rather than an interval, so `_symmetric_ratio_interval` returns None
+    for it and the decision asks this instead, against a constant already found. A value,
+    step or constant that is not finite gives inf: a miss that cannot be measured never
+    reads as written."""
+    bv, qa, qb, kv = float(b), float(q_a), float(q_b), float(k)
+    if not all(math.isfinite(x) for x in (bv, qa, qb, kv)):
+        return math.inf
+    b_lo, b_hi = bv - qb / 2.0, bv + qb / 2.0
+    distance = 0.0 if b_lo <= 0.0 <= b_hi else min(abs(b_lo), abs(b_hi))
+    return max(0.0, distance - abs(kv) * qa / 2.0)
 ```
 
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 18 passed.
+Expected: 21 passed.
 
 - [ ] **Step 5: 提交**
 
@@ -463,14 +507,16 @@ def _segments(positions):
     return out
 
 
-def _group_constant_runs(runs, spans):
+def _group_constant_runs(runs, spans, admit=None):
     """Gather the runs one constant accounts for.
 
     Longest first, a run joins the first group whose interval it still intersects and
     none of whose runs it overlaps; the group's interval narrows to the intersection. A
     group's POSITIONS are then every cell whose interval admits that constant, in a run
     or not -- a lone consistent cell between two runs is the same relation, not its
-    outside. Returns [{"lo", "hi", "positions", "informative", "segments"}].
+    outside. A cell with no interval (None) joins only if `admit(i, lo, hi)` says the constant
+    writes it -- a source read as zero, which one interval cannot describe. Returns
+    [{"lo", "hi", "positions", "informative", "segments"}].
     """
     groups = []
     for r in sorted(runs, key=lambda r: (-(r["end"] - r["start"]), r["start"])):
@@ -485,9 +531,11 @@ def _group_constant_runs(runs, spans):
     out = []
     for g in groups:
         positions = [i for i, s in enumerate(spans)
-                     if s is not None and s[0] <= g["hi"] and s[1] >= g["lo"]]
-        informative = [i for i in positions
-                       if math.isfinite(spans[i][0]) and math.isfinite(spans[i][1])]
+                     if (s is not None and s[0] <= g["hi"] and s[1] >= g["lo"])
+                     or (s is None and admit is not None and admit(i, g["lo"], g["hi"]))]
+        # an admitted cell without an interval says only that |k| clears a threshold: not informative
+        informative = [i for i in positions if spans[i] is not None
+                       and math.isfinite(spans[i][0]) and math.isfinite(spans[i][1])]
         out.append({"lo": g["lo"], "hi": g["hi"], "positions": positions,
                     "informative": informative, "segments": _segments(positions)})
     return out
@@ -496,7 +544,7 @@ def _group_constant_runs(runs, spans):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 21 passed.
+Expected: 24 passed.
 
 - [ ] **Step 5: 提交**
 
@@ -512,22 +560,25 @@ git commit -m "feat(detect): gather the stretches one constant accounts for"
 - Modify: `src/paperconan/_audit.py`
 - Modify: `tests/test_local_pair_runs.py`
 
-- [ ] **Step 1: 写测试**（导入行加入 `_LOCAL_RUN_DEPARTURE_CAP, _outside_departure`）
+- [ ] **Step 1: 写测试**（导入行加入 `_outside_departure`）
 
 ```python
 # --- outside departure ---------------------------------------------------------------------
 
-def test_outside_departure_counts_an_unwritable_cell_at_the_cap():
+def test_outside_departure_measures_a_source_read_as_zero_by_its_miss():
     a, b = _arr([1.0, 2.0, 3.0, 0.0]), _arr([2.0, 4.0, 6.0, 5.0])
+    q = [0.1] * 4
     spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
     group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2]}
-    assert _outside_departure(a, b, group, spans, "ratio") == _LOCAL_RUN_DEPARTURE_CAP
+    # k = 2 writes 0 +/- 0.05 as at most 0.1; B's box starts at 4.95: a miss of 4.85 over median |b| 4.5
+    assert _outside_departure(a, b, q, q, group, spans, "ratio") == pytest.approx(4.85 / 4.5)
 
 
 def test_outside_departure_is_none_for_a_whole_line_relation():
     a, b = _arr([1.0, 2.0, 3.0]), _arr([2.0, 4.0, 6.0])
     spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
-    assert _outside_departure(a, b, {"lo": 1.9, "hi": 2.1, "positions": [0, 1, 2]}, spans, "ratio") is None
+    q = [0.1] * 3
+    assert _outside_departure(a, b, q, q, {"lo": 1.9, "hi": 2.1, "positions": [0, 1, 2]}, spans, "ratio") is None
 ```
 
 - [ ] **Step 2: 运行，确认失败**
@@ -538,7 +589,7 @@ Expected: ImportError。
 - [ ] **Step 3: 实现**（四个函数一起加入；后三个由 Task 5 的判定测试覆盖）
 
 ```python
-def _outside_departure(a_line, b_line, group, spans, relation):
+def _outside_departure(a_line, b_line, q_a, q_b, group, spans, relation):
     """Median departure from the group's constant at the line's other positions, beyond
     what each cell's own rounding explains.
 
@@ -546,8 +597,10 @@ def _outside_departure(a_line, b_line, group, spans, relation):
     Ratio: that gap as an amount of B (gap * |a|) over the line's median |b| -- measured
     against the line's scale, not the cell's, so additive noise on a near-zero cell is
     not read as a departure (curve families leak through their smallest cell otherwise).
-    Offset: the gap over |c|. A cell no constant writes counts at the cap. None when the
-    line has no finite position outside the group: the relation covers the whole line.
+    Offset: the gap over |c|. A source read as zero (no interval) departs by what the constant
+    falls short of writing it (`_zero_source_miss`), over the same scale. Departures are capped
+    at `_LOCAL_RUN_DEPARTURE_CAP`. None when the line has no finite position outside the
+    group: the relation covers the whole line.
     """
     k = (group["lo"] + group["hi"]) / 2.0
     if k == 0.0 or not math.isfinite(k):
@@ -562,8 +615,10 @@ def _outside_departure(a_line, b_line, group, spans, relation):
         a, b = float(a_line[i]), float(b_line[i])
         if not (math.isfinite(a) and math.isfinite(b)):
             continue
-        if span is None:
-            departures.append(_LOCAL_RUN_DEPARTURE_CAP)
+        if span is None:                      # a source read as zero (ratio arm)
+            miss = _zero_source_miss(b, q_a[i], q_b[i], k)
+            departures.append(min(_LOCAL_RUN_DEPARTURE_CAP, miss / scale) if scale > 0
+                              else _LOCAL_RUN_DEPARTURE_CAP)
             continue
         lo, hi = span
         if not (math.isfinite(lo) and math.isfinite(hi)):
@@ -590,8 +645,8 @@ def _edge_steps(a_line, b_line, q_a, q_b, group, spans, relation):
     """Departure, in the cell's own rounding steps and beyond rounding, of the first cell
     past each end of the group's longest segment -- walking outward over blank cells (a
     panel separator) and over the group's own positions, so the cell judged is the data
-    that actually adjoins the stretch. [] when nothing lies outside on either side. A cell
-    no constant writes counts as infinitely far."""
+    that actually adjoins the stretch. [] when nothing lies outside on either side. A source
+    read as zero counts by what the constant falls short of writing it, in B's steps."""
     start, end = max(group["segments"], key=lambda se: (se[1] - se[0], -se[0]))
     inside = set(group["positions"])
     k = (group["lo"] + group["hi"]) / 2.0
@@ -603,8 +658,9 @@ def _edge_steps(a_line, b_line, q_a, q_b, group, spans, relation):
         if not 0 <= i < len(spans):
             continue
         span = spans[i]
-        if span is None:
-            out.append(math.inf)
+        if span is None:                          # a source read as zero (ratio arm)
+            miss = _zero_source_miss(b_line[i], q_a[i], q_b[i], k)
+            out.append(miss / q_b[i] if q_b[i] > 0 else math.inf)
             continue
         lo, hi = span
         if not (math.isfinite(lo) and math.isfinite(hi)):
@@ -635,7 +691,7 @@ def _local_line_usable(values, label=None):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 23 passed.
+Expected: 26 passed.
 
 - [ ] **Step 5: 提交**
 
@@ -654,12 +710,12 @@ git commit -m "feat(detect): measure how a stretch departs outside itself, beyon
 - [ ] **Step 1: 写测试**（导入行加入 `_best_local_group`；先加一个辅助函数）
 
 ```python
+# --- the decision -------------------------------------------------------------------------
+
 def _best(a, b, n_tests=4):
     a, b = _arr(a), _arr(b)
     return _best_local_group(a, b, _effective_line_quantums(a), _effective_line_quantums(b), n_tests)
 
-
-# --- the decision -------------------------------------------------------------------------
 
 def test_a_stretch_of_a_scaled_copy_is_reported():
     b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
@@ -751,6 +807,45 @@ def test_a_formula_cached_cell_cannot_carry_the_score(monkeypatch):
     assert _best(a, b)[2] - plain > math.log2(cap) + 1      # the cap is what bounds it
 
 
+def test_a_whole_line_relation_with_a_source_rounded_to_zero_is_not_a_stretch():
+    true = [0.04, 1.37, 2.81, 0.66, 1.92, 2.44, 0.83, 1.58, 2.17, 1.05, 2.69, 0.31]
+    a, b = [round(x, 1) for x in true], [round(2.5 * x, 1) for x in true]
+    assert a[0] == 0.0 and b[0] == 0.1
+    assert _best(a, b) is None and _best(b, a) is None
+
+
+def test_a_source_read_as_zero_that_the_constant_cannot_write_departs():
+    a = [21.3, 22.8, 20.9, 23.4, 22.1, 21.7, 24.0, 22.6, 0.0]
+    b = [round(x * 0.96, 3) for x in a[:8]] + [21.6]
+    relation, group, _bits, departure = _best(a, b)
+    assert relation == "ratio" and group["positions"] == list(range(8)) and departure > 0.05
+
+
+def test_a_source_read_as_zero_inside_a_stretch_joins_it_when_the_constant_writes_it():
+    true = [3.42, 1.87, 0.04, 2.95, 4.11, 3.06, 2.58, 1.73]
+    a = [round(x, 1) for x in true] + [3.9, 2.2, 4.6, 1.4]
+    b = [round(2.5 * x, 2) for x in true] + [5.3, 9.1, 3.2, 6.6]
+    assert a[2] == 0.0 and b[2] == 0.1
+    relation, group, _bits, departure = _best(a, b)
+    assert relation == "ratio" and group["positions"] == list(range(8)) and departure > 0.05
+
+
+def test_a_source_read_as_zero_that_the_constant_barely_misses_is_not_an_abrupt_edge():
+    true = [3.42, 1.87, 2.95, 4.11, 3.06, 2.58, 1.73, 3.37]
+    a = [round(x, 1) for x in true] + [0.0, 3.9, 2.2, 4.6]
+    b = [round(2.5 * x, 2) for x in true] + [0.15, 5.3, 9.1, 3.2]
+    assert _best(a, b) is None
+
+
+def test_a_sign_flip_and_a_stretch_of_zeros_are_not_reported():
+    # A sign-flipped copy: its interval holds -1, a power of ten, so it is left with the unit
+    # restatements -- a recorded gap rather than a judgement. A stretch of zeros: its constant
+    # is 0, which carries no information on the zero side and leaves no departure to measure;
+    # not a relation this pass looks for, and three of its tests refuse it independently.
+    assert _best(A10, [round(-x, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]) is None
+    assert _best(A10, [0.0] * 6 + [11.9, 9.1, 18.7, 6.2]) is None
+
+
 def test_a_zero_target_inside_a_stretch_is_scored_without_dividing_by_it():
     a = [100.37, 2.11, 85.42, 1.73, 63.18, 97.55, 2.46, 71.09, 55.31, 40.12, 33.87, 12.64]
     b = [round(0.002 * x, 2) for x in a[:9]] + [0.35, 0.91, 0.47]
@@ -772,7 +867,13 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests):
     for relation, interval in (("ratio", _symmetric_ratio_interval),
                                ("offset", _symmetric_offset_interval)):
         spans = [interval(a, b, x, y) for a, b, x, y in zip(a_line, b_line, q_a, q_b)]
-        for g in _group_constant_runs(_scan_interval_runs(spans, a_line), spans):
+        admit = None
+        if relation == "ratio":
+            def admit(i, lo, hi):
+                a, b = float(a_line[i]), float(b_line[i])
+                return (math.isfinite(a) and math.isfinite(b)
+                        and _zero_source_miss(b, q_a[i], q_b[i], max(abs(lo), abs(hi))) == 0.0)
+        for g in _group_constant_runs(_scan_interval_runs(spans, a_line), spans, admit):
             lo, hi = g["lo"], g["hi"]
             if relation == "ratio" and (lo <= 1.0 <= hi or _interval_holds_a_power_of_ten(lo, hi)):
                 continue
@@ -793,7 +894,7 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests):
                 _ratio_prediction_bits([a_line[i] for i in inf], [q_a[i] for i in inf], n_tests)["bits"])
             if bits < _LOCAL_RUN_MIN_BITS:
                 continue
-            departure = _outside_departure(a_line, b_line, g, spans, relation)
+            departure = _outside_departure(a_line, b_line, q_a, q_b, g, spans, relation)
             if departure is None or departure <= _LOCAL_RUN_OUT_DEV:
                 continue
             if any(e < _LOCAL_RUN_MIN_EDGE_STEPS
@@ -808,7 +909,7 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 38 passed.
+Expected: 45 passed.
 
 - [ ] **Step 5: 逐条核对“关掉即变红”**
 
@@ -1006,7 +1107,7 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 44 passed.
+Expected: 51 passed.
 
 - [ ] **Step 5: 提交**
 
@@ -1075,7 +1176,7 @@ Expected: FAIL，`assert len(found) == 1`（0 条：块循环还没调用新检�
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 45 passed.
+Expected: 52 passed.
 
 - [ ] **Step 5: 跑全套测试，看有没有别处被带动**
 
@@ -1205,7 +1306,7 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
 - [ ] **Step 6: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 49 passed.
+Expected: 56 passed.
 
 - [ ] **Step 7: 提交**
 
