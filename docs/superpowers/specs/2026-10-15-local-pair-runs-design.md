@@ -48,64 +48,82 @@ paperconan 输出的是待解释的数据不一致，不是结论。本检测器
 
 ## 3. 组成
 
-全部放在 `_audit.py`，作为**独立的一遍检测**：不读写任何现有检测器的候选池、频次表、预算或上限。
+全部放在 `_audit.py`，作为**独立的一遍检测**：不读写任何现有检测器的候选池、频次表、预算或上限。现有的 `_effective_row_quantums` 和 `_scan_quantized_ratio_runs` 不改动，也不调用（理由见 §3.1）。
 
-| 单元 | 作用 | 依赖 |
-|---|---|---|
-| `_directed_offset_interval(a, b, q_target)` | 由舍入推出常数 c 的可能区间：目标格按步长 q 记录，`c ∈ [b − q/2 − a, b + q/2 − a]`；源格按记录值使用 | 无 |
-| `_scan_quantized_offset_runs(source, target, quantums, …)` | 区间逐格求交，求同一个 c 能写出的极大连续段。与现有 `_scan_quantized_ratio_runs` 同构；用 `contains_zero` 代替 `contains_one` | 上一项 |
-| 复用 `_scan_quantized_ratio_runs` | 比例臂的段 | 现有 |
-| 复用 `_effective_row_quantums` | 每格的记录步长 | 现有 |
-| 复用 `_ratio_prediction_bits` | 段的压缩得分：按搜索次数扣减，单格贡献设上限。只看段内目标值与步长，与关系类型无关，两臂共用 | 现有 |
-| `_out_of_run_deviation(source, target, run, relation)` | 同一条线上段外有效位置的偏离中位数。比例：`|B/A ÷ k − 1|`；差值：`|B − A − c| / |c|`。段外没有有效位置时返回 `None` | 无 |
-| `detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already, coverage)` | 驱动：枚举行对和列对、两个方向、两种关系，套用 §4 的判定，产出 finding | 以上各项 |
+| 单元 | 作用 |
+|---|---|
+| `_effective_line_quantums(values)` | 每格的记录步长。对整条线判断导出方式：固定小数位，还是固定有效数字。看哪种模式让更多格的位数恰好等于众数；平局取固定小数位。固定小数位时，与 `_effective_row_quantums` 的结果相同；固定有效数字时，按每格数量级推步长，且不粗于该格自身的位数 |
+| `_symmetric_ratio_interval(a, b, q_a, q_b)` | 两侧都舍入时 k 的可能区间：取 `[a ± q_a/2]`、`[b ± q_b/2]` 四个角之比的最小、最大值。源的区间含 0 时：目标的区间也含 0，返回 `(−inf, +inf)`，即相容但无信息；否则返回 `None`，即任何常数都写不出 |
+| `_symmetric_offset_interval(a, b, q_a, q_b)` | `c ∈ [b − a − (q_a+q_b)/2, b − a + (q_a+q_b)/2]` |
+| `_scan_interval_runs(spans, source, min_informative, min_distinct_source)` | 区间逐格求交，求极大连续段。与 `_scan_quantized_ratio_runs` 的段落逻辑相同，但接收现成的区间，比例和差值共用 |
+| `_group_constant_runs(runs, spans)` | 同一常数的几段合为一组：区间相交、位置不重叠的段归入同组，长段优先。组的常数区间取各段之交；组的**位置**是这条线上所有与该区间相容的格，成不成段都算 |
+| `_outside_departure(a_line, b_line, group, spans, relation)` | 组外位置的偏离中位数，扣除舍入能解释的部分（§4 第 2 条）。没有组外的有效位置时返回 `None` |
+| 复用 `_ratio_prediction_bits` | 压缩得分：按搜索次数扣减，单格贡献设上限。只看给定的值与步长，与关系类型无关 |
+| `detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already, coverage, skip_columns)` | 驱动：枚举行对和列对、两种关系，套用 §4 的判定，产出 finding |
 
-**调用点**：`_audit.py` 的块循环里，在 `detect_relations` 与 `detect_row_relations` 之后。`already` 是这两个检测器在本块已经报出的 (方向, 线对) 集合，用于去重。
+### 3.1 为什么不复用现有的步长推断和比例扫描
+
+在本地评估集上用原型检验，两处现有做法会漏掉本设计要找的形状：
+
+- **步长**：按有效数字导出的表（如统一 7 位有效数字），三位整数的值只有 4 位小数，两位整数的值有 5 位。`_effective_row_quantums` 按整行小数位的众数读，把前者读细了 10 倍，舍入区间过窄，本该成段的被切断。
+- **方向**：`_scan_quantized_ratio_runs` 假设只有目标一侧经过舍入、源一侧按记录值精确。两组都由同一组更高精度的原始值各自舍入时，源的舍入误差乘以 k，会超出目标半个步长，区间求不出交集。
+
+所以本检测器改用对称区间，两侧都按舍入处理，也就不再分方向。
+
+**调用点**：`_audit.py` 的块循环里，在 `detect_relations` 与 `detect_row_relations` 之后。
+
+- `already` 是这两个检测器在本块已经报出的 (方向, 线对) 集合，用于去重。
+- 块过宽（`_MAX_BLOCK_COLS`）时不跑列对，与 `detect_relations` 一致；行对照常跑。
+- 列方向的发现并入本块的 `relations` 组，行方向的并入 `row_relations` 组。组登记表（`_PRODUCED_BLOCK_GROUPS` / `BLOCK_FINDING_GROUPS`）不变，证据、良性说明、profile 和降权都沿用现有路径。
 
 ## 4. 判定
 
-对块内每一对线（行对或列对），以及 A→B、B→A 两个方向，求出比例臂和差值臂的极大段。一段同时满足以下各条，才产出 finding：
+对块内每一对线（行对或列对），分别求比例和差值的区间，扫出极大段，按常数分组。一组同时满足以下各条，才产出 finding：
 
-1. **显著**：`_ratio_prediction_bits(...)["bits"] ≥ PAPERCONAN_LOCAL_RUN_MIN_BITS`。
+1. **显著**：分别以两侧当目标，用 `_ratio_prediction_bits` 对组内有信息的位置各打一次分，取较小值，须 ≥ `PAPERCONAN_LOCAL_RUN_MIN_BITS`。
    - 默认值等于 `_SHORT_ROW_MIN_PREDICTION_BITS`（20），两处口径一致。
-   - `n_tests` = 本块线对数 × 2 个方向 × 2 种关系 × 线长，即本块里搜索的起点总数。
+   - `n_tests` = 本块该方向的线对数 × 2 种关系 × 线长。
    - 1 位小数、取值分布宽的线，靠格数多过关；高精度的线，短段也能过关。门槛不按小数位一刀切。
-2. **局部**：`_out_of_run_deviation(...)` 不是 `None`，且大于 `PAPERCONAN_LOCAL_RUN_OUT_DEV`（默认 0.05）。整条线都成立的关系在这里被排除。
+2. **局部**：组外偏离的中位数 > `PAPERCONAN_LOCAL_RUN_OUT_DEV`（默认 0.05）。整条线都成立的关系在这里被排除。偏离扣除舍入能解释的部分：
+   - **比例**：常数到该格区间的距离 × |a|，再除以这条线 |b| 的中位数。按整条线的量级归一，小数值上的加性噪声不会被放大。原型显示，曲线族的误报都出在曲线最低端那一格；
+   - **差值**：常数到该格区间的距离 ÷ |c|；
+   - 源为 0、目标非 0 的格（任何比例都写不出）按上限 `_LOCAL_RUN_DEPARTURE_CAP` 计。
 3. **常数不平凡**：
-   - 比例：区间不含 1（相同关系由别处负责），也不含 10 的整数次幂（单位改写），沿用 `_scan_quantized_ratio_runs` 返回的两个标志；
+   - 比例：区间不含 1（相同关系由别处负责），也不含 10 的整数次幂（单位改写，用现有 `_interval_holds_a_power_of_ten`）；
    - 差值：区间不含 0。
 4. **线本身不平凡**：
-   - 段内源值至少有 3 个不同的数；
+   - 组内有信息的位置上，A 侧至少有 3 个不同的数；
    - 行标签匹配 `_AXIS_CONTEXT_LABEL_RE` 的行不参与；
-   - 整条线本身是等差数列（时间、剂量轴）的不参与。
+   - 整条线本身是等差数列（时间、剂量轴）的不参与；
+   - 有限值少于 4 个的线不参与：至少要有一段，外加一个组外位置。
 5. **去重**：
    - 该线对已在 `already` 中，就跳过；
-   - 同一线对两个方向、两种关系都过关时，只留得分最高的一条；
+   - 同一线对两种关系都过关时，只留得分最高的一条；
    - `detect_short_row_reuse` 在全表阶段运行，可能对同一行对再报一次。本设计不做跨阶段去重，重复的情况在评估时计数报告（§8）。
 
 ## 5. 输出
 
 两个新的 finding 类型：
 
-- `local_ratio_run`：B = k·A，只在段内成立；
-- `local_offset_run`：B = A + c，只在段内成立。
+- `local_ratio_run`：B = k·A，只在组内成立；
+- `local_offset_run`：B = A + c，只在组内成立。
 
 字段如下：
 
-- **线对**：列对给 `col_a/col_b/col_a_idx/col_b_idx`，行对给 `row_a/row_b/row_a_idx/row_b_idx`。索引沿用现有约定：0-based 的 sheet 绝对位置。
-- **关系**：`direction`（`a_to_b` 或 `b_to_a`）；`k`（比例）或 `offset`（差值）；`k_lo/k_hi` 或 `offset_lo/offset_hi`。
-- **段**：`run_start`、`run_end`，为线上 1-based 的 sheet 行号或列号；另有 `run_length`、`line_length`。
-- **判据**：`out_of_run_deviation`、`prediction_bits`。
+- **线对**：`orientation`（`cols` 或 `rows`）。列对给 `col_a/col_b/col_a_idx/col_b_idx`，行对给 `row_a/row_b/row_a_idx/row_b_idx`。索引沿用现有约定：0-based 的 sheet 绝对位置。
+- **关系**：`k`、`k_lo`、`k_hi`（比例），或 `offset`、`offset_lo`、`offset_hi`（差值）；B 是索引较大的那条线。
+- **位置**：`segments` 是组内的连续段，每段为 `[起, 止]`，用线上 1-based 的 sheet 行号或列号；`run_length` 是组内位置数（也写进 `n`，供误报控制读取）；`line_length` 是线上两侧都有值的位置数。
+- **判据**：`outside_departure`、`prediction_bits`。
 - **样本**：`col_a_sample/col_b_sample`（或 `row_*_sample`），沿用 `_sample`。
-- **证据**：`evidence` 的 `highlight_rows/highlight_cols` 只标段内的格。匹配器和 HTML 报告据此定位到单元格。
-- **其余**：`severity = "high"`；`rule` 用一句话写清关系和段。
+- **证据**：`example_cells` 列出组内的格，1-based 的 `(行, 列)`，两侧都列。`_attach_evidence` 据此只高亮组内的格，匹配器和 HTML 报告据此定位到单元格。
+- **其余**：`severity = "high"`；`rule` 用一句话写清关系、段和组外偏离。
 
 严重度先定为 high，首屏代价实测后再定是否调整（§8）。
 
 ## 6. 良性控制（复用现有规则，不另起一套）
 
-- **列方向**：接入 `_prefilter._relation_prefilter` 的表头标签分流，与 `constant_ratio/constant_offset` 同路。派生列、轴、计数、公式或单位换算 → 降权或丢弃。
-- **行方向**：接入 `_profiles._is_derived_relation`，与 `constant_ratio_row/offset_row_reuse` 同路。同名行之间的关系不因单位词而豁免。
+- **派生关系**（两个方向都适用）：`_profiles._is_derived_relation` 的类型集合加入两个新类型。行方向套用同名行规则：同名行之间的关系不因单位词而豁免，与 `constant_ratio_row/offset_row_reuse` 相同。
+- **列方向**：`_profiles._relation_prefilter` 按别名接入表头标签分流：`local_ratio_run` 当作 `constant_ratio`，`local_offset_run` 当作 `constant_offset`。派生列、轴、计数、公式或单位换算 → 降权或丢弃，与整列关系同等对待。
 - **说明文字**：`_audit.py` 里按类型给出的良性说明，加一句“请核对图注是否说明这一段为换算、归一或共用数据”。
 - **文档**：`skills/paperconan/references/detectors.md` 增加两个条目，`output-schema.md` 同步字段。
 
@@ -123,9 +141,11 @@ paperconan 输出的是待解释的数据不一致，不是结论。本检测器
    - 区间与段扫描：舍入边界、负源值、零值、方向；
    - 判定各条：去掉任意一条，对应的合成反例必须出现；
    - 去重与输出字段。
-2. **台架**：
-   - `tests/test_curve_bench_baseline.py`（短行）、`tests/test_column_pair_bench_baseline.py`（列对）的良性层必须不动；有变动就逐条说明，否则不合并；
-   - 两个台架各加一个“复制一段后缩放或平移”的真阳性层，冻结它的档位；被检出的比例如实记录，哪怕很低。
+2. **台架**：现有的 `tests/test_curve_bench_baseline.py`、`tests/test_column_pair_bench_baseline.py` 只调用各自的检测器，测不到本检测器，它们“不动”是必然的，不能当作验收。所以新建 `tests/test_local_run_bench_baseline.py`：
+   - **良性层**：直接导入上述两个台架的生成器，让本检测器在完全相同的良性数据上受检，包括曲线族（逐张表、所有行对）和列对的全部良性家族；另加独立随机数对作远端对照；
+   - **已知代价层**：“部分换算”，即同一列只有一段由另一列换算而来。数值上与复制一段无法区分，档位如实冻结，靠表头标签分流兜底；
+   - **真阳性层**：复制一段（4 格、6 格）后缩放或平移，列对和行对都有；
+   - 按 CLAUDE.md 冻结档位（静默 / 部分 / 普遍），不冻结计数。
 3. **本地评估集**（不入库）：
    - 发 v2 命中范围：只在比例、差值两个家族里加入两个新类型，目标卡不动；v1、v2 都报数；
    - **收益**：`compare_runs.py` 对比当前 main 的扫描，按卡看检测层和首屏两层的升降；
@@ -143,5 +163,6 @@ paperconan 输出的是待解释的数据不一致，不是结论。本检测器
 ## 9. 风险
 
 - **部分换算的良性列**：同一列里只有一段是计算出来的，比如只对子面板归一。它在形态上就是局部段。列方向靠表头标签分流兜底；行方向的风险要在台架上专门构造一个层来量。
-- **记录步长推断**：`_effective_row_quantums` 可能把个别带公式缓存值的格读得过细。得分沿用 `max_quantum_ratio` 上限，用单元测试锁住这个上限对新检测器同样生效。
+- **记录步长推断**：`_effective_line_quantums` 仍可能把个别带公式缓存值的格读得过细。区间过窄只会让匹配变严；打分时，`_ratio_prediction_bits` 的 `max_quantum_ratio` 上限限制单格贡献，用单元测试锁住这个上限对新检测器同样生效。固定有效数字与固定小数位两种模式都解释不好的线（混合导出），按固定小数位处理，与现有行为一致。
+- **对称区间更宽**：两侧都按舍入处理，比单侧区间宽，更容易连成段。由显著性门槛和局部性判据把关，代价在新台架上量。
 - **首屏挤出**：新的 high 级 finding 会和现有 panel 争首屏。按 §8 第 3 条量，代价过高就降为 medium，再量一次。
