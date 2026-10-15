@@ -883,6 +883,7 @@ def test_a_row_pair_away_from_the_corner_points_at_its_own_cells():
     b = [round(x * 1.137, 3) for x in A10[:6]]
     (f,) = detect_local_pair_runs(sheet, r0, r1, c0, c1, labels)
     assert (f["row_a_idx"], f["row_b_idx"]) == (2, 3) and (f["row_a"], f["row_b"]) == ("ctrl", "drug")
+    assert f["row_a_sample"][0] == pytest.approx(A10[0]) and f["row_b_sample"][0] == pytest.approx(b[0])
     assert f["segments"] == [[4, 9]]                        # sheet columns, 1-based
     assert f["rule"].startswith("row[4] = row[3] *") and f["rule"].endswith("on columns 4-9")
     assert {r for r, _ in f["example_cells"]} == {3, 4} and {c for _, c in f["example_cells"]} == set(range(4, 10))
@@ -952,15 +953,67 @@ def test_on_the_whole_sheet_a_pair_across_panels_is_still_compared():
     assert [(f["col_a_idx"], f["col_b_idx"]) for f in found] == [(0, 3)]
 
 
+def test_on_the_whole_sheet_a_panel_holding_both_lines_leaves_out_only_its_own_positions():
+    # side by side, then a panel across the full width below: it holds columns 0 and 3, but only
+    # over its own rows -- where the first two panels meet, no panel compared those columns
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    rng = random.Random(20261023)
+    below = [[round(rng.uniform(5.0, 20.0), 3) for _ in range(5)] for _ in range(10)]
+    rows = ([["Group A", "Group C", None, "Group B", "Group D"]] + [[x, z, None, y, w] for x, y, z, w in zip(A10, b, c, c[::-1])]
+            + [[None] * 5, [f"x{j}" for j in range(5)]] + below)
+    sheet = Sheet.from_rows(rows)
+    header = ["Group A", "Group C", "", "Group B", "Group D"]
+    panels = [(1, 11, 0, 2), (1, 11, 3, 5), (13, 23, 0, 5)]
+    found = detect_local_pair_runs(sheet, 1, 23, 0, 5, header, panels=panels)
+    assert [(f["col_a_idx"], f["col_b_idx"], f["segments"]) for f in found] == [(0, 3, [[2, 7]])]
+
+
+def test_on_the_whole_sheet_rows_of_two_panels_are_compared_where_no_panel_holds_both():
+    # a row of one panel above a row of another, and a third panel to their right spanning both
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    rng = random.Random(20261024)
+    side = [[round(rng.uniform(5.0, 20.0), 3) for _ in range(3)] for _ in range(3)]
+    rows = ([[None, *[f"t{j}" for j in range(10)], None, "u0", "u1", "u2"]]
+            + [["ctrl", *A10, None, *side[0]], [None] * 11 + [None, *side[1]], ["drug", *b, None, *side[2]]])
+    sheet = Sheet.from_rows(rows)
+    panels = [(1, 2, 1, 11), (3, 4, 1, 11), (1, 4, 12, 15)]
+    found = detect_local_pair_runs(sheet, 1, 4, 1, 15, [""] * 14, panels=panels)
+    assert [(f["orientation"], f["row_a_idx"], f["row_b_idx"]) for f in found] == [("rows", 1, 3)]
+
+
+def test_on_the_whole_sheet_panels_that_touch_do_not_hold_each_others_edge_rows():
+    # two panels with no row between them: the last row of one and the first of the next meet
+    # only on the whole sheet
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    rows = [[None, *[f"t{j}" for j in range(10)]], ["p", *c], ["ctrl", *A10], ["drug", *b], ["q", *c[::-1]]]
+    sheet = Sheet.from_rows(rows)
+    panels = [(1, 3, 1, 11), (3, 5, 1, 11)]
+    found = detect_local_pair_runs(sheet, 1, 5, 1, 11, [""] * 10, panels=panels, skip_columns=True)
+    assert [(f["row_a_idx"], f["row_b_idx"]) for f in found] == [(2, 3)]
+
+
 def test_a_block_taller_than_the_row_limit_is_compared_by_columns_only(monkeypatch):
     import paperconan._audit as audit_module
     monkeypatch.setattr(audit_module, "_LOCAL_RUN_MAX_ROWS", 5)
     b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
-    sheet, header = _block([A10, b])
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    sheet, header = _block([A10, b, c, c[::-1]])            # rows of four cells could be compared
     cov = _Coverage()
-    (f,) = detect_local_pair_runs(sheet, 1, 11, 0, 2, header, coverage=cov)
-    assert f["orientation"] == "cols"
+    found = detect_local_pair_runs(sheet, 1, 11, 0, 4, header, coverage=cov)
+    assert {f["orientation"] for f in found} == {"cols"}
     assert [(args[1], kwargs["detector"]) for args, kwargs in cov.calls] == [("detector_row_limit", "detect_local_pair_runs")]
+    sheet, header = _block([A10, b])                        # rows of two cells never could
+    cov = _Coverage()
+    assert len(detect_local_pair_runs(sheet, 1, 11, 0, 2, header, coverage=cov)) == 1 and not cov.calls
+
+
+def test_a_block_exactly_at_the_row_limit_is_compared_by_rows(monkeypatch):
+    import paperconan._audit as audit_module
+    sheet, r0, r1, c0, c1, labels = _row_pair_away_from_the_corner()
+    monkeypatch.setattr(audit_module, "_LOCAL_RUN_MAX_ROWS", r1 - r0)
+    assert len(detect_local_pair_runs(sheet, r0, r1, c0, c1, labels)) == 1
 
 
 def test_a_pair_already_reported_costs_nothing(monkeypatch):
@@ -986,6 +1039,8 @@ def test_a_header_shorter_than_the_block_leaves_a_label_empty():
     sheet, _header = _block([A10, b])
     (f,) = detect_local_pair_runs(sheet, 1, 11, 0, 2, ["Group A"])
     assert (f["col_a"], f["col_b"]) == ("Group A", "")
+    (f,) = detect_local_pair_runs(sheet, 1, 11, 0, 2, [None, "Group B"])
+    assert (f["col_a"], f["col_b"]) == ("", "Group B")
 
 
 class _Coverage:
