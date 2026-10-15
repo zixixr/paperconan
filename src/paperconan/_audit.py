@@ -4375,9 +4375,10 @@ _LOCAL_RUN_MIN_CONTIGUOUS_SHARE = 0.5
 _LOCAL_RUN_MIN_IDENTITY_STEPS = 10
 # A copied stretch ends abruptly. Walking outward from each end of the longest segment, past
 # blank cells and the group's own positions, the first cell with data must depart from the
-# constant by at least this many of its own rounding steps beyond rounding; a side whose first
-# such cell confirms nothing (in the ratio arm, zero against zero) is not judged. A rounding plateau on a smooth
-# trend, and the noise exceptions of a relation holding approximately everywhere, depart by less.
+# constant by at least this many of its own rounding steps beyond rounding; a side whose
+# first such cell confirms nothing (in the ratio arm, zero against zero) is not judged. A
+# rounding plateau on a smooth trend, and the noise exceptions of a relation holding
+# approximately everywhere, depart by less.
 _LOCAL_RUN_MIN_EDGE_STEPS = float(os.environ.get("PAPERCONAN_LOCAL_RUN_MIN_EDGE_STEPS", "3"))
 # A line needs the distinct source values a stretch asks for, and one finite cell outside it.
 _LOCAL_RUN_MIN_FINITE = _LOCAL_RUN_MIN_DISTINCT_SOURCE + 1
