@@ -919,7 +919,7 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 46 passed.
+Expected: 47 passed.
 
 - [ ] **Step 5: 逐条核对“关掉即变红”**
 
@@ -1117,7 +1117,7 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 52 passed.
+Expected: 53 passed.
 
 - [ ] **Step 5: 提交**
 
@@ -1186,7 +1186,7 @@ Expected: FAIL，`assert len(found) == 1`（0 条：块循环还没调用新检�
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 53 passed.
+Expected: 54 passed.
 
 - [ ] **Step 5: 跑全套测试，看有没有别处被带动**
 
@@ -1316,7 +1316,7 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
 - [ ] **Step 6: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 57 passed.
+Expected: 58 passed.
 
 - [ ] **Step 7: 提交**
 
