@@ -4776,9 +4776,10 @@ def _local_line_usable(values, label=None):
 
 # Fixed-decimal steps put counts on a lattice: in the offset arm the identity and edge steps fall
 # on halves when both sides share a step (on a finer rational lattice otherwise), the outside
-# departure on round values, and prediction bits on whole numbers when the steps are powers of
-# two apart. At a lattice point float error, not the data, decided which side of a threshold a
-# count fell, so thresholds are compared within this relative tolerance.
+# departure on round values, and prediction bits on whole numbers when a segment's spread is a
+# power-of-two multiple of its step and n_tests a power of two. At a lattice point float error,
+# not the data, decided which side of a threshold a count fell, so thresholds are compared
+# within this relative tolerance.
 _LOCAL_RUN_THRESHOLD_RTOL = 1e-9
 
 
