@@ -4344,6 +4344,86 @@ def _ratio_prediction_bits(target_values, quantums, n_tests, *, informative=None
             "confirming": len(per_cell), "per_cell": per_cell}
 
 
+# ---------- local pair runs ----------
+# docs/superpowers/specs/2026-10-15-local-pair-runs-design.md
+#
+# Two lines of one block -- two rows or two columns -- related as B = k*A or B = A + c on
+# part of the line and departing from that constant elsewhere. A separate pass: it reads
+# the sheet and the scoring helper above, and no detector's candidate pools, counters,
+# budgets or caps.
+_LOCAL_RUN_MIN_BITS = float(os.environ.get(
+    "PAPERCONAN_LOCAL_RUN_MIN_BITS", str(_SHORT_ROW_MIN_PREDICTION_BITS)))
+_LOCAL_RUN_OUT_DEV = float(os.environ.get("PAPERCONAN_LOCAL_RUN_OUT_DEV", "0.05"))
+_LOCAL_RUN_BUDGET = int(os.environ.get("PAPERCONAN_LOCAL_RUN_BUDGET", "4000000"))
+# A cell no constant writes (a zero source against a non-zero target) departs by an
+# unbounded amount; it is recorded at this cap so a median stays finite and JSON-safe.
+_LOCAL_RUN_DEPARTURE_CAP = 1e3
+_LOCAL_RUN_MIN_DISTINCT_SOURCE = 3
+# A STRETCH: the longest segment must hold at least this share of the positions one constant
+# accounts for. Consistency scattered along the line is what noise makes of a relation that
+# holds approximately everywhere (a curve family's proportional columns), not a copied stretch.
+_LOCAL_RUN_MIN_CONTIGUOUS_SHARE = 0.5
+# The constant must clear the identity -- an offset of 0, a ratio of 1 -- by this many rounding
+# steps. Within a few steps, rounding a slowly varying quantity makes a stretch "constant" that
+# no copy produced; and a small offset reads as a ratio near 1, so both arms ask it.
+_LOCAL_RUN_MIN_IDENTITY_STEPS = 10
+# A copied stretch ends abruptly: the cell just past each end is independent data. Where it
+# exists, that cell must depart from the constant by at least this many of its own rounding
+# steps beyond rounding. A rounding plateau on a smooth trend, and the noise exceptions of a
+# relation holding approximately everywhere, depart by a step or two.
+_LOCAL_RUN_MIN_EDGE_STEPS = float(os.environ.get("PAPERCONAN_LOCAL_RUN_MIN_EDGE_STEPS", "3"))
+# A stretch needs two informative cells and the line one more outside it.
+_LOCAL_RUN_MIN_FINITE = 4
+# example_cells lists both sides of each position; bounded like every other evidence list.
+_LOCAL_RUN_MAX_EXAMPLE_POSITIONS = 64
+LOCAL_RUN_KINDS = ("local_ratio_run", "local_offset_run")
+
+
+def _effective_line_quantums(values):
+    """The step each cell of a line was RECORDED at, deciding per line between a
+    fixed-decimals export and a fixed-significant-figures one.
+
+    `_effective_row_quantums` assumes fixed decimals: a line's commonest decimal count is
+    every cell's floor. An export at fixed significant figures breaks that -- at seven
+    figures 123.4567 carries four decimals and 45.67891 five, and reading the first at
+    1e-5 makes its rounding interval ten times too narrow. So the line is read both ways,
+    over its non-zero finite cells, and the mode more cells match exactly decides. A tie
+    keeps fixed decimals, and under fixed decimals this returns exactly what
+    `_effective_row_quantums` returns.
+
+    Under fixed significant figures a cell's step comes from its magnitude and is never
+    COARSER than the cell's own decimals, since a cell carrying more digits than the mode
+    has real extra precision. Zero has no magnitude and keeps its own decimals.
+    Non-finite cells get NaN.
+    """
+    by_decimals = _effective_row_quantums(values)
+    cells = []
+    for v in values:
+        fv = float(v)
+        if math.isfinite(fv) and fv != 0.0:
+            sig, dec = _sigfigs_and_frac(fv)
+            cells.append((sig, min(dec, _MAX_READ_DECIMALS)))
+    if not cells:
+        return by_decimals
+    decimals = Counter(d for _, d in cells)
+    sigfigs = Counter(s for s, _ in cells)
+    sig_mode, sig_top = max(sigfigs.items(), key=lambda kv: (kv[1], kv[0]))
+    if sig_top <= max(decimals.values()):
+        return by_decimals
+    out = []
+    for v, q in zip(values, by_decimals):
+        fv = float(v)
+        if not math.isfinite(fv):
+            out.append(math.nan)
+            continue
+        own = 10.0 ** -min(_sigfigs_and_frac(fv)[1], _MAX_READ_DECIMALS)
+        if fv == 0.0:
+            out.append(own)
+            continue
+        out.append(min(own, 10.0 ** (math.floor(math.log10(abs(fv))) - sig_mode + 1)))
+    return out
+
+
 def _as_rectangular(matrix):
     """A finite 2-D float array, or None. Ragged input is rejected, never raised on.
 
