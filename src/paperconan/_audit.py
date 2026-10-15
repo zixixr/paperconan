@@ -4635,12 +4635,16 @@ def _outside_departure(a_line, b_line, q_a, q_b, group, spans, relation):
     Ratio: that gap as an amount of B (gap * |a|) over the line's median |b| -- measured
     against the line's scale, not the cell's, so additive noise on a near-zero cell is
     not read as a departure (curve families leak through their smallest cell otherwise).
-    Offset: the gap over |c|. A source read as zero (no interval) departs by what the constant
-    falls short of writing it (`_zero_source_miss`), over the same scale. A cell that confirms
-    nothing neither counts as a departure nor sets that median: zeros against zeros filling
-    most of a line would otherwise make the scale 0. Departures are capped at
-    `_LOCAL_RUN_DEPARTURE_CAP`. None when nothing outside the group can be measured: the
-    relation covers the whole line, or what lies outside confirms nothing.
+    Offset: the gap over |c|. A source read as zero (no interval; ratio arm only, since offset
+    intervals always exist) departs by what the constant falls short of writing it
+    (`_zero_source_miss`), over the line's median |b|. A cell that confirms nothing neither
+    counts as a departure nor sets that median: zeros against zeros filling most of a line
+    would otherwise make it 0. When the median is 0 all the same -- B zero against non-zero A
+    across most of the line -- every ratio departure is recorded at the cap. Departures are
+    capped at `_LOCAL_RUN_DEPARTURE_CAP`. None when nothing outside the group can be
+    measured -- the relation covers the whole line, or what lies outside confirms nothing --
+    and for a constant of 0 or one that is not finite: a stretch of zeros in B is not a
+    ratio this pass looks for, and an offset of 0 is the identity.
     """
     k = (group["lo"] + group["hi"]) / 2.0
     if k == 0.0 or not math.isfinite(k):
@@ -4676,7 +4680,10 @@ def _outside_departure(a_line, b_line, q_a, q_b, group, spans, relation):
 def _identity_steps(spans, informative, constant, relation):
     """How many rounding steps the constant lies from the identity -- 1 for a ratio, 0 for an
     offset -- measured in the half-width of the group's own intervals (their median over the
-    informative cells). Read off the intervals, so no cell value is divided by."""
+    informative cells). Read off the intervals, so no cell value is divided by. With no
+    informative cell there is no width to count in, and the constant is not refused here."""
+    if not informative:
+        return math.inf
     half = float(np.median([(spans[i][1] - spans[i][0]) / 2.0 for i in informative]))
     identity = 1.0 if relation == "ratio" else 0.0
     return abs(constant - identity) / half if half > 0 else math.inf
@@ -4686,11 +4693,14 @@ def _edge_steps(a_line, b_line, q_a, q_b, group, spans, relation):
     """Departure, in the cell's own rounding steps and beyond rounding, of the first cell
     past each end of the group's longest segment -- walking outward over blank cells (a
     panel separator), cells that confirm nothing and the group's own positions, so the cell
-    judged is the data that actually adjoins the stretch. [] when nothing lies outside on
-    either side. A source read as zero counts by what the constant falls short of writing
-    it, in B's steps."""
-    start, end = max(group["segments"], key=lambda se: (se[1] - se[0], -se[0]))
+    judged is the data that actually adjoins the stretch. The longest segment is the one the
+    contiguity test calls longest, by informative cells; of two equally long, the earlier.
+    [] when nothing lies outside on either side. A source read as zero counts by what the
+    constant falls short of writing it, in B's steps."""
     inside = set(group["positions"])
+    informing = {i for i in inside if spans[i] is not None and not _confirms_nothing(spans[i])}
+    start, end = max(group["segments"],
+                     key=lambda se: (sum(i in informing for i in range(se[0], se[1] + 1)), -se[0]))
     k = (group["lo"] + group["hi"]) / 2.0
     out = []
     for i, stride in ((start - 1, -1), (end + 1, 1)):
@@ -4714,18 +4724,38 @@ def _edge_steps(a_line, b_line, q_a, q_b, group, spans, relation):
     return out
 
 
+def _line_is_grid(values):
+    """Does one difference, or one ratio, write every step of the line within its rounding --
+    a time or dose axis, a dilution series, or a constant line? Zeros are left out of the
+    ratio reading: a dilution series ends in its vehicle at 0."""
+    cells = [(float(v), q) for v, q in zip(values, _effective_line_quantums(values))
+             if math.isfinite(float(v))]
+    for interval, line in ((_symmetric_offset_interval, cells),
+                           (_symmetric_ratio_interval, [c for c in cells if c[0] != 0.0])):
+        if len(line) < _LOCAL_RUN_MIN_FINITE:
+            continue
+        lo, hi = -math.inf, math.inf
+        for (x, q_x), (y, q_y) in zip(line, line[1:]):
+            span = interval(x, y, q_x, q_y)
+            if span is None:
+                break
+            lo, hi = max(lo, span[0]), min(hi, span[1])
+            if lo > hi:
+                break
+        else:
+            return True
+    return False
+
+
 def _local_line_usable(values, label=None):
     """Enough finite cells for a stretch and an outside, not an axis by its row label, and
-    not itself an arithmetic progression (a time or dose grid)."""
+    not itself a grid (`_line_is_grid`)."""
     finite = values[np.isfinite(values)]
     if finite.size < _LOCAL_RUN_MIN_FINITE:
         return False
     if label and _AXIS_CONTEXT_LABEL_RE.search(label):
         return False
-    steps = np.diff(finite)
-    if steps[0] != 0.0 and np.allclose(steps, steps[0], rtol=1e-9, atol=0.0):
-        return False
-    return True
+    return not _line_is_grid(values)
 
 
 def _as_rectangular(matrix):

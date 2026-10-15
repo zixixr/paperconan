@@ -8,8 +8,9 @@ import pytest
 
 from paperconan._sheet import Sheet
 from paperconan._audit import (
-    _edge_steps, _effective_line_quantums, _effective_row_quantums, _group_constant_runs,
-    _identity_steps, _local_line_usable, _outside_departure, _scan_interval_runs, _segments,
+    _LOCAL_RUN_DEPARTURE_CAP, _edge_steps, _effective_line_quantums, _effective_row_quantums,
+    _group_constant_runs, _identity_steps, _local_line_usable, _outside_departure,
+    _scan_interval_runs, _segments,
     _symmetric_offset_interval, _symmetric_ratio_interval, _zero_source_miss,
 )
 
@@ -262,11 +263,63 @@ def test_outside_departure_reads_its_scale_from_cells_that_confirm_something():
     assert _outside_departure(a, b, q, q, group, spans, "ratio") == pytest.approx((1.25 / 0.55 - 2.0) * 0.5 / 30.0)
 
 
+def test_outside_departure_is_the_median_of_the_outside_not_its_mean():
+    a, b = _arr([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), _arr([4.0, 5.0, 6.0, 7.5, 7.6, 20.0])
+    q = [0.1] * 6
+    spans = [_symmetric_offset_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 2.9, "hi": 3.1, "positions": [0, 1, 2]}
+    # gaps 0.4, 0.3 and 10.9 over |c|: the median is the first, the mean far above it
+    assert _outside_departure(a, b, q, q, group, spans, "offset") == pytest.approx(0.4 / 3.0)
+
+
+def test_outside_departure_is_capped_when_the_lines_scale_is_zero():
+    a = _arr([10.0, 20.0, 30.0, 11.0, 12.0, 13.0, 14.0])
+    b = _arr([20.0, 40.0, 60.0, 0.0, 0.0, 0.0, 0.0])
+    q = [0.1] * 7
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2]}
+    assert _outside_departure(a, b, q, q, group, spans, "ratio") == _LOCAL_RUN_DEPARTURE_CAP
+
+
+def test_outside_departure_refuses_a_constant_of_zero():
+    a, b = _arr([10.0, 20.0, 30.0, 5.0]), _arr([0.0, 0.0, 0.0, 13.0])
+    q = [0.1] * 4
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": -0.001, "hi": 0.001, "positions": [0, 1, 2]}
+    assert _outside_departure(a, b, q, q, group, spans, "ratio") is None
+
+
+@pytest.mark.parametrize("relation", ["ratio", "offset"])
+@pytest.mark.parametrize("blank", ["a", "b"])
+def test_a_cell_blank_on_one_side_is_neither_a_departure_nor_an_edge(relation, blank):
+    a = [10.0, 20.0, 30.0, 40.0, 5.0]
+    b = [20.0, 40.0, 60.0, 80.0, 13.0] if relation == "ratio" else [20.0, 30.0, 40.0, 50.0, 13.0]
+    (a if blank == "a" else b)[3] = math.nan
+    a, b = _arr(a), _arr(b)
+    q_a = [0.1 if math.isfinite(x) else math.nan for x in a]
+    q_b = [0.1 if math.isfinite(x) else math.nan for x in b]
+    interval = _symmetric_ratio_interval if relation == "ratio" else _symmetric_offset_interval
+    spans = [interval(x, y, s, t) for x, y, s, t in zip(a, b, q_a, q_b)]
+    lo, hi = (1.99, 2.01) if relation == "ratio" else (9.9, 10.1)
+    group = {"lo": lo, "hi": hi, "positions": [0, 1, 2], "segments": [[0, 2]]}
+    # the edge is read past the half-blank cell, at (5, 13)
+    want = (12.95 / 5.05 - 2.0) * 5.0 / 0.1 if relation == "ratio" else (10.0 - 8.1) / 0.1
+    assert _edge_steps(a, b, q_a, q_b, group, spans, relation) == pytest.approx([want])
+    # with (5, 13) in the group, the half-blank cell is all that lies outside: nothing to measure
+    group = {"lo": lo, "hi": hi, "positions": [0, 1, 2, 4], "segments": [[0, 2], [4, 4]]}
+    assert _outside_departure(a, b, q_a, q_b, group, spans, relation) is None
+
+
+@pytest.mark.filterwarnings("error")
+def test_identity_steps_with_no_informative_cell_refuse_nothing():
+    assert _identity_steps([(-math.inf, math.inf)] * 3, [], 2.0, "ratio") == math.inf
+
+
 def test_identity_steps_are_read_in_the_groups_half_widths():
     spans = [(1.9, 2.1), (1.8, 2.2), (1.95, 2.05), (-math.inf, math.inf)]
     # half-widths 0.1, 0.2 and 0.05 over the informative cells: a median of 0.1
     assert _identity_steps(spans, [0, 1, 2], 2.0, "ratio") == pytest.approx(10.0)
-    assert _identity_steps(spans, [0, 1, 2], 0.5, "offset") == pytest.approx(5.0)
+    assert _identity_steps(spans, [0, 1, 2], 0.3, "offset") == pytest.approx(3.0)        # counted from 0, not 1
 
 
 def test_edge_steps_count_a_ratio_gap_in_the_targets_steps():
@@ -305,8 +358,48 @@ def test_edge_steps_walk_past_a_cell_that_confirms_nothing():
     assert _edge_steps(a, b, q, q, group, spans, "ratio") == pytest.approx([(12.95 / 5.05 - 2.0) * 5.0 / 0.1])
 
 
+def test_edge_steps_read_the_segment_with_the_most_informative_cells():
+    a = _arr([10.0, 0.0, 0.0, 0.0, 20.0, 30.0, 5.0, 7.0, 11.0, 12.0, 13.0, 14.0, 9.0])
+    b = _arr([20.0, 0.0, 0.0, 0.0, 40.0, 60.0, 13.0, 30.0, 22.0, 24.0, 26.0, 28.0, 40.0])
+    q = [0.1] * 13
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2, 3, 4, 5, 8, 9, 10, 11],
+             "segments": [[0, 5], [8, 11]]}
+    # [0, 5] spans six positions but informs at three; [8, 11] informs at four: its edges are judged
+    assert _edge_steps(a, b, q, q, group, spans, "ratio") == pytest.approx(
+        [(29.95 / 7.05 - 2.0) * 7.0 / 0.1, (39.95 / 9.05 - 2.0) * 9.0 / 0.1])
+
+
+def test_edge_steps_take_the_earlier_of_two_equally_long_segments():
+    a = _arr([10.0, 20.0, 30.0, 5.0, 8.0, 7.0, 11.0, 12.0, 13.0, 9.0])
+    b = _arr([20.0, 40.0, 60.0, 13.0, 3.0, 30.0, 22.0, 24.0, 26.0, 40.0])
+    q = [0.1] * 10
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2, 6, 7, 8], "segments": [[0, 2], [6, 8]]}
+    assert _edge_steps(a, b, q, q, group, spans, "ratio") == pytest.approx([(12.95 / 5.05 - 2.0) * 5.0 / 0.1])
+
+
+def test_edge_steps_count_a_zero_source_in_the_targets_steps():
+    a, b = _arr([3.42, 1.87, 2.95, 0.0]), _arr([8.6, 4.7, 7.4, 0.3])
+    q_a, q_b = [0.01] * 4, [0.1] * 4
+    spans = [_symmetric_ratio_interval(x, y, s, t) for x, y, s, t in zip(a, b, q_a, q_b)]
+    group = {"lo": 2.49, "hi": 2.51, "positions": [0, 1, 2], "segments": [[0, 2]]}
+    # B's box starts at 0.25; k = 2.5 writes 0 +/- 0.005 as at most 0.0125: a miss of 0.2375, in B's steps
+    assert _edge_steps(a, b, q_a, q_b, group, spans, "ratio") == pytest.approx([0.2375 / 0.1])
+
+
 def test_a_line_is_usable_with_enough_cells_and_no_axis_shape():
     assert _local_line_usable(_arr([1.2, 3.4, math.nan, 2.7, 5.1]))
     assert not _local_line_usable(_arr([1.2, 3.4, math.nan, 2.7]))           # three finite cells
     assert not _local_line_usable(_arr([1.2, 3.4, 2.7, 5.1]), "Time (h)")      # an axis by its label
     assert not _local_line_usable(_arr([0.5, 1.0, math.nan, 1.5, 2.0]))       # a dose or time grid
+
+
+def test_a_line_that_is_itself_a_grid_within_rounding_is_not_compared():
+    assert not _local_line_usable(_arr([0.1, 0.2, 0.3, 0.4, 0.5]))                         # float error in a typed grid
+    assert not _local_line_usable(_arr([round(i / 3, 2) for i in range(1, 9)]))           # thirds, at 2 dp
+    assert not _local_line_usable(_arr([0.0, 1.0, 2.0, 3.0]))                              # a time axis from 0
+    assert not _local_line_usable(_arr([100 / 2 ** i for i in range(8)] + [0.0]))          # a dilution and its vehicle
+    assert not _local_line_usable(_arr([float(f"{50 / 3 ** i:.3g}") for i in range(7)]))   # 3-fold, at 3 figures
+    assert not _local_line_usable(_arr([4.2] * 6))                                        # a constant line
+    assert _local_line_usable(_arr([10.01, 11.02, 12.08, 13.01, 14.02]))                  # off any grid by more than rounding
