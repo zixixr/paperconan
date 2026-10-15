@@ -1012,6 +1012,12 @@ def test_on_the_whole_sheet_what_is_left_of_a_grid_is_still_a_grid():
     panels = [(1, 11, 0, 2), (1, 11, 3, 5), (13, 23, 0, 5)]
     found = detect_local_pair_runs(sheet, 1, 23, 0, 5, header, panels=panels)
     assert [f for f in found if (f["col_a_idx"], f["col_b_idx"]) == (0, 3)] == []
+    # the same with the series in B: each line is judged on what is left of it
+    a = [round(x / 0.731, 4) for x in ladder[:6]] + [11.9, 9.1, 18.7, 6.2]
+    rows = ([["Group A", "Group C", None, "Dose", "Group D"]] + [[x, z, None, y, w] for x, y, z, w in zip(a, ladder, c, c[::-1])]
+            + [[None] * 5, [f"x{j}" for j in range(5)]] + below)
+    found = detect_local_pair_runs(Sheet.from_rows(rows), 1, 23, 0, 5, ["Group A", "Group C", "", "Dose", "Group D"], panels=panels)
+    assert [f for f in found if (f["col_a_idx"], f["col_b_idx"]) == (0, 3)] == []
 
 
 def test_on_the_whole_sheet_a_panel_leaves_out_exactly_its_own_rows():
@@ -1042,6 +1048,18 @@ def test_on_the_whole_sheet_a_pair_with_nothing_left_costs_nothing(monkeypatch):
     found = detect_local_pair_runs(sheet, 1, 22, 0, 2, ["Group A", "Group B"], coverage=cov,
                                    panels=[(1, 11, 0, 2), (12, 22, 0, 2)])
     assert found == [] and not cov.calls
+    # and the pair after it gets the whole budget: a third column, in no panel with the first,
+    # holds a stretch of it; the budget is that pair's cost and no more
+    e = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2] + [None] + [5.5, 13.2, 8.1, 16.4, 10.9, 7.2, 14.8, 9.6, 12.3, 6.8]
+    rows = [["Group A", "Group B", "Group E"]] + [[x, y, z] for x, y, z in zip(A10 + [None] + c, first + [None] + d, e)]
+    sheet = Sheet.from_rows(rows)
+    a_line, e_line = sheet.numeric[1:22, 0].astype(float), sheet.numeric[1:22, 2].astype(float)
+    spent = [10 ** 9]
+    _best_local_group(a_line, e_line, _effective_line_quantums(a_line), _effective_line_quantums(e_line), 1, spent)
+    monkeypatch.setattr(audit_module, "_LOCAL_RUN_BUDGET", 21 + (10 ** 9 - spent[0]))
+    found = detect_local_pair_runs(sheet, 1, 22, 0, 3, ["Group A", "Group B", "Group E"],
+                                   panels=[(1, 11, 0, 2), (12, 22, 0, 2), (1, 22, 2, 3)])
+    assert [(f["col_a_idx"], f["col_b_idx"]) for f in found] == [(0, 2)]
 
 
 def test_a_block_taller_than_the_row_limit_is_compared_by_columns_only(monkeypatch):
