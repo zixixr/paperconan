@@ -4376,7 +4376,7 @@ _LOCAL_RUN_MIN_IDENTITY_STEPS = 10
 # A copied stretch ends abruptly. Walking outward from each end of the longest segment, past
 # blank cells and the group's own positions, the first cell with data must depart from the
 # constant by at least this many of its own rounding steps beyond rounding; a side whose first
-# such cell confirms nothing (zero against zero) is not judged. A rounding plateau on a smooth
+# such cell confirms nothing (in the ratio arm, zero against zero) is not judged. A rounding plateau on a smooth
 # trend, and the noise exceptions of a relation holding approximately everywhere, depart by less.
 _LOCAL_RUN_MIN_EDGE_STEPS = float(os.environ.get("PAPERCONAN_LOCAL_RUN_MIN_EDGE_STEPS", "3"))
 # A line needs the distinct source values a stretch asks for, and one finite cell outside it.
@@ -4394,7 +4394,7 @@ def _effective_line_quantums(values):
     figures 123.4567 carries four decimals and 45.67891 five, and reading the first at
     1e-5 makes its rounding interval ten times too narrow. So the line is read both ways
     and the mode more cells match exactly decides; a tie keeps fixed decimals. Under fixed
-    decimals every non-zero cell gets what `_effective_row_quantums` gives it.
+    decimals every cell that reads as non-zero gets what `_effective_row_quantums` gives it.
 
     Only cells with a fractional part vote. A zero has no magnitude, and a whole number's
     figure count is its digit count whatever it was written to (50 reads as two figures),
@@ -4408,11 +4408,12 @@ def _effective_line_quantums(values):
     digit counts are both taken at `_MAX_READ_DECIMALS` read precision.
 
     A cell that reads as zero at that precision -- a zero, or a value too small to register --
-    gets the finest step of the line's other cells, under either reading. Rounding to n
-    figures never yields 0, and an export at fixed decimals wrote its 0 at its neighbours'
-    step; `_effective_row_quantums` instead lets zeros vote, so a mostly-zero line reads them
-    at 1, a rounding interval wide enough to pass for any constant. Only when no cell of the
-    line reads as non-zero does a zero keep the row inference's step. Non-finite cells get NaN.
+    gets the finest step on its line, under either reading: at least as fine as its neighbours',
+    the stricter reading. Rounding to n figures never yields 0, and an export at fixed decimals
+    wrote its 0 no coarser than its neighbours; `_effective_row_quantums` instead lets zeros
+    vote, so a mostly-zero line reads them at 1, a rounding interval wide enough to pass for any
+    constant. Only when no cell of the line reads as non-zero does a zero keep the row
+    inference's step. Non-finite cells get NaN.
     """
     by_decimals = _effective_row_quantums(values)
     cells = []
@@ -4447,9 +4448,10 @@ def _effective_line_quantums(values):
             out.append(min(own, 10.0 ** (math.floor(math.log10(read)) - sig_mode + 1)))
         else:
             out.append(q)
-    steps = [x for j, x in enumerate(out) if j not in unread and not math.isnan(x)]
+    steps = [x for x in out if not math.isnan(x)]      # unread cells are still NaN here
+    finest = min(steps) if steps else None
     for i in unread:
-        out[i] = min(steps) if steps else by_decimals[i]
+        out[i] = finest if finest is not None else by_decimals[i]
     return out
 
 

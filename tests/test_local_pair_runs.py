@@ -78,3 +78,11 @@ def test_a_value_too_small_to_read_takes_the_lines_finest_step():
 def test_the_magnitude_is_taken_at_the_read_precision():
     q = _effective_line_quantums([123.4567, 234.5678, 45.67891, 56.78912, 99.99999999999])
     assert q[-1] == pytest.approx(1e-4)
+
+
+def test_a_line_with_no_non_zero_cell_keeps_the_row_step():
+    assert _effective_line_quantums([0.0, 0.0, math.nan])[:2] == [1.0, 1.0]
+
+
+def test_a_blank_cell_does_not_set_a_zeros_step():
+    assert _effective_line_quantums([math.nan, 0.0, 234.5678, 45.67891, 56.78912])[1] == pytest.approx(1e-5)
