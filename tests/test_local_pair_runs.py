@@ -263,6 +263,17 @@ def test_outside_departure_reads_its_scale_from_cells_that_confirm_something():
     assert _outside_departure(a, b, q, q, group, spans, "ratio") == pytest.approx((1.25 / 0.55 - 2.0) * 0.5 / 30.0)
 
 
+def test_outside_departure_reads_its_scale_over_the_pair_only():
+    # B against a blank in A is not part of the pair: it does not pull the median |b| to 0
+    a = _arr([10.0, 20.0, 30.0, 0.0] + [math.nan] * 5)
+    b = _arr([20.0, 40.0, 60.0, 5.0] + [0.0] * 5)
+    q_a, q_b = [0.1] * 4 + [math.nan] * 5, [0.1] * 9
+    spans = [_symmetric_ratio_interval(x, y, s, t) for x, y, s, t in zip(a, b, q_a, q_b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2]}
+    # the source read as zero misses 5 by 4.95 - 2 * 0.05; the pair's median |b| is that of 20, 40, 60, 5
+    assert _outside_departure(a, b, q_a, q_b, group, spans, "ratio") == pytest.approx(4.85 / 30.0)
+
+
 def test_outside_departure_is_the_median_of_the_outside_not_its_mean():
     a, b = _arr([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), _arr([4.0, 5.0, 6.0, 7.5, 7.6, 20.0])
     q = [0.1] * 6
@@ -402,4 +413,8 @@ def test_a_line_that_is_itself_a_grid_within_rounding_is_not_compared():
     assert not _local_line_usable(_arr([100 / 2 ** i for i in range(8)] + [0.0]))          # a dilution and its vehicle
     assert not _local_line_usable(_arr([float(f"{50 / 3 ** i:.3g}") for i in range(7)]))   # 3-fold, at 3 figures
     assert not _local_line_usable(_arr([4.2] * 6))                                        # a constant line
+    ladder = [100 / 2 ** i for i in range(6)]
+    assert not _local_line_usable(_arr([x for x in ladder for _ in range(3)]))            # each dose, once per replicate
+    assert not _local_line_usable(_arr(ladder + [0.0] + ladder + [0.0]))                  # the ladder listed twice
+    assert _local_line_usable(_arr([0.0, 0.0, 3.2, 6.4, 0.0]))                            # two ratios are not a ladder
     assert _local_line_usable(_arr([10.01, 11.02, 12.08, 13.01, 14.02]))                  # off any grid by more than rounding

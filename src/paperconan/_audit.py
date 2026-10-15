@@ -4637,9 +4637,10 @@ def _outside_departure(a_line, b_line, q_a, q_b, group, spans, relation):
     not read as a departure (curve families leak through their smallest cell otherwise).
     Offset: the gap over |c|. A source read as zero (no interval; ratio arm only, since offset
     intervals always exist) departs by what the constant falls short of writing it
-    (`_zero_source_miss`), over the line's median |b|. A cell that confirms nothing neither
-    counts as a departure nor sets that median: zeros against zeros filling most of a line
-    would otherwise make it 0. When the median is 0 all the same -- B zero against non-zero A
+    (`_zero_source_miss`), over the line's median |b|. That median is read over the pair's
+    cells: those where both lines have values and that confirm something -- B against a blank
+    in A is not part of the pair, and zeros against zeros filling most of a line would
+    otherwise make it 0. When the median is 0 all the same -- B zero against non-zero A
     across most of the line -- every ratio departure is recorded at the cap. Departures are
     capped at `_LOCAL_RUN_DEPARTURE_CAP`. None when nothing outside the group can be
     measured -- the relation covers the whole line, or what lies outside confirms nothing --
@@ -4651,7 +4652,8 @@ def _outside_departure(a_line, b_line, q_a, q_b, group, spans, relation):
         return None
     inside = set(group["positions"])
     finite_b = [abs(float(b_line[i])) for i, s in enumerate(spans)
-                if math.isfinite(float(b_line[i])) and not _confirms_nothing(s)]
+                if math.isfinite(float(a_line[i])) and math.isfinite(float(b_line[i]))
+                and not _confirms_nothing(s)]
     scale = float(np.median(finite_b)) if finite_b else 0.0
     departures = []
     for i, span in enumerate(spans):
@@ -4725,25 +4727,38 @@ def _edge_steps(a_line, b_line, q_a, q_b, group, spans, relation):
 
 
 def _line_is_grid(values):
-    """Does one difference, or one ratio, write every step of the line within its rounding --
-    a time or dose axis, a dilution series, or a constant line? Zeros are left out of the
-    ratio reading: a dilution series ends in its vehicle at 0."""
+    """Does one difference, or one ratio, write every step between consecutive cells with
+    values, within their rounding -- a time or dose axis, a dilution series, a constant line?
+
+    A line that repeats values is read a second time with each value at its first appearance
+    only, so a dose listed once per replicate, or a whole ladder listed twice, still reads as
+    its ladder. Zeros are left out of the ratio reading: a dilution series ends in its vehicle
+    at 0. The difference reading also takes a data line that is straight within its rounding;
+    a stretch copied into such a line is then not looked for -- the cost of keeping the
+    parallel, then diverging, straight trends of benign data out.
+    """
     cells = [(float(v), q) for v, q in zip(values, _effective_line_quantums(values))
              if math.isfinite(float(v))]
-    for interval, line in ((_symmetric_offset_interval, cells),
-                           (_symmetric_ratio_interval, [c for c in cells if c[0] != 0.0])):
-        if len(line) < _LOCAL_RUN_MIN_FINITE:
-            continue
-        lo, hi = -math.inf, math.inf
-        for (x, q_x), (y, q_y) in zip(line, line[1:]):
-            span = interval(x, y, q_x, q_y)
-            if span is None:
-                break
-            lo, hi = max(lo, span[0]), min(hi, span[1])
-            if lo > hi:
-                break
-        else:
-            return True
+    seen, first = set(), []
+    for c in cells:
+        if c[0] not in seen:
+            seen.add(c[0])
+            first.append(c)
+    for line in ([cells, first] if len(first) < len(cells) else [cells]):
+        for interval, steps in ((_symmetric_offset_interval, line),
+                                (_symmetric_ratio_interval, [c for c in line if c[0] != 0.0])):
+            if len(steps) < _LOCAL_RUN_MIN_FINITE:
+                continue
+            lo, hi = -math.inf, math.inf
+            for (x, q_x), (y, q_y) in zip(steps, steps[1:]):
+                span = interval(x, y, q_x, q_y)
+                if span is None:
+                    break
+                lo, hi = max(lo, span[0]), min(hi, span[1])
+                if lo > hi:
+                    break
+            else:
+                return True
     return False
 
 
