@@ -4774,9 +4774,11 @@ def _local_line_usable(values, label=None):
     return not _line_is_grid(values)
 
 
-# Fixed-decimal steps put the identity and edge counts on a lattice of halves and the outside
-# departure on round values; at a lattice point float error, not the data, decided which side
-# of a threshold a count fell. Thresholds are compared within this relative tolerance.
+# Fixed-decimal steps put counts on a lattice: in the offset arm the identity and edge steps fall
+# on halves when both sides share a step (on a finer rational lattice otherwise), the outside
+# departure on round values, and prediction bits on whole numbers when the steps are powers of
+# two apart. At a lattice point float error, not the data, decided which side of a threshold a
+# count fell, so thresholds are compared within this relative tolerance.
 _LOCAL_RUN_THRESHOLD_RTOL = 1e-9
 
 
@@ -4807,7 +4809,7 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
     (section 4; which lines take part, and which pairs are already reported, are the
     caller's), as (relation, group, bits, departure), or None. Highest by bits; a tie keeps
     the first found -- the ratio arm before the offset, and within an arm the group seeded by
-    the longest run.
+    the longest run, of equally long runs the earlier.
 
     Each group costs a pass over the line, and a slowly drifting relation can hold many of
     them. So when `budget` (a one-element list of remaining cell operations) is given, each
@@ -4820,7 +4822,8 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
         spans = [interval(a, b, x, y) for a, b, x, y in zip(a_line, b_line, q_a, q_b)]
         admit = None
         if relation == "ratio":
-            def admit(i, lo, hi):           # a non-finite value or step misses by inf
+            def admit(i, lo, hi):           # a non-finite b or step misses by inf; a non-finite a
+                # is read at a NaN step (`_effective_line_quantums`), so it misses too
                 return _zero_source_miss(b_line[i], q_a[i], q_b[i], max(abs(lo), abs(hi))) == 0.0
         runs = _scan_interval_runs(spans, a_line)
         if budget is not None:
@@ -4847,7 +4850,7 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
                     < _LOCAL_RUN_MIN_IDENTITY_STEPS * (1.0 - rtol)):
                 continue
             bits = _local_group_bits(a_line, b_line, q_a, q_b, g, n_tests)
-            if bits < _LOCAL_RUN_MIN_BITS:
+            if bits < _LOCAL_RUN_MIN_BITS * (1.0 - rtol):
                 continue
             departure = _outside_departure(a_line, b_line, q_a, q_b, g, spans, relation)
             if departure is None or departure <= _LOCAL_RUN_OUT_DEV * (1.0 + rtol):

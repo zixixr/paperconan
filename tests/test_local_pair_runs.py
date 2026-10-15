@@ -674,6 +674,21 @@ def test_an_offset_exactly_ten_steps_from_the_identity_is_reported():
         assert _best(a, b) is not None
 
 
+def test_an_offset_nine_and_a_half_steps_from_the_identity_is_not_reported():
+    rng = random.Random(20261021)
+    for _ in range(20):           # the tolerance only takes float error: 0.95 over 0.1 is not ten steps
+        a = [round(rng.uniform(20.0, 25.0), 1) for _ in range(10)]
+        b = [round(x + d, 1) for x, d in zip(a[:8], [1.0, 0.9] * 4)] + [round(a[8] + 3.7, 1), round(a[9] - 4.4, 1)]
+        assert _best(a, b) is None
+
+
+def test_prediction_bits_exactly_at_the_threshold_are_enough():
+    a = [13.6, 10.4, 11.5, 13.6, 10.4, 9.9, 19.6, 7.3, 9.4, 20.9]
+    b = [37.639, 28.783, 31.827, 37.639, 28.783, 23.289, 49.875, 10.533, 13.05, 43.372]
+    # a segment spreading over 32 of A's steps: four confirming cells at 5 bits each, exactly 20
+    assert _best(a, b, n_tests=1) is not None
+
+
 def test_an_edge_exactly_three_steps_off_is_abrupt_enough():
     rng = random.Random(20261019)
     for _ in range(20):           # 3.4 against 3.0 at 1 dp: 0.3 beyond rounding, in steps of 0.1
