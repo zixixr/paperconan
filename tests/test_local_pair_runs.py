@@ -292,6 +292,18 @@ def test_outside_departure_is_capped_when_the_lines_scale_is_zero():
     assert _outside_departure(a, b, q, q, group, spans, "ratio") == _LOCAL_RUN_DEPARTURE_CAP
 
 
+def test_a_source_read_as_zero_departs_at_the_cap_when_the_pairs_scale_is_zero():
+    # inside the stretch k * a falls below half B's step more often than not: B reads 0 there,
+    # those cells are part of the pair, and the pair's median |b| is 0
+    a = _arr([20.0, 40.0, 60.0, 0.5, 0.6, 0.7, 0.8, 0.9, 0.0])
+    b = _arr([1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0])
+    q = [0.1] * 9
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    assert all(s is not None and s[0] <= 0.05 <= s[1] for s in spans[:8])     # k = 0.05 writes every inside cell
+    group = {"lo": 0.049, "hi": 0.051, "positions": list(range(8))}
+    assert _outside_departure(a, b, q, q, group, spans, "ratio") == _LOCAL_RUN_DEPARTURE_CAP
+
+
 def test_outside_departure_refuses_a_constant_of_zero():
     a, b = _arr([10.0, 20.0, 30.0, 5.0]), _arr([0.0, 0.0, 0.0, 13.0])
     q = [0.1] * 4

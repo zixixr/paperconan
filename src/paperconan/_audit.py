@@ -4632,20 +4632,21 @@ def _outside_departure(a_line, b_line, q_a, q_b, group, spans, relation):
     what each cell's own rounding explains.
 
     The gap is from the constant to the cell's interval, so rounding alone never counts.
-    Ratio: that gap as an amount of B (gap * |a|) over the line's median |b| -- measured
+    Ratio: that gap as an amount of B (gap * |a|) over the pair's median |b| -- measured
     against the line's scale, not the cell's, so additive noise on a near-zero cell is
     not read as a departure (curve families leak through their smallest cell otherwise).
     Offset: the gap over |c|. A source read as zero (no interval; ratio arm only, since offset
     intervals always exist) departs by what the constant falls short of writing it
-    (`_zero_source_miss`), over the line's median |b|. That median is read over the pair's
+    (`_zero_source_miss`), over the pair's median |b|. That median is read over the pair's
     cells: those where both lines have values and that confirm something -- B against a blank
     in A is not part of the pair, and zeros against zeros filling most of a line would
     otherwise make it 0. When the median is 0 all the same -- B zero against non-zero A
-    across most of the line -- every ratio departure is recorded at the cap. Departures are
-    capped at `_LOCAL_RUN_DEPARTURE_CAP`. None when nothing outside the group can be
-    measured -- the relation covers the whole line, or what lies outside confirms nothing --
-    and for a constant of 0 or one that is not finite: a stretch of zeros in B is not a
-    ratio this pass looks for, and an offset of 0 is the identity.
+    across most of the pair's cells, inside the stretch or out -- every ratio departure is
+    recorded at the cap. Departures are capped at `_LOCAL_RUN_DEPARTURE_CAP`. None when
+    nothing outside the group can be measured -- the relation covers the whole line, or what
+    lies outside confirms nothing -- and for a constant of 0 or one that is not finite: a
+    stretch of zeros in B is not a ratio this pass looks for, and an offset of 0 is the
+    identity.
     """
     k = (group["lo"] + group["hi"]) / 2.0
     if k == 0.0 or not math.isfinite(k):
