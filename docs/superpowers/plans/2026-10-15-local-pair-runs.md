@@ -1098,6 +1098,40 @@ def test_a_groups_bits_are_those_of_its_less_precise_side():
     assert _local_group_bits(coarse, a, q_c, q_a, group, 1) == pytest.approx(coarse_side)
 
 
+def test_a_source_read_as_zero_does_not_carry_scattered_consistency():
+    a = [12.437, 8.912, 15.226, 9.871, 11.054, 13.388, 7.645, 10.902, 14.117, 9.333,
+         10.051, 12.884, 9.447, 13.103, 11.774]
+    b = [round(x * 1.137, 3) for x in a]
+    for i, v in ((3, 2.5), (7, 30.0), (11, 4.2)):
+        b[i] = v
+    for at in (1, 5, 9, 13):        # six sources read as zero, each target one step above it
+        assert _best(a[:at] + [0.0] * 6 + a[at:], b[:at] + [0.001] * 6 + b[at:]) is None
+
+
+def test_a_groups_bits_score_only_its_informative_cells():
+    a = _arr(A10[:4] + [0.0] + A10[4:])
+    b = _arr([round(x * 1.137, 3) for x in A10[:4]] + [0.0] + [round(x * 1.137, 3) for x in A10[4:]])
+    q_a, q_b = _effective_line_quantums(a), _effective_line_quantums(b)
+    keep = [i for i in range(11) if i != 4]                   # the zero against zero informs nothing
+    group = {"segments": [[0, 10]], "positions": list(range(11)), "informative": keep}
+    expected = min(_ratio_prediction_bits([b[i] for i in keep], [q_b[i] for i in keep], 1)["raw_bits"],
+                   _ratio_prediction_bits([a[i] for i in keep], [q_a[i] for i in keep], 1)["raw_bits"])
+    assert _local_group_bits(a, b, q_a, q_b, group, 1) == pytest.approx(expected)
+
+
+def test_a_pair_that_cannot_pay_for_its_runs_is_abandoned_before_grouping(monkeypatch):
+    import paperconan._audit as audit_module
+
+    def grouped(*args, **kwargs):
+        raise AssertionError("grouped before paying for the runs")
+
+    monkeypatch.setattr(audit_module, "_group_constant_runs", grouped)
+    a, b = _arr(A10), _arr([round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2])
+    budget = [len(A10) - 1]
+    assert _best_local_group(a, b, _effective_line_quantums(a), _effective_line_quantums(b), 4, budget) is None
+    assert budget[0] < 0
+
+
 def test_two_independently_sorted_lines_are_not_a_stretch():
     rng = random.Random(20261017)
     a = sorted(round(rng.uniform(5.0, 20.0), 3) for _ in range(1000))
@@ -1134,7 +1168,8 @@ def _local_group_bits(a_line, b_line, q_a, q_b, group, n_tests):
 
     Each segment is scored against its own spread, the segments' bits summed and the search
     penalty, log2(n_tests), taken once. Scored over the whole group at once, positions
-    scattered along a sorted or smooth line are credited with the line's whole range, though
+    scattered along a sorted or smooth line are credited with the whole group's spread -- up to
+    the line's whole range -- though
     each is predictable from its neighbours to within the local spacing -- and two independently
     sorted columns read as a stretch. Within a segment the spread is local, and a cell alone in
     its segment only anchors it and earns nothing.
@@ -1180,11 +1215,12 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
             if relation == "offset" and lo <= 0.0 <= hi:
                 continue
             inf = g["informative"]
+            informing = set(inf)
             if len({float(a_line[i]) for i in inf}) < _LOCAL_RUN_MIN_DISTINCT_SOURCE:
                 continue
-            # counted in cells that confirm something: zeros against zeros inside a stretch
-            # neither lengthen it nor add to what the constant accounts for
-            told = [sum(not _confirms_nothing(spans[i]) for i in range(s, e + 1)) for s, e in g["segments"]]
+            # counted in informative cells: zeros against zeros, and sources read as zero that a
+            # large enough constant writes, neither lengthen a stretch nor add to what it accounts for
+            told = [sum(i in informing for i in range(s, e + 1)) for s, e in g["segments"]]
             if max(told) < _LOCAL_RUN_MIN_CONTIGUOUS_SHARE * sum(told):
                 continue
             if _identity_steps(spans, inf, (lo + hi) / 2.0, relation) < _LOCAL_RUN_MIN_IDENTITY_STEPS:
@@ -1207,7 +1243,7 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 69 passed.
+Expected: 72 passed.
 
 - [ ] **Step 5: 逐条核对“关掉即变红”**
 
@@ -1233,11 +1269,15 @@ Expected: 六行都是 `1 failed`。任何一行 `1 passed`，说明那条测试
 
 | 改动 | 必须失败的测试 |
 |---|---|
-| 成段比例按位置数计，而不按提供信息的格数 | `test_cells_that_confirm_nothing_inside_a_stretch_do_not_carry_scattered_consistency` |
+| 成段比例按位置数计，而不按有信息的格数 | `test_cells_that_confirm_nothing_inside_a_stretch_do_not_carry_scattered_consistency` |
+| 成段比例把源读作 0 而被写出的格也算作有信息 | `test_a_source_read_as_zero_does_not_carry_scattered_consistency` |
+| `_local_group_bits`：把组内无信息的位置也拿来计分 | `test_a_groups_bits_score_only_its_informative_cells` |
 | `_local_group_bits`：整组一起打分，不分段 | `test_two_independently_sorted_lines_are_not_a_stretch` |
 | `_local_group_bits`：每段各减一次搜索惩罚 | `test_a_groups_bits_are_summed_over_its_segments_each_against_its_own_spread` |
 | `_local_group_bits`：只取一侧，或取较大的一侧 | `test_a_groups_bits_are_those_of_its_less_precise_side` |
 | 分组前不扣预算，或扣不起时不放弃 | `test_a_pair_pays_a_pass_over_the_line_for_each_run_before_grouping` |
+| 分组之后才按组数扣预算 | `test_a_pair_that_cannot_pay_for_its_runs_is_abandoned_before_grouping` |
+| 预算恰好用到 0 就放弃（`<= 0`） | Task 6 的 `test_a_pair_that_spends_the_budget_exactly_keeps_its_finding` |
 
 - [ ] **Step 6: 提交**
 
@@ -1335,6 +1375,15 @@ def test_the_run_work_of_a_pair_is_charged_to_the_blocks_budget(monkeypatch):
         cov = _Coverage()
         assert len(detect_local_pair_runs(sheet, 1, 11, 0, 3, header, coverage=cov)) == 1
         assert bool(cov.calls) is exhausted
+
+
+def test_a_pair_that_spends_the_budget_exactly_keeps_its_finding(monkeypatch):
+    import paperconan._audit as audit_module
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    sheet, header = _block([A10, b])
+    monkeypatch.setattr(audit_module, "_LOCAL_RUN_BUDGET", 20)     # 10 for the scan, 10 for its one run
+    cov = _Coverage()
+    assert len(detect_local_pair_runs(sheet, 1, 11, 0, 2, header, coverage=cov)) == 1 and not cov.calls
 ```
 
 - [ ] **Step 2: 运行，确认失败**
@@ -1437,7 +1486,7 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 76 passed.
+Expected: 80 passed.
 
 - [ ] **Step 4b: 预算的“删掉即变红”**
 
@@ -1447,6 +1496,7 @@ Expected: 76 passed.
 |---|---|
 | 调用 `_best_local_group` 时不传 `budget` | `test_the_run_work_of_a_pair_is_charged_to_the_blocks_budget` |
 | 调用后不检查 `budget[0] < 0`（中途放弃） | `test_an_exhausted_budget_is_recorded` |
+| 调用后的检查写成 `<= 0` | `test_a_pair_that_spends_the_budget_exactly_keeps_its_finding` |
 
 - [ ] **Step 5: 提交**
 
@@ -1515,7 +1565,7 @@ Expected: FAIL，`assert len(found) == 1`（0 条：块循环还没调用新检�
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 77 passed.
+Expected: 81 passed.
 
 - [ ] **Step 5: 跑全套测试，看有没有别处被带动**
 
@@ -1645,7 +1695,7 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
 - [ ] **Step 6: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 81 passed.
+Expected: 85 passed.
 
 - [ ] **Step 7: 提交**
 
@@ -1677,9 +1727,15 @@ imported rather than copied so the three benches stay about the same data -- plu
                each a smooth curve with noise. Each moves little from one cell to the next,
                so a constant fits a few neighbouring cells by coincidence; scored against the
                whole line's range such a stretch once read as significant.
+  DECAY        two proportional decays with a near-zero tail: a whole-line relation that
+               locality should refuse, but the tail makes the line's median |b| -- the scale
+               the ratio arm reads departures against -- small. Frozen as measured.
   PLANTED      one stretch (4 or 6 cells) copied from a line, then scaled or shifted, in
                columns and in rows. A bench of things that must not fire is passed perfectly
                by a detector that never fires; this is the side that gives it teeth.
+  PLANTED_MONOTONE  a 6-cell stretch copied into one of two MONOTONE lines: the cost side of
+               scoring by segment, since within a sorted or smooth line a segment's spread is
+               local and a copied stretch there carries less than among unrelated values.
 
 Verdicts, not counts (CLAUDE.md "Freeze a verdict, not a count"): each stratum is the band
 of _verdict -- silent / partial / pervasive -- over its draws, using the column-pair bench's
@@ -1760,6 +1816,25 @@ def _measure_monotone(shape, n, decimals):
                        for _ in range(REPEATS))
 
 
+# --- benign: two proportional decays with a near-zero tail ------------------------------------
+
+DECAYS = ((24, 2.0, 0.02, 2), (30, 3.0, 0.002, 3))
+
+
+def _decay_pair(rng, n, rate, noise, decimals):
+    k = rng.uniform(1.2, 2.0)
+    base = [10.0 * math.exp(-t / rate) for t in range(n)]
+    return ([round(v + rng.gauss(0.0, noise), decimals) for v in base],
+            [round(k * v + rng.gauss(0.0, noise), decimals) for v in base])
+
+
+@functools.lru_cache(maxsize=None)
+def _measure_decays(n, rate, noise, decimals):
+    rng = random.Random(SEED * 23 + n * 113 + decimals)
+    return CP._verdict(_local(_pair_sheet(*_decay_pair(rng, n, rate, noise, decimals)))
+                       for _ in range(REPEATS))
+
+
 # --- known cost: one stretch of a column computed from another --------------------------------
 
 def _partial_computed(rng, digits, segment):
@@ -1802,6 +1877,26 @@ def _measure_planted_columns(relation, digits, segment):
     for _ in range(REPEATS):
         a, b, start = _planted_columns(rng, digits, segment, relation)
         draws.append(_found(_local(_pair_sheet(a, b)), kind, start + 2))   # header row, 1-based
+    return CP._verdict(draws)
+
+
+PLANTED_MONOTONE = tuple((shape, decimals, relation)
+                         for shape, decimals in (("sorted", 2), ("smooth", 2), ("smooth", 3))
+                         for relation in ("ratio", "offset"))
+
+
+@functools.lru_cache(maxsize=None)
+def _measure_planted_monotone(shape, decimals, relation):
+    rng = random.Random(SEED * 29 + decimals * 127 + (shape == "smooth") * 3 + (relation == "offset"))
+    kind = "local_ratio_run" if relation == "ratio" else "local_offset_run"
+    draws = []
+    for _ in range(REPEATS):
+        a, b = _monotone_pair(rng, shape, 100, decimals)
+        start = rng.randrange(10, 100 - 16)
+        k = rng.uniform(1.2, 2.4) if relation == "ratio" else round(rng.uniform(0.5, 3.0), decimals)
+        for i in range(start, start + 6):
+            b[i] = round(a[i] * k if relation == "ratio" else a[i] + k, decimals)
+        draws.append(_found(_local(_pair_sheet(a, b)), kind, start + 2))    # header row, 1-based
     return CP._verdict(draws)
 
 
@@ -1932,6 +2027,20 @@ MONOTONE_BASELINE = {
     ('smooth', 100, 3): ('silent', {}),
 }
 
+DECAY_BASELINE = {
+    (24, 2.0, 0.02, 2): ('silent', {}),
+    (30, 3.0, 0.002, 3): ('silent', {}),
+}
+
+PLANTED_MONOTONE_BASELINE = {
+    ('sorted', 2, 'ratio'): ('partial', {'local_ratio_run': 'partial'}),
+    ('sorted', 2, 'offset'): ('partial', {'local_offset_run': 'partial'}),
+    ('smooth', 2, 'ratio'): ('partial', {'local_ratio_run': 'partial'}),
+    ('smooth', 2, 'offset'): ('partial', {'local_offset_run': 'partial'}),
+    ('smooth', 3, 'ratio'): ('pervasive', {'local_ratio_run': 'pervasive'}),
+    ('smooth', 3, 'offset'): ('pervasive', {'local_offset_run': 'pervasive'}),
+}
+
 KNOWN_COST_BASELINE = {
     (4, 4): ('pervasive', {'local_ratio_run': 'pervasive'}),
     (4, 6): ('pervasive', {'local_ratio_run': 'pervasive'}),
@@ -1993,11 +2102,13 @@ def _tables():
         "CURVE_BASELINE": {(lay, d): _measure_curves(lay, d) for lay, d in CV._STRATA},
         "COLUMN_BASELINE": {(f, d): _measure_column_family(f, d) for f in sorted(CP.BENIGN) for d in CP.SIG_FIGURES},
         "MONOTONE_BASELINE": {m: _measure_monotone(*m) for m in MONOTONE},
+        "DECAY_BASELINE": {d: _measure_decays(*d) for d in DECAYS},
         "KNOWN_COST_BASELINE": {(d, s): _measure_known_cost(d, s) for d in CP.SIG_FIGURES for s in SEGMENTS},
         "PLANTED_COLUMNS_BASELINE": {(r, d, s): _measure_planted_columns(r, d, s)
                                      for r in ("ratio", "offset") for d in CP.SIG_FIGURES for s in SEGMENTS},
         "PLANTED_ROWS_BASELINE": {(r, d, s): _measure_planted_rows(r, d, s)
                                   for r in ("ratio", "offset") for d in CV._DECIMALS for s in SEGMENTS},
+        "PLANTED_MONOTONE_BASELINE": {m: _measure_planted_monotone(*m) for m in PLANTED_MONOTONE},
     }
 
 
@@ -2024,6 +2135,16 @@ def test_independent_monotone_lines_hold_their_frozen_verdict(stratum):
     _check(MONOTONE_BASELINE, _measure_monotone, stratum, "local runs on two independent monotone lines")
 
 
+@pytest.mark.parametrize("stratum", sorted(DECAY_BASELINE))
+def test_proportional_decays_hold_their_frozen_verdict(stratum):
+    _check(DECAY_BASELINE, _measure_decays, stratum, "local runs on two proportional decays")
+
+
+@pytest.mark.parametrize("stratum", sorted(PLANTED_MONOTONE_BASELINE))
+def test_stretches_planted_in_monotone_lines_are_found_as_often_as_recorded(stratum):
+    _check(PLANTED_MONOTONE_BASELINE, _measure_planted_monotone, stratum, "recall of a stretch planted in a monotone line")
+
+
 @pytest.mark.parametrize("stratum", sorted(KNOWN_COST_BASELINE))
 def test_the_known_cost_holds_its_frozen_verdict(stratum):
     _check(KNOWN_COST_BASELINE, _measure_known_cost, stratum, "the partial-normalisation cost")
@@ -2044,6 +2165,8 @@ def test_every_stratum_the_generators_define_is_frozen():
     assert set(CURVE_BASELINE) == set(CV._STRATA)
     assert set(COLUMN_BASELINE) == {(f, d) for f in CP.BENIGN for d in CP.SIG_FIGURES}
     assert set(MONOTONE_BASELINE) == set(MONOTONE)
+    assert set(DECAY_BASELINE) == set(DECAYS)
+    assert set(PLANTED_MONOTONE_BASELINE) == set(PLANTED_MONOTONE)
     assert set(KNOWN_COST_BASELINE) == {(d, s) for d in CP.SIG_FIGURES for s in SEGMENTS}
     assert set(PLANTED_COLUMNS_BASELINE) == {(r, d, s) for r in ("ratio", "offset")
                                              for d in CP.SIG_FIGURES for s in SEGMENTS}
@@ -2070,7 +2193,7 @@ if __name__ == "__main__":
 - [ ] **Step 2: 运行**
 
 Run: `.venv/bin/python -m pytest tests/test_local_run_bench_baseline.py -q`
-Expected: 139 passed（约 15 秒）。若有档位不同，说明实现与本计划有出入：先找出出入在哪里，确认是有意的，再用 `python -m tests.test_local_run_bench_baseline` 重新生成表并粘贴，提交信息里写明哪一层、往哪个方向变了、为什么。
+Expected: 147 passed（约 15 秒）。若有档位不同，说明实现与本计划有出入：先找出出入在哪里，确认是有意的，再用 `python -m tests.test_local_run_bench_baseline` 重新生成表并粘贴，提交信息里写明哪一层、往哪个方向变了、为什么。
 
 - [ ] **Step 3: 核对台架有牙齿**
 
