@@ -4506,6 +4506,94 @@ def _zero_source_miss(b, q_a, q_b, k):
     return max(0.0, distance - abs(kv) * qa / 2.0)
 
 
+def _scan_interval_runs(spans, source, min_informative=2, min_distinct_source=None):
+    """Maximal contiguous runs whose intervals share a point.
+
+    The run logic of `_scan_quantized_ratio_runs`, taking the intervals ready-made so the
+    ratio and the offset arm share it: `None` breaks a run, (-inf, inf) joins one without
+    informing it, a run needs `min_informative` informative cells and
+    `min_distinct_source` distinct source values, and a run inside another is dropped.
+    Returns [{"start", "end", "lo", "hi", "informative"}] in order of start. The distinct-source
+    floor defaults to `_LOCAL_RUN_MIN_DISTINCT_SOURCE`, read at call time.
+    """
+    if min_distinct_source is None:
+        min_distinct_source = _LOCAL_RUN_MIN_DISTINCT_SOURCE
+    n = len(spans)
+    found = []
+    for start in range(n):
+        lo, hi = -math.inf, math.inf
+        informative, seen = [], set()
+        end = start - 1
+        for j in range(start, n):
+            span = spans[j]
+            if span is None:
+                break
+            new_lo, new_hi = max(lo, span[0]), min(hi, span[1])
+            if new_lo > new_hi:
+                break
+            lo, hi, end = new_lo, new_hi, j
+            if math.isfinite(span[0]) and math.isfinite(span[1]):
+                informative.append(j)
+                seen.add(float(source[j]))
+        if end < start or len(informative) < min_informative or len(seen) < min_distinct_source:
+            continue
+        found.append({"start": start, "end": end, "lo": lo, "hi": hi, "informative": informative})
+    maximal = []
+    for r in found:
+        if any(o is not r and o["start"] <= r["start"] and o["end"] >= r["end"]
+               and (o["start"], o["end"]) != (r["start"], r["end"]) for o in found):
+            continue
+        if any((m["start"], m["end"]) == (r["start"], r["end"]) for m in maximal):
+            continue
+        maximal.append(r)
+    return maximal
+
+
+def _segments(positions):
+    """[[start, end], ...] of the contiguous stretches in a sorted list of positions."""
+    out = []
+    for p in positions:
+        if out and p == out[-1][1] + 1:
+            out[-1][1] = p
+        else:
+            out.append([p, p])
+    return out
+
+
+def _group_constant_runs(runs, spans, admit=None):
+    """Gather the runs one constant accounts for.
+
+    Longest first, a run joins the first group whose interval it still intersects and
+    none of whose runs it overlaps; the group's interval narrows to the intersection. A
+    group's POSITIONS are then every cell whose interval admits that constant, in a run
+    or not -- a lone consistent cell between two runs is the same relation, not its
+    outside. A cell with no interval (None) joins only if `admit(i, lo, hi)` says the constant
+    writes it -- a source read as zero, which one interval cannot describe. Returns
+    [{"lo", "hi", "positions", "informative", "segments"}].
+    """
+    groups = []
+    for r in sorted(runs, key=lambda r: (-(r["end"] - r["start"]), r["start"])):
+        for g in groups:
+            lo, hi = max(g["lo"], r["lo"]), min(g["hi"], r["hi"])
+            if lo <= hi and all(r["end"] < s["start"] or r["start"] > s["end"] for s in g["runs"]):
+                g["lo"], g["hi"] = lo, hi
+                g["runs"].append(r)
+                break
+        else:
+            groups.append({"lo": r["lo"], "hi": r["hi"], "runs": [r]})
+    out = []
+    for g in groups:
+        positions = [i for i, s in enumerate(spans)
+                     if (s is not None and s[0] <= g["hi"] and s[1] >= g["lo"])
+                     or (s is None and admit is not None and admit(i, g["lo"], g["hi"]))]
+        # an admitted cell without an interval says only that |k| clears a threshold: not informative
+        informative = [i for i in positions if spans[i] is not None
+                       and math.isfinite(spans[i][0]) and math.isfinite(spans[i][1])]
+        out.append({"lo": g["lo"], "hi": g["hi"], "positions": positions,
+                    "informative": informative, "segments": _segments(positions)})
+    return out
+
+
 def _as_rectangular(matrix):
     """A finite 2-D float array, or None. Ragged input is rejected, never raised on.
 

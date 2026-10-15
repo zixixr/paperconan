@@ -8,7 +8,8 @@ import pytest
 
 from paperconan._sheet import Sheet
 from paperconan._audit import (
-    _effective_line_quantums, _effective_row_quantums,
+    _effective_line_quantums, _effective_row_quantums, _group_constant_runs,
+    _scan_interval_runs, _segments,
     _symmetric_offset_interval, _symmetric_ratio_interval, _zero_source_miss,
 )
 
@@ -142,3 +143,37 @@ def test_symmetric_offset_interval():
     lo, hi = _symmetric_offset_interval(2.0, 5.0, 0.1, 0.01)
     assert lo == pytest.approx(3.0 - 0.055) and hi == pytest.approx(3.0 + 0.055)
     assert _symmetric_offset_interval(2.0, math.nan, 0.1, 0.1) is None
+
+
+# --- runs and groups ----------------------------------------------------------------------
+
+def test_scan_interval_runs_breaks_on_none_and_drops_sub_runs():
+    spans = [(1.0, 2.0), (1.5, 3.0), None, (4.0, 5.0), (4.5, 6.0), (4.8, 4.9)]
+    runs = _scan_interval_runs(spans, [1, 2, 3, 4, 5, 6], min_distinct_source=2)
+    assert [(r["start"], r["end"]) for r in runs] == [(0, 1), (3, 5)]
+    assert runs[1]["lo"] == pytest.approx(4.8) and runs[1]["hi"] == pytest.approx(4.9)
+
+
+def test_an_unbounded_span_joins_a_run_without_informing_it():
+    spans = [(1.0, 2.0), (-math.inf, math.inf), (1.5, 2.5)]
+    (run,) = _scan_interval_runs(spans, [1, 2, 3], min_distinct_source=2)
+    assert (run["start"], run["end"]) == (0, 2) and run["informative"] == [0, 2]
+
+
+def test_runs_of_one_constant_form_one_group_with_the_lone_cells_between():
+    spans = [(1.9, 2.1)] * 3 + [(5.0, 6.0), (1.95, 2.05), (7.0, 8.0)] + [(1.9, 2.1)] * 3
+    runs = _scan_interval_runs(spans, list(range(9)))
+    (group, *others) = _group_constant_runs(runs, spans)
+    assert group["positions"] == [0, 1, 2, 4, 6, 7, 8]
+    assert group["segments"] == [[0, 2], [4, 4], [6, 8]]
+    assert _segments([0, 1, 3]) == [[0, 1], [3, 3]]
+
+
+def test_a_cell_without_an_interval_joins_a_group_only_when_admitted():
+    spans = [(1.9, 2.1)] * 3 + [None] + [(1.9, 2.1)] * 2
+    runs = _scan_interval_runs(spans, list(range(6)), min_distinct_source=2)
+    (group,) = _group_constant_runs(runs, spans)
+    assert group["positions"] == [0, 1, 2, 4, 5]
+    (group,) = _group_constant_runs(runs, spans, admit=lambda i, lo, hi: i == 3 and lo <= 2.0 <= hi)
+    assert group["positions"] == [0, 1, 2, 3, 4, 5] and group["segments"] == [[0, 5]]
+    assert 3 not in group["informative"]
