@@ -1699,6 +1699,7 @@ def test_a_row_pair_away_from_the_corner_points_at_its_own_cells():
     b = [round(x * 1.137, 3) for x in A10[:6]]
     (f,) = detect_local_pair_runs(sheet, r0, r1, c0, c1, labels)
     assert (f["row_a_idx"], f["row_b_idx"]) == (2, 3) and (f["row_a"], f["row_b"]) == ("ctrl", "drug")
+    assert f["row_a_sample"][0] == pytest.approx(A10[0]) and f["row_b_sample"][0] == pytest.approx(b[0])
     assert f["segments"] == [[4, 9]]                        # sheet columns, 1-based
     assert f["rule"].startswith("row[4] = row[3] *") and f["rule"].endswith("on columns 4-9")
     assert {r for r, _ in f["example_cells"]} == {3, 4} and {c for _, c in f["example_cells"]} == set(range(4, 10))
@@ -2008,6 +2009,7 @@ Expected: 121 passed.
 | `already` 里的线对先扣预算再跳过 | `test_a_pair_already_reported_costs_nothing` |
 | 表头比块短时不回退为空标签 | `test_a_header_shorter_than_the_block_leaves_a_label_empty` |
 | `line_length` 只数 A；样本两侧对调 | `test_an_offset_stretch_is_reported_as_one` |
+| 行方向的样本两侧对调 | `test_a_row_pair_away_from_the_corner_points_at_its_own_cells` |
 | rule 里 rows/columns 写反 | `test_a_column_pair_away_from_the_corner_points_at_its_own_cells` |
 | `_stretch_text` 不数零散格，或不封顶 | `test_the_rule_lists_the_runs_and_counts_the_lone_positions` |
 
