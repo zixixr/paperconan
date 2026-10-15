@@ -443,6 +443,16 @@ def test_runs_of_one_constant_form_one_group_with_the_lone_cells_between():
     assert group["positions"] == [0, 1, 2, 4, 6, 7, 8]
     assert group["segments"] == [[0, 2], [4, 4], [6, 8]]
     assert _segments([0, 1, 3]) == [[0, 1], [3, 3]]
+
+
+def test_a_cell_without_an_interval_joins_a_group_only_when_admitted():
+    spans = [(1.9, 2.1)] * 3 + [None] + [(1.9, 2.1)] * 2
+    runs = _scan_interval_runs(spans, list(range(6)), min_distinct_source=2)
+    (group,) = _group_constant_runs(runs, spans)
+    assert group["positions"] == [0, 1, 2, 4, 5]
+    (group,) = _group_constant_runs(runs, spans, admit=lambda i, lo, hi: i == 3 and lo <= 2.0 <= hi)
+    assert group["positions"] == [0, 1, 2, 3, 4, 5] and group["segments"] == [[0, 5]]
+    assert 3 not in group["informative"]
 ```
 
 - [ ] **Step 2: 运行，确认失败**
@@ -544,7 +554,7 @@ def _group_constant_runs(runs, spans, admit=None):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 24 passed.
+Expected: 25 passed.
 
 - [ ] **Step 5: 提交**
 
@@ -691,7 +701,7 @@ def _local_line_usable(values, label=None):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 26 passed.
+Expected: 27 passed.
 
 - [ ] **Step 5: 提交**
 
@@ -909,7 +919,7 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 45 passed.
+Expected: 46 passed.
 
 - [ ] **Step 5: 逐条核对“关掉即变红”**
 
@@ -1107,7 +1117,7 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 51 passed.
+Expected: 52 passed.
 
 - [ ] **Step 5: 提交**
 
@@ -1176,7 +1186,7 @@ Expected: FAIL，`assert len(found) == 1`（0 条：块循环还没调用新检�
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 52 passed.
+Expected: 53 passed.
 
 - [ ] **Step 5: 跑全套测试，看有没有别处被带动**
 
@@ -1306,7 +1316,7 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
 - [ ] **Step 6: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 56 passed.
+Expected: 57 passed.
 
 - [ ] **Step 7: 提交**
 
