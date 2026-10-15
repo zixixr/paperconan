@@ -173,6 +173,13 @@ def test_a_run_needs_distinct_source_values_among_its_informative_cells():
     assert _scan_interval_runs([(1.9, 2.1), (-math.inf, math.inf), (1.9, 2.1), (1.9, 2.1)], [5.0, 7.0, 6.0, 6.0]) == []
 
 
+def test_a_run_starting_inside_another_can_reach_further():
+    spans = [(1.0, 2.0), (1.5, 2.5), (2.2, 3.0), (2.6, 3.5)]
+    runs = _scan_interval_runs(spans, [1, 2, 3, 4], min_distinct_source=2)
+    assert [(r["start"], r["end"], r["lo"], r["hi"]) for r in runs] == [
+        (0, 1, 1.5, 2.0), (1, 2, 2.2, 2.5), (2, 3, 2.6, 3.0)]
+
+
 def test_runs_of_one_constant_form_one_group_with_the_lone_cells_between():
     spans = [(1.9, 2.1)] * 3 + [(5.0, 6.0), (1.95, 2.05), (7.0, 8.0)] + [(1.9, 2.1)] * 3
     runs = _scan_interval_runs(spans, list(range(9)))

@@ -4511,7 +4511,7 @@ def _scan_interval_runs(spans, source, min_informative=2, min_distinct_source=No
     The run logic of `_scan_quantized_ratio_runs`, taking the intervals ready-made so the
     ratio and the offset arm share it: `None` breaks a run, (-inf, inf) joins one without
     informing it, a run needs `min_informative` informative cells and `min_distinct_source`
-    distinct source values among them (at the default floor of 3 the first never binds), and
+    distinct source values among them (at the defaults the first never binds), and
     a run inside another is dropped. Returns [{"start", "end", "lo", "hi"}] in order of start.
     The distinct-source floor defaults to `_LOCAL_RUN_MIN_DISTINCT_SOURCE`, read at call time.
 
@@ -4527,8 +4527,7 @@ def _scan_interval_runs(spans, source, min_informative=2, min_distinct_source=No
         return math.isfinite(span[0]) and math.isfinite(span[1])
 
     n = len(spans)
-    # indices whose lower (upper) bound can still be the window's largest (smallest); on a tie
-    # the earliest leads, as the sequential max/min fold of the older scan keeps it
+    # indices whose lower (upper) bound can still be the window's largest (smallest)
     los, his = deque(), deque()
     values, informative = Counter(), 0
     end, prev_end, out = -1, None, []
@@ -4580,7 +4579,8 @@ def _segments(positions):
 
 
 def _confirms_nothing(span):
-    """A cell compatible with every constant -- in the ratio arm, zero against zero."""
+    """A cell whose interval is unbounded: in practice zero against zero in the ratio arm,
+    which every constant writes."""
     return span is not None and not (math.isfinite(span[0]) and math.isfinite(span[1]))
 
 
@@ -4588,12 +4588,13 @@ def _group_constant_runs(runs, spans, admit=None):
     """Gather the runs one constant accounts for.
 
     Longest first, a run joins the first group whose interval it still intersects; the
-    group's interval narrows to the intersection. (Two runs that overlap in position never
-    share a point -- the earlier would have extended -- so a run never joins a group holding
-    one it overlaps.) A group's POSITIONS are then every cell whose interval meets the
-    group's, in a run or not -- a lone consistent cell between two runs is the same relation,
-    not its outside. A cell with no interval (None) joins only if `admit(i, lo, hi)` says
-    some constant of the group writes it -- a source read as zero, which one interval cannot
+    group's interval narrows to the intersection. (Of runs `_scan_interval_runs` found over
+    these same spans, two that overlap in position never share a point -- the earlier would
+    have extended -- so a run never joins a group holding one it overlaps.) A group's
+    POSITIONS are then the cells whose interval meets the group's, in a run or not -- a lone
+    consistent cell between two runs is the same relation, not its outside -- less those
+    trimmed below. A cell with no interval (None) joins only if `admit(i, lo, hi)` says some
+    constant of the group writes it -- a source read as zero, which one interval cannot
     describe. A cell that confirms nothing (`_confirms_nothing`) may sit inside a stretch but
     never extends one: it is trimmed off both ends of every segment. Returns
     [{"lo", "hi", "positions", "informative", "segments"}].
