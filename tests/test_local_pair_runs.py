@@ -62,3 +62,19 @@ def test_zeros_do_not_vote():
 def test_equally_common_figure_counts_take_the_finer_reading():
     q = _effective_line_quantums([123.4567, 45.67891, 6.789123, 12.3456, 1.23456, 345.678])
     assert q[3] == pytest.approx(1e-5)
+
+
+def test_a_mostly_zero_line_reads_its_zeros_at_its_finest_step():
+    q = _effective_line_quantums([0, 0, 0, 0, 0, 0.001234, 0.01234, 0.002345, 0.1234])
+    assert q[:5] == pytest.approx([1e-6] * 5)
+    q = _effective_line_quantums([0, 0, 0, 0, 1.23, 4.56, 7.89])          # fixed decimals
+    assert q == pytest.approx([0.01] * 7)
+
+
+def test_a_value_too_small_to_read_takes_the_lines_finest_step():
+    assert _effective_line_quantums([0.0123, 0.000234, 3.45e-5, 1.2e-12])[3] == pytest.approx(1e-7)
+
+
+def test_the_magnitude_is_taken_at_the_read_precision():
+    q = _effective_line_quantums([123.4567, 234.5678, 45.67891, 56.78912, 99.99999999999])
+    assert q[-1] == pytest.approx(1e-4)

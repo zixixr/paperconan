@@ -4363,7 +4363,7 @@ _LOCAL_RUN_BUDGET = int(os.environ.get("PAPERCONAN_LOCAL_RUN_BUDGET", "4000000")
 # A cell no constant writes (a zero source against a non-zero target) departs by an
 # unbounded amount; it is recorded at this cap so a median stays finite and JSON-safe.
 _LOCAL_RUN_DEPARTURE_CAP = 1e3
-# A constant confirmed against fewer distinct source values says little about a constant.
+# Fewer distinct source values than this cannot tell one constant from a coincidence of rounding.
 _LOCAL_RUN_MIN_DISTINCT_SOURCE = 3
 # A STRETCH: the longest segment must hold at least this share of the positions one constant
 # accounts for. Consistency scattered along the line is what noise makes of a relation that
@@ -4375,9 +4375,9 @@ _LOCAL_RUN_MIN_CONTIGUOUS_SHARE = 0.5
 _LOCAL_RUN_MIN_IDENTITY_STEPS = 10
 # A copied stretch ends abruptly. Walking outward from each end of the longest segment, past
 # blank cells and the group's own positions, the first cell with data must depart from the
-# constant by at least this many of its own rounding steps beyond rounding. A rounding plateau
-# on a smooth trend, and the noise exceptions of a relation holding approximately everywhere,
-# depart by less.
+# constant by at least this many of its own rounding steps beyond rounding; a side whose first
+# such cell confirms nothing (zero against zero) is not judged. A rounding plateau on a smooth
+# trend, and the noise exceptions of a relation holding approximately everywhere, depart by less.
 _LOCAL_RUN_MIN_EDGE_STEPS = float(os.environ.get("PAPERCONAN_LOCAL_RUN_MIN_EDGE_STEPS", "3"))
 # A line needs the distinct source values a stretch asks for, and one finite cell outside it.
 _LOCAL_RUN_MIN_FINITE = _LOCAL_RUN_MIN_DISTINCT_SOURCE + 1
@@ -4393,8 +4393,8 @@ def _effective_line_quantums(values):
     every cell's floor. An export at fixed significant figures breaks that -- at seven
     figures 123.4567 carries four decimals and 45.67891 five, and reading the first at
     1e-5 makes its rounding interval ten times too narrow. So the line is read both ways
-    and the mode more cells match exactly decides. A tie keeps fixed decimals, and under
-    fixed decimals this returns exactly what `_effective_row_quantums` returns.
+    and the mode more cells match exactly decides; a tie keeps fixed decimals. Under fixed
+    decimals every non-zero cell gets what `_effective_row_quantums` gives it.
 
     Only cells with a fractional part vote. A zero has no magnitude, and a whole number's
     figure count is its digit count whatever it was written to (50 reads as two figures),
@@ -4404,10 +4404,15 @@ def _effective_line_quantums(values):
     Under fixed significant figures a cell's step comes from its magnitude and is never
     COARSER than the cell's own decimals, since a cell carrying more digits than the mode
     has real extra precision (a whole number with trailing zeros is the exception: 98770 at
-    four figures is read at 1, not 10, which is the stricter direction). Rounding to n
-    figures never yields 0, so a zero is read at the line's decimal step rather than at 1.
-    Magnitudes are taken at `_MAX_READ_DECIMALS` read precision, like the digit counts;
-    below that floor a value reads as zero digits in both functions. Non-finite cells get NaN.
+    four figures is read at 1, not 10, which is the stricter direction). Magnitudes and
+    digit counts are both taken at `_MAX_READ_DECIMALS` read precision.
+
+    A cell that reads as zero at that precision -- a zero, or a value too small to register --
+    gets the finest step of the line's other cells, under either reading. Rounding to n
+    figures never yields 0, and an export at fixed decimals wrote its 0 at its neighbours'
+    step; `_effective_row_quantums` instead lets zeros vote, so a mostly-zero line reads them
+    at 1, a rounding interval wide enough to pass for any constant. Only when no cell of the
+    line reads as non-zero does a zero keep the row inference's step. Non-finite cells get NaN.
     """
     by_decimals = _effective_row_quantums(values)
     cells = []
@@ -4420,28 +4425,31 @@ def _effective_line_quantums(values):
         if dec == 0:
             continue
         cells.append((sig, dec))
-    if not cells:
-        return by_decimals
-    decimals = Counter(d for _, d in cells)
-    sigfigs = Counter(s for s, _ in cells)
-    sig_mode, sig_top = max(sigfigs.items(), key=lambda kv: (kv[1], kv[0]))
-    if sig_top <= max(decimals.values()):
-        return by_decimals
-    out = []
-    for v, q in zip(values, by_decimals):
+    use_figures = False
+    if cells:
+        decimals = Counter(d for _, d in cells)
+        sigfigs = Counter(s for s, _ in cells)
+        sig_mode, sig_top = max(sigfigs.items(), key=lambda kv: (kv[1], kv[0]))
+        use_figures = sig_top > max(decimals.values())
+    out, unread = [], []
+    for i, (v, q) in enumerate(zip(values, by_decimals)):
         fv = float(v)
         if not math.isfinite(fv):
             out.append(math.nan)
             continue
-        if fv == 0.0:
-            out.append(q)
-            continue
-        own = 10.0 ** -min(_sigfigs_and_frac(fv)[1], _MAX_READ_DECIMALS)
         read = round(abs(fv), _MAX_READ_DECIMALS)
         if read == 0.0:
-            out.append(own)
+            out.append(math.nan)
+            unread.append(i)
             continue
-        out.append(min(own, 10.0 ** (math.floor(math.log10(read)) - sig_mode + 1)))
+        if use_figures:
+            own = 10.0 ** -min(_sigfigs_and_frac(fv)[1], _MAX_READ_DECIMALS)
+            out.append(min(own, 10.0 ** (math.floor(math.log10(read)) - sig_mode + 1)))
+        else:
+            out.append(q)
+    steps = [x for j, x in enumerate(out) if j not in unread and not math.isnan(x)]
+    for i in unread:
+        out[i] = min(steps) if steps else by_decimals[i]
     return out
 
 
