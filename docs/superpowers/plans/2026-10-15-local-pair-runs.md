@@ -1769,15 +1769,67 @@ def test_on_the_whole_sheet_a_pair_across_panels_is_still_compared():
     assert [(f["col_a_idx"], f["col_b_idx"]) for f in found] == [(0, 3)]
 
 
+def test_on_the_whole_sheet_a_panel_holding_both_lines_leaves_out_only_its_own_positions():
+    # side by side, then a panel across the full width below: it holds columns 0 and 3, but only
+    # over its own rows -- where the first two panels meet, no panel compared those columns
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    rng = random.Random(20261023)
+    below = [[round(rng.uniform(5.0, 20.0), 3) for _ in range(5)] for _ in range(10)]
+    rows = ([["Group A", "Group C", None, "Group B", "Group D"]] + [[x, z, None, y, w] for x, y, z, w in zip(A10, b, c, c[::-1])]
+            + [[None] * 5, [f"x{j}" for j in range(5)]] + below)
+    sheet = Sheet.from_rows(rows)
+    header = ["Group A", "Group C", "", "Group B", "Group D"]
+    panels = [(1, 11, 0, 2), (1, 11, 3, 5), (13, 23, 0, 5)]
+    found = detect_local_pair_runs(sheet, 1, 23, 0, 5, header, panels=panels)
+    assert [(f["col_a_idx"], f["col_b_idx"], f["segments"]) for f in found] == [(0, 3, [[2, 7]])]
+
+
+def test_on_the_whole_sheet_rows_of_two_panels_are_compared_where_no_panel_holds_both():
+    # a row of one panel above a row of another, and a third panel to their right spanning both
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    rng = random.Random(20261024)
+    side = [[round(rng.uniform(5.0, 20.0), 3) for _ in range(3)] for _ in range(3)]
+    rows = ([[None, *[f"t{j}" for j in range(10)], None, "u0", "u1", "u2"]]
+            + [["ctrl", *A10, None, *side[0]], [None] * 11 + [None, *side[1]], ["drug", *b, None, *side[2]]])
+    sheet = Sheet.from_rows(rows)
+    panels = [(1, 2, 1, 11), (3, 4, 1, 11), (1, 4, 12, 15)]
+    found = detect_local_pair_runs(sheet, 1, 4, 1, 15, [""] * 14, panels=panels)
+    assert [(f["orientation"], f["row_a_idx"], f["row_b_idx"]) for f in found] == [("rows", 1, 3)]
+
+
+def test_on_the_whole_sheet_panels_that_touch_do_not_hold_each_others_edge_rows():
+    # two panels with no row between them: the last row of one and the first of the next meet
+    # only on the whole sheet
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    rows = [[None, *[f"t{j}" for j in range(10)]], ["p", *c], ["ctrl", *A10], ["drug", *b], ["q", *c[::-1]]]
+    sheet = Sheet.from_rows(rows)
+    panels = [(1, 3, 1, 11), (3, 5, 1, 11)]
+    found = detect_local_pair_runs(sheet, 1, 5, 1, 11, [""] * 10, panels=panels, skip_columns=True)
+    assert [(f["row_a_idx"], f["row_b_idx"]) for f in found] == [(2, 3)]
+
+
 def test_a_block_taller_than_the_row_limit_is_compared_by_columns_only(monkeypatch):
     import paperconan._audit as audit_module
     monkeypatch.setattr(audit_module, "_LOCAL_RUN_MAX_ROWS", 5)
     b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
-    sheet, header = _block([A10, b])
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    sheet, header = _block([A10, b, c, c[::-1]])            # rows of four cells could be compared
     cov = _Coverage()
-    (f,) = detect_local_pair_runs(sheet, 1, 11, 0, 2, header, coverage=cov)
-    assert f["orientation"] == "cols"
+    found = detect_local_pair_runs(sheet, 1, 11, 0, 4, header, coverage=cov)
+    assert {f["orientation"] for f in found} == {"cols"}
     assert [(args[1], kwargs["detector"]) for args, kwargs in cov.calls] == [("detector_row_limit", "detect_local_pair_runs")]
+    sheet, header = _block([A10, b])                        # rows of two cells never could
+    cov = _Coverage()
+    assert len(detect_local_pair_runs(sheet, 1, 11, 0, 2, header, coverage=cov)) == 1 and not cov.calls
+
+
+def test_a_block_exactly_at_the_row_limit_is_compared_by_rows(monkeypatch):
+    import paperconan._audit as audit_module
+    sheet, r0, r1, c0, c1, labels = _row_pair_away_from_the_corner()
+    monkeypatch.setattr(audit_module, "_LOCAL_RUN_MAX_ROWS", r1 - r0)
+    assert len(detect_local_pair_runs(sheet, r0, r1, c0, c1, labels)) == 1
 
 
 def test_a_pair_already_reported_costs_nothing(monkeypatch):
@@ -1803,6 +1855,8 @@ def test_a_header_shorter_than_the_block_leaves_a_label_empty():
     sheet, _header = _block([A10, b])
     (f,) = detect_local_pair_runs(sheet, 1, 11, 0, 2, ["Group A"])
     assert (f["col_a"], f["col_b"]) == ("Group A", "")
+    (f,) = detect_local_pair_runs(sheet, 1, 11, 0, 2, [None, "Group B"])
+    assert (f["col_a"], f["col_b"]) == ("", "Group B")
 
 
 class _Coverage:
@@ -1912,8 +1966,9 @@ def _local_run_finding(orientation, ia, ib, labels, first, a_line, b_line,
 
 # Rows per block the row arm compares. Every pair of rows is a call: a tall block of short rows
 # -- a long table read across -- makes millions of pairs and spends the block's budget, and its
-# time, on them. The row-relation detectors stop at 60 and 400 rows. Past it the row arm is
-# skipped and coverage says so; columns are still compared.
+# time, on them. Past it the row arm is skipped, as `detect_row_relations` skips a block past 60
+# rows, but coverage says so -- when the block has at least two rows a row could be compared on;
+# columns are still compared.
 _LOCAL_RUN_MAX_ROWS = int(os.environ.get("PAPERCONAN_LOCAL_RUN_MAX_ROWS", "400"))
 
 
@@ -1926,10 +1981,11 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
     to part of a line has the same shape. `already` holds (orientation, lower index,
     higher index) pairs, in sheet coordinates, that the whole-line detectors reported in
     this block. `panels` is the sheet's other blocks when this one is the whole-sheet
-    extent: a pair lying together inside one of them was compared there, against its own
-    panel -- here the other panels' cells would only lend it an outside -- so it is
-    skipped. `skip_columns` follows the `wide` flag the column detectors honour, and a
-    block taller than `_LOCAL_RUN_MAX_ROWS` is not compared row by row.
+    extent. A panel holding both lines of a pair compared them over its own span, against
+    its own outside; here those positions are left out, and the pair is read only over what
+    no such panel covers -- where the extent's longer line is the only place the two meet. A
+    pair with nothing left is skipped. `skip_columns` follows the `wide` flag the column
+    detectors honour, and a block taller than `_LOCAL_RUN_MAX_ROWS` is not compared row by row.
 
     `n_tests` counts every pair of usable lines in the orientation, skipped ones too.
     """
@@ -1945,7 +2001,9 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
     arms = ["rows"] if skip_columns else ["cols", "rows"]
     if r1 - r0 > _LOCAL_RUN_MAX_ROWS:
         arms.remove("rows")
-        _note_detector_cap(coverage, "detect_local_pair_runs", "detector_row_limit")
+        rows_with_room = np.isfinite(sheet.numeric[r0:r1, c0:c1]).sum(axis=1) >= _LOCAL_RUN_MIN_FINITE
+        if int(rows_with_room.sum()) >= 2:
+            _note_detector_cap(coverage, "detect_local_pair_runs", "detector_row_limit")
     for orientation in arms:
         if orientation == "cols":
             idxs = list(range(c0, c1))
@@ -1954,37 +2012,46 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
                       else "" for c in idxs}
             first, length = r0, r1 - r0
             usable = [c for c in idxs if _local_line_usable(lines[c])]
-            inside = [(p0, p1) for _, _, p0, p1 in panels]
+            # (span holding the lines, span covered along them) for each panel
+            spans = [((q0, q1), (p0, p1)) for p0, p1, q0, q1 in panels]
         else:
             idxs = list(range(r0, r1))
             lines = {r: sheet.numeric[r, c0:c1].astype(float) for r in idxs}
             labels = {r: _row_label(sheet, r, c0) for r in idxs}
             first, length = c0, c1 - c0
             usable = [r for r in idxs if _local_line_usable(lines[r], labels[r])]
-            inside = [(p0, p1) for p0, p1, _, _ in panels]
+            spans = [((p0, p1), (q0, q1)) for p0, p1, q0, q1 in panels]
         n_tests = max(1, len(usable) * (len(usable) - 1) // 2 * 2 * length)
         quantums = {i: _effective_line_quantums(lines[i]) for i in usable}
         for x, ia in enumerate(usable):
             for ib in usable[x + 1:]:
-                if (orientation, ia, ib) in already or any(p0 <= ia and ib < p1 for p0, p1 in inside):
+                if (orientation, ia, ib) in already:
                     continue
+                a_line, b_line = lines[ia], lines[ib]
+                covered = [cover for (h0, h1), cover in spans if h0 <= ia and ib < h1]
+                if covered:                      # blank what a panel holding both lines covered
+                    keep = np.ones(length, dtype=bool)
+                    for s0, s1 in covered:
+                        keep[max(0, s0 - first):max(0, s1 - first)] = False
+                    if not (keep & np.isfinite(a_line) & np.isfinite(b_line)).any():
+                        continue
+                    a_line, b_line = np.where(keep, a_line, np.nan), np.where(keep, b_line, np.nan)
                 budget[0] -= length              # the scan; the call pays for its runs
                 if budget[0] < 0:
                     return exhausted()
-                hit = _best_local_group(lines[ia], lines[ib], quantums[ia], quantums[ib],
-                                        n_tests, budget)
+                hit = _best_local_group(a_line, b_line, quantums[ia], quantums[ib], n_tests, budget)
                 if budget[0] < 0:                # abandoned part-way
                     return exhausted()
                 if hit is not None:
                     findings.append(_local_run_finding(orientation, ia, ib, labels, first,
-                                                       lines[ia], lines[ib], *hit))
+                                                       a_line, b_line, *hit))
     return findings
 ```
 
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 121 passed.
+Expected: 125 passed.
 
 - [ ] **Step 4b: 预算的“删掉即变红”**
 
@@ -2003,11 +2070,16 @@ Expected: 121 passed.
 | `skip_columns` 时两个方向都不跑 | `test_skip_columns_leaves_only_rows` |
 | `n_tests` 去掉 ×2，或按全部线而不是可用线计 | `test_the_search_penalty_counts_the_pairs_of_usable_lines` |
 | 去掉 `example_cells` 的上限，或 `example_cells_truncated` 恒为 False | `test_example_cells_are_bounded` |
-| 不看 `panels` | `test_on_the_whole_sheet_a_pair_inside_one_panel_is_left_to_that_panel` |
-| 有 `panels` 时跳过所有线对 | `test_on_the_whole_sheet_a_pair_across_panels_is_still_compared` |
+| 不看 `panels`（`if covered:` 改成 `if False:`） | `test_on_the_whole_sheet_a_pair_inside_one_panel_is_left_to_that_panel` |
+| `panels` 不为空就跳过所有线对 | `test_on_the_whole_sheet_a_pair_across_panels_is_still_compared` |
+| 某个面板同时持有两条线就整对跳过，而不是只遮掉它覆盖的位置 | `test_on_the_whole_sheet_a_panel_holding_both_lines_leaves_out_only_its_own_positions`、`test_on_the_whole_sheet_rows_of_two_panels_are_compared_where_no_panel_holds_both` |
+| 行方向按列范围判断持有 | `test_on_the_whole_sheet_rows_of_two_panels_are_compared_where_no_panel_holds_both`、`test_on_the_whole_sheet_panels_that_touch_do_not_hold_each_others_edge_rows` |
+| 持有判断写成 `ib <= h1` | `test_on_the_whole_sheet_panels_that_touch_do_not_hold_each_others_edge_rows` |
+| 行数上限写成 `>=` | `test_a_block_exactly_at_the_row_limit_is_compared_by_rows` |
+| 行上限的登记不看行能否比较 | `test_a_block_taller_than_the_row_limit_is_compared_by_columns_only` |
 | 不看 `_LOCAL_RUN_MAX_ROWS` | `test_a_block_taller_than_the_row_limit_is_compared_by_columns_only` |
 | `already` 里的线对先扣预算再跳过 | `test_a_pair_already_reported_costs_nothing` |
-| 表头比块短时不回退为空标签 | `test_a_header_shorter_than_the_block_leaves_a_label_empty` |
+| 表头比块短时不回退为空标签；表头元素为 None 时写成 'None' | `test_a_header_shorter_than_the_block_leaves_a_label_empty` |
 | `line_length` 只数 A；样本两侧对调 | `test_an_offset_stretch_is_reported_as_one` |
 | 行方向的样本两侧对调 | `test_a_row_pair_away_from_the_corner_points_at_its_own_cells` |
 | rule 里 rows/columns 写反 | `test_a_column_pair_away_from_the_corner_points_at_its_own_cells` |
@@ -2116,7 +2188,7 @@ Expected: `test_a_scan_reports_the_stretch_in_the_relations_group` 与 `test_a_s
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 124 passed.
+Expected: 128 passed.
 
 - [ ] **Step 5: 跑全套测试，看有没有别处被带动**
 
@@ -2246,7 +2318,7 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
 - [ ] **Step 6: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 128 passed.
+Expected: 132 passed.
 
 - [ ] **Step 7: 提交**
 
