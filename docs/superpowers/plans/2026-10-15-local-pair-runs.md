@@ -259,7 +259,7 @@ def _effective_line_quantums(values):
 
 ```python
 from paperconan._audit import (
-    _best_local_group, _edge_steps, _effective_line_quantums, _effective_row_quantums,
+    _LOCAL_RUN_DEPARTURE_CAP, _best_local_group, _edge_steps, _effective_line_quantums, _effective_row_quantums,
     _group_constant_runs, _identity_steps, _local_group_bits, _local_line_usable, _outside_departure,
     _ratio_prediction_bits, _scan_interval_runs, _segments, _symmetric_offset_interval,
     _symmetric_ratio_interval, _zero_source_miss, detect_local_pair_runs,
@@ -657,7 +657,7 @@ git commit -m "feat(detect): gather the stretches one constant accounts for"
 - Modify: `src/paperconan/_audit.py`
 - Modify: `tests/test_local_pair_runs.py`
 
-- [ ] **Step 1: 写测试**（导入行加入 `_edge_steps, _identity_steps, _local_line_usable, _outside_departure`）
+- [ ] **Step 1: 写测试**（导入行加入 `_LOCAL_RUN_DEPARTURE_CAP, _edge_steps, _identity_steps, _local_line_usable, _outside_departure`）
 
 ```python
 # --- outside departure ---------------------------------------------------------------------
@@ -706,11 +706,63 @@ def test_outside_departure_reads_its_scale_from_cells_that_confirm_something():
     assert _outside_departure(a, b, q, q, group, spans, "ratio") == pytest.approx((1.25 / 0.55 - 2.0) * 0.5 / 30.0)
 
 
+def test_outside_departure_is_the_median_of_the_outside_not_its_mean():
+    a, b = _arr([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), _arr([4.0, 5.0, 6.0, 7.5, 7.6, 20.0])
+    q = [0.1] * 6
+    spans = [_symmetric_offset_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 2.9, "hi": 3.1, "positions": [0, 1, 2]}
+    # gaps 0.4, 0.3 and 10.9 over |c|: the median is the first, the mean far above it
+    assert _outside_departure(a, b, q, q, group, spans, "offset") == pytest.approx(0.4 / 3.0)
+
+
+def test_outside_departure_is_capped_when_the_lines_scale_is_zero():
+    a = _arr([10.0, 20.0, 30.0, 11.0, 12.0, 13.0, 14.0])
+    b = _arr([20.0, 40.0, 60.0, 0.0, 0.0, 0.0, 0.0])
+    q = [0.1] * 7
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2]}
+    assert _outside_departure(a, b, q, q, group, spans, "ratio") == _LOCAL_RUN_DEPARTURE_CAP
+
+
+def test_outside_departure_refuses_a_constant_of_zero():
+    a, b = _arr([10.0, 20.0, 30.0, 5.0]), _arr([0.0, 0.0, 0.0, 13.0])
+    q = [0.1] * 4
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": -0.001, "hi": 0.001, "positions": [0, 1, 2]}
+    assert _outside_departure(a, b, q, q, group, spans, "ratio") is None
+
+
+@pytest.mark.parametrize("relation", ["ratio", "offset"])
+@pytest.mark.parametrize("blank", ["a", "b"])
+def test_a_cell_blank_on_one_side_is_neither_a_departure_nor_an_edge(relation, blank):
+    a = [10.0, 20.0, 30.0, 40.0, 5.0]
+    b = [20.0, 40.0, 60.0, 80.0, 13.0] if relation == "ratio" else [20.0, 30.0, 40.0, 50.0, 13.0]
+    (a if blank == "a" else b)[3] = math.nan
+    a, b = _arr(a), _arr(b)
+    q_a = [0.1 if math.isfinite(x) else math.nan for x in a]
+    q_b = [0.1 if math.isfinite(x) else math.nan for x in b]
+    interval = _symmetric_ratio_interval if relation == "ratio" else _symmetric_offset_interval
+    spans = [interval(x, y, s, t) for x, y, s, t in zip(a, b, q_a, q_b)]
+    lo, hi = (1.99, 2.01) if relation == "ratio" else (9.9, 10.1)
+    group = {"lo": lo, "hi": hi, "positions": [0, 1, 2], "segments": [[0, 2]]}
+    # the edge is read past the half-blank cell, at (5, 13)
+    want = (12.95 / 5.05 - 2.0) * 5.0 / 0.1 if relation == "ratio" else (10.0 - 8.1) / 0.1
+    assert _edge_steps(a, b, q_a, q_b, group, spans, relation) == pytest.approx([want])
+    # with (5, 13) in the group, the half-blank cell is all that lies outside: nothing to measure
+    group = {"lo": lo, "hi": hi, "positions": [0, 1, 2, 4], "segments": [[0, 2], [4, 4]]}
+    assert _outside_departure(a, b, q_a, q_b, group, spans, relation) is None
+
+
+@pytest.mark.filterwarnings("error")
+def test_identity_steps_with_no_informative_cell_refuse_nothing():
+    assert _identity_steps([(-math.inf, math.inf)] * 3, [], 2.0, "ratio") == math.inf
+
+
 def test_identity_steps_are_read_in_the_groups_half_widths():
     spans = [(1.9, 2.1), (1.8, 2.2), (1.95, 2.05), (-math.inf, math.inf)]
     # half-widths 0.1, 0.2 and 0.05 over the informative cells: a median of 0.1
     assert _identity_steps(spans, [0, 1, 2], 2.0, "ratio") == pytest.approx(10.0)
-    assert _identity_steps(spans, [0, 1, 2], 0.5, "offset") == pytest.approx(5.0)
+    assert _identity_steps(spans, [0, 1, 2], 0.3, "offset") == pytest.approx(3.0)        # counted from 0, not 1
 
 
 def test_edge_steps_count_a_ratio_gap_in_the_targets_steps():
@@ -749,11 +801,51 @@ def test_edge_steps_walk_past_a_cell_that_confirms_nothing():
     assert _edge_steps(a, b, q, q, group, spans, "ratio") == pytest.approx([(12.95 / 5.05 - 2.0) * 5.0 / 0.1])
 
 
+def test_edge_steps_read_the_segment_with_the_most_informative_cells():
+    a = _arr([10.0, 0.0, 0.0, 0.0, 20.0, 30.0, 5.0, 7.0, 11.0, 12.0, 13.0, 14.0, 9.0])
+    b = _arr([20.0, 0.0, 0.0, 0.0, 40.0, 60.0, 13.0, 30.0, 22.0, 24.0, 26.0, 28.0, 40.0])
+    q = [0.1] * 13
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2, 3, 4, 5, 8, 9, 10, 11],
+             "segments": [[0, 5], [8, 11]]}
+    # [0, 5] spans six positions but informs at three; [8, 11] informs at four: its edges are judged
+    assert _edge_steps(a, b, q, q, group, spans, "ratio") == pytest.approx(
+        [(29.95 / 7.05 - 2.0) * 7.0 / 0.1, (39.95 / 9.05 - 2.0) * 9.0 / 0.1])
+
+
+def test_edge_steps_take_the_earlier_of_two_equally_long_segments():
+    a = _arr([10.0, 20.0, 30.0, 5.0, 8.0, 7.0, 11.0, 12.0, 13.0, 9.0])
+    b = _arr([20.0, 40.0, 60.0, 13.0, 3.0, 30.0, 22.0, 24.0, 26.0, 40.0])
+    q = [0.1] * 10
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2, 6, 7, 8], "segments": [[0, 2], [6, 8]]}
+    assert _edge_steps(a, b, q, q, group, spans, "ratio") == pytest.approx([(12.95 / 5.05 - 2.0) * 5.0 / 0.1])
+
+
+def test_edge_steps_count_a_zero_source_in_the_targets_steps():
+    a, b = _arr([3.42, 1.87, 2.95, 0.0]), _arr([8.6, 4.7, 7.4, 0.3])
+    q_a, q_b = [0.01] * 4, [0.1] * 4
+    spans = [_symmetric_ratio_interval(x, y, s, t) for x, y, s, t in zip(a, b, q_a, q_b)]
+    group = {"lo": 2.49, "hi": 2.51, "positions": [0, 1, 2], "segments": [[0, 2]]}
+    # B's box starts at 0.25; k = 2.5 writes 0 +/- 0.005 as at most 0.0125: a miss of 0.2375, in B's steps
+    assert _edge_steps(a, b, q_a, q_b, group, spans, "ratio") == pytest.approx([0.2375 / 0.1])
+
+
 def test_a_line_is_usable_with_enough_cells_and_no_axis_shape():
     assert _local_line_usable(_arr([1.2, 3.4, math.nan, 2.7, 5.1]))
     assert not _local_line_usable(_arr([1.2, 3.4, math.nan, 2.7]))           # three finite cells
     assert not _local_line_usable(_arr([1.2, 3.4, 2.7, 5.1]), "Time (h)")      # an axis by its label
     assert not _local_line_usable(_arr([0.5, 1.0, math.nan, 1.5, 2.0]))       # a dose or time grid
+
+
+def test_a_line_that_is_itself_a_grid_within_rounding_is_not_compared():
+    assert not _local_line_usable(_arr([0.1, 0.2, 0.3, 0.4, 0.5]))                         # float error in a typed grid
+    assert not _local_line_usable(_arr([round(i / 3, 2) for i in range(1, 9)]))           # thirds, at 2 dp
+    assert not _local_line_usable(_arr([0.0, 1.0, 2.0, 3.0]))                              # a time axis from 0
+    assert not _local_line_usable(_arr([100 / 2 ** i for i in range(8)] + [0.0]))          # a dilution and its vehicle
+    assert not _local_line_usable(_arr([float(f"{50 / 3 ** i:.3g}") for i in range(7)]))   # 3-fold, at 3 figures
+    assert not _local_line_usable(_arr([4.2] * 6))                                        # a constant line
+    assert _local_line_usable(_arr([10.01, 11.02, 12.08, 13.01, 14.02]))                  # off any grid by more than rounding
 ```
 
 - [ ] **Step 2: 运行，确认失败**
@@ -761,7 +853,7 @@ def test_a_line_is_usable_with_enough_cells_and_no_axis_shape():
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
 Expected: ImportError。
 
-- [ ] **Step 3: 实现**（四个函数一起加入，各有直接测试）
+- [ ] **Step 3: 实现**（五个函数一起加入，各有直接测试）
 
 ```python
 def _outside_departure(a_line, b_line, q_a, q_b, group, spans, relation):
@@ -772,12 +864,16 @@ def _outside_departure(a_line, b_line, q_a, q_b, group, spans, relation):
     Ratio: that gap as an amount of B (gap * |a|) over the line's median |b| -- measured
     against the line's scale, not the cell's, so additive noise on a near-zero cell is
     not read as a departure (curve families leak through their smallest cell otherwise).
-    Offset: the gap over |c|. A source read as zero (no interval) departs by what the constant
-    falls short of writing it (`_zero_source_miss`), over the same scale. A cell that confirms
-    nothing neither counts as a departure nor sets that median: zeros against zeros filling
-    most of a line would otherwise make the scale 0. Departures are capped at
-    `_LOCAL_RUN_DEPARTURE_CAP`. None when nothing outside the group can be measured: the
-    relation covers the whole line, or what lies outside confirms nothing.
+    Offset: the gap over |c|. A source read as zero (no interval; ratio arm only, since offset
+    intervals always exist) departs by what the constant falls short of writing it
+    (`_zero_source_miss`), over the line's median |b|. A cell that confirms nothing neither
+    counts as a departure nor sets that median: zeros against zeros filling most of a line
+    would otherwise make it 0. When the median is 0 all the same -- B zero against non-zero A
+    across most of the line -- every ratio departure is recorded at the cap. Departures are
+    capped at `_LOCAL_RUN_DEPARTURE_CAP`. None when nothing outside the group can be
+    measured -- the relation covers the whole line, or what lies outside confirms nothing --
+    and for a constant of 0 or one that is not finite: a stretch of zeros in B is not a
+    ratio this pass looks for, and an offset of 0 is the identity.
     """
     k = (group["lo"] + group["hi"]) / 2.0
     if k == 0.0 or not math.isfinite(k):
@@ -813,7 +909,10 @@ def _outside_departure(a_line, b_line, q_a, q_b, group, spans, relation):
 def _identity_steps(spans, informative, constant, relation):
     """How many rounding steps the constant lies from the identity -- 1 for a ratio, 0 for an
     offset -- measured in the half-width of the group's own intervals (their median over the
-    informative cells). Read off the intervals, so no cell value is divided by."""
+    informative cells). Read off the intervals, so no cell value is divided by. With no
+    informative cell there is no width to count in, and the constant is not refused here."""
+    if not informative:
+        return math.inf
     half = float(np.median([(spans[i][1] - spans[i][0]) / 2.0 for i in informative]))
     identity = 1.0 if relation == "ratio" else 0.0
     return abs(constant - identity) / half if half > 0 else math.inf
@@ -823,11 +922,14 @@ def _edge_steps(a_line, b_line, q_a, q_b, group, spans, relation):
     """Departure, in the cell's own rounding steps and beyond rounding, of the first cell
     past each end of the group's longest segment -- walking outward over blank cells (a
     panel separator), cells that confirm nothing and the group's own positions, so the cell
-    judged is the data that actually adjoins the stretch. [] when nothing lies outside on
-    either side. A source read as zero counts by what the constant falls short of writing
-    it, in B's steps."""
-    start, end = max(group["segments"], key=lambda se: (se[1] - se[0], -se[0]))
+    judged is the data that actually adjoins the stretch. The longest segment is the one the
+    contiguity test calls longest, by informative cells; of two equally long, the earlier.
+    [] when nothing lies outside on either side. A source read as zero counts by what the
+    constant falls short of writing it, in B's steps."""
     inside = set(group["positions"])
+    informing = {i for i in inside if spans[i] is not None and not _confirms_nothing(spans[i])}
+    start, end = max(group["segments"],
+                     key=lambda se: (sum(i in informing for i in range(se[0], se[1] + 1)), -se[0]))
     k = (group["lo"] + group["hi"]) / 2.0
     out = []
     for i, stride in ((start - 1, -1), (end + 1, 1)):
@@ -851,24 +953,44 @@ def _edge_steps(a_line, b_line, q_a, q_b, group, spans, relation):
     return out
 
 
+def _line_is_grid(values):
+    """Does one difference, or one ratio, write every step of the line within its rounding --
+    a time or dose axis, a dilution series, or a constant line? Zeros are left out of the
+    ratio reading: a dilution series ends in its vehicle at 0."""
+    cells = [(float(v), q) for v, q in zip(values, _effective_line_quantums(values))
+             if math.isfinite(float(v))]
+    for interval, line in ((_symmetric_offset_interval, cells),
+                           (_symmetric_ratio_interval, [c for c in cells if c[0] != 0.0])):
+        if len(line) < _LOCAL_RUN_MIN_FINITE:
+            continue
+        lo, hi = -math.inf, math.inf
+        for (x, q_x), (y, q_y) in zip(line, line[1:]):
+            span = interval(x, y, q_x, q_y)
+            if span is None:
+                break
+            lo, hi = max(lo, span[0]), min(hi, span[1])
+            if lo > hi:
+                break
+        else:
+            return True
+    return False
+
+
 def _local_line_usable(values, label=None):
     """Enough finite cells for a stretch and an outside, not an axis by its row label, and
-    not itself an arithmetic progression (a time or dose grid)."""
+    not itself a grid (`_line_is_grid`)."""
     finite = values[np.isfinite(values)]
     if finite.size < _LOCAL_RUN_MIN_FINITE:
         return False
     if label and _AXIS_CONTEXT_LABEL_RE.search(label):
         return False
-    steps = np.diff(finite)
-    if steps[0] != 0.0 and np.allclose(steps, steps[0], rtol=1e-9, atol=0.0):
-        return False
-    return True
+    return not _line_is_grid(values)
 ```
 
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 41 passed.
+Expected: 53 passed.
 
 - [ ] **Step 4b: 逐条核对“删掉即变红”**
 
@@ -888,7 +1010,18 @@ Expected: 41 passed.
 | `_edge_steps`：向外走时不跳过组内位置 | `test_edge_steps_walk_past_a_blank_and_the_groups_own_positions` |
 | `_edge_steps`：向外走时不跳过空格 | `test_edge_steps_walk_past_a_blank_and_the_groups_own_positions` |
 | `_edge_steps`：向外走时不跳过不提供信息的格 | `test_edge_steps_walk_past_a_cell_that_confirms_nothing` |
-| `_local_line_usable`：三条规则各关掉一次 | `test_a_line_is_usable_with_enough_cells_and_no_axis_shape` |
+| `_local_line_usable`：最少有限格数、行标签两条规则各关掉一次 | `test_a_line_is_usable_with_enough_cells_and_no_axis_shape` |
+| `_local_line_usable`：不问 `_line_is_grid` | `test_a_line_that_is_itself_a_grid_within_rounding_is_not_compared` |
+| `_line_is_grid`：去掉差值或比例的读法之一；比例读法不去 0；差值读法也去 0 | `test_a_line_that_is_itself_a_grid_within_rounding_is_not_compared` |
+| `_outside_departure`：只查 a 是否有值 | `test_a_cell_blank_on_one_side_is_neither_a_departure_nor_an_edge` |
+| `_outside_departure`：中位数换成均值 | `test_outside_departure_is_the_median_of_the_outside_not_its_mean` |
+| `_outside_departure`：尺度为 0 时记 0 而不记上限 | `test_outside_departure_is_capped_when_the_lines_scale_is_zero` |
+| `_outside_departure`：去掉 `k == 0` 的拒绝 | `test_outside_departure_refuses_a_constant_of_zero` |
+| `_identity_steps`：差值也从 1 算起 | `test_identity_steps_are_read_in_the_groups_half_widths` |
+| `_identity_steps`：去掉空输入的判断（numpy 警告当作错误） | `test_identity_steps_with_no_informative_cell_refuse_nothing` |
+| `_edge_steps`：按跨度而不按有信息的格数选最长一段；取最短一段；并列取靠后的 | `test_edge_steps_read_the_segment_with_the_most_informative_cells`、`test_edge_steps_take_the_earlier_of_two_equally_long_segments` |
+| `_edge_steps`：向外走时只查 a（或只查 b）是否有值 | `test_a_cell_blank_on_one_side_is_neither_a_departure_nor_an_edge` |
+| `_edge_steps`：源读作 0 的格按 A 的步长计 | `test_edge_steps_count_a_zero_source_in_the_targets_steps` |
 
 - [ ] **Step 5: 提交**
 
@@ -1245,7 +1378,7 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 72 passed.
+Expected: 84 passed.
 
 - [ ] **Step 5: 逐条核对“关掉即变红”**
 
@@ -1279,6 +1412,7 @@ Expected: 六行都是 `1 failed`。任何一行 `1 passed`，说明那条测试
 | `_local_group_bits`：只取一侧，或取较大的一侧 | `test_a_groups_bits_are_those_of_its_less_precise_side` |
 | 分组前不扣预算，或扣不起时不放弃 | `test_a_pair_pays_a_pass_over_the_line_for_each_run_before_grouping` |
 | 分组之后才按组数扣预算 | `test_a_pair_that_cannot_pay_for_its_runs_is_abandoned_before_grouping` |
+| `_identity_steps` 传入组内全部位置，而不是有信息的格 | `test_a_source_read_as_zero_inside_a_stretch_joins_it_when_the_constant_writes_it` |
 | 预算恰好用到 0 就放弃（`<= 0`） | Task 6 的 `test_a_pair_that_spends_the_budget_exactly_keeps_its_finding` |
 
 - [ ] **Step 6: 提交**
@@ -1488,7 +1622,7 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 80 passed.
+Expected: 92 passed.
 
 - [ ] **Step 4b: 预算的“删掉即变红”**
 
@@ -1567,7 +1701,7 @@ Expected: FAIL，`assert len(found) == 1`（0 条：块循环还没调用新检�
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 81 passed.
+Expected: 93 passed.
 
 - [ ] **Step 5: 跑全套测试，看有没有别处被带动**
 
@@ -1697,7 +1831,7 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
 - [ ] **Step 6: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 85 passed.
+Expected: 97 passed.
 
 - [ ] **Step 7: 提交**
 
@@ -1729,6 +1863,9 @@ imported rather than copied so the three benches stay about the same data -- plu
                each a smooth curve with noise. Each moves little from one cell to the next,
                so a constant fits a few neighbouring cells by coincidence; scored against the
                whole line's range such a stretch once read as significant.
+  DOSE         two dilution series with different top concentrations, one ending in its
+               vehicle at 0 where the other has one dilution more: a whole-line ratio whose
+               last cell departs. Each line is itself a grid, which is what keeps it out.
   DECAY        two proportional decays with a near-zero tail: a whole-line relation that
                locality should refuse, but the tail makes the line's median |b| -- the scale
                the ratio arm reads departures against -- small. Frozen as measured.
@@ -1816,6 +1953,25 @@ def _measure_monotone(shape, n, decimals):
     rng = random.Random(SEED * 19 + n * 109 + decimals * 7 + (shape == "smooth"))
     return CP._verdict(_local(_pair_sheet(*_monotone_pair(rng, shape, n, decimals)))
                        for _ in range(REPEATS))
+
+
+# --- benign: two dilution series ---------------------------------------------------------------
+
+DOSES = ((2, 0), (2, 3), (3, 0), (3, 3))          # (fold, significant figures; 0 = as computed)
+
+
+def _dose_pair(rng, fold, figures):
+    def series(top, n):
+        values = [top / fold ** i for i in range(n)]
+        return [float(f"{v:.{figures}g}") for v in values] if figures else values
+    top = round(rng.uniform(5.0, 100.0), 1)
+    return series(top, 9), series(top * rng.choice((0.2, 0.25, 0.5, 2.0, 3.0, 4.0)), 8) + [0.0]
+
+
+@functools.lru_cache(maxsize=None)
+def _measure_doses(fold, figures):
+    rng = random.Random(SEED * 31 + fold * 131 + figures)
+    return CP._verdict(_local(_pair_sheet(*_dose_pair(rng, fold, figures))) for _ in range(REPEATS))
 
 
 # --- benign: two proportional decays with a near-zero tail ------------------------------------
@@ -2029,6 +2185,13 @@ MONOTONE_BASELINE = {
     ('smooth', 100, 3): ('silent', {}),
 }
 
+DOSE_BASELINE = {
+    (2, 0): ('silent', {}),
+    (2, 3): ('silent', {}),
+    (3, 0): ('silent', {}),
+    (3, 3): ('silent', {}),
+}
+
 DECAY_BASELINE = {
     (24, 2.0, 0.02, 2): ('silent', {}),
     (30, 3.0, 0.002, 3): ('silent', {}),
@@ -2104,6 +2267,7 @@ def _tables():
         "CURVE_BASELINE": {(lay, d): _measure_curves(lay, d) for lay, d in CV._STRATA},
         "COLUMN_BASELINE": {(f, d): _measure_column_family(f, d) for f in sorted(CP.BENIGN) for d in CP.SIG_FIGURES},
         "MONOTONE_BASELINE": {m: _measure_monotone(*m) for m in MONOTONE},
+        "DOSE_BASELINE": {d: _measure_doses(*d) for d in DOSES},
         "DECAY_BASELINE": {d: _measure_decays(*d) for d in DECAYS},
         "KNOWN_COST_BASELINE": {(d, s): _measure_known_cost(d, s) for d in CP.SIG_FIGURES for s in SEGMENTS},
         "PLANTED_COLUMNS_BASELINE": {(r, d, s): _measure_planted_columns(r, d, s)
@@ -2137,6 +2301,11 @@ def test_independent_monotone_lines_hold_their_frozen_verdict(stratum):
     _check(MONOTONE_BASELINE, _measure_monotone, stratum, "local runs on two independent monotone lines")
 
 
+@pytest.mark.parametrize("stratum", sorted(DOSE_BASELINE))
+def test_dilution_series_hold_their_frozen_verdict(stratum):
+    _check(DOSE_BASELINE, _measure_doses, stratum, "local runs on two dilution series")
+
+
 @pytest.mark.parametrize("stratum", sorted(DECAY_BASELINE))
 def test_proportional_decays_hold_their_frozen_verdict(stratum):
     _check(DECAY_BASELINE, _measure_decays, stratum, "local runs on two proportional decays")
@@ -2167,6 +2336,7 @@ def test_every_stratum_the_generators_define_is_frozen():
     assert set(CURVE_BASELINE) == set(CV._STRATA)
     assert set(COLUMN_BASELINE) == {(f, d) for f in CP.BENIGN for d in CP.SIG_FIGURES}
     assert set(MONOTONE_BASELINE) == set(MONOTONE)
+    assert set(DOSE_BASELINE) == set(DOSES)
     assert set(DECAY_BASELINE) == set(DECAYS)
     assert set(PLANTED_MONOTONE_BASELINE) == set(PLANTED_MONOTONE)
     assert set(KNOWN_COST_BASELINE) == {(d, s) for d in CP.SIG_FIGURES for s in SEGMENTS}
@@ -2195,7 +2365,7 @@ if __name__ == "__main__":
 - [ ] **Step 2: 运行**
 
 Run: `.venv/bin/python -m pytest tests/test_local_run_bench_baseline.py -q`
-Expected: 147 passed（约 15 秒）。若有档位不同，说明实现与本计划有出入：先找出出入在哪里，确认是有意的，再用 `python -m tests.test_local_run_bench_baseline` 重新生成表并粘贴，提交信息里写明哪一层、往哪个方向变了、为什么。
+Expected: 151 passed（约 15 秒）。若有档位不同，说明实现与本计划有出入：先找出出入在哪里，确认是有意的，再用 `python -m tests.test_local_run_bench_baseline` 重新生成表并粘贴，提交信息里写明哪一层、往哪个方向变了、为什么。
 
 - [ ] **Step 3: 核对台架有牙齿**
 
