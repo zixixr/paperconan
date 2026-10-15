@@ -4864,6 +4864,16 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
     return None if best is None else best[1:]
 
 
+def _stretch_text(segments, shown=4):
+    """Where a stretch lies, for the rule: its runs of two or more positions (at most `shown`)
+    and a count of the lone positions the constant also writes."""
+    runs = [f"{s}-{e}" for s, e in segments if e > s]
+    lone = [str(s) for s, e in segments if e == s]
+    listed = runs or lone
+    text = ", ".join(listed[:shown]) + (f" and {len(listed) - shown} more" if len(listed) > shown else "")
+    return text + (f" (+{len(lone)} scattered)" if runs and lone else "")
+
+
 def _local_run_finding(orientation, ia, ib, labels, first, a_line, b_line,
                        relation, group, bits, departure):
     positions = group["positions"]
@@ -4875,12 +4885,13 @@ def _local_run_finding(orientation, ia, ib, labels, first, a_line, b_line,
         cells = [[first + p + 1, i + 1] for p in shown for i in (ia, ib)]
         pair = dict(col_a=labels[ia], col_b=labels[ib], col_a_idx=ia, col_b_idx=ib,
                     col_a_sample=_sample(a_line[positions]), col_b_sample=_sample(b_line[positions]))
-        where = "rows"
+        # the block-relation group's own naming: col[N] 0-based, row[N] 1-based
+        names, where = (f"col[{ia}]", f"col[{ib}]"), "rows"
     else:
         cells = [[i + 1, first + p + 1] for p in shown for i in (ia, ib)]
         pair = dict(row_a=labels[ia], row_b=labels[ib], row_a_idx=ia, row_b_idx=ib,
                     row_a_sample=_sample(a_line[positions]), row_b_sample=_sample(b_line[positions]))
-        where = "columns"
+        names, where = (f"row[{ia + 1}]", f"row[{ib + 1}]"), "columns"
     if relation == "ratio":
         kind = "local_ratio_run"
         op = "*"
@@ -4889,27 +4900,39 @@ def _local_run_finding(orientation, ia, ib, labels, first, a_line, b_line,
         kind = "local_offset_run"
         op = "+"
         constant = dict(offset=value, offset_lo=group["lo"], offset_hi=group["hi"])
-    stretch = ", ".join(f"{s}-{e}" if s != e else f"{s}" for s, e in segments)
     return dict(
         kind=kind, orientation=orientation, **pair, **constant,
         segments=segments, run_length=len(positions), n=len(group["informative"]), line_length=paired,
         outside_departure=round(departure, 6), prediction_bits=round(bits, 2),
         example_cells=cells, example_cells_truncated=len(shown) < len(positions),
         severity="high",
-        rule=(f"{labels[ib]} = {labels[ia]} {op} {value:.6g} on {where} {stretch} "
-              f"({len(positions)} of {paired}); elsewhere on the line it departs by a "
-              f"median {departure:.1%} beyond rounding"))
+        # nothing here that depends on the block's extent: the same stretch read from an
+        # overlapping block must give the same rule, which is what de-duplication compares
+        rule=f"{names[1]} = {names[0]} {op} {value:.6g} on {where} {_stretch_text(segments)}")
+
+
+# Rows per block the row arm compares. Every pair of rows is a call: a tall block of short rows
+# -- a long table read across -- makes millions of pairs and spends the block's budget, and its
+# time, on them. The row-relation detectors stop at 60 and 400 rows. Past it the row arm is
+# skipped and coverage says so; columns are still compared.
+_LOCAL_RUN_MAX_ROWS = int(os.environ.get("PAPERCONAN_LOCAL_RUN_MAX_ROWS", "400"))
 
 
 def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
-                           coverage=None, skip_columns=False):
+                           coverage=None, skip_columns=False, panels=()):
     """Two rows or two columns of one block related as B = k*A or B = A + c over part of
     the line only. docs/superpowers/specs/2026-10-15-local-pair-runs-design.md.
 
     Signal, not verdict: a normalisation, a unit conversion or a shared control applied
-    to part of a line has the same shape. `already` holds (orientation, a, b) pairs the
-    whole-line detectors reported in this block; `skip_columns` follows the `wide` flag
-    the column detectors honour.
+    to part of a line has the same shape. `already` holds (orientation, lower index,
+    higher index) pairs, in sheet coordinates, that the whole-line detectors reported in
+    this block. `panels` is the sheet's other blocks when this one is the whole-sheet
+    extent: a pair lying together inside one of them was compared there, against its own
+    panel -- here the other panels' cells would only lend it an outside -- so it is
+    skipped. `skip_columns` follows the `wide` flag the column detectors honour, and a
+    block taller than `_LOCAL_RUN_MAX_ROWS` is not compared row by row.
+
+    `n_tests` counts every pair of usable lines in the orientation, skipped ones too.
     """
     findings = []
     budget = [_LOCAL_RUN_BUDGET]
@@ -4920,29 +4943,35 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
         _note_detector_cap(coverage, "detect_local_pair_runs", "detector_compute_budget_limit")
         return findings
 
-    for orientation in (("rows",) if skip_columns else ("cols", "rows")):
+    arms = ["rows"] if skip_columns else ["cols", "rows"]
+    if r1 - r0 > _LOCAL_RUN_MAX_ROWS:
+        arms.remove("rows")
+        _note_detector_cap(coverage, "detect_local_pair_runs", "detector_row_limit")
+    for orientation in arms:
         if orientation == "cols":
             idxs = list(range(c0, c1))
             lines = {c: sheet.numeric[r0:r1, c].astype(float) for c in idxs}
-            labels = {c: str(header[c - c0]) if header[c - c0] not in (None, "") else f"col {c + 1}"
-                      for c in idxs}
+            labels = {c: str(header[c - c0]) if c - c0 < len(header) and header[c - c0] is not None
+                      else "" for c in idxs}
             first, length = r0, r1 - r0
             usable = [c for c in idxs if _local_line_usable(lines[c])]
+            inside = [(p0, p1) for _, _, p0, p1 in panels]
         else:
             idxs = list(range(r0, r1))
             lines = {r: sheet.numeric[r, c0:c1].astype(float) for r in idxs}
             labels = {r: _row_label(sheet, r, c0) for r in idxs}
             first, length = c0, c1 - c0
             usable = [r for r in idxs if _local_line_usable(lines[r], labels[r])]
+            inside = [(p0, p1) for p0, p1, _, _ in panels]
         n_tests = max(1, len(usable) * (len(usable) - 1) // 2 * 2 * length)
         quantums = {i: _effective_line_quantums(lines[i]) for i in usable}
         for x, ia in enumerate(usable):
             for ib in usable[x + 1:]:
+                if (orientation, ia, ib) in already or any(p0 <= ia and ib < p1 for p0, p1 in inside):
+                    continue
                 budget[0] -= length              # the scan; the call pays for its runs
                 if budget[0] < 0:
                     return exhausted()
-                if (orientation, ia, ib) in already:
-                    continue
                 hit = _best_local_group(lines[ia], lines[ib], quantums[ia], quantums[ib],
                                         n_tests, budget)
                 if budget[0] < 0:                # abandoned part-way

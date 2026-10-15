@@ -8,10 +8,10 @@ import pytest
 
 from paperconan._sheet import Sheet
 from paperconan._audit import (
-    _LOCAL_RUN_DEPARTURE_CAP, _best_local_group, _edge_steps, _effective_line_quantums,
-    _effective_row_quantums, _group_constant_runs, _identity_steps, _local_group_bits,
-    _local_line_usable, _outside_departure, _ratio_prediction_bits,
-    _scan_interval_runs, _segments,
+    _LOCAL_RUN_DEPARTURE_CAP, _LOCAL_RUN_MAX_EXAMPLE_POSITIONS, _best_local_group, _edge_steps,
+    _effective_line_quantums, _effective_row_quantums, _group_constant_runs, _identity_steps,
+    _local_group_bits, _local_line_usable, _outside_departure, _ratio_prediction_bits,
+    _scan_interval_runs, _segments, _stretch_text,
     _symmetric_offset_interval, _symmetric_ratio_interval, _zero_source_miss,
     detect_local_pair_runs,
 )
@@ -807,7 +807,9 @@ def test_detector_reports_a_column_pair_with_its_cells_and_orientation():
     assert f["segments"] == [[2, 7]]                       # sheet rows, 1-based
     assert sorted({r for r, _ in f["example_cells"]}) == [2, 3, 4, 5, 6, 7]
     assert f["n"] == f["run_length"] == 6 and f["line_length"] == 10
-    assert f["severity"] == "high" and "Group B = Group A *" in f["rule"]
+    assert (f["col_a"], f["col_b"]) == ("Group A", "Group B") and f["severity"] == "high"
+    assert f["k_lo"] <= f["k"] <= f["k_hi"] and f["k"] == pytest.approx(1.137, rel=1e-3)
+    assert f["rule"].startswith("col[1] = col[0] * 1.13") and f["rule"].endswith("on rows 2-7")
 
 
 def test_detector_reports_a_row_pair():
@@ -830,6 +832,9 @@ def test_skip_columns_leaves_only_rows():
     b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
     sheet, header = _block([A10, b])
     assert detect_local_pair_runs(sheet, 1, 11, 0, 2, header, skip_columns=True) == []
+    sheet, r0, r1, c0, c1, labels = _row_pair_away_from_the_corner()
+    (f,) = detect_local_pair_runs(sheet, r0, r1, c0, c1, labels, skip_columns=True)
+    assert f["orientation"] == "rows"
 
 
 def test_an_axis_row_is_not_compared():
@@ -845,6 +850,142 @@ def test_a_findings_n_counts_the_cells_the_relation_was_tested_on():
     (finding,) = detect_local_pair_runs(sheet, 1, 14, 0, 2, header)
     # three zeros against zeros sit inside the stretch and confirm nothing
     assert finding["run_length"] == 9 and finding["n"] == 6
+
+
+def _row_pair_away_from_the_corner():
+    """Rows 2 and 3 of a sheet whose data start at column 3, labelled in column 2."""
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    labels = [f"t{j}" for j in range(10)]
+    rows = [[None] * 13, [None, None, None, *labels], [None, None, "ctrl", *A10], [None, None, "drug", *b]]
+    return Sheet.from_rows(rows), 2, 4, 3, 13, labels
+
+
+def _read_back(sheet, finding, a, b):
+    """Every example cell, read off the sheet, is a value of A or B at a position of the stretch."""
+    wanted = {round(v, 9) for v in a + b}
+    return all(round(float(sheet.cell(r - 1, c - 1)), 9) in wanted for r, c in finding["example_cells"])
+
+
+def test_a_column_pair_away_from_the_corner_points_at_its_own_cells():
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    rows = ([[None] * 6 for _ in range(3)] + [[None, None, None, None, "Group A", "Group B"]]
+            + [[None, None, None, None, x, y] for x, y in zip(A10, b)])
+    sheet = Sheet.from_rows(rows)
+    (f,) = detect_local_pair_runs(sheet, 4, 14, 4, 6, ["Group A", "Group B"])
+    assert (f["col_a_idx"], f["col_b_idx"]) == (4, 5) and f["segments"] == [[5, 10]]
+    assert f["rule"].startswith("col[5] = col[4] *") and f["rule"].endswith("on rows 5-10")
+    assert {c for _, c in f["example_cells"]} == {5, 6} and {r for r, _ in f["example_cells"]} == set(range(5, 11))
+    assert _read_back(sheet, f, A10[:6], b[:6])
+
+
+def test_a_row_pair_away_from_the_corner_points_at_its_own_cells():
+    sheet, r0, r1, c0, c1, labels = _row_pair_away_from_the_corner()
+    b = [round(x * 1.137, 3) for x in A10[:6]]
+    (f,) = detect_local_pair_runs(sheet, r0, r1, c0, c1, labels)
+    assert (f["row_a_idx"], f["row_b_idx"]) == (2, 3) and (f["row_a"], f["row_b"]) == ("ctrl", "drug")
+    assert f["segments"] == [[4, 9]]                        # sheet columns, 1-based
+    assert f["rule"].startswith("row[4] = row[3] *") and f["rule"].endswith("on columns 4-9")
+    assert {r for r, _ in f["example_cells"]} == {3, 4} and {c for _, c in f["example_cells"]} == set(range(4, 10))
+    assert _read_back(sheet, f, A10[:6], b)
+
+
+def test_an_offset_stretch_is_reported_as_one():
+    b = [round(x + 3.517, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, math.nan]
+    sheet, header = _block([A10, b])
+    (f,) = detect_local_pair_runs(sheet, 1, 11, 0, 2, header)
+    assert f["line_length"] == 9                           # the blank in B is not part of the pair
+    assert f["kind"] == "local_offset_run" and f["offset_lo"] <= 3.517 <= f["offset_hi"]
+    assert f["rule"].startswith("col[1] = col[0] + 3.517")
+    assert f["col_a_sample"][0] == pytest.approx(A10[0]) and f["col_b_sample"][0] == pytest.approx(b[0])
+
+
+def test_a_pair_already_reported_in_one_orientation_is_compared_in_the_other():
+    sheet, r0, r1, c0, c1, labels = _row_pair_away_from_the_corner()
+    assert len(detect_local_pair_runs(sheet, r0, r1, c0, c1, labels, already={("cols", 2, 3)})) == 1
+
+
+def test_the_search_penalty_counts_the_pairs_of_usable_lines():
+    a, b = A10, [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    alone = _best(a, b, n_tests=1 * 2 * 10)[2]           # one pair, two relations, ten cells
+    sheet, header = _block([a, b])
+    (f,) = detect_local_pair_runs(sheet, 1, 11, 0, 2, header)
+    assert f["prediction_bits"] == round(alone, 2)
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    sheet, header = _block([a, b, c])
+    (f,) = [f for f in detect_local_pair_runs(sheet, 1, 11, 0, 3, header) if (f["col_a_idx"], f["col_b_idx"]) == (0, 1)]
+    assert f["prediction_bits"] == round(alone - math.log2(3), 2)            # three pairs now
+    sheet, header = _block([a, b, [float(i) for i in range(10)]])           # a grid is not compared
+    (f,) = detect_local_pair_runs(sheet, 1, 11, 0, 3, header)
+    assert f["prediction_bits"] == round(alone, 2)
+
+
+def test_example_cells_are_bounded():
+    rng = random.Random(20261022)
+    a = [round(rng.uniform(5.0, 20.0), 3) for _ in range(100)]
+    b = [round(x * 1.137, 3) for x in a[:80]] + [round(rng.uniform(5.0, 20.0), 3) for _ in range(20)]
+    sheet, header = _block([a, b])
+    (f,) = detect_local_pair_runs(sheet, 1, 101, 0, 2, header)
+    assert len(f["example_cells"]) == 2 * _LOCAL_RUN_MAX_EXAMPLE_POSITIONS and f["example_cells_truncated"]
+
+
+def test_on_the_whole_sheet_a_pair_inside_one_panel_is_left_to_that_panel():
+    # two panels stacked in the same columns: B = 1.137 * A over all of the first, unrelated in
+    # the second. Read over the whole sheet the second panel would make the first a stretch.
+    first = [round(x * 1.137, 3) for x in A10]
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    d = [12.6, 5.2, 18.4, 9.9, 14.1, 6.6, 11.3, 16.8, 7.4, 13.5]
+    rows = [["Group A", "Group B"]] + [[x, y] for x, y in zip(A10, first)] + [[None, None]] + [[x, y] for x, y in zip(c, d)]
+    sheet = Sheet.from_rows(rows)
+    panels = [(1, 11, 0, 2), (12, 22, 0, 2)]
+    assert detect_local_pair_runs(sheet, 1, 22, 0, 2, ["Group A", "Group B"]) != []      # the reading this prevents
+    assert detect_local_pair_runs(sheet, 1, 22, 0, 2, ["Group A", "Group B"], panels=panels) == []
+
+
+def test_on_the_whole_sheet_a_pair_across_panels_is_still_compared():
+    # two panels side by side: a stretch of the first panel's column copied into the second's
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    rows = [["Group A", "Group C", None, "Group B", "Group D"]] + [[x, z, None, y, w] for x, y, z, w in zip(A10, b, c, c[::-1])]
+    sheet = Sheet.from_rows(rows)
+    header = ["Group A", "Group C", "", "Group B", "Group D"]
+    found = detect_local_pair_runs(sheet, 1, 11, 0, 5, header, panels=[(1, 11, 0, 2), (1, 11, 3, 5)])
+    assert [(f["col_a_idx"], f["col_b_idx"]) for f in found] == [(0, 3)]
+
+
+def test_a_block_taller_than_the_row_limit_is_compared_by_columns_only(monkeypatch):
+    import paperconan._audit as audit_module
+    monkeypatch.setattr(audit_module, "_LOCAL_RUN_MAX_ROWS", 5)
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    sheet, header = _block([A10, b])
+    cov = _Coverage()
+    (f,) = detect_local_pair_runs(sheet, 1, 11, 0, 2, header, coverage=cov)
+    assert f["orientation"] == "cols"
+    assert [(args[1], kwargs["detector"]) for args, kwargs in cov.calls] == [("detector_row_limit", "detect_local_pair_runs")]
+
+
+def test_a_pair_already_reported_costs_nothing(monkeypatch):
+    import paperconan._audit as audit_module
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    sheet, header = _block([c, A10, b])
+    monkeypatch.setattr(audit_module, "_LOCAL_RUN_BUDGET", 20)     # the one compared pair: its scan and its run
+    cov = _Coverage()
+    found = detect_local_pair_runs(sheet, 1, 11, 0, 3, header, already={("cols", 0, 1), ("cols", 0, 2)}, coverage=cov)
+    assert len(found) == 1 and not cov.calls
+
+
+def test_the_rule_lists_the_runs_and_counts_the_lone_positions():
+    assert _stretch_text([[2, 7]]) == "2-7"
+    assert _stretch_text([[2, 3], [9, 9], [12, 15], [20, 20]]) == "2-3, 12-15 (+2 scattered)"
+    assert _stretch_text([[1, 2], [4, 5], [7, 8], [10, 11], [13, 14]]) == "1-2, 4-5, 7-8, 10-11 and 1 more"
+    assert _stretch_text([[3, 3], [6, 6]]) == "3, 6"
+
+
+def test_a_header_shorter_than_the_block_leaves_a_label_empty():
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    sheet, _header = _block([A10, b])
+    (f,) = detect_local_pair_runs(sheet, 1, 11, 0, 2, ["Group A"])
+    assert (f["col_a"], f["col_b"]) == ("Group A", "")
 
 
 class _Coverage:
