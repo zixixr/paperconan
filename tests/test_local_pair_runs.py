@@ -6,7 +6,10 @@ import numpy as np
 import pytest
 
 from paperconan._sheet import Sheet
-from paperconan._audit import _effective_line_quantums, _effective_row_quantums
+from paperconan._audit import (
+    _effective_line_quantums, _effective_row_quantums,
+    _symmetric_offset_interval, _symmetric_ratio_interval,
+)
 
 A10 = [12.437, 8.912, 15.226, 9.871, 11.054, 13.388, 7.645, 10.902, 14.117, 9.333]
 
@@ -86,3 +89,27 @@ def test_a_line_with_no_non_zero_cell_keeps_the_row_step():
 
 def test_a_blank_cell_does_not_set_a_zeros_step():
     assert _effective_line_quantums([math.nan, 0.0, 234.5678, 45.67891, 56.78912])[1] == pytest.approx(1e-5)
+
+
+# --- intervals ----------------------------------------------------------------------------
+
+def test_symmetric_ratio_interval_spans_both_roundings():
+    lo, hi = _symmetric_ratio_interval(2.0, 3.0, 0.1, 0.1)
+    assert lo == pytest.approx(2.95 / 2.05) and hi == pytest.approx(3.05 / 1.95)
+
+
+def test_symmetric_ratio_interval_with_a_negative_source_is_ordered():
+    lo, hi = _symmetric_ratio_interval(-2.0, 3.0, 0.1, 0.1)
+    assert lo <= hi < 0
+
+
+def test_zero_source_is_uninformative_against_zero_and_unwritable_otherwise():
+    assert _symmetric_ratio_interval(0.0, 0.0, 0.1, 0.1) == (-math.inf, math.inf)
+    assert _symmetric_ratio_interval(0.0, 1.0, 0.1, 0.1) is None
+    assert _symmetric_ratio_interval(math.nan, 1.0, 0.1, 0.1) is None
+
+
+def test_symmetric_offset_interval():
+    lo, hi = _symmetric_offset_interval(2.0, 5.0, 0.1, 0.01)
+    assert lo == pytest.approx(3.0 - 0.055) and hi == pytest.approx(3.0 + 0.055)
+    assert _symmetric_offset_interval(2.0, math.nan, 0.1, 0.1) is None

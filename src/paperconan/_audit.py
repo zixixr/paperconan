@@ -4456,6 +4456,40 @@ def _effective_line_quantums(values):
     return out
 
 
+def _symmetric_ratio_interval(a, b, q_a, q_b):
+    """Which k could have written both cells, when EACH was rounded to its own step?
+
+    `_directed_ratio_interval` takes the source as exact. Two lines rounded separately
+    from one higher-precision original break that: the source's rounding, multiplied
+    by k, can exceed half the target's step. Here both cells admit their rounding
+    interval and k ranges over the ratios of the corners.
+
+    Returns (lo, hi); (-inf, inf) when both cells are indistinguishable from zero --
+    compatible with every k, so it confirms nothing; None when no k writes the pair (a
+    source indistinguishable from zero against a target that is not) or a value is not
+    finite.
+    """
+    av, bv, qa, qb = float(a), float(b), float(q_a), float(q_b)
+    if not all(math.isfinite(x) for x in (av, bv, qa, qb)):
+        return None
+    a_lo, a_hi = av - qa / 2.0, av + qa / 2.0
+    b_lo, b_hi = bv - qb / 2.0, bv + qb / 2.0
+    if a_lo <= 0.0 <= a_hi:
+        return (-math.inf, math.inf) if b_lo <= 0.0 <= b_hi else None
+    corners = (b_lo / a_lo, b_lo / a_hi, b_hi / a_lo, b_hi / a_hi)
+    return (min(corners), max(corners))
+
+
+def _symmetric_offset_interval(a, b, q_a, q_b):
+    """Which c could have written both cells as B = A + c, each rounded to its own step.
+    None when a value is not finite."""
+    av, bv, qa, qb = float(a), float(b), float(q_a), float(q_b)
+    if not all(math.isfinite(x) for x in (av, bv, qa, qb)):
+        return None
+    half = (qa + qb) / 2.0
+    return (bv - av - half, bv - av + half)
+
+
 def _as_rectangular(matrix):
     """A finite 2-D float array, or None. Ragged input is rejected, never raised on.
 
