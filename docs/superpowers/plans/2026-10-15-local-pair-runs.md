@@ -773,9 +773,11 @@ def _outside_departure(a_line, b_line, q_a, q_b, group, spans, relation):
     against the line's scale, not the cell's, so additive noise on a near-zero cell is
     not read as a departure (curve families leak through their smallest cell otherwise).
     Offset: the gap over |c|. A source read as zero (no interval) departs by what the constant
-    falls short of writing it (`_zero_source_miss`), over the same scale. Departures are capped
-    at `_LOCAL_RUN_DEPARTURE_CAP`. None when the line has no finite position outside the
-    group: the relation covers the whole line.
+    falls short of writing it (`_zero_source_miss`), over the same scale. A cell that confirms
+    nothing neither counts as a departure nor sets that median: zeros against zeros filling
+    most of a line would otherwise make the scale 0. Departures are capped at
+    `_LOCAL_RUN_DEPARTURE_CAP`. None when nothing outside the group can be measured: the
+    relation covers the whole line, or what lies outside confirms nothing.
     """
     k = (group["lo"] + group["hi"]) / 2.0
     if k == 0.0 or not math.isfinite(k):
