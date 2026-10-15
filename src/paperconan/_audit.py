@@ -31,7 +31,7 @@ import os
 import re
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from fractions import Fraction
 from pathlib import Path
 
@@ -4373,11 +4373,10 @@ _LOCAL_RUN_MIN_CONTIGUOUS_SHARE = 0.5
 # no copy produced; and a small offset reads as a ratio near 1, so both arms ask it.
 _LOCAL_RUN_MIN_IDENTITY_STEPS = 10
 # A copied stretch ends abruptly. Walking outward from each end of the longest segment, past
-# blank cells and the group's own positions, the first cell with data must depart from the
-# constant by at least this many of its own rounding steps beyond rounding; a side whose
-# first such cell confirms nothing (in the ratio arm, zero against zero) is not judged. A
-# rounding plateau on a smooth trend, and the noise exceptions of a relation holding
-# approximately everywhere, depart by less.
+# blank cells, cells that confirm nothing (in the ratio arm, zero against zero) and the group's
+# own positions, the first cell with data must depart from the constant by at least this many
+# of its own rounding steps beyond rounding. A rounding plateau on a smooth trend, and the
+# noise exceptions of a relation holding approximately everywhere, depart by less.
 _LOCAL_RUN_MIN_EDGE_STEPS = float(os.environ.get("PAPERCONAN_LOCAL_RUN_MIN_EDGE_STEPS", "3"))
 # A line needs the distinct source values a stretch asks for, and one finite cell outside it.
 _LOCAL_RUN_MIN_FINITE = _LOCAL_RUN_MIN_DISTINCT_SOURCE + 1
@@ -4511,46 +4510,66 @@ def _scan_interval_runs(spans, source, min_informative=2, min_distinct_source=No
 
     The run logic of `_scan_quantized_ratio_runs`, taking the intervals ready-made so the
     ratio and the offset arm share it: `None` breaks a run, (-inf, inf) joins one without
-    informing it, a run needs `min_informative` informative cells and
-    `min_distinct_source` distinct source values, and a run inside another is dropped.
-    Returns [{"start", "end", "lo", "hi", "informative"}] in order of start. The distinct-source
-    floor defaults to `_LOCAL_RUN_MIN_DISTINCT_SOURCE`, read at call time.
+    informing it, a run needs `min_informative` informative cells and `min_distinct_source`
+    distinct source values among them (at the default floor of 3 the first never binds), and
+    a run inside another is dropped. Returns [{"start", "end", "lo", "hi"}] in order of start.
+    The distinct-source floor defaults to `_LOCAL_RUN_MIN_DISTINCT_SOURCE`, read at call time.
+
+    Linear in the line's length. What can join a run starting at s can join one starting
+    later, so the run's end only moves forward as its start does: one window slides along the
+    line, its bounds kept by two monotone queues. A run is then inside another exactly when the
+    run one start earlier reaches the same end.
     """
     if min_distinct_source is None:
         min_distinct_source = _LOCAL_RUN_MIN_DISTINCT_SOURCE
+
+    def informing(span):
+        return math.isfinite(span[0]) and math.isfinite(span[1])
+
     n = len(spans)
-    found = []
+    # indices whose lower (upper) bound can still be the window's largest (smallest); on a tie
+    # the earliest leads, as the sequential max/min fold of the older scan keeps it
+    los, his = deque(), deque()
+    values, informative = Counter(), 0
+    end, prev_end, out = -1, None, []
     for start in range(n):
-        lo, hi = -math.inf, math.inf
-        informative, seen = [], set()
-        end = start - 1
-        for j in range(start, n):
-            span = spans[j]
-            if span is None:
+        if start - 1 <= end and start > 0 and spans[start - 1] is not None and informing(spans[start - 1]):
+            informative -= 1
+            v = float(source[start - 1])
+            values[v] -= 1
+            if not values[v]:
+                del values[v]
+        end = max(end, start - 1)
+        for q in (los, his):
+            while q and q[0] < start:
+                q.popleft()
+        while end + 1 < n and spans[end + 1] is not None:
+            lo_j, hi_j = spans[end + 1]
+            lo = spans[los[0]][0] if los else -math.inf
+            hi = spans[his[0]][1] if his else math.inf
+            if max(lo, lo_j) > min(hi, hi_j):
                 break
-            new_lo, new_hi = max(lo, span[0]), min(hi, span[1])
-            if new_lo > new_hi:
-                break
-            lo, hi, end = new_lo, new_hi, j
-            if math.isfinite(span[0]) and math.isfinite(span[1]):
-                informative.append(j)
-                seen.add(float(source[j]))
-        if end < start or len(informative) < min_informative or len(seen) < min_distinct_source:
+            end += 1
+            while los and spans[los[-1]][0] < lo_j:
+                los.pop()
+            los.append(end)
+            while his and spans[his[-1]][1] > hi_j:
+                his.pop()
+            his.append(end)
+            if informing(spans[end]):
+                informative += 1
+                values[float(source[end])] += 1
+        contained, prev_end = prev_end == end, end
+        if end < start or contained or informative < min_informative or len(values) < min_distinct_source:
             continue
-        found.append({"start": start, "end": end, "lo": lo, "hi": hi, "informative": informative})
-    maximal = []
-    for r in found:
-        if any(o is not r and o["start"] <= r["start"] and o["end"] >= r["end"]
-               and (o["start"], o["end"]) != (r["start"], r["end"]) for o in found):
-            continue
-        if any((m["start"], m["end"]) == (r["start"], r["end"]) for m in maximal):
-            continue
-        maximal.append(r)
-    return maximal
+        out.append({"start": start, "end": end,
+                    "lo": spans[los[0]][0] if los else -math.inf,
+                    "hi": spans[his[0]][1] if his else math.inf})
+    return out
 
 
 def _segments(positions):
-    """[[start, end], ...] of the contiguous stretches in a sorted list of positions."""
+    """[[start, end], ...] of the contiguous stretches in a strictly increasing list of positions."""
     out = []
     for p in positions:
         if out and p == out[-1][1] + 1:
@@ -4560,35 +4579,48 @@ def _segments(positions):
     return out
 
 
+def _confirms_nothing(span):
+    """A cell compatible with every constant -- in the ratio arm, zero against zero."""
+    return span is not None and not (math.isfinite(span[0]) and math.isfinite(span[1]))
+
+
 def _group_constant_runs(runs, spans, admit=None):
     """Gather the runs one constant accounts for.
 
-    Longest first, a run joins the first group whose interval it still intersects and
-    none of whose runs it overlaps; the group's interval narrows to the intersection. A
-    group's POSITIONS are then every cell whose interval admits that constant, in a run
-    or not -- a lone consistent cell between two runs is the same relation, not its
-    outside. A cell with no interval (None) joins only if `admit(i, lo, hi)` says the constant
-    writes it -- a source read as zero, which one interval cannot describe. Returns
+    Longest first, a run joins the first group whose interval it still intersects; the
+    group's interval narrows to the intersection. (Two runs that overlap in position never
+    share a point -- the earlier would have extended -- so a run never joins a group holding
+    one it overlaps.) A group's POSITIONS are then every cell whose interval meets the
+    group's, in a run or not -- a lone consistent cell between two runs is the same relation,
+    not its outside. A cell with no interval (None) joins only if `admit(i, lo, hi)` says
+    some constant of the group writes it -- a source read as zero, which one interval cannot
+    describe. A cell that confirms nothing (`_confirms_nothing`) may sit inside a stretch but
+    never extends one: it is trimmed off both ends of every segment. Returns
     [{"lo", "hi", "positions", "informative", "segments"}].
     """
     groups = []
     for r in sorted(runs, key=lambda r: (-(r["end"] - r["start"]), r["start"])):
         for g in groups:
             lo, hi = max(g["lo"], r["lo"]), min(g["hi"], r["hi"])
-            if lo <= hi and all(r["end"] < s["start"] or r["start"] > s["end"] for s in g["runs"]):
+            if lo <= hi:
                 g["lo"], g["hi"] = lo, hi
-                g["runs"].append(r)
                 break
         else:
-            groups.append({"lo": r["lo"], "hi": r["hi"], "runs": [r]})
+            groups.append({"lo": r["lo"], "hi": r["hi"]})
     out = []
     for g in groups:
-        positions = [i for i, s in enumerate(spans)
-                     if (s is not None and s[0] <= g["hi"] and s[1] >= g["lo"])
-                     or (s is None and admit is not None and admit(i, g["lo"], g["hi"]))]
+        met = [i for i, s in enumerate(spans)
+               if (s is not None and s[0] <= g["hi"] and s[1] >= g["lo"])
+               or (s is None and admit is not None and admit(i, g["lo"], g["hi"]))]
+        positions = []
+        for start, end in _segments(met):
+            while start <= end and _confirms_nothing(spans[start]):
+                start += 1
+            while end >= start and _confirms_nothing(spans[end]):
+                end -= 1
+            positions.extend(range(start, end + 1))
         # an admitted cell without an interval says only that |k| clears a threshold: not informative
-        informative = [i for i in positions if spans[i] is not None
-                       and math.isfinite(spans[i][0]) and math.isfinite(spans[i][1])]
+        informative = [i for i in positions if spans[i] is not None and not _confirms_nothing(spans[i])]
         out.append({"lo": g["lo"], "hi": g["hi"], "positions": positions,
                     "informative": informative, "segments": _segments(positions)})
     return out

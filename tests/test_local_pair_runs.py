@@ -157,13 +157,27 @@ def test_scan_interval_runs_breaks_on_none_and_drops_sub_runs():
 def test_an_unbounded_span_joins_a_run_without_informing_it():
     spans = [(1.0, 2.0), (-math.inf, math.inf), (1.5, 2.5)]
     (run,) = _scan_interval_runs(spans, [1, 2, 3], min_distinct_source=2)
-    assert (run["start"], run["end"]) == (0, 2) and run["informative"] == [0, 2]
+    assert (run["start"], run["end"]) == (0, 2)
+    assert _scan_interval_runs(spans, [1, 2, 3], min_informative=3, min_distinct_source=2) == []
+
+
+def test_intervals_that_only_touch_share_a_point():
+    (run,) = _scan_interval_runs([(1.0, 2.0), (2.0, 3.0), (2.0, 2.5)], [1, 2, 3])
+    assert (run["start"], run["end"], run["lo"], run["hi"]) == (0, 2, 2.0, 2.0)
+
+
+def test_a_run_needs_distinct_source_values_among_its_informative_cells():
+    spans = [(1.9, 2.1)] * 4
+    assert _scan_interval_runs(spans, [5.0, 5.0, 6.0, 6.0]) == []
+    assert len(_scan_interval_runs(spans, [5.0, 5.0, 6.0, 7.0])) == 1
+    assert _scan_interval_runs([(1.9, 2.1), (-math.inf, math.inf), (1.9, 2.1), (1.9, 2.1)], [5.0, 7.0, 6.0, 6.0]) == []
 
 
 def test_runs_of_one_constant_form_one_group_with_the_lone_cells_between():
     spans = [(1.9, 2.1)] * 3 + [(5.0, 6.0), (1.95, 2.05), (7.0, 8.0)] + [(1.9, 2.1)] * 3
     runs = _scan_interval_runs(spans, list(range(9)))
     (group, *others) = _group_constant_runs(runs, spans)
+    assert others == []
     assert group["positions"] == [0, 1, 2, 4, 6, 7, 8]
     assert group["segments"] == [[0, 2], [4, 4], [6, 8]]
     assert _segments([0, 1, 3]) == [[0, 1], [3, 3]]
@@ -177,3 +191,19 @@ def test_a_cell_without_an_interval_joins_a_group_only_when_admitted():
     (group,) = _group_constant_runs(runs, spans, admit=lambda i, lo, hi: i == 3 and lo <= 2.0 <= hi)
     assert group["positions"] == [0, 1, 2, 3, 4, 5] and group["segments"] == [[0, 5]]
     assert 3 not in group["informative"]
+
+
+def test_a_run_joins_the_longest_group_its_constant_still_meets():
+    sep = (9.0, 9.5)
+    spans = [(2.3, 2.5)] * 4 + [sep] + [(2.05, 2.35)] * 3 + [sep] + [(1.9, 2.1)] * 6
+    first, second = _group_constant_runs(_scan_interval_runs(spans, list(range(len(spans)))), spans)
+    assert (first["lo"], first["hi"]) == (2.05, 2.1) and first["positions"] == [5, 6, 7, 9, 10, 11, 12, 13, 14]
+    assert (second["lo"], second["hi"]) == (2.3, 2.5) and second["positions"] == [0, 1, 2, 3, 5, 6, 7]
+
+
+def test_a_cell_that_confirms_nothing_sits_inside_a_stretch_but_never_extends_one():
+    every = (-math.inf, math.inf)
+    spans = [every] * 4 + [(1.9, 2.1), (1.95, 2.05), every, (1.92, 2.08), every, every, (5.0, 6.0)]
+    (group,) = _group_constant_runs(_scan_interval_runs(spans, list(range(len(spans)))), spans)
+    assert group["positions"] == [4, 5, 6, 7] and group["segments"] == [[4, 7]]
+    assert group["informative"] == [4, 5, 7]
