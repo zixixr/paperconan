@@ -44,7 +44,7 @@
 
 - [ ] **Step 1: 建测试文件，写步长的测试**
 
-`tests/test_local_pair_runs.py` 的开头与第一组测试：
+`tests/test_local_pair_runs.py` 的开头与第一组测试（含三轮评审后补入的测试，见提交 95f3051、a33a677、957d72d）：
 
 ```python
 """Local pair runs: two lines of one block related as B = k*A or B = A + c over part of the
@@ -62,7 +62,6 @@ A10 = [12.437, 8.912, 15.226, 9.871, 11.054, 13.388, 7.645, 10.902, 14.117, 9.33
 
 def _arr(xs):
     return np.array(xs, dtype=float)
-
 
 
 # --- steps --------------------------------------------------------------------------------
@@ -85,10 +84,57 @@ def test_a_cell_that_lost_trailing_zeros_keeps_the_lines_step():
     assert _effective_line_quantums(line)[0] == pytest.approx(1e-4)
 
 
-def test_zero_and_non_finite_cells_under_significant_figures():
+def test_a_zero_reads_at_the_lines_step_and_non_finite_cells_are_nan():
     q = _effective_line_quantums([0.0, 234.5678, 45.67891, 56.78912, 67.89123, math.nan])
-    assert q[0] == pytest.approx(1.0)
+    assert q[0] == pytest.approx(1e-5)
     assert math.isnan(q[-1])
+
+
+def test_a_cell_with_more_digits_than_the_mode_keeps_them():
+    q = _effective_line_quantums([123.4567, 234.5678, 45.67891, 56.78912, 67.89123, 1 / 3])
+    assert q[-1] == pytest.approx(1e-10)
+
+
+def test_a_tie_keeps_fixed_decimals_where_the_readings_differ():
+    assert _effective_line_quantums([12.34, 56.78, 1.234, 4.567, 8.91, 2.34]) == \
+        pytest.approx([1e-2, 1e-2, 1e-3, 1e-3, 1e-2, 1e-2])
+
+
+def test_whole_numbers_do_not_vote_for_significant_figures():
+    assert _effective_line_quantums([50.0, 25.0, 12.5, 6.3, 3.1, 1.6]) == pytest.approx([0.1] * 6)
+
+
+def test_zeros_do_not_vote():
+    assert _effective_line_quantums([0, 0, 0, 0, 123.4, 234.5678, 45.67891])[4] == pytest.approx(1e-4)
+
+
+def test_equally_common_figure_counts_take_the_finer_reading():
+    q = _effective_line_quantums([123.4567, 45.67891, 6.789123, 12.3456, 1.23456, 345.678])
+    assert q[3] == pytest.approx(1e-5)
+
+
+def test_a_mostly_zero_line_reads_its_zeros_at_its_finest_step():
+    q = _effective_line_quantums([0, 0, 0, 0, 0, 0.001234, 0.01234, 0.002345, 0.1234])
+    assert q[:5] == pytest.approx([1e-6] * 5)
+    q = _effective_line_quantums([0, 0, 0, 0, 1.23, 4.56, 7.89])          # fixed decimals
+    assert q == pytest.approx([0.01] * 7)
+
+
+def test_a_value_too_small_to_read_takes_the_lines_finest_step():
+    assert _effective_line_quantums([0.0123, 0.000234, 3.45e-5, 1.2e-12])[3] == pytest.approx(1e-7)
+
+
+def test_the_magnitude_is_taken_at_the_read_precision():
+    q = _effective_line_quantums([123.4567, 234.5678, 45.67891, 56.78912, 99.99999999999])
+    assert q[-1] == pytest.approx(1e-4)
+
+
+def test_a_line_with_no_non_zero_cell_keeps_the_row_step():
+    assert _effective_line_quantums([0.0, 0.0, math.nan])[:2] == [1.0, 1.0]
+
+
+def test_a_blank_cell_does_not_set_a_zeros_step():
+    assert _effective_line_quantums([math.nan, 0.0, 234.5678, 45.67891, 56.78912])[1] == pytest.approx(1e-5)
 ```
 
 - [ ] **Step 2: 运行，确认失败**
@@ -103,16 +149,22 @@ Expected: 收集阶段 ImportError（`_effective_line_quantums` 等尚未定义�
 # docs/superpowers/specs/2026-10-15-local-pair-runs-design.md
 #
 # Two lines of one block -- two rows or two columns -- related as B = k*A or B = A + c on
-# part of the line and departing from that constant elsewhere. A separate pass: it reads
-# the sheet and the scoring helper above, and no detector's candidate pools, counters,
-# budgets or caps.
+# part of the line and departing from that constant elsewhere. A separate pass: it reads the
+# sheet and no detector's candidate pools, counters or budgets. It does share the short-row
+# detector's score bar (`_LOCAL_RUN_MIN_BITS` defaults to `_SHORT_ROW_MIN_PREDICTION_BITS`)
+# and, through `_ratio_prediction_bits`, its per-cell cap, so the two score alike.
 _LOCAL_RUN_MIN_BITS = float(os.environ.get(
     "PAPERCONAN_LOCAL_RUN_MIN_BITS", str(_SHORT_ROW_MIN_PREDICTION_BITS)))
+# The median departure outside a stretch must exceed this: for a ratio as a share of the line's
+# median |b|, for an offset as a share of |c|. A relation holding across the whole line has no
+# outside and is left to the whole-line detectors.
 _LOCAL_RUN_OUT_DEV = float(os.environ.get("PAPERCONAN_LOCAL_RUN_OUT_DEV", "0.05"))
+# Cell operations per block; when spent the pass stops for that block and says so in coverage.
 _LOCAL_RUN_BUDGET = int(os.environ.get("PAPERCONAN_LOCAL_RUN_BUDGET", "4000000"))
 # A cell no constant writes (a zero source against a non-zero target) departs by an
 # unbounded amount; it is recorded at this cap so a median stays finite and JSON-safe.
 _LOCAL_RUN_DEPARTURE_CAP = 1e3
+# Fewer distinct source values than this cannot tell one constant from a coincidence of rounding.
 _LOCAL_RUN_MIN_DISTINCT_SOURCE = 3
 # A STRETCH: the longest segment must hold at least this share of the positions one constant
 # accounts for. Consistency scattered along the line is what noise makes of a relation that
@@ -122,16 +174,17 @@ _LOCAL_RUN_MIN_CONTIGUOUS_SHARE = 0.5
 # steps. Within a few steps, rounding a slowly varying quantity makes a stretch "constant" that
 # no copy produced; and a small offset reads as a ratio near 1, so both arms ask it.
 _LOCAL_RUN_MIN_IDENTITY_STEPS = 10
-# A copied stretch ends abruptly: the cell just past each end is independent data. Where it
-# exists, that cell must depart from the constant by at least this many of its own rounding
-# steps beyond rounding. A rounding plateau on a smooth trend, and the noise exceptions of a
-# relation holding approximately everywhere, depart by a step or two.
+# A copied stretch ends abruptly. Walking outward from each end of the longest segment, past
+# blank cells and the group's own positions, the first cell with data must depart from the
+# constant by at least this many of its own rounding steps beyond rounding; a side whose
+# first such cell confirms nothing (in the ratio arm, zero against zero) is not judged. A
+# rounding plateau on a smooth trend, and the noise exceptions of a relation holding
+# approximately everywhere, depart by less.
 _LOCAL_RUN_MIN_EDGE_STEPS = float(os.environ.get("PAPERCONAN_LOCAL_RUN_MIN_EDGE_STEPS", "3"))
-# A stretch needs two informative cells and the line one more outside it.
-_LOCAL_RUN_MIN_FINITE = 4
+# A line needs the distinct source values a stretch asks for, and one finite cell outside it.
+_LOCAL_RUN_MIN_FINITE = _LOCAL_RUN_MIN_DISTINCT_SOURCE + 1
 # example_cells lists both sides of each position; bounded like every other evidence list.
 _LOCAL_RUN_MAX_EXAMPLE_POSITIONS = 64
-LOCAL_RUN_KINDS = ("local_ratio_run", "local_offset_run")
 
 
 def _effective_line_quantums(values):
@@ -141,41 +194,66 @@ def _effective_line_quantums(values):
     `_effective_row_quantums` assumes fixed decimals: a line's commonest decimal count is
     every cell's floor. An export at fixed significant figures breaks that -- at seven
     figures 123.4567 carries four decimals and 45.67891 five, and reading the first at
-    1e-5 makes its rounding interval ten times too narrow. So the line is read both ways,
-    over its non-zero finite cells, and the mode more cells match exactly decides. A tie
-    keeps fixed decimals, and under fixed decimals this returns exactly what
-    `_effective_row_quantums` returns.
+    1e-5 makes its rounding interval ten times too narrow. So the line is read both ways
+    and the mode more cells match exactly decides; a tie keeps fixed decimals. Under fixed
+    decimals every cell that reads as non-zero gets what `_effective_row_quantums` gives it.
+
+    Only cells with a fractional part vote. A zero has no magnitude, and a whole number's
+    figure count is its digit count whatever it was written to (50 reads as two figures),
+    so neither is evidence for either reading. Between two equally common figure counts the
+    larger, i.e. the finer reading, is taken.
 
     Under fixed significant figures a cell's step comes from its magnitude and is never
     COARSER than the cell's own decimals, since a cell carrying more digits than the mode
-    has real extra precision. Zero has no magnitude and keeps its own decimals.
-    Non-finite cells get NaN.
+    has real extra precision (a whole number with trailing zeros is the exception: 98770 at
+    four figures is read at 1, not 10, which is the stricter direction). Magnitudes and
+    digit counts are both taken at `_MAX_READ_DECIMALS` read precision.
+
+    A cell that reads as zero at that precision -- a zero, or a value too small to register --
+    gets the finest step on its line, under either reading: at least as fine as its neighbours',
+    the stricter reading. Rounding to n figures never yields 0, and an export at fixed decimals
+    wrote its 0 no coarser than its neighbours; `_effective_row_quantums` instead lets zeros
+    vote, so a mostly-zero line reads them at 1, a rounding interval wide enough to pass for any
+    constant. Only when no cell of the line reads as non-zero does a zero keep the row
+    inference's step. Non-finite cells get NaN.
     """
     by_decimals = _effective_row_quantums(values)
     cells = []
     for v in values:
         fv = float(v)
-        if math.isfinite(fv) and fv != 0.0:
-            sig, dec = _sigfigs_and_frac(fv)
-            cells.append((sig, min(dec, _MAX_READ_DECIMALS)))
-    if not cells:
-        return by_decimals
-    decimals = Counter(d for _, d in cells)
-    sigfigs = Counter(s for s, _ in cells)
-    sig_mode, sig_top = max(sigfigs.items(), key=lambda kv: (kv[1], kv[0]))
-    if sig_top <= max(decimals.values()):
-        return by_decimals
-    out = []
-    for v, q in zip(values, by_decimals):
+        if not math.isfinite(fv) or fv == 0.0:
+            continue
+        sig, dec = _sigfigs_and_frac(fv)
+        dec = min(dec, _MAX_READ_DECIMALS)
+        if dec == 0:
+            continue
+        cells.append((sig, dec))
+    use_figures = False
+    if cells:
+        decimals = Counter(d for _, d in cells)
+        sigfigs = Counter(s for s, _ in cells)
+        sig_mode, sig_top = max(sigfigs.items(), key=lambda kv: (kv[1], kv[0]))
+        use_figures = sig_top > max(decimals.values())
+    out, unread = [], []
+    for i, (v, q) in enumerate(zip(values, by_decimals)):
         fv = float(v)
         if not math.isfinite(fv):
             out.append(math.nan)
             continue
-        own = 10.0 ** -min(_sigfigs_and_frac(fv)[1], _MAX_READ_DECIMALS)
-        if fv == 0.0:
-            out.append(own)
+        read = round(abs(fv), _MAX_READ_DECIMALS)
+        if read == 0.0:
+            out.append(math.nan)
+            unread.append(i)
             continue
-        out.append(min(own, 10.0 ** (math.floor(math.log10(abs(fv))) - sig_mode + 1)))
+        if use_figures:
+            own = 10.0 ** -min(_sigfigs_and_frac(fv)[1], _MAX_READ_DECIMALS)
+            out.append(min(own, 10.0 ** (math.floor(math.log10(read)) - sig_mode + 1)))
+        else:
+            out.append(q)
+    steps = [x for x in out if not math.isnan(x)]      # unread cells are still NaN here
+    finest = min(steps) if steps else None
+    for i in unread:
+        out[i] = finest if finest is not None else by_decimals[i]
     return out
 ```
 
@@ -192,7 +270,7 @@ from paperconan._audit import (
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 4 passed.
+Expected: 14 passed.
 
 - [ ] **Step 5: 提交**
 
@@ -280,7 +358,7 @@ def _symmetric_offset_interval(a, b, q_a, q_b):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 8 passed.
+Expected: 18 passed.
 
 - [ ] **Step 5: 提交**
 
@@ -331,16 +409,18 @@ Expected: ImportError。
 - [ ] **Step 3: 实现**
 
 ```python
-def _scan_interval_runs(spans, source, min_informative=2,
-                        min_distinct_source=_LOCAL_RUN_MIN_DISTINCT_SOURCE):
+def _scan_interval_runs(spans, source, min_informative=2, min_distinct_source=None):
     """Maximal contiguous runs whose intervals share a point.
 
     The run logic of `_scan_quantized_ratio_runs`, taking the intervals ready-made so the
     ratio and the offset arm share it: `None` breaks a run, (-inf, inf) joins one without
     informing it, a run needs `min_informative` informative cells and
     `min_distinct_source` distinct source values, and a run inside another is dropped.
-    Returns [{"start", "end", "lo", "hi", "informative"}] in order of start.
+    Returns [{"start", "end", "lo", "hi", "informative"}] in order of start. The distinct-source
+    floor defaults to `_LOCAL_RUN_MIN_DISTINCT_SOURCE`, read at call time.
     """
+    if min_distinct_source is None:
+        min_distinct_source = _LOCAL_RUN_MIN_DISTINCT_SOURCE
     n = len(spans)
     found = []
     for start in range(n):
@@ -416,7 +496,7 @@ def _group_constant_runs(runs, spans):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 11 passed.
+Expected: 21 passed.
 
 - [ ] **Step 5: 提交**
 
@@ -497,16 +577,13 @@ def _outside_departure(a_line, b_line, group, spans, relation):
     return float(np.median(departures)) if departures else None
 
 
-def _identity_steps(a_line, b_line, q_a, q_b, informative, constant, relation):
-    """How many rounding steps the constant lies from the identity, over the group's
-    informative cells (median step). Offset: |c| over the combined step. Ratio: |k - 1| over
-    the relative step, the half-widths each cell's rounding adds to b/a."""
-    if relation == "offset":
-        step = float(np.median([(q_a[i] + q_b[i]) / 2.0 for i in informative]))
-        return abs(constant) / step if step > 0 else math.inf
-    rel = float(np.median([q_a[i] / (2.0 * abs(float(a_line[i]))) + q_b[i] / (2.0 * abs(float(b_line[i])))
-                           for i in informative]))
-    return abs(constant - 1.0) / (abs(constant) * rel) if rel > 0 else math.inf
+def _identity_steps(spans, informative, constant, relation):
+    """How many rounding steps the constant lies from the identity -- 1 for a ratio, 0 for an
+    offset -- measured in the half-width of the group's own intervals (their median over the
+    informative cells). Read off the intervals, so no cell value is divided by."""
+    half = float(np.median([(spans[i][1] - spans[i][0]) / 2.0 for i in informative]))
+    identity = 1.0 if relation == "ratio" else 0.0
+    return abs(constant - identity) / half if half > 0 else math.inf
 
 
 def _edge_steps(a_line, b_line, q_a, q_b, group, spans, relation):
@@ -558,7 +635,7 @@ def _local_line_usable(values, label=None):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 13 passed.
+Expected: 23 passed.
 
 - [ ] **Step 5: 提交**
 
@@ -672,6 +749,12 @@ def test_a_formula_cached_cell_cannot_carry_the_score(monkeypatch):
     assert _best(a, b)[2] - plain <= math.log2(cap) + 1e-6
     monkeypatch.setattr(audit_module, "_SHORT_ROW_MAX_QUANTUM_RATIO", 1e12)
     assert _best(a, b)[2] - plain > math.log2(cap) + 1      # the cap is what bounds it
+
+
+def test_a_zero_target_inside_a_stretch_is_scored_without_dividing_by_it():
+    a = [100.37, 2.11, 85.42, 1.73, 63.18, 97.55, 2.46, 71.09, 55.31, 40.12, 33.87, 12.64]
+    b = [round(0.002 * x, 2) for x in a[:9]] + [0.35, 0.91, 0.47]
+    _best(a, b)          # must not raise
 ```
 
 - [ ] **Step 2: 运行，确认失败**
@@ -701,8 +784,7 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests):
             longest = max(e - s + 1 for s, e in g["segments"])
             if longest < _LOCAL_RUN_MIN_CONTIGUOUS_SHARE * len(g["positions"]):
                 continue
-            if _identity_steps(a_line, b_line, q_a, q_b, inf, (lo + hi) / 2.0, relation) \
-                    < _LOCAL_RUN_MIN_IDENTITY_STEPS:
+            if _identity_steps(spans, inf, (lo + hi) / 2.0, relation) < _LOCAL_RUN_MIN_IDENTITY_STEPS:
                 continue
             # Scored with each side as the target, keeping the lower: neither side is
             # privileged when both were rounded.
@@ -726,7 +808,7 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 27 passed.
+Expected: 38 passed.
 
 - [ ] **Step 5: 逐条核对“关掉即变红”**
 
@@ -856,10 +938,12 @@ def _local_run_finding(orientation, ia, ib, labels, first, a_line, b_line,
                     row_a_sample=_sample(a_line[positions]), row_b_sample=_sample(b_line[positions]))
         where = "columns"
     if relation == "ratio":
-        kind, op = "local_ratio_run", "*"
+        kind = "local_ratio_run"
+        op = "*"
         constant = dict(k=value, k_lo=group["lo"], k_hi=group["hi"])
     else:
-        kind, op = "local_offset_run", "+"
+        kind = "local_offset_run"
+        op = "+"
         constant = dict(offset=value, offset_lo=group["lo"], offset_hi=group["hi"])
     stretch = ", ".join(f"{s}-{e}" if s != e else f"{s}" for s, e in segments)
     return dict(
@@ -922,7 +1006,7 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 33 passed.
+Expected: 44 passed.
 
 - [ ] **Step 5: 提交**
 
@@ -991,7 +1075,7 @@ Expected: FAIL，`assert len(found) == 1`（0 条：块循环还没调用新检�
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 34 passed.
+Expected: 45 passed.
 
 - [ ] **Step 5: 跑全套测试，看有没有别处被带动**
 
@@ -1121,7 +1205,7 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
 - [ ] **Step 6: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 38 passed.
+Expected: 49 passed.
 
 - [ ] **Step 7: 提交**
 
