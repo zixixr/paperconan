@@ -960,6 +960,8 @@ def test_on_the_whole_sheet_a_panel_holding_both_lines_leaves_out_only_its_own_p
     c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
     rng = random.Random(20261023)
     below = [[round(rng.uniform(5.0, 20.0), 3) for _ in range(5)] for _ in range(10)]
+    for row in below[::2]:
+        row[3] = 0.0                     # zeros in B where the full-width panel holds both columns
     rows = ([["Group A", "Group C", None, "Group B", "Group D"]] + [[x, z, None, y, w] for x, y, z, w in zip(A10, b, c, c[::-1])]
             + [[None] * 5, [f"x{j}" for j in range(5)]] + below)
     sheet = Sheet.from_rows(rows)
@@ -967,6 +969,7 @@ def test_on_the_whole_sheet_a_panel_holding_both_lines_leaves_out_only_its_own_p
     panels = [(1, 11, 0, 2), (1, 11, 3, 5), (13, 23, 0, 5)]
     found = detect_local_pair_runs(sheet, 1, 23, 0, 5, header, panels=panels)
     assert [(f["col_a_idx"], f["col_b_idx"], f["segments"]) for f in found] == [(0, 3, [[2, 7]])]
+    assert found[0]["run_length"] == 6 and found[0]["line_length"] == 10     # read over what is left
 
 
 def test_on_the_whole_sheet_rows_of_two_panels_are_compared_where_no_panel_holds_both():
@@ -994,6 +997,53 @@ def test_on_the_whole_sheet_panels_that_touch_do_not_hold_each_others_edge_rows(
     assert [(f["row_a_idx"], f["row_b_idx"]) for f in found] == [(2, 3)]
 
 
+def test_on_the_whole_sheet_what_is_left_of_a_grid_is_still_a_grid():
+    # the full-width panel below makes the first column look like data over the whole sheet;
+    # over the rows left to compare it is a dilution series again
+    ladder = [round(100.0 / 2 ** i, 4) for i in range(10)]
+    b = [round(0.731 * x, 4) for x in ladder[:6]] + [11.9, 9.1, 18.7, 6.2]
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    rng = random.Random(20261025)
+    below = [[round(rng.uniform(5.0, 20.0), 3) for _ in range(5)] for _ in range(10)]
+    rows = ([["Dose", "Group C", None, "Group B", "Group D"]] + [[x, z, None, y, w] for x, y, z, w in zip(ladder, b, c, c[::-1])]
+            + [[None] * 5, [f"x{j}" for j in range(5)]] + below)
+    sheet = Sheet.from_rows(rows)
+    header = ["Dose", "Group C", "", "Group B", "Group D"]
+    panels = [(1, 11, 0, 2), (1, 11, 3, 5), (13, 23, 0, 5)]
+    found = detect_local_pair_runs(sheet, 1, 23, 0, 5, header, panels=panels)
+    assert [f for f in found if (f["col_a_idx"], f["col_b_idx"]) == (0, 3)] == []
+
+
+def test_on_the_whole_sheet_a_panel_leaves_out_exactly_its_own_rows():
+    # a full-width panel directly above two side by side; its last rows hold the same constant
+    rng = random.Random(20261026)
+    top = [[round(rng.uniform(5.0, 20.0), 3) for _ in range(5)] for _ in range(5)]
+    for row in top[3:]:
+        row[3] = round(row[0] * 1.137, 3)
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    rows = [["Group A", "Group C", None, "Group B", "Group D"]] + top + [[x, z, None, y, w] for x, y, z, w in zip(A10, b, c, c[::-1])]
+    sheet = Sheet.from_rows(rows)
+    header = ["Group A", "Group C", "", "Group B", "Group D"]
+    panels = [(1, 6, 0, 5), (6, 16, 0, 2), (6, 16, 3, 5)]
+    found = detect_local_pair_runs(sheet, 1, 16, 0, 5, header, panels=panels)
+    assert [(f["col_a_idx"], f["col_b_idx"], f["segments"]) for f in found] == [(0, 3, [[7, 12]])]
+
+
+def test_on_the_whole_sheet_a_pair_with_nothing_left_costs_nothing(monkeypatch):
+    import paperconan._audit as audit_module
+    first = [round(x * 1.137, 3) for x in A10]
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    d = [12.6, 5.2, 18.4, 9.9, 14.1, 6.6, 11.3, 16.8, 7.4, 13.5]
+    rows = [["Group A", "Group B"]] + [[x, y] for x, y in zip(A10, first)] + [[None, None]] + [[x, y] for x, y in zip(c, d)]
+    sheet = Sheet.from_rows(rows)
+    monkeypatch.setattr(audit_module, "_LOCAL_RUN_BUDGET", 5)       # less than one scan of the extent
+    cov = _Coverage()
+    found = detect_local_pair_runs(sheet, 1, 22, 0, 2, ["Group A", "Group B"], coverage=cov,
+                                   panels=[(1, 11, 0, 2), (12, 22, 0, 2)])
+    assert found == [] and not cov.calls
+
+
 def test_a_block_taller_than_the_row_limit_is_compared_by_columns_only(monkeypatch):
     import paperconan._audit as audit_module
     monkeypatch.setattr(audit_module, "_LOCAL_RUN_MAX_ROWS", 5)
@@ -1007,6 +1057,10 @@ def test_a_block_taller_than_the_row_limit_is_compared_by_columns_only(monkeypat
     sheet, header = _block([A10, b])                        # rows of two cells never could
     cov = _Coverage()
     assert len(detect_local_pair_runs(sheet, 1, 11, 0, 2, header, coverage=cov)) == 1 and not cov.calls
+    sheet, header = _block([A10, b, c, [c[0]] + [math.nan] * 9])     # one row could; a pair of rows could not
+    cov = _Coverage()
+    detect_local_pair_runs(sheet, 1, 11, 0, 4, header, coverage=cov)
+    assert not cov.calls
 
 
 def test_a_block_exactly_at_the_row_limit_is_compared_by_rows(monkeypatch):

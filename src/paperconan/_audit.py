@@ -4928,11 +4928,14 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
     to part of a line has the same shape. `already` holds (orientation, lower index,
     higher index) pairs, in sheet coordinates, that the whole-line detectors reported in
     this block. `panels` is the sheet's other blocks when this one is the whole-sheet
-    extent. A panel holding both lines of a pair compared them over its own span, against
-    its own outside; here those positions are left out, and the pair is read only over what
-    no such panel covers -- where the extent's longer line is the only place the two meet. A
-    pair with nothing left is skipped. `skip_columns` follows the `wide` flag the column
-    detectors honour, and a block taller than `_LOCAL_RUN_MAX_ROWS` is not compared row by row.
+    extent. A panel holding both lines of a pair had them to compare over its own span,
+    against its own outside; here those positions are left out -- values and steps -- and the
+    pair is read only over what no such panel covers, where the extent's longer line is the
+    only place the two meet. What is left must itself be usable -- a dilution series is still a
+    grid once another panel's cells are cut off it -- and a pair with too little left is skipped
+    before it is charged. `skip_columns` follows the `wide` flag the
+    column detectors honour, and a block taller than `_LOCAL_RUN_MAX_ROWS` is not compared
+    row by row.
 
     `n_tests` counts every pair of usable lines in the orientation, skipped ones too.
     """
@@ -4974,19 +4977,22 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
             for ib in usable[x + 1:]:
                 if (orientation, ia, ib) in already:
                     continue
-                a_line, b_line = lines[ia], lines[ib]
+                a_line, b_line, q_a, q_b = lines[ia], lines[ib], quantums[ia], quantums[ib]
                 covered = [cover for (h0, h1), cover in spans if h0 <= ia and ib < h1]
                 if covered:                      # blank what a panel holding both lines covered
                     keep = np.ones(length, dtype=bool)
                     for s0, s1 in covered:
                         keep[max(0, s0 - first):max(0, s1 - first)] = False
-                    if not (keep & np.isfinite(a_line) & np.isfinite(b_line)).any():
-                        continue
                     a_line, b_line = np.where(keep, a_line, np.nan), np.where(keep, b_line, np.nan)
+                    q_a = [q if k else math.nan for q, k in zip(q_a, keep)]
+                    q_b = [q if k else math.nan for q, k in zip(q_b, keep)]
+                    label = labels.get if orientation == "rows" else (lambda _i: None)
+                    if not (_local_line_usable(a_line, label(ia)) and _local_line_usable(b_line, label(ib))):
+                        continue
                 budget[0] -= length              # the scan; the call pays for its runs
                 if budget[0] < 0:
                     return exhausted()
-                hit = _best_local_group(a_line, b_line, quantums[ia], quantums[ib], n_tests, budget)
+                hit = _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget)
                 if budget[0] < 0:                # abandoned part-way
                     return exhausted()
                 if hit is not None:
