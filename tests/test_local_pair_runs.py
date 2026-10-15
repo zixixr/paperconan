@@ -8,8 +8,8 @@ import pytest
 
 from paperconan._sheet import Sheet
 from paperconan._audit import (
-    _effective_line_quantums, _effective_row_quantums, _group_constant_runs,
-    _scan_interval_runs, _segments,
+    _edge_steps, _effective_line_quantums, _effective_row_quantums, _group_constant_runs,
+    _identity_steps, _local_line_usable, _outside_departure, _scan_interval_runs, _segments,
     _symmetric_offset_interval, _symmetric_ratio_interval, _zero_source_miss,
 )
 
@@ -214,3 +214,99 @@ def test_a_cell_that_confirms_nothing_sits_inside_a_stretch_but_never_extends_on
     (group,) = _group_constant_runs(_scan_interval_runs(spans, list(range(len(spans)))), spans)
     assert group["positions"] == [4, 5, 6, 7] and group["segments"] == [[4, 7]]
     assert group["informative"] == [4, 5, 7]
+
+
+# --- outside departure ---------------------------------------------------------------------
+
+def test_outside_departure_measures_a_source_read_as_zero_by_its_miss():
+    a, b = _arr([1.0, 2.0, 3.0, 0.0]), _arr([2.0, 4.0, 6.0, 5.0])
+    q = [0.1] * 4
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2]}
+    # k = 2 writes 0 +/- 0.05 as at most 0.1; B's box starts at 4.95: a miss of 4.85 over median |b| 4.5
+    assert _outside_departure(a, b, q, q, group, spans, "ratio") == pytest.approx(4.85 / 4.5)
+
+
+def test_outside_departure_is_none_for_a_whole_line_relation():
+    a, b = _arr([1.0, 2.0, 3.0]), _arr([2.0, 4.0, 6.0])
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    q = [0.1] * 3
+    assert _outside_departure(a, b, q, q, {"lo": 1.9, "hi": 2.1, "positions": [0, 1, 2]}, spans, "ratio") is None
+
+
+def test_outside_departure_of_an_offset_is_its_gap_over_the_constant():
+    a, b = _arr([1.0, 2.0, 3.0, 4.0, 5.0]), _arr([4.0, 5.0, 6.0, 7.5, 7.6])
+    q = [0.1] * 5
+    spans = [_symmetric_offset_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 2.9, "hi": 3.1, "positions": [0, 1, 2]}
+    # c = 3 against [3.4, 3.6] below it and [2.5, 2.7] above it: gaps 0.4 and 0.3 over |c|, their median
+    assert _outside_departure(a, b, q, q, group, spans, "offset") == pytest.approx((0.4 + 0.3) / 2 / 3.0)
+
+
+def test_outside_departure_of_a_ratio_is_read_against_the_lines_scale():
+    a, b = _arr([10.0, 20.0, 30.0, 0.5]), _arr([20.0, 40.0, 60.0, 1.3])
+    q = [0.1] * 4
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2]}
+    # the small cell admits k from 1.25/0.55; that gap as an amount of B, over the line's median |b|
+    # of 30 -- not over the cell's own 1.3, which would read a small additive error as a large one
+    assert _outside_departure(a, b, q, q, group, spans, "ratio") == pytest.approx((1.25 / 0.55 - 2.0) * 0.5 / 30.0)
+
+
+def test_outside_departure_reads_its_scale_from_cells_that_confirm_something():
+    a, b = _arr([10.0, 20.0, 30.0, 0.5] + [0.0] * 4), _arr([20.0, 40.0, 60.0, 1.3] + [0.0] * 4)
+    q = [0.1] * 8
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2]}
+    # four zeros against zeros: they neither set the median |b|, still 30, nor count as departures
+    assert _outside_departure(a, b, q, q, group, spans, "ratio") == pytest.approx((1.25 / 0.55 - 2.0) * 0.5 / 30.0)
+
+
+def test_identity_steps_are_read_in_the_groups_half_widths():
+    spans = [(1.9, 2.1), (1.8, 2.2), (1.95, 2.05), (-math.inf, math.inf)]
+    # half-widths 0.1, 0.2 and 0.05 over the informative cells: a median of 0.1
+    assert _identity_steps(spans, [0, 1, 2], 2.0, "ratio") == pytest.approx(10.0)
+    assert _identity_steps(spans, [0, 1, 2], 0.5, "offset") == pytest.approx(5.0)
+
+
+def test_edge_steps_count_a_ratio_gap_in_the_targets_steps():
+    a, b = _arr([10.0, 20.0, 30.0, 5.0]), _arr([20.0, 40.0, 60.0, 13.0])
+    q = [0.1] * 4
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2], "segments": [[0, 2]]}
+    # nothing precedes the stretch; past its end the cell admits k from 12.95/5.05, a gap that is
+    # (12.95/5.05 - 2) * 5 as an amount of B, counted in B's steps
+    assert _edge_steps(a, b, q, q, group, spans, "ratio") == pytest.approx([(12.95 / 5.05 - 2.0) * 5.0 / 0.1])
+
+
+def test_edge_steps_walk_past_a_blank_and_the_groups_own_positions():
+    a = _arr([10.0, 20.0, 30.0, math.nan, 15.0, 5.0])
+    b = _arr([20.0, 40.0, 60.0, math.nan, 30.0, 13.0])
+    q = [0.1] * 6
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2, 4], "segments": [[0, 2], [4, 4]]}
+    assert _edge_steps(a, b, q, q, group, spans, "ratio") == pytest.approx([(12.95 / 5.05 - 2.0) * 5.0 / 0.1])
+
+
+def test_edge_steps_count_an_offset_gap_in_the_pairs_combined_step():
+    a, b = _arr([1.0, 2.0, 3.0, 4.0]), _arr([4.0, 5.0, 6.0, 7.5])
+    q_a, q_b = [0.1] * 4, [0.01] * 4
+    spans = [_symmetric_offset_interval(x, y, s, t) for x, y, s, t in zip(a, b, q_a, q_b)]
+    group = {"lo": 2.9, "hi": 3.1, "positions": [0, 1, 2], "segments": [[0, 2]]}
+    # the last cell admits c in 3.5 +/- 0.055: a gap of 0.445, in steps of (0.1 + 0.01) / 2
+    assert _edge_steps(a, b, q_a, q_b, group, spans, "offset") == pytest.approx([0.445 / 0.055])
+
+
+def test_edge_steps_walk_past_a_cell_that_confirms_nothing():
+    a, b = _arr([10.0, 20.0, 30.0, 0.0, 5.0]), _arr([20.0, 40.0, 60.0, 0.0, 13.0])
+    q = [0.1] * 5
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2], "segments": [[0, 2]]}
+    assert _edge_steps(a, b, q, q, group, spans, "ratio") == pytest.approx([(12.95 / 5.05 - 2.0) * 5.0 / 0.1])
+
+
+def test_a_line_is_usable_with_enough_cells_and_no_axis_shape():
+    assert _local_line_usable(_arr([1.2, 3.4, math.nan, 2.7, 5.1]))
+    assert not _local_line_usable(_arr([1.2, 3.4, math.nan, 2.7]))           # three finite cells
+    assert not _local_line_usable(_arr([1.2, 3.4, 2.7, 5.1]), "Time (h)")      # an axis by its label
+    assert not _local_line_usable(_arr([0.5, 1.0, math.nan, 1.5, 2.0]))       # a dose or time grid

@@ -4627,6 +4627,107 @@ def _group_constant_runs(runs, spans, admit=None):
     return out
 
 
+def _outside_departure(a_line, b_line, q_a, q_b, group, spans, relation):
+    """Median departure from the group's constant at the line's other positions, beyond
+    what each cell's own rounding explains.
+
+    The gap is from the constant to the cell's interval, so rounding alone never counts.
+    Ratio: that gap as an amount of B (gap * |a|) over the line's median |b| -- measured
+    against the line's scale, not the cell's, so additive noise on a near-zero cell is
+    not read as a departure (curve families leak through their smallest cell otherwise).
+    Offset: the gap over |c|. A source read as zero (no interval) departs by what the constant
+    falls short of writing it (`_zero_source_miss`), over the same scale. A cell that confirms
+    nothing neither counts as a departure nor sets that median: zeros against zeros filling
+    most of a line would otherwise make the scale 0. Departures are capped at
+    `_LOCAL_RUN_DEPARTURE_CAP`. None when nothing outside the group can be measured: the
+    relation covers the whole line, or what lies outside confirms nothing.
+    """
+    k = (group["lo"] + group["hi"]) / 2.0
+    if k == 0.0 or not math.isfinite(k):
+        return None
+    inside = set(group["positions"])
+    finite_b = [abs(float(b_line[i])) for i, s in enumerate(spans)
+                if math.isfinite(float(b_line[i])) and not _confirms_nothing(s)]
+    scale = float(np.median(finite_b)) if finite_b else 0.0
+    departures = []
+    for i, span in enumerate(spans):
+        if i in inside:
+            continue
+        a, b = float(a_line[i]), float(b_line[i])
+        if not (math.isfinite(a) and math.isfinite(b)):
+            continue
+        if span is None:                      # a source read as zero (ratio arm)
+            miss = _zero_source_miss(b, q_a[i], q_b[i], k)
+            departures.append(min(_LOCAL_RUN_DEPARTURE_CAP, miss / scale) if scale > 0
+                              else _LOCAL_RUN_DEPARTURE_CAP)
+            continue
+        lo, hi = span
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            continue
+        gap = lo - k if k < lo else (k - hi if k > hi else 0.0)
+        if relation == "ratio":
+            d = abs(gap) * abs(a) / scale if scale > 0 else _LOCAL_RUN_DEPARTURE_CAP
+        else:
+            d = abs(gap / k)
+        departures.append(min(_LOCAL_RUN_DEPARTURE_CAP, d))
+    return float(np.median(departures)) if departures else None
+
+
+def _identity_steps(spans, informative, constant, relation):
+    """How many rounding steps the constant lies from the identity -- 1 for a ratio, 0 for an
+    offset -- measured in the half-width of the group's own intervals (their median over the
+    informative cells). Read off the intervals, so no cell value is divided by."""
+    half = float(np.median([(spans[i][1] - spans[i][0]) / 2.0 for i in informative]))
+    identity = 1.0 if relation == "ratio" else 0.0
+    return abs(constant - identity) / half if half > 0 else math.inf
+
+
+def _edge_steps(a_line, b_line, q_a, q_b, group, spans, relation):
+    """Departure, in the cell's own rounding steps and beyond rounding, of the first cell
+    past each end of the group's longest segment -- walking outward over blank cells (a
+    panel separator), cells that confirm nothing and the group's own positions, so the cell
+    judged is the data that actually adjoins the stretch. [] when nothing lies outside on
+    either side. A source read as zero counts by what the constant falls short of writing
+    it, in B's steps."""
+    start, end = max(group["segments"], key=lambda se: (se[1] - se[0], -se[0]))
+    inside = set(group["positions"])
+    k = (group["lo"] + group["hi"]) / 2.0
+    out = []
+    for i, stride in ((start - 1, -1), (end + 1, 1)):
+        while 0 <= i < len(spans) and (i in inside or _confirms_nothing(spans[i]) or not (
+                math.isfinite(float(a_line[i])) and math.isfinite(float(b_line[i])))):
+            i += stride
+        if not 0 <= i < len(spans):
+            continue
+        span = spans[i]
+        if span is None:                          # a source read as zero (ratio arm)
+            miss = _zero_source_miss(b_line[i], q_a[i], q_b[i], k)
+            out.append(miss / q_b[i] if q_b[i] > 0 else math.inf)
+            continue
+        lo, hi = span
+        gap = lo - k if k < lo else (k - hi if k > hi else 0.0)
+        if relation == "ratio":
+            out.append(abs(gap) * abs(float(a_line[i])) / q_b[i] if q_b[i] > 0 else math.inf)
+        else:
+            step = (q_a[i] + q_b[i]) / 2.0
+            out.append(abs(gap) / step if step > 0 else math.inf)
+    return out
+
+
+def _local_line_usable(values, label=None):
+    """Enough finite cells for a stretch and an outside, not an axis by its row label, and
+    not itself an arithmetic progression (a time or dose grid)."""
+    finite = values[np.isfinite(values)]
+    if finite.size < _LOCAL_RUN_MIN_FINITE:
+        return False
+    if label and _AXIS_CONTEXT_LABEL_RE.search(label):
+        return False
+    steps = np.diff(finite)
+    if steps[0] != 0.0 and np.allclose(steps, steps[0], rtol=1e-9, atol=0.0):
+        return False
+    return True
+
+
 def _as_rectangular(matrix):
     """A finite 2-D float array, or None. Ragged input is rejected, never raised on.
 
