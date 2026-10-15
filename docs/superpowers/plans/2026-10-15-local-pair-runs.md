@@ -174,11 +174,10 @@ _LOCAL_RUN_MIN_CONTIGUOUS_SHARE = 0.5
 # no copy produced; and a small offset reads as a ratio near 1, so both arms ask it.
 _LOCAL_RUN_MIN_IDENTITY_STEPS = 10
 # A copied stretch ends abruptly. Walking outward from each end of the longest segment, past
-# blank cells and the group's own positions, the first cell with data must depart from the
-# constant by at least this many of its own rounding steps beyond rounding; a side whose
-# first such cell confirms nothing (in the ratio arm, zero against zero) is not judged. A
-# rounding plateau on a smooth trend, and the noise exceptions of a relation holding
-# approximately everywhere, depart by less.
+# blank cells, cells that confirm nothing (in the ratio arm, zero against zero) and the group's
+# own positions, the first cell with data must depart from the constant by at least this many
+# of its own rounding steps beyond rounding. A rounding plateau on a smooth trend, and the
+# noise exceptions of a relation holding approximately everywhere, depart by less.
 _LOCAL_RUN_MIN_EDGE_STEPS = float(os.environ.get("PAPERCONAN_LOCAL_RUN_MIN_EDGE_STEPS", "3"))
 # A line needs the distinct source values a stretch asks for, and one finite cell outside it.
 _LOCAL_RUN_MIN_FINITE = _LOCAL_RUN_MIN_DISTINCT_SOURCE + 1
@@ -433,13 +432,27 @@ def test_scan_interval_runs_breaks_on_none_and_drops_sub_runs():
 def test_an_unbounded_span_joins_a_run_without_informing_it():
     spans = [(1.0, 2.0), (-math.inf, math.inf), (1.5, 2.5)]
     (run,) = _scan_interval_runs(spans, [1, 2, 3], min_distinct_source=2)
-    assert (run["start"], run["end"]) == (0, 2) and run["informative"] == [0, 2]
+    assert (run["start"], run["end"]) == (0, 2)
+    assert _scan_interval_runs(spans, [1, 2, 3], min_informative=3, min_distinct_source=2) == []
+
+
+def test_intervals_that_only_touch_share_a_point():
+    (run,) = _scan_interval_runs([(1.0, 2.0), (2.0, 3.0), (2.0, 2.5)], [1, 2, 3])
+    assert (run["start"], run["end"], run["lo"], run["hi"]) == (0, 2, 2.0, 2.0)
+
+
+def test_a_run_needs_distinct_source_values_among_its_informative_cells():
+    spans = [(1.9, 2.1)] * 4
+    assert _scan_interval_runs(spans, [5.0, 5.0, 6.0, 6.0]) == []
+    assert len(_scan_interval_runs(spans, [5.0, 5.0, 6.0, 7.0])) == 1
+    assert _scan_interval_runs([(1.9, 2.1), (-math.inf, math.inf), (1.9, 2.1), (1.9, 2.1)], [5.0, 7.0, 6.0, 6.0]) == []
 
 
 def test_runs_of_one_constant_form_one_group_with_the_lone_cells_between():
     spans = [(1.9, 2.1)] * 3 + [(5.0, 6.0), (1.95, 2.05), (7.0, 8.0)] + [(1.9, 2.1)] * 3
     runs = _scan_interval_runs(spans, list(range(9)))
     (group, *others) = _group_constant_runs(runs, spans)
+    assert others == []
     assert group["positions"] == [0, 1, 2, 4, 6, 7, 8]
     assert group["segments"] == [[0, 2], [4, 4], [6, 8]]
     assert _segments([0, 1, 3]) == [[0, 1], [3, 3]]
@@ -453,6 +466,22 @@ def test_a_cell_without_an_interval_joins_a_group_only_when_admitted():
     (group,) = _group_constant_runs(runs, spans, admit=lambda i, lo, hi: i == 3 and lo <= 2.0 <= hi)
     assert group["positions"] == [0, 1, 2, 3, 4, 5] and group["segments"] == [[0, 5]]
     assert 3 not in group["informative"]
+
+
+def test_a_run_joins_the_longest_group_its_constant_still_meets():
+    sep = (9.0, 9.5)
+    spans = [(2.3, 2.5)] * 4 + [sep] + [(2.05, 2.35)] * 3 + [sep] + [(1.9, 2.1)] * 6
+    first, second = _group_constant_runs(_scan_interval_runs(spans, list(range(len(spans)))), spans)
+    assert (first["lo"], first["hi"]) == (2.05, 2.1) and first["positions"] == [5, 6, 7, 9, 10, 11, 12, 13, 14]
+    assert (second["lo"], second["hi"]) == (2.3, 2.5) and second["positions"] == [0, 1, 2, 3, 5, 6, 7]
+
+
+def test_a_cell_that_confirms_nothing_sits_inside_a_stretch_but_never_extends_one():
+    every = (-math.inf, math.inf)
+    spans = [every] * 4 + [(1.9, 2.1), (1.95, 2.05), every, (1.92, 2.08), every, every, (5.0, 6.0)]
+    (group,) = _group_constant_runs(_scan_interval_runs(spans, list(range(len(spans)))), spans)
+    assert group["positions"] == [4, 5, 6, 7] and group["segments"] == [[4, 7]]
+    assert group["informative"] == [4, 5, 7]
 ```
 
 - [ ] **Step 2: 运行，确认失败**
@@ -460,7 +489,7 @@ def test_a_cell_without_an_interval_joins_a_group_only_when_admitted():
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
 Expected: ImportError。
 
-- [ ] **Step 3: 实现**
+- [ ] **Step 3: 实现**（`_audit.py` 顶部的 `from collections import Counter, defaultdict` 加上 `deque`）
 
 ```python
 def _scan_interval_runs(spans, source, min_informative=2, min_distinct_source=None):
@@ -468,46 +497,66 @@ def _scan_interval_runs(spans, source, min_informative=2, min_distinct_source=No
 
     The run logic of `_scan_quantized_ratio_runs`, taking the intervals ready-made so the
     ratio and the offset arm share it: `None` breaks a run, (-inf, inf) joins one without
-    informing it, a run needs `min_informative` informative cells and
-    `min_distinct_source` distinct source values, and a run inside another is dropped.
-    Returns [{"start", "end", "lo", "hi", "informative"}] in order of start. The distinct-source
-    floor defaults to `_LOCAL_RUN_MIN_DISTINCT_SOURCE`, read at call time.
+    informing it, a run needs `min_informative` informative cells and `min_distinct_source`
+    distinct source values among them (at the default floor of 3 the first never binds), and
+    a run inside another is dropped. Returns [{"start", "end", "lo", "hi"}] in order of start.
+    The distinct-source floor defaults to `_LOCAL_RUN_MIN_DISTINCT_SOURCE`, read at call time.
+
+    Linear in the line's length. What can join a run starting at s can join one starting
+    later, so the run's end only moves forward as its start does: one window slides along the
+    line, its bounds kept by two monotone queues. A run is then inside another exactly when the
+    run one start earlier reaches the same end.
     """
     if min_distinct_source is None:
         min_distinct_source = _LOCAL_RUN_MIN_DISTINCT_SOURCE
+
+    def informing(span):
+        return math.isfinite(span[0]) and math.isfinite(span[1])
+
     n = len(spans)
-    found = []
+    # indices whose lower (upper) bound can still be the window's largest (smallest); on a tie
+    # the earliest leads, as the sequential max/min fold of the older scan keeps it
+    los, his = deque(), deque()
+    values, informative = Counter(), 0
+    end, prev_end, out = -1, None, []
     for start in range(n):
-        lo, hi = -math.inf, math.inf
-        informative, seen = [], set()
-        end = start - 1
-        for j in range(start, n):
-            span = spans[j]
-            if span is None:
+        if start - 1 <= end and start > 0 and spans[start - 1] is not None and informing(spans[start - 1]):
+            informative -= 1
+            v = float(source[start - 1])
+            values[v] -= 1
+            if not values[v]:
+                del values[v]
+        end = max(end, start - 1)
+        for q in (los, his):
+            while q and q[0] < start:
+                q.popleft()
+        while end + 1 < n and spans[end + 1] is not None:
+            lo_j, hi_j = spans[end + 1]
+            lo = spans[los[0]][0] if los else -math.inf
+            hi = spans[his[0]][1] if his else math.inf
+            if max(lo, lo_j) > min(hi, hi_j):
                 break
-            new_lo, new_hi = max(lo, span[0]), min(hi, span[1])
-            if new_lo > new_hi:
-                break
-            lo, hi, end = new_lo, new_hi, j
-            if math.isfinite(span[0]) and math.isfinite(span[1]):
-                informative.append(j)
-                seen.add(float(source[j]))
-        if end < start or len(informative) < min_informative or len(seen) < min_distinct_source:
+            end += 1
+            while los and spans[los[-1]][0] < lo_j:
+                los.pop()
+            los.append(end)
+            while his and spans[his[-1]][1] > hi_j:
+                his.pop()
+            his.append(end)
+            if informing(spans[end]):
+                informative += 1
+                values[float(source[end])] += 1
+        contained, prev_end = prev_end == end, end
+        if end < start or contained or informative < min_informative or len(values) < min_distinct_source:
             continue
-        found.append({"start": start, "end": end, "lo": lo, "hi": hi, "informative": informative})
-    maximal = []
-    for r in found:
-        if any(o is not r and o["start"] <= r["start"] and o["end"] >= r["end"]
-               and (o["start"], o["end"]) != (r["start"], r["end"]) for o in found):
-            continue
-        if any((m["start"], m["end"]) == (r["start"], r["end"]) for m in maximal):
-            continue
-        maximal.append(r)
-    return maximal
+        out.append({"start": start, "end": end,
+                    "lo": spans[los[0]][0] if los else -math.inf,
+                    "hi": spans[his[0]][1] if his else math.inf})
+    return out
 
 
 def _segments(positions):
-    """[[start, end], ...] of the contiguous stretches in a sorted list of positions."""
+    """[[start, end], ...] of the contiguous stretches in a strictly increasing list of positions."""
     out = []
     for p in positions:
         if out and p == out[-1][1] + 1:
@@ -517,35 +566,48 @@ def _segments(positions):
     return out
 
 
+def _confirms_nothing(span):
+    """A cell compatible with every constant -- in the ratio arm, zero against zero."""
+    return span is not None and not (math.isfinite(span[0]) and math.isfinite(span[1]))
+
+
 def _group_constant_runs(runs, spans, admit=None):
     """Gather the runs one constant accounts for.
 
-    Longest first, a run joins the first group whose interval it still intersects and
-    none of whose runs it overlaps; the group's interval narrows to the intersection. A
-    group's POSITIONS are then every cell whose interval admits that constant, in a run
-    or not -- a lone consistent cell between two runs is the same relation, not its
-    outside. A cell with no interval (None) joins only if `admit(i, lo, hi)` says the constant
-    writes it -- a source read as zero, which one interval cannot describe. Returns
+    Longest first, a run joins the first group whose interval it still intersects; the
+    group's interval narrows to the intersection. (Two runs that overlap in position never
+    share a point -- the earlier would have extended -- so a run never joins a group holding
+    one it overlaps.) A group's POSITIONS are then every cell whose interval meets the
+    group's, in a run or not -- a lone consistent cell between two runs is the same relation,
+    not its outside. A cell with no interval (None) joins only if `admit(i, lo, hi)` says
+    some constant of the group writes it -- a source read as zero, which one interval cannot
+    describe. A cell that confirms nothing (`_confirms_nothing`) may sit inside a stretch but
+    never extends one: it is trimmed off both ends of every segment. Returns
     [{"lo", "hi", "positions", "informative", "segments"}].
     """
     groups = []
     for r in sorted(runs, key=lambda r: (-(r["end"] - r["start"]), r["start"])):
         for g in groups:
             lo, hi = max(g["lo"], r["lo"]), min(g["hi"], r["hi"])
-            if lo <= hi and all(r["end"] < s["start"] or r["start"] > s["end"] for s in g["runs"]):
+            if lo <= hi:
                 g["lo"], g["hi"] = lo, hi
-                g["runs"].append(r)
                 break
         else:
-            groups.append({"lo": r["lo"], "hi": r["hi"], "runs": [r]})
+            groups.append({"lo": r["lo"], "hi": r["hi"]})
     out = []
     for g in groups:
-        positions = [i for i, s in enumerate(spans)
-                     if (s is not None and s[0] <= g["hi"] and s[1] >= g["lo"])
-                     or (s is None and admit is not None and admit(i, g["lo"], g["hi"]))]
+        met = [i for i, s in enumerate(spans)
+               if (s is not None and s[0] <= g["hi"] and s[1] >= g["lo"])
+               or (s is None and admit is not None and admit(i, g["lo"], g["hi"]))]
+        positions = []
+        for start, end in _segments(met):
+            while start <= end and _confirms_nothing(spans[start]):
+                start += 1
+            while end >= start and _confirms_nothing(spans[end]):
+                end -= 1
+            positions.extend(range(start, end + 1))
         # an admitted cell without an interval says only that |k| clears a threshold: not informative
-        informative = [i for i in positions if spans[i] is not None
-                       and math.isfinite(spans[i][0]) and math.isfinite(spans[i][1])]
+        informative = [i for i in positions if spans[i] is not None and not _confirms_nothing(spans[i])]
         out.append({"lo": g["lo"], "hi": g["hi"], "positions": positions,
                     "informative": informative, "segments": _segments(positions)})
     return out
@@ -554,7 +616,22 @@ def _group_constant_runs(runs, spans, admit=None):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 25 passed.
+Expected: 29 passed.
+
+- [ ] **Step 4b: 逐条核对“删掉即变红”**
+
+每一项在磁盘上改动后跑一次测试文件，确认点名的测试失败，再从备份恢复并用 `cmp` 确认与备份逐字节相同。每次运行都设 `PYTHONDONTWRITEBYTECODE=1`。替换只在新函数体内做（旧的 `_scan_quantized_ratio_runs` 里有相似的片段）。
+
+| 改动 | 必须失败的测试 |
+|---|---|
+| `_scan_interval_runs`：`max(lo, lo_j) > min(hi, hi_j)` 改为 `>=` | `test_intervals_that_only_touch_share_a_point` |
+| `_scan_interval_runs`：`contained` 恒为 `False` | `test_scan_interval_runs_breaks_on_none_and_drops_sub_runs` |
+| `_scan_interval_runs`：不同源值按全部格计，而不只按有信息的格 | `test_a_run_needs_distinct_source_values_among_its_informative_cells` |
+| `_group_constant_runs`：组的区间不随加入的段收窄 | `test_a_run_joins_the_longest_group_its_constant_still_meets` |
+| `_group_constant_runs`：按段长升序加入 | `test_a_run_joins_the_longest_group_its_constant_still_meets` |
+| `_group_constant_runs`：去掉 `admit` 一支 | `test_a_cell_without_an_interval_joins_a_group_only_when_admitted` |
+| `_group_constant_runs`：不从段首（或段尾）剪掉不提供信息的格 | `test_a_cell_that_confirms_nothing_sits_inside_a_stretch_but_never_extends_one` |
+| `_group_constant_runs`：不提供信息的格算作有信息 | `test_a_cell_that_confirms_nothing_sits_inside_a_stretch_but_never_extends_one` |
 
 - [ ] **Step 5: 提交**
 
@@ -645,6 +722,14 @@ def test_edge_steps_count_an_offset_gap_in_the_pairs_combined_step():
     assert _edge_steps(a, b, q_a, q_b, group, spans, "offset") == pytest.approx([0.445 / 0.055])
 
 
+def test_edge_steps_walk_past_a_cell_that_confirms_nothing():
+    a, b = _arr([10.0, 20.0, 30.0, 0.0, 5.0]), _arr([20.0, 40.0, 60.0, 0.0, 13.0])
+    q = [0.1] * 5
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2], "segments": [[0, 2]]}
+    assert _edge_steps(a, b, q, q, group, spans, "ratio") == pytest.approx([(12.95 / 5.05 - 2.0) * 5.0 / 0.1])
+
+
 def test_a_line_is_usable_with_enough_cells_and_no_axis_shape():
     assert _local_line_usable(_arr([1.2, 3.4, math.nan, 2.7, 5.1]))
     assert not _local_line_usable(_arr([1.2, 3.4, math.nan, 2.7]))           # three finite cells
@@ -715,15 +800,16 @@ def _identity_steps(spans, informative, constant, relation):
 def _edge_steps(a_line, b_line, q_a, q_b, group, spans, relation):
     """Departure, in the cell's own rounding steps and beyond rounding, of the first cell
     past each end of the group's longest segment -- walking outward over blank cells (a
-    panel separator) and over the group's own positions, so the cell judged is the data
-    that actually adjoins the stretch. [] when nothing lies outside on either side. A source
-    read as zero counts by what the constant falls short of writing it, in B's steps."""
+    panel separator), cells that confirm nothing and the group's own positions, so the cell
+    judged is the data that actually adjoins the stretch. [] when nothing lies outside on
+    either side. A source read as zero counts by what the constant falls short of writing
+    it, in B's steps."""
     start, end = max(group["segments"], key=lambda se: (se[1] - se[0], -se[0]))
     inside = set(group["positions"])
     k = (group["lo"] + group["hi"]) / 2.0
     out = []
     for i, stride in ((start - 1, -1), (end + 1, 1)):
-        while 0 <= i < len(spans) and (i in inside or not (
+        while 0 <= i < len(spans) and (i in inside or _confirms_nothing(spans[i]) or not (
                 math.isfinite(float(a_line[i])) and math.isfinite(float(b_line[i])))):
             i += stride
         if not 0 <= i < len(spans):
@@ -734,8 +820,6 @@ def _edge_steps(a_line, b_line, q_a, q_b, group, spans, relation):
             out.append(miss / q_b[i] if q_b[i] > 0 else math.inf)
             continue
         lo, hi = span
-        if not (math.isfinite(lo) and math.isfinite(hi)):
-            continue
         gap = lo - k if k < lo else (k - hi if k > hi else 0.0)
         if relation == "ratio":
             out.append(abs(gap) * abs(float(a_line[i])) / q_b[i] if q_b[i] > 0 else math.inf)
@@ -762,7 +846,7 @@ def _local_line_usable(values, label=None):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 34 passed.
+Expected: 39 passed.
 
 - [ ] **Step 4b: 逐条核对“删掉即变红”**
 
@@ -779,6 +863,7 @@ Expected: 34 passed.
 | `_edge_steps`：差值臂步长改为 `q_b[i]` | `test_edge_steps_count_an_offset_gap_in_the_pairs_combined_step` |
 | `_edge_steps`：向外走时不跳过组内位置 | `test_edge_steps_walk_past_a_blank_and_the_groups_own_positions` |
 | `_edge_steps`：向外走时不跳过空格 | `test_edge_steps_walk_past_a_blank_and_the_groups_own_positions` |
+| `_edge_steps`：向外走时不跳过不提供信息的格 | `test_edge_steps_walk_past_a_cell_that_confirms_nothing` |
 | `_local_line_usable`：三条规则各关掉一次 | `test_a_line_is_usable_with_enough_cells_and_no_axis_shape` |
 
 - [ ] **Step 5: 提交**
@@ -925,6 +1010,28 @@ def test_a_source_read_as_zero_that_the_constant_barely_misses_is_not_an_abrupt_
     assert _best(a, b) is None
 
 
+def test_cells_that_confirm_nothing_do_not_make_scattered_consistency_a_stretch():
+    a = [12.437, 8.912, 15.226, 9.871, 11.054, 13.388, 7.645, 10.902, 14.117, 9.333,
+         10.051, 12.884, 9.4466, 13.1027, 11.7739]
+    b = [round(x * 1.137, 3) for x in a]
+    for i, v in ((3, 2.5), (7, 30.0), (11, 4.2)):
+        b[i] = v
+    assert _best([0.0] * 6 + a, [0.0] * 6 + b) is None          # zero against zero, six times
+
+
+def test_a_stretch_is_reported_without_the_shared_zeros_beside_it():
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    relation, group, _bits, _dep = _best([0.0] * 4 + A10, [0.0] * 4 + b)
+    assert relation == "ratio" and group["positions"] == list(range(4, 10))
+
+
+def test_the_work_of_a_pair_counts_a_pass_over_the_line_for_each_group():
+    a, b = _arr(A10), _arr([round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2])
+    work = [0]
+    _best_local_group(a, b, _effective_line_quantums(a), _effective_line_quantums(b), 4, work)
+    assert work == [len(A10)]          # one ratio group, no offset group
+
+
 def test_a_sign_flip_and_a_stretch_of_zeros_are_not_reported():
     # A sign-flipped copy: its interval holds -1, a power of ten, so it is left with the unit
     # restatements -- a recorded gap rather than a judgement. A stretch of zeros: its constant
@@ -948,9 +1055,13 @@ Expected: ImportError。
 - [ ] **Step 3: 实现**
 
 ```python
-def _best_local_group(a_line, b_line, q_a, q_b, n_tests):
+def _best_local_group(a_line, b_line, q_a, q_b, n_tests, work=None):
     """The highest-scoring group passing every test of the design's section 4, as
-    (relation, group, bits, departure), or None."""
+    (relation, group, bits, departure), or None.
+
+    Each group costs a pass over the line, and a slowly drifting relation can hold many of
+    them, so when `work` (a one-element list) is given, one line's length per group is
+    added to it for the caller's budget."""
     best = None
     for relation, interval in (("ratio", _symmetric_ratio_interval),
                                ("offset", _symmetric_offset_interval)):
@@ -961,7 +1072,10 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests):
                 a, b = float(a_line[i]), float(b_line[i])
                 return (math.isfinite(a) and math.isfinite(b)
                         and _zero_source_miss(b, q_a[i], q_b[i], max(abs(lo), abs(hi))) == 0.0)
-        for g in _group_constant_runs(_scan_interval_runs(spans, a_line), spans, admit):
+        groups = _group_constant_runs(_scan_interval_runs(spans, a_line), spans, admit)
+        if work is not None:
+            work[0] += len(spans) * len(groups)
+        for g in groups:
             lo, hi = g["lo"], g["hi"]
             if relation == "ratio" and (lo <= 1.0 <= hi or _interval_holds_a_power_of_ten(lo, hi)):
                 continue
@@ -997,7 +1111,7 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 54 passed.
+Expected: 62 passed.
 
 - [ ] **Step 5: 逐条核对“关掉即变红”**
 
@@ -1185,7 +1299,9 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
                     return findings
                 if (orientation, ia, ib) in already:
                     continue
-                hit = _best_local_group(lines[ia], lines[ib], quantums[ia], quantums[ib], n_tests)
+                work = [0]
+                hit = _best_local_group(lines[ia], lines[ib], quantums[ia], quantums[ib], n_tests, work)
+                budget -= work[0]
                 if hit is not None:
                     findings.append(_local_run_finding(orientation, ia, ib, labels, first,
                                                        lines[ia], lines[ib], *hit))
@@ -1195,7 +1311,7 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 60 passed.
+Expected: 68 passed.
 
 - [ ] **Step 5: 提交**
 
@@ -1264,7 +1380,7 @@ Expected: FAIL，`assert len(found) == 1`（0 条：块循环还没调用新检�
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 61 passed.
+Expected: 69 passed.
 
 - [ ] **Step 5: 跑全套测试，看有没有别处被带动**
 
@@ -1394,7 +1510,7 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
 - [ ] **Step 6: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 65 passed.
+Expected: 73 passed.
 
 - [ ] **Step 7: 提交**
 
