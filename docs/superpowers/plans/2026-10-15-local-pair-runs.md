@@ -1602,6 +1602,7 @@ git commit -m "feat(detect): decide whether a pair of lines holds a constant on 
 **Files:**
 - Modify: `src/paperconan/_audit.py`
 - Modify: `tests/test_local_pair_runs.py`
+- Modify: `skills/paperconan/SKILL.md`（coverage 一节加一条 `detector_row_limit` 的引用）
 
 - [ ] **Step 1: 写测试**（导入行加入 `_LOCAL_RUN_MAX_EXAMPLE_POSITIONS, _stretch_text, detect_local_pair_runs`）
 
@@ -1878,6 +1879,35 @@ def test_on_the_whole_sheet_a_pair_with_nothing_left_costs_nothing(monkeypatch):
     assert [(f["col_a_idx"], f["col_b_idx"]) for f in found] == [(0, 2)]
 
 
+def test_a_pair_whose_lines_never_meet_costs_nothing(monkeypatch):
+    import paperconan._audit as audit_module
+    monkeypatch.setattr(audit_module, "_LOCAL_RUN_BUDGET", 5)
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    # each line usable on its own, but never with a value where the other has one
+    rows = [["Group A", "Group B"]] + [[x, None] for x in A10[:5]] + [[None, y] for y in c[:5]]
+    sheet = Sheet.from_rows(rows)
+    cov = _Coverage()
+    assert detect_local_pair_runs(sheet, 1, 11, 0, 2, ["Group A", "Group B"], coverage=cov) == [] and not cov.calls
+    # three cells with both values: still one short of a stretch and its outside
+    meet = [["Group A", "Group B"]] + [[x, None] for x in A10[:4]] + [[x, y] for x, y in zip(A10[4:7], c[4:7])] + [[None, y] for y in c[7:]]
+    cov = _Coverage()
+    assert detect_local_pair_runs(Sheet.from_rows(meet), 1, 11, 0, 2, ["Group A", "Group B"], coverage=cov) == [] and not cov.calls
+    # the same once a panel holding both lines is left out of the whole sheet
+    rows += [[None, None]] + [[x, y] for x, y in zip(A10, c)]
+    sheet = Sheet.from_rows(rows)
+    cov = _Coverage()
+    found = detect_local_pair_runs(sheet, 1, 22, 0, 2, ["Group A", "Group B"], coverage=cov, panels=[(12, 22, 0, 2)])
+    assert found == [] and not cov.calls
+
+
+def test_four_cells_with_both_values_can_hold_a_stretch_and_its_outside():
+    a = [5.123, 15.456, 25.789, 12.345, 8.765, 19.432, None, None]
+    b = [round(x * 1.137, 3) for x in a[:3]] + [30.111, None, None, 7.654, 22.987]
+    (f,) = detect_local_pair_runs(Sheet.from_rows([["Group A", "Group B"]] + [[x, y] for x, y in zip(a, b)]),
+                                  1, 9, 0, 2, ["Group A", "Group B"])
+    assert f["segments"] == [[2, 4]] and f["line_length"] == 4
+
+
 def test_a_block_taller_than_the_row_limit_is_compared_by_columns_only(monkeypatch):
     import paperconan._audit as audit_module
     monkeypatch.setattr(audit_module, "_LOCAL_RUN_MAX_ROWS", 5)
@@ -2114,6 +2144,10 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
                     label = labels.get if orientation == "rows" else (lambda _i: None)
                     if not (_local_line_usable(a_line, label(ia)) and _local_line_usable(b_line, label(ib))):
                         continue
+                # a stretch needs three informative cells and its outside one more, each with both
+                # values: a pair with fewer such cells cannot hold one and is not worth a scan
+                if int((np.isfinite(a_line) & np.isfinite(b_line)).sum()) < _LOCAL_RUN_MIN_FINITE:
+                    continue
                 budget[0] -= length              # the scan; the call pays for its runs
                 if budget[0] < 0:
                     return exhausted()
@@ -2129,7 +2163,7 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 128 passed.
+Expected: 130 passed.
 
 - [ ] **Step 4b: 预算的“删掉即变红”**
 
@@ -2161,6 +2195,8 @@ Expected: 128 passed.
 | 被覆盖区间的右端少留空一格 | `test_on_the_whole_sheet_a_panel_leaves_out_exactly_its_own_rows` |
 | finding 用留空前的整条线 | `test_on_the_whole_sheet_a_panel_holding_both_lines_leaves_out_only_its_own_positions` |
 | 留空后的可用性判断放到扣预算之后（放在预算检查之前或之后各一次） | `test_on_the_whole_sheet_a_pair_with_nothing_left_costs_nothing` |
+| 去掉“两侧都有值的格少于 `_LOCAL_RUN_MIN_FINITE` 就跳过”，或把门槛降到 3 | `test_a_pair_whose_lines_never_meet_costs_nothing` |
+| 这道门槛升到 5 | `test_four_cells_with_both_values_can_hold_a_stretch_and_its_outside` |
 | 不看 `_LOCAL_RUN_MAX_ROWS` | `test_a_block_taller_than_the_row_limit_is_compared_by_columns_only` |
 | `already` 里的线对先扣预算再跳过 | `test_a_pair_already_reported_costs_nothing` |
 | 表头比块短时不回退为空标签；表头元素为 None 时写成 'None' | `test_a_header_shorter_than_the_block_leaves_a_label_empty` |
@@ -2169,10 +2205,23 @@ Expected: 128 passed.
 | rule 里 rows/columns 写反 | `test_a_column_pair_away_from_the_corner_points_at_its_own_cells` |
 | `_stretch_text` 不数零散格，或不封顶 | `test_the_rule_lists_the_runs_and_counts_the_lone_positions` |
 
+- [ ] **Step 4c: `SKILL.md` 引用新的覆盖登记，并跑全套测试**
+
+`detector_row_limit` 是本任务新加的覆盖原因。`tests/test_detector_cap_coverage.py` 要求每个原因要么在 `SKILL.md` 里以 `scan: ...` 行引用，要么登记为有意不引用；这一条的意思是“整个行方向没有比”，处理办法是调高 `PAPERCONAN_LOCAL_RUN_MAX_ROWS`，与计算预算不是同一类，所以引用。在 `skills/paperconan/SKILL.md` 的 coverage 条目里，紧接 `scan: detector compute budget limit in detect_row_relations` 那一条之后加入：
+
+```text
+  - `scan: detector row limit in detect_local_pair_runs` — a block taller than
+    `PAPERCONAN_LOCAL_RUN_MAX_ROWS` was not compared row by row by this pass; its
+    columns were.
+```
+
+Run: `.venv/bin/python -m pytest tests -q -p no:cacheprovider -k "not bench_baseline"`
+Expected: 汇总行无 failed。只跑本任务的测试文件看不到这类跨文件的约束。
+
 - [ ] **Step 5: 提交**
 
 ```bash
-git add src/paperconan/_audit.py tests/test_local_pair_runs.py
+git add src/paperconan/_audit.py tests/test_local_pair_runs.py skills/paperconan/SKILL.md
 git commit -m "feat(detect): report a pair of rows or columns related on one stretch only"
 ```
 
@@ -2272,7 +2321,7 @@ Expected: `test_a_scan_reports_the_stretch_in_the_relations_group` 与 `test_a_s
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 131 passed.
+Expected: 133 passed.
 
 - [ ] **Step 5: 跑全套测试，看有没有别处被带动**
 
@@ -2402,7 +2451,12 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
 - [ ] **Step 6: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 135 passed.
+Expected: 137 passed.
+
+- [ ] **Step 6b: 跑全套测试**（本任务改了共用的 `_profiles.py` 与 `benign_reason`）
+
+Run: `.venv/bin/python -m pytest tests -q -p no:cacheprovider -k "not bench_baseline"`
+Expected: 汇总行无 failed。
 
 - [ ] **Step 7: 提交**
 
