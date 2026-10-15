@@ -706,6 +706,17 @@ def test_outside_departure_reads_its_scale_from_cells_that_confirm_something():
     assert _outside_departure(a, b, q, q, group, spans, "ratio") == pytest.approx((1.25 / 0.55 - 2.0) * 0.5 / 30.0)
 
 
+def test_outside_departure_reads_its_scale_over_the_pair_only():
+    # B against a blank in A is not part of the pair: it does not pull the median |b| to 0
+    a = _arr([10.0, 20.0, 30.0, 0.0] + [math.nan] * 5)
+    b = _arr([20.0, 40.0, 60.0, 5.0] + [0.0] * 5)
+    q_a, q_b = [0.1] * 4 + [math.nan] * 5, [0.1] * 9
+    spans = [_symmetric_ratio_interval(x, y, s, t) for x, y, s, t in zip(a, b, q_a, q_b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2]}
+    # the source read as zero misses 5 by 4.95 - 2 * 0.05; the pair's median |b| is that of 20, 40, 60, 5
+    assert _outside_departure(a, b, q_a, q_b, group, spans, "ratio") == pytest.approx(4.85 / 30.0)
+
+
 def test_outside_departure_is_the_median_of_the_outside_not_its_mean():
     a, b = _arr([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), _arr([4.0, 5.0, 6.0, 7.5, 7.6, 20.0])
     q = [0.1] * 6
@@ -845,6 +856,10 @@ def test_a_line_that_is_itself_a_grid_within_rounding_is_not_compared():
     assert not _local_line_usable(_arr([100 / 2 ** i for i in range(8)] + [0.0]))          # a dilution and its vehicle
     assert not _local_line_usable(_arr([float(f"{50 / 3 ** i:.3g}") for i in range(7)]))   # 3-fold, at 3 figures
     assert not _local_line_usable(_arr([4.2] * 6))                                        # a constant line
+    ladder = [100 / 2 ** i for i in range(6)]
+    assert not _local_line_usable(_arr([x for x in ladder for _ in range(3)]))            # each dose, once per replicate
+    assert not _local_line_usable(_arr(ladder + [0.0] + ladder + [0.0]))                  # the ladder listed twice
+    assert _local_line_usable(_arr([0.0, 0.0, 3.2, 6.4, 0.0]))                            # two ratios are not a ladder
     assert _local_line_usable(_arr([10.01, 11.02, 12.08, 13.01, 14.02]))                  # off any grid by more than rounding
 ```
 
@@ -866,9 +881,10 @@ def _outside_departure(a_line, b_line, q_a, q_b, group, spans, relation):
     not read as a departure (curve families leak through their smallest cell otherwise).
     Offset: the gap over |c|. A source read as zero (no interval; ratio arm only, since offset
     intervals always exist) departs by what the constant falls short of writing it
-    (`_zero_source_miss`), over the line's median |b|. A cell that confirms nothing neither
-    counts as a departure nor sets that median: zeros against zeros filling most of a line
-    would otherwise make it 0. When the median is 0 all the same -- B zero against non-zero A
+    (`_zero_source_miss`), over the line's median |b|. That median is read over the pair's
+    cells: those where both lines have values and that confirm something -- B against a blank
+    in A is not part of the pair, and zeros against zeros filling most of a line would
+    otherwise make it 0. When the median is 0 all the same -- B zero against non-zero A
     across most of the line -- every ratio departure is recorded at the cap. Departures are
     capped at `_LOCAL_RUN_DEPARTURE_CAP`. None when nothing outside the group can be
     measured -- the relation covers the whole line, or what lies outside confirms nothing --
@@ -880,7 +896,8 @@ def _outside_departure(a_line, b_line, q_a, q_b, group, spans, relation):
         return None
     inside = set(group["positions"])
     finite_b = [abs(float(b_line[i])) for i, s in enumerate(spans)
-                if math.isfinite(float(b_line[i])) and not _confirms_nothing(s)]
+                if math.isfinite(float(a_line[i])) and math.isfinite(float(b_line[i]))
+                and not _confirms_nothing(s)]
     scale = float(np.median(finite_b)) if finite_b else 0.0
     departures = []
     for i, span in enumerate(spans):
@@ -954,25 +971,38 @@ def _edge_steps(a_line, b_line, q_a, q_b, group, spans, relation):
 
 
 def _line_is_grid(values):
-    """Does one difference, or one ratio, write every step of the line within its rounding --
-    a time or dose axis, a dilution series, or a constant line? Zeros are left out of the
-    ratio reading: a dilution series ends in its vehicle at 0."""
+    """Does one difference, or one ratio, write every step between consecutive cells with
+    values, within their rounding -- a time or dose axis, a dilution series, a constant line?
+
+    A line that repeats values is read a second time with each value at its first appearance
+    only, so a dose listed once per replicate, or a whole ladder listed twice, still reads as
+    its ladder. Zeros are left out of the ratio reading: a dilution series ends in its vehicle
+    at 0. The difference reading also takes a data line that is straight within its rounding;
+    a stretch copied into such a line is then not looked for -- the cost of keeping the
+    parallel, then diverging, straight trends of benign data out.
+    """
     cells = [(float(v), q) for v, q in zip(values, _effective_line_quantums(values))
              if math.isfinite(float(v))]
-    for interval, line in ((_symmetric_offset_interval, cells),
-                           (_symmetric_ratio_interval, [c for c in cells if c[0] != 0.0])):
-        if len(line) < _LOCAL_RUN_MIN_FINITE:
-            continue
-        lo, hi = -math.inf, math.inf
-        for (x, q_x), (y, q_y) in zip(line, line[1:]):
-            span = interval(x, y, q_x, q_y)
-            if span is None:
-                break
-            lo, hi = max(lo, span[0]), min(hi, span[1])
-            if lo > hi:
-                break
-        else:
-            return True
+    seen, first = set(), []
+    for c in cells:
+        if c[0] not in seen:
+            seen.add(c[0])
+            first.append(c)
+    for line in ([cells, first] if len(first) < len(cells) else [cells]):
+        for interval, steps in ((_symmetric_offset_interval, line),
+                                (_symmetric_ratio_interval, [c for c in line if c[0] != 0.0])):
+            if len(steps) < _LOCAL_RUN_MIN_FINITE:
+                continue
+            lo, hi = -math.inf, math.inf
+            for (x, q_x), (y, q_y) in zip(steps, steps[1:]):
+                span = interval(x, y, q_x, q_y)
+                if span is None:
+                    break
+                lo, hi = max(lo, span[0]), min(hi, span[1])
+                if lo > hi:
+                    break
+            else:
+                return True
     return False
 
 
@@ -990,7 +1020,7 @@ def _local_line_usable(values, label=None):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 53 passed.
+Expected: 54 passed.
 
 - [ ] **Step 4b: 逐条核对“删掉即变红”**
 
@@ -1013,6 +1043,8 @@ Expected: 53 passed.
 | `_local_line_usable`：最少有限格数、行标签两条规则各关掉一次 | `test_a_line_is_usable_with_enough_cells_and_no_axis_shape` |
 | `_local_line_usable`：不问 `_line_is_grid` | `test_a_line_that_is_itself_a_grid_within_rounding_is_not_compared` |
 | `_line_is_grid`：去掉差值或比例的读法之一；比例读法不去 0；差值读法也去 0 | `test_a_line_that_is_itself_a_grid_within_rounding_is_not_compared` |
+| `_line_is_grid`：不按首次出现再读一遍；每种读法的格数下限改成 2 | `test_a_line_that_is_itself_a_grid_within_rounding_is_not_compared` |
+| `_outside_departure`：尺度也取 A 为空的格 | `test_outside_departure_reads_its_scale_over_the_pair_only` |
 | `_outside_departure`：只查 a 是否有值 | `test_a_cell_blank_on_one_side_is_neither_a_departure_nor_an_edge` |
 | `_outside_departure`：中位数换成均值 | `test_outside_departure_is_the_median_of_the_outside_not_its_mean` |
 | `_outside_departure`：尺度为 0 时记 0 而不记上限 | `test_outside_departure_is_capped_when_the_lines_scale_is_zero` |
@@ -1378,7 +1410,7 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 84 passed.
+Expected: 85 passed.
 
 - [ ] **Step 5: 逐条核对“关掉即变红”**
 
@@ -1622,7 +1654,7 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 92 passed.
+Expected: 93 passed.
 
 - [ ] **Step 4b: 预算的“删掉即变红”**
 
@@ -1701,7 +1733,7 @@ Expected: FAIL，`assert len(found) == 1`（0 条：块循环还没调用新检�
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 93 passed.
+Expected: 94 passed.
 
 - [ ] **Step 5: 跑全套测试，看有没有别处被带动**
 
@@ -1831,7 +1863,7 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
 - [ ] **Step 6: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 97 passed.
+Expected: 98 passed.
 
 - [ ] **Step 7: 提交**
 
@@ -1865,7 +1897,11 @@ imported rather than copied so the three benches stay about the same data -- plu
                whole line's range such a stretch once read as significant.
   DOSE         two dilution series with different top concentrations, one ending in its
                vehicle at 0 where the other has one dilution more: a whole-line ratio whose
-               last cell departs. Each line is itself a grid, which is what keeps it out.
+               last cell departs. Listed once per dose, once per replicate, or twice over.
+               Each line is itself a grid, which is what keeps it out.
+  PARALLEL     two straight trends, noisy within about a rounding step, running parallel and
+               then diverging. At the cell level this is a stretch of one line shifted onto
+               the other; frozen as measured, a recorded cost rather than a target.
   DECAY        two proportional decays with a near-zero tail: a whole-line relation that
                locality should refuse, but the tail makes the line's median |b| -- the scale
                the ratio arm reads departures against -- small. Frozen as measured.
@@ -1875,6 +1911,8 @@ imported rather than copied so the three benches stay about the same data -- plu
   PLANTED_MONOTONE  a 6-cell stretch copied into one of two MONOTONE lines: the cost side of
                scoring by segment, since within a sorted or smooth line a segment's spread is
                local and a copied stretch there carries less than among unrelated values.
+  PLANTED_STRAIGHT  8 cells of a line straight within rounding, shifted onto another: the cost
+               side of reading such a line as a grid, which leaves it out of the comparison.
 
 Verdicts, not counts (CLAUDE.md "Freeze a verdict, not a count"): each stratum is the band
 of _verdict -- silent / partial / pervasive -- over its draws, using the column-pair bench's
@@ -1957,21 +1995,50 @@ def _measure_monotone(shape, n, decimals):
 
 # --- benign: two dilution series ---------------------------------------------------------------
 
-DOSES = ((2, 0), (2, 3), (3, 0), (3, 3))          # (fold, significant figures; 0 = as computed)
+# (fold, significant figures with 0 = as computed, layout)
+DOSES = tuple((fold, figures, layout) for fold in (2, 3) for figures in (0, 3)
+              for layout in ("once", "per_replicate", "twice"))
 
 
-def _dose_pair(rng, fold, figures):
+def _dose_pair(rng, fold, figures, layout):
     def series(top, n):
         values = [top / fold ** i for i in range(n)]
         return [float(f"{v:.{figures}g}") for v in values] if figures else values
     top = round(rng.uniform(5.0, 100.0), 1)
-    return series(top, 9), series(top * rng.choice((0.2, 0.25, 0.5, 2.0, 3.0, 4.0)), 8) + [0.0]
+    a, b = series(top, 9), series(top * rng.choice((0.2, 0.25, 0.5, 2.0, 3.0, 4.0)), 8) + [0.0]
+    if layout == "per_replicate":
+        return [x for x in a for _ in range(3)], [x for x in b for _ in range(3)]
+    return (a * 2, b * 2) if layout == "twice" else (a, b)
 
 
 @functools.lru_cache(maxsize=None)
-def _measure_doses(fold, figures):
-    rng = random.Random(SEED * 31 + fold * 131 + figures)
-    return CP._verdict(_local(_pair_sheet(*_dose_pair(rng, fold, figures))) for _ in range(REPEATS))
+def _measure_doses(fold, figures, layout):
+    rng = random.Random(SEED * 31 + fold * 131 + figures + ("once", "per_replicate", "twice").index(layout) * 17)
+    return CP._verdict(_local(_pair_sheet(*_dose_pair(rng, fold, figures, layout))) for _ in range(REPEATS))
+
+
+# --- benign: two straight trends, parallel and then diverging ----------------------------------
+
+PARALLEL = ((1, 0.05), (0, 0.5), (0, 1.0))          # (decimals, noise sd)
+
+
+def _straight(rng, slope, base, noise, decimals, length=12):
+    return [round(base + slope * t + rng.gauss(0.0, noise), decimals) for t in range(length)]
+
+
+@functools.lru_cache(maxsize=None)
+def _measure_parallel(decimals, noise):
+    rng = random.Random(SEED * 37 + decimals * 137 + int(noise * 100))
+    draws = []
+    for _ in range(REPEATS):
+        slope = rng.uniform(0.3, 1.0) if decimals else rng.uniform(3.0, 15.0)
+        base, shift = rng.uniform(10.0, 40.0), rng.uniform(2.0, 8.0) * (1 if decimals else 6)
+        bend = rng.choice((-1, 1)) * slope * rng.uniform(0.5, 1.5)
+        a = _straight(rng, slope, base, noise, decimals)
+        b = [round(base + shift + slope * t + (bend * (t - 7) if t >= 8 else 0.0) + rng.gauss(0.0, noise), decimals)
+             for t in range(12)]
+        draws.append(_local(_pair_sheet(a, b)))
+    return CP._verdict(draws)
 
 
 # --- benign: two proportional decays with a near-zero tail ------------------------------------
@@ -2055,6 +2122,22 @@ def _measure_planted_monotone(shape, decimals, relation):
         for i in range(start, start + 6):
             b[i] = round(a[i] * k if relation == "ratio" else a[i] + k, decimals)
         draws.append(_found(_local(_pair_sheet(a, b)), kind, start + 2))    # header row, 1-based
+    return CP._verdict(draws)
+
+
+PLANTED_STRAIGHT = ((1, 0.05), (0, 0.5))          # (decimals, noise sd)
+
+
+@functools.lru_cache(maxsize=None)
+def _measure_planted_straight(decimals, noise):
+    rng = random.Random(SEED * 41 + decimals * 139 + int(noise * 100))
+    draws = []
+    for _ in range(REPEATS):
+        slope = rng.uniform(0.3, 1.0) if decimals else rng.uniform(3.0, 15.0)
+        a = _straight(rng, slope, rng.uniform(10.0, 40.0), noise, decimals)
+        shift = round(rng.uniform(2.0, 8.0) * (1 if decimals else 6), decimals)
+        b = [round(x + shift, decimals) for x in a[:8]] + [round(rng.uniform(10.0, 60.0), decimals) for _ in range(4)]
+        draws.append(_found(_local(_pair_sheet(a, b)), "local_offset_run", 2))     # the stretch starts at row 1
     return CP._verdict(draws)
 
 
@@ -2186,10 +2269,29 @@ MONOTONE_BASELINE = {
 }
 
 DOSE_BASELINE = {
-    (2, 0): ('silent', {}),
-    (2, 3): ('silent', {}),
-    (3, 0): ('silent', {}),
-    (3, 3): ('silent', {}),
+    (2, 0, 'once'): ('silent', {}),
+    (2, 0, 'per_replicate'): ('silent', {}),
+    (2, 0, 'twice'): ('silent', {}),
+    (2, 3, 'once'): ('silent', {}),
+    (2, 3, 'per_replicate'): ('silent', {}),
+    (2, 3, 'twice'): ('silent', {}),
+    (3, 0, 'once'): ('silent', {}),
+    (3, 0, 'per_replicate'): ('silent', {}),
+    (3, 0, 'twice'): ('silent', {}),
+    (3, 3, 'once'): ('silent', {}),
+    (3, 3, 'per_replicate'): ('silent', {}),
+    (3, 3, 'twice'): ('silent', {}),
+}
+
+PARALLEL_BASELINE = {
+    (1, 0.05): ('partial', {'local_offset_run': 'partial'}),
+    (0, 0.5): ('partial', {'local_offset_run': 'partial'}),
+    (0, 1.0): ('partial', {'local_offset_run': 'partial'}),
+}
+
+PLANTED_STRAIGHT_BASELINE = {
+    (1, 0.05): ('partial', {'local_offset_run': 'partial'}),
+    (0, 0.5): ('partial', {'local_offset_run': 'partial'}),
 }
 
 DECAY_BASELINE = {
@@ -2268,6 +2370,7 @@ def _tables():
         "COLUMN_BASELINE": {(f, d): _measure_column_family(f, d) for f in sorted(CP.BENIGN) for d in CP.SIG_FIGURES},
         "MONOTONE_BASELINE": {m: _measure_monotone(*m) for m in MONOTONE},
         "DOSE_BASELINE": {d: _measure_doses(*d) for d in DOSES},
+        "PARALLEL_BASELINE": {p: _measure_parallel(*p) for p in PARALLEL},
         "DECAY_BASELINE": {d: _measure_decays(*d) for d in DECAYS},
         "KNOWN_COST_BASELINE": {(d, s): _measure_known_cost(d, s) for d in CP.SIG_FIGURES for s in SEGMENTS},
         "PLANTED_COLUMNS_BASELINE": {(r, d, s): _measure_planted_columns(r, d, s)
@@ -2275,6 +2378,7 @@ def _tables():
         "PLANTED_ROWS_BASELINE": {(r, d, s): _measure_planted_rows(r, d, s)
                                   for r in ("ratio", "offset") for d in CV._DECIMALS for s in SEGMENTS},
         "PLANTED_MONOTONE_BASELINE": {m: _measure_planted_monotone(*m) for m in PLANTED_MONOTONE},
+        "PLANTED_STRAIGHT_BASELINE": {p: _measure_planted_straight(*p) for p in PLANTED_STRAIGHT},
     }
 
 
@@ -2304,6 +2408,16 @@ def test_independent_monotone_lines_hold_their_frozen_verdict(stratum):
 @pytest.mark.parametrize("stratum", sorted(DOSE_BASELINE))
 def test_dilution_series_hold_their_frozen_verdict(stratum):
     _check(DOSE_BASELINE, _measure_doses, stratum, "local runs on two dilution series")
+
+
+@pytest.mark.parametrize("stratum", sorted(PARALLEL_BASELINE))
+def test_parallel_then_diverging_trends_hold_their_frozen_verdict(stratum):
+    _check(PARALLEL_BASELINE, _measure_parallel, stratum, "local runs on parallel, then diverging, trends")
+
+
+@pytest.mark.parametrize("stratum", sorted(PLANTED_STRAIGHT_BASELINE))
+def test_stretches_planted_in_straight_lines_are_found_as_often_as_recorded(stratum):
+    _check(PLANTED_STRAIGHT_BASELINE, _measure_planted_straight, stratum, "recall of a stretch planted in a straight line")
 
 
 @pytest.mark.parametrize("stratum", sorted(DECAY_BASELINE))
@@ -2337,6 +2451,8 @@ def test_every_stratum_the_generators_define_is_frozen():
     assert set(COLUMN_BASELINE) == {(f, d) for f in CP.BENIGN for d in CP.SIG_FIGURES}
     assert set(MONOTONE_BASELINE) == set(MONOTONE)
     assert set(DOSE_BASELINE) == set(DOSES)
+    assert set(PARALLEL_BASELINE) == set(PARALLEL)
+    assert set(PLANTED_STRAIGHT_BASELINE) == set(PLANTED_STRAIGHT)
     assert set(DECAY_BASELINE) == set(DECAYS)
     assert set(PLANTED_MONOTONE_BASELINE) == set(PLANTED_MONOTONE)
     assert set(KNOWN_COST_BASELINE) == {(d, s) for d in CP.SIG_FIGURES for s in SEGMENTS}
@@ -2365,7 +2481,7 @@ if __name__ == "__main__":
 - [ ] **Step 2: 运行**
 
 Run: `.venv/bin/python -m pytest tests/test_local_run_bench_baseline.py -q`
-Expected: 151 passed（约 15 秒）。若有档位不同，说明实现与本计划有出入：先找出出入在哪里，确认是有意的，再用 `python -m tests.test_local_run_bench_baseline` 重新生成表并粘贴，提交信息里写明哪一层、往哪个方向变了、为什么。
+Expected: 164 passed（约 15 秒）。若有档位不同，说明实现与本计划有出入：先找出出入在哪里，确认是有意的，再用 `python -m tests.test_local_run_bench_baseline` 重新生成表并粘贴，提交信息里写明哪一层、往哪个方向变了、为什么。
 
 - [ ] **Step 3: 核对台架有牙齿**
 
