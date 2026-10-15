@@ -570,7 +570,7 @@ git commit -m "feat(detect): gather the stretches one constant accounts for"
 - Modify: `src/paperconan/_audit.py`
 - Modify: `tests/test_local_pair_runs.py`
 
-- [ ] **Step 1: 写测试**（导入行加入 `_outside_departure`）
+- [ ] **Step 1: 写测试**（导入行加入 `_edge_steps, _identity_steps, _local_line_usable, _outside_departure`）
 
 ```python
 # --- outside departure ---------------------------------------------------------------------
@@ -589,6 +589,67 @@ def test_outside_departure_is_none_for_a_whole_line_relation():
     spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
     q = [0.1] * 3
     assert _outside_departure(a, b, q, q, {"lo": 1.9, "hi": 2.1, "positions": [0, 1, 2]}, spans, "ratio") is None
+
+
+def test_outside_departure_of_an_offset_is_its_gap_over_the_constant():
+    a, b = _arr([1.0, 2.0, 3.0, 4.0, 5.0]), _arr([4.0, 5.0, 6.0, 7.5, 7.6])
+    q = [0.1] * 5
+    spans = [_symmetric_offset_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 2.9, "hi": 3.1, "positions": [0, 1, 2]}
+    # c = 3 against [3.4, 3.6] below it and [2.5, 2.7] above it: gaps 0.4 and 0.3 over |c|, their median
+    assert _outside_departure(a, b, q, q, group, spans, "offset") == pytest.approx((0.4 + 0.3) / 2 / 3.0)
+
+
+def test_outside_departure_of_a_ratio_is_read_against_the_lines_scale():
+    a, b = _arr([10.0, 20.0, 30.0, 0.5]), _arr([20.0, 40.0, 60.0, 1.3])
+    q = [0.1] * 4
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2]}
+    # the small cell admits k from 1.25/0.55; that gap as an amount of B, over the line's median |b|
+    # of 30 -- not over the cell's own 1.3, which would read a small additive error as a large one
+    assert _outside_departure(a, b, q, q, group, spans, "ratio") == pytest.approx((1.25 / 0.55 - 2.0) * 0.5 / 30.0)
+
+
+def test_identity_steps_are_read_in_the_groups_half_widths():
+    spans = [(1.9, 2.1), (1.8, 2.2), (1.95, 2.05), (-math.inf, math.inf)]
+    # half-widths 0.1, 0.2 and 0.05 over the informative cells: a median of 0.1
+    assert _identity_steps(spans, [0, 1, 2], 2.0, "ratio") == pytest.approx(10.0)
+    assert _identity_steps(spans, [0, 1, 2], 0.5, "offset") == pytest.approx(5.0)
+
+
+def test_edge_steps_count_a_ratio_gap_in_the_targets_steps():
+    a, b = _arr([10.0, 20.0, 30.0, 5.0]), _arr([20.0, 40.0, 60.0, 13.0])
+    q = [0.1] * 4
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2], "segments": [[0, 2]]}
+    # nothing precedes the stretch; past its end the cell admits k from 12.95/5.05, a gap that is
+    # (12.95/5.05 - 2) * 5 as an amount of B, counted in B's steps
+    assert _edge_steps(a, b, q, q, group, spans, "ratio") == pytest.approx([(12.95 / 5.05 - 2.0) * 5.0 / 0.1])
+
+
+def test_edge_steps_walk_past_a_blank_and_the_groups_own_positions():
+    a = _arr([10.0, 20.0, 30.0, math.nan, 15.0, 5.0])
+    b = _arr([20.0, 40.0, 60.0, math.nan, 30.0, 13.0])
+    q = [0.1] * 6
+    spans = [_symmetric_ratio_interval(x, y, 0.1, 0.1) for x, y in zip(a, b)]
+    group = {"lo": 1.99, "hi": 2.01, "positions": [0, 1, 2, 4], "segments": [[0, 2], [4, 4]]}
+    assert _edge_steps(a, b, q, q, group, spans, "ratio") == pytest.approx([(12.95 / 5.05 - 2.0) * 5.0 / 0.1])
+
+
+def test_edge_steps_count_an_offset_gap_in_the_pairs_combined_step():
+    a, b = _arr([1.0, 2.0, 3.0, 4.0]), _arr([4.0, 5.0, 6.0, 7.5])
+    q_a, q_b = [0.1] * 4, [0.01] * 4
+    spans = [_symmetric_offset_interval(x, y, s, t) for x, y, s, t in zip(a, b, q_a, q_b)]
+    group = {"lo": 2.9, "hi": 3.1, "positions": [0, 1, 2], "segments": [[0, 2]]}
+    # the last cell admits c in 3.5 +/- 0.055: a gap of 0.445, in steps of (0.1 + 0.01) / 2
+    assert _edge_steps(a, b, q_a, q_b, group, spans, "offset") == pytest.approx([0.445 / 0.055])
+
+
+def test_a_line_is_usable_with_enough_cells_and_no_axis_shape():
+    assert _local_line_usable(_arr([1.2, 3.4, math.nan, 2.7, 5.1]))
+    assert not _local_line_usable(_arr([1.2, 3.4, math.nan, 2.7]))           # three finite cells
+    assert not _local_line_usable(_arr([1.2, 3.4, 2.7, 5.1]), "Time (h)")      # an axis by its label
+    assert not _local_line_usable(_arr([0.5, 1.0, math.nan, 1.5, 2.0]))       # a dose or time grid
 ```
 
 - [ ] **Step 2: 运行，确认失败**
@@ -596,7 +657,7 @@ def test_outside_departure_is_none_for_a_whole_line_relation():
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
 Expected: ImportError。
 
-- [ ] **Step 3: 实现**（四个函数一起加入；后三个由 Task 5 的判定测试覆盖）
+- [ ] **Step 3: 实现**（四个函数一起加入，各有直接测试）
 
 ```python
 def _outside_departure(a_line, b_line, q_a, q_b, group, spans, relation):
@@ -701,7 +762,24 @@ def _local_line_usable(values, label=None):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 27 passed.
+Expected: 34 passed.
+
+- [ ] **Step 4b: 逐条核对“删掉即变红”**
+
+每一项在磁盘上改动后跑一次测试文件，确认点名的测试失败，再从备份恢复并用 `cmp` 确认与备份逐字节相同。每次运行都设 `PYTHONDONTWRITEBYTECODE=1`。替换只在对应函数体内做（`gap = ...` 一行在两个函数里各出现一次）。
+
+| 改动 | 必须失败的测试 |
+|---|---|
+| `_outside_departure`：比例臂的尺度 `scale` 换成该格自身的 `abs(b)` | `test_outside_departure_of_a_ratio_is_read_against_the_lines_scale` |
+| `_outside_departure`：差值臂 `abs(gap / k)` 改为 `abs(gap)` | `test_outside_departure_of_an_offset_is_its_gap_over_the_constant` |
+| `_outside_departure`：`gap` 去掉 `k > hi` 分支 | `test_outside_departure_of_an_offset_is_its_gap_over_the_constant` |
+| `_outside_departure`：源读作 0 的格改为直接记上限 | `test_outside_departure_measures_a_source_read_as_zero_by_its_miss` |
+| `_identity_steps`：半宽改为全宽 | `test_identity_steps_are_read_in_the_groups_half_widths` |
+| `_edge_steps`：比例臂去掉 `abs(float(a_line[i]))` 因子 | `test_edge_steps_count_a_ratio_gap_in_the_targets_steps` |
+| `_edge_steps`：差值臂步长改为 `q_b[i]` | `test_edge_steps_count_an_offset_gap_in_the_pairs_combined_step` |
+| `_edge_steps`：向外走时不跳过组内位置 | `test_edge_steps_walk_past_a_blank_and_the_groups_own_positions` |
+| `_edge_steps`：向外走时不跳过空格 | `test_edge_steps_walk_past_a_blank_and_the_groups_own_positions` |
+| `_local_line_usable`：三条规则各关掉一次 | `test_a_line_is_usable_with_enough_cells_and_no_axis_shape` |
 
 - [ ] **Step 5: 提交**
 
@@ -919,7 +997,7 @@ def _best_local_group(a_line, b_line, q_a, q_b, n_tests):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 47 passed.
+Expected: 54 passed.
 
 - [ ] **Step 5: 逐条核对“关掉即变红”**
 
@@ -1117,7 +1195,7 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 53 passed.
+Expected: 60 passed.
 
 - [ ] **Step 5: 提交**
 
@@ -1186,7 +1264,7 @@ Expected: FAIL，`assert len(found) == 1`（0 条：块循环还没调用新检�
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 54 passed.
+Expected: 61 passed.
 
 - [ ] **Step 5: 跑全套测试，看有没有别处被带动**
 
@@ -1316,7 +1394,7 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
 - [ ] **Step 6: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 58 passed.
+Expected: 65 passed.
 
 - [ ] **Step 7: 提交**
 
