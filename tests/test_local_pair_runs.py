@@ -1062,6 +1062,47 @@ def test_on_the_whole_sheet_a_pair_with_nothing_left_costs_nothing(monkeypatch):
     assert [(f["col_a_idx"], f["col_b_idx"]) for f in found] == [(0, 2)]
 
 
+def test_a_pair_whose_lines_never_meet_costs_nothing(monkeypatch):
+    import paperconan._audit as audit_module
+    monkeypatch.setattr(audit_module, "_LOCAL_RUN_BUDGET", 5)
+    c = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    # each line usable on its own, but never with a value where the other has one
+    rows = [["Group A", "Group B"]] + [[x, None] for x in A10[:5]] + [[None, y] for y in c[:5]]
+    sheet = Sheet.from_rows(rows)
+    cov = _Coverage()
+    assert detect_local_pair_runs(sheet, 1, 11, 0, 2, ["Group A", "Group B"], coverage=cov) == [] and not cov.calls
+    # three cells with both values: still one short of a stretch and its outside
+    meet = [["Group A", "Group B"]] + [[x, None] for x in A10[:4]] + [[x, y] for x, y in zip(A10[4:7], c[4:7])] + [[None, y] for y in c[7:]]
+    cov = _Coverage()
+    assert detect_local_pair_runs(Sheet.from_rows(meet), 1, 11, 0, 2, ["Group A", "Group B"], coverage=cov) == [] and not cov.calls
+    # the same once a panel holding both lines is left out of the whole sheet
+    rows += [[None, None]] + [[x, y] for x, y in zip(A10, c)]
+    sheet = Sheet.from_rows(rows)
+    cov = _Coverage()
+    found = detect_local_pair_runs(sheet, 1, 22, 0, 2, ["Group A", "Group B"], coverage=cov, panels=[(12, 22, 0, 2)])
+    assert found == [] and not cov.calls
+    # and the pair after it gets the whole budget: a third column holds a stretch of the first,
+    # and the budget is that pair's cost and no more
+    a = A10[:6] + [None] * 4
+    b = [None] * 6 + c[6:]
+    e = [round(x * 1.137, 3) for x in A10[:5]] + [11.9] + [5.5, 13.2, 8.1, 16.4]
+    sheet = Sheet.from_rows([["Group A", "Group B", "Group E"]] + [[x, y, z] for x, y, z in zip(a, b, e)])
+    a_line, e_line = sheet.numeric[1:11, 0].astype(float), sheet.numeric[1:11, 2].astype(float)
+    spent = [10 ** 9]
+    _best_local_group(a_line, e_line, _effective_line_quantums(a_line), _effective_line_quantums(e_line), 1, spent)
+    monkeypatch.setattr(audit_module, "_LOCAL_RUN_BUDGET", 10 + (10 ** 9 - spent[0]))
+    found = detect_local_pair_runs(sheet, 1, 11, 0, 3, ["Group A", "Group B", "Group E"])
+    assert [(f["col_a_idx"], f["col_b_idx"]) for f in found] == [(0, 2)]
+
+
+def test_four_cells_with_both_values_can_hold_a_stretch_and_its_outside():
+    a = [5.123, 15.456, 25.789, 12.345, 8.765, 19.432, None, None]
+    b = [round(x * 1.137, 3) for x in a[:3]] + [30.111, None, None, 7.654, 22.987]
+    (f,) = detect_local_pair_runs(Sheet.from_rows([["Group A", "Group B"]] + [[x, y] for x, y in zip(a, b)]),
+                                  1, 9, 0, 2, ["Group A", "Group B"])
+    assert f["segments"] == [[2, 4]] and f["line_length"] == 4
+
+
 def test_a_block_taller_than_the_row_limit_is_compared_by_columns_only(monkeypatch):
     import paperconan._audit as audit_module
     monkeypatch.setattr(audit_module, "_LOCAL_RUN_MAX_ROWS", 5)

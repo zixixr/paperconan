@@ -4989,6 +4989,10 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
                     label = labels.get if orientation == "rows" else (lambda _i: None)
                     if not (_local_line_usable(a_line, label(ia)) and _local_line_usable(b_line, label(ib))):
                         continue
+                # a stretch needs three informative cells and its outside one more, each with both
+                # values: a pair with fewer such cells cannot hold one and is not worth a scan
+                if int((np.isfinite(a_line) & np.isfinite(b_line)).sum()) < _LOCAL_RUN_MIN_FINITE:
+                    continue
                 budget[0] -= length              # the scan; the call pays for its runs
                 if budget[0] < 0:
                     return exhausted()
