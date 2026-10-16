@@ -2247,7 +2247,8 @@ Expected: 131 passed.
 ```text
   - `scan: detector row limit in detect_local_pair_runs` — a block taller than
     `PAPERCONAN_LOCAL_RUN_MAX_ROWS` was not compared row by row by this pass; its
-    columns were.
+    columns were, unless the block was also wider than `PAPERCONAN_MAX_BLOCK_COLS`,
+    where no column pairs are compared either.
 ```
 
 反方向也有一条检查：`test_every_scan_line_quoted_in_the_skill_is_one_the_code_can_emit` 要求 `SKILL.md` 引用的每一行都由它的 fixture 产生。在 `tests/test_detector_cap_coverage.py` 那条测试里，紧接 `detector_compute_budget_limit` 那一行之后加入：

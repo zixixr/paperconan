@@ -126,7 +126,8 @@ Three things to hold onto while reading:
     out of its work budget.
   - `scan: detector row limit in detect_local_pair_runs` — a block taller than
     `PAPERCONAN_LOCAL_RUN_MAX_ROWS` was not compared row by row by this pass; its
-    columns were.
+    columns were, unless the block was also wider than `PAPERCONAN_MAX_BLOCK_COLS`,
+    where no column pairs are compared either.
   - `scan: detector within row folded independent repeat in detect_recurring_row_vectors (count=2)`
     — not a truncation but an omission:
     the within-row pass folds the overlapping windows one physical repeat
