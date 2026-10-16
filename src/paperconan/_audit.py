@@ -1445,18 +1445,29 @@ def _demote_dense_relations(relations, cap=RELATION_FLOOD_CAP):
     But they are not exempt from the crowding they cause. Judging each class against the
     full cap on its own left a sheet able to carry nearly twice it with nothing demoted at
     all, which is the flood this cap exists for arriving by a side door. So the short ones
-    go low once the sheet is crowded by any measure, while the ordinary ones answer only to
-    their own count. The newcomers carry what they add."""
-    ordinary = [r for r in relations if _relation_meets_ordinary_floor(r)]
-    short = [r for r in relations if not _relation_meets_ordinary_floor(r)]
-    flooded = []
-    if len(ordinary) > cap:
-        flooded = relations                      # a dense matrix, judged as it always was
-    elif len(relations) > cap:
-        flooded = short                          # crowded, and the newcomers carry it
-    for r in flooded:
-        r["severity"] = "low"
-        r["dense_block"] = True
+    go low once they and the ordinary ones together pass the cap, while the ordinary ones
+    answer only to their own count. The newcomers carry what they add.
+
+    The local-run kinds (`_LOCAL_RUN_KINDS`) arrived later still, whatever their length, and
+    the same rule extends to them as a third class: each class answers to its own count plus
+    the older classes', never a newer one's. Letting them vote turned a sheet holding one local
+    run beside a cap's worth of exact column relations dense, and demoted every one of those
+    relations to low; counting them into the short ones' crowding demoted short equalities
+    for runs that had nothing to do with them."""
+    def arrival(r):                      # 0 ordinary, 1 short, 2 local run
+        if r.get("kind") in _LOCAL_RUN_KINDS:
+            return 2
+        return 0 if _relation_meets_ordinary_floor(r) else 1
+    classes = [[r for r in relations if arrival(r) == c] for c in range(3)]
+    counted = 0
+    for c, members in enumerate(classes):
+        counted += len(members)
+        if counted > cap:                # this class is crowded: it and every newer one go low
+            for later in classes[c:]:
+                for r in later:
+                    r["severity"] = "low"
+                    r["dense_block"] = True
+            break
     return relations
 
 
@@ -4383,6 +4394,11 @@ _LOCAL_RUN_MIN_FINITE = _LOCAL_RUN_MIN_DISTINCT_SOURCE + 1
 # example_cells lists both sides of each position; bounded like every other evidence list.
 _LOCAL_RUN_MAX_EXAMPLE_POSITIONS = 64
 
+# The kinds this pass emits. The pass adds to a block's findings, so the two output gates that
+# count findings treat these as the later arrivals: `_cap_block_findings` drops them first among
+# findings of one severity, and `_demote_dense_relations` does not let them vote a sheet dense.
+_LOCAL_RUN_KINDS = frozenset({"local_ratio_run", "local_offset_run"})
+
 
 def _effective_line_quantums(values):
     """The step each cell of a line was RECORDED at, deciding per line between a
@@ -6994,8 +7010,9 @@ def _cap_block_findings(groups, cap):
     """Trim a block's findings to at most `cap`, keeping the highest-severity ones.
 
     `groups` maps a BLOCK_FINDING_GROUPS key to its list of findings; each list is
-    trimmed IN PLACE. Selection is by severity (high > medium > low); ties keep the
-    original detector/emission order, so output stays deterministic. Returns the number
+    trimmed IN PLACE. Selection is by severity (high > medium > low); within a severity the
+    local-run kinds go last, and ties otherwise keep the original detector/emission order,
+    so output stays deterministic. Returns the number
     of findings dropped. `cap is None` means unlimited (no trimming); `cap == 0` drops all."""
     if cap is None:
         return 0
@@ -7006,8 +7023,11 @@ def _cap_block_findings(groups, cap):
     flat = [(name, idx, f)
             for name, lst in groups.items()
             for idx, f in enumerate(lst)]
-    # Stable sort by severity keeps original order within a severity band.
-    flat.sort(key=lambda t: _SEVERITY_RANK.get((t[2].get("severity") or "low").lower(), 3))
+    # Stable sort by severity keeps original order within a severity band; within a band the
+    # local-run kinds go last, so they take only what the block's other findings of their
+    # severity leave.
+    flat.sort(key=lambda t: (_SEVERITY_RANK.get((t[2].get("severity") or "low").lower(), 3),
+                             t[2].get("kind") in _LOCAL_RUN_KINDS))
     keep = {(name, idx) for name, idx, _ in flat[:cap]}
     omitted = 0
     for name, lst in groups.items():
@@ -7241,15 +7261,14 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 # layouts are exactly the wide blocks the column detectors skip, and this is
                 # where a "row B = row A * k" relationship lives. Self-gates on rows/cols.
                 rr = detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=coverage)
-                # Pairs related on one stretch only; the whole-line detectors above report the
-                # rest, so the pairs they already hold are passed in and skipped. On the
-                # whole-sheet extent the other blocks are its panels: a pair lying together inside
-                # one of them was compared there. Column pairs follow `wide` like the column
-                # detectors; row pairs always run.
-                already = {("cols", f["col_a_idx"], f["col_b_idx"]) for f in rel
-                           if isinstance(f.get("col_a_idx"), int) and isinstance(f.get("col_b_idx"), int)}
-                already |= {("rows", f["row_a_idx"], f["row_b_idx"]) for f in rr
-                            if isinstance(f.get("row_a_idx"), int) and isinstance(f.get("row_b_idx"), int)}
+                # Pairs related on one stretch only. A pair `detect_relations` or
+                # `detect_row_relations` already reported, under any kind, is passed in and
+                # skipped. On the whole-sheet extent the other blocks are its panels: a pair lying
+                # together inside one of them was compared there. Column pairs follow `wide` like
+                # the column detectors; row pairs do not, and `detect_local_pair_runs` skips them
+                # instead on a block taller than `_LOCAL_RUN_MAX_ROWS`.
+                already = {("cols", f.get("col_a_idx"), f.get("col_b_idx")) for f in rel}
+                already |= {("rows", f.get("row_a_idx"), f.get("row_b_idx")) for f in rr}
                 panels = [b for b in blocks if b != (r0, r1, c0, c1)] if (r0, r1, c0, c1) == extent else []
                 local = detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=already,
                                                coverage=coverage, skip_columns=bool(wide), panels=panels)

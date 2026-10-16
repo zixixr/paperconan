@@ -1264,3 +1264,118 @@ def test_a_relation_over_one_whole_panel_is_not_a_stretch_of_the_sheet(tmp_path)
     b = [round(x * 1.137, 3) for x in A10]
     scan = _scan(tmp_path, [["Group A", "Group B"], *zip(A10, b), [], ["Group C", "Group D"], *zip(_C, _D)])
     assert _kinds(scan, "local_ratio_run") == []
+
+
+def _found(scan, group, kind):
+    return [f for blk in scan["relations_blocks"] for f in blk.get(group, []) if f["kind"] == kind]
+
+
+def _drawn(seed, shape):
+    return np.random.default_rng(seed).uniform(5, 25, shape).round(3)
+
+
+def test_a_pair_the_column_detectors_report_is_not_reported_again(tmp_path):
+    a, b = _drawn(1, 30), _drawn(2, 30)
+    b[:22] = (a[:22] + 2.345).round(3)
+    scan = _scan(tmp_path, [["Ctrl", "Treated"], *[[f"{x:.3f}", f"{y:.3f}"] for x, y in zip(a, b)]])
+    assert len(_found(scan, "relations", "partial_constant_offset")) == 1
+    assert _found(scan, "relations", "local_offset_run") == []
+
+
+def test_a_pair_the_row_detector_reports_is_not_reported_again(tmp_path):
+    m = _drawn(3, (5, 20))
+    m[1, :14] = (m[0, :14] * 1.37).round(4)
+    rows = [["Cond"] + [f"S{j}" for j in range(20)]]
+    rows += [[f"Cond{i}"] + [f"{v:.4f}" for v in m[i]] for i in range(5)]
+    scan = _scan(tmp_path, rows)
+    assert len(_found(scan, "row_relations", "constant_ratio_row")) == 1
+    assert _found(scan, "row_relations", "local_ratio_run") == []
+
+
+def test_a_row_stretch_is_reported_in_the_row_relations_group(tmp_path):
+    m = _drawn(4, (6, 10))
+    m[2, :6] = (m[0, :6] * 1.083).round(3)
+    rows = [["Cond"] + [f"S{j}" for j in range(10)]]
+    rows += [[f"Cond{i}"] + [f"{v:.3f}" for v in m[i]] for i in range(6)]
+    scan = _scan(tmp_path, rows)
+    (f,) = _found(scan, "row_relations", "local_ratio_run")
+    assert (f["row_a_idx"], f["row_b_idx"]) == (1, 3)
+    assert _found(scan, "relations", "local_ratio_run") == []
+
+
+def test_a_stretch_across_side_by_side_panels_is_found_on_the_whole_sheet(tmp_path):
+    pa, pb = _drawn(5, (20, 2)), _drawn(6, (20, 2))
+    pb[4:16, 0] = pa[4:16, 0] * 1.2
+    rows = [["A x", "A y", "", "B x", "B y"]]
+    rows += [[f"{pa[i, 0]:.3f}", f"{pa[i, 1]:.3f}", "", f"{pb[i, 0]:.3f}", f"{pb[i, 1]:.3f}"] for i in range(20)]
+    scan = _scan(tmp_path, rows)
+    found = [(blk["block"]["cols"], f["col_a_idx"], f["col_b_idx"]) for blk in scan["relations_blocks"]
+             for f in blk.get("relations", []) if f["kind"] == "local_ratio_run"]
+    assert found == [("1-5", 0, 3)]
+
+
+def test_a_row_arm_skipped_for_height_reaches_the_scan_coverage(tmp_path, monkeypatch):
+    import paperconan._audit as audit_module
+    monkeypatch.setattr(audit_module, "_LOCAL_RUN_MAX_ROWS", 5)
+    m = _drawn(7, (10, 5))
+    scan = _scan(tmp_path, [[f"C{j}" for j in range(5)], *[[f"{v:.3f}" for v in r] for r in m]])
+    named = [(i.get("detector"), i["reason"]) for i in scan["coverage"]["limitations"]]
+    assert ("detect_local_pair_runs", "detector_row_limit") in named
+
+
+def _three_columns_with_a_stretch():
+    a, b, c = _drawn(8, 40), _drawn(9, 40), _drawn(10, 40)
+    b[10:22] = (a[10:22] * 1.083).round(3)
+    return [["Ctrl", "Treated", "Other"], *[[f"{x:.3f}", f"{y:.3f}", f"{z:.3f}"] for x, y, z in zip(a, b, c)]]
+
+
+def test_a_block_too_wide_for_the_column_detectors_skips_column_pairs_here_too(tmp_path, monkeypatch):
+    import paperconan._audit as audit_module
+    monkeypatch.setattr(audit_module, "_MAX_BLOCK_COLS", 2)
+    assert _found(_scan(tmp_path, _three_columns_with_a_stretch()), "relations", "local_ratio_run") == []
+
+
+def test_the_same_block_within_the_width_limit_reports_the_stretch(tmp_path):
+    assert len(_found(_scan(tmp_path, _three_columns_with_a_stretch()), "relations", "local_ratio_run")) == 1
+
+
+def test_over_the_block_cap_a_local_run_gives_way_to_other_findings_of_its_severity():
+    import paperconan._audit as audit_module
+    local = [dict(kind="local_ratio_run", severity="high") for _ in range(5)]
+    whole = [dict(kind="constant_ratio", severity="high"), dict(kind="partial_constant_offset", severity="medium")]
+    rows = [dict(kind="constant_ratio_row", severity="high") for _ in range(3)]
+    groups = dict(relations=local + whole, row_relations=list(rows))
+    assert audit_module._cap_block_findings(groups, 6) == 4
+    assert groups["row_relations"] == rows
+    # only among findings of its own severity: the medium one still gives way to a local high
+    assert [f["kind"] for f in groups["relations"]] == ["local_ratio_run"] * 2 + ["constant_ratio"]
+
+
+def test_a_local_run_does_not_vote_a_sheet_dense():
+    import paperconan._audit as audit_module
+    n = audit_module._COLUMN_PAIR_MIN_ROWS + 20
+    whole = [dict(kind="constant_ratio", n=n, severity="high") for _ in range(audit_module.RELATION_FLOOD_CAP)]
+    local = dict(kind="local_ratio_run", n=n, severity="high")
+    audit_module._demote_dense_relations(whole + [local])
+    assert {f["severity"] for f in whole} == {"high"}
+    assert local["severity"] == "low" and local["dense_block"]   # it carries the crowding it adds
+
+
+def test_a_sheet_dense_without_its_local_runs_demotes_them_too():
+    import paperconan._audit as audit_module
+    n = audit_module._COLUMN_PAIR_MIN_ROWS + 20
+    whole = [dict(kind="constant_ratio", n=n, severity="high") for _ in range(audit_module.RELATION_FLOOD_CAP + 1)]
+    local = dict(kind="local_offset_run", n=n, severity="high")
+    audit_module._demote_dense_relations(whole + [local])
+    assert {f["severity"] for f in whole + [local]} == {"low"}
+
+
+def test_local_runs_do_not_crowd_the_short_relations_into_low():
+    import paperconan._audit as audit_module
+    cap, floor = audit_module.RELATION_FLOOD_CAP, audit_module._COLUMN_PAIR_MIN_ROWS
+    whole = [dict(kind="constant_ratio", n=floor + 20, severity="high") for _ in range(cap - 10)]
+    short = [dict(kind="identical_column", n=floor - 1, severity="high") for _ in range(5)]
+    local = [dict(kind="local_ratio_run", n=floor + 20, severity="high") for _ in range(10)]
+    audit_module._demote_dense_relations(whole + short + local)
+    assert {f["severity"] for f in whole + short} == {"high"}
+    assert {f["severity"] for f in local} == {"low"}
