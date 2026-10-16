@@ -1921,6 +1921,28 @@ def test_four_cells_with_both_values_can_hold_a_stretch_and_its_outside():
     assert f["segments"] == [[2, 4]] and f["line_length"] == 4
 
 
+def test_on_the_whole_sheet_a_pair_left_with_a_grid_costs_nothing(monkeypatch):
+    import paperconan._audit as audit_module
+    # three one-column panels above a full-width one: over the rows left, the first column is a
+    # dilution series again, so its pairs are skipped before they are charged and the last pair,
+    # holding a stretch, gets a budget of exactly its own cost
+    ladder = [round(100.0 / 2 ** i, 4) for i in range(10)]
+    x = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    y = [round(v * 1.137, 3) for v in x[:6]] + [11.9, 9.1, 18.7, 6.2]
+    rng = random.Random(20261027)
+    below = [[round(rng.uniform(5.0, 20.0), 3) for _ in range(3)] for _ in range(10)]
+    rows = [["Dose", "Group X", "Group Y"]] + [list(r) for r in zip(ladder, x, y)] + [[None] * 3] + below
+    sheet = Sheet.from_rows(rows)
+    x_line = np.array(x + [math.nan] * 11)
+    y_line = np.array(y + [math.nan] * 11)
+    spent = [10 ** 9]
+    _best_local_group(x_line, y_line, _effective_line_quantums(x_line), _effective_line_quantums(y_line), 1, spent)
+    monkeypatch.setattr(audit_module, "_LOCAL_RUN_BUDGET", 21 + (10 ** 9 - spent[0]))
+    panels = [(1, 11, 0, 1), (1, 11, 1, 2), (1, 11, 2, 3), (12, 22, 0, 3)]
+    found = detect_local_pair_runs(sheet, 1, 22, 0, 3, ["Dose", "Group X", "Group Y"], panels=panels)
+    assert [(f["col_a_idx"], f["col_b_idx"]) for f in found] == [(1, 2)]
+
+
 def test_a_block_taller_than_the_row_limit_is_compared_by_columns_only(monkeypatch):
     import paperconan._audit as audit_module
     monkeypatch.setattr(audit_module, "_LOCAL_RUN_MAX_ROWS", 5)
@@ -2176,7 +2198,7 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 130 passed.
+Expected: 131 passed.
 
 - [ ] **Step 4b: 预算的“删掉即变红”**
 
@@ -2207,7 +2229,7 @@ Expected: 130 passed.
 | 只留空 A 的值（步长照常留空） | `test_on_the_whole_sheet_what_is_left_of_a_grid_is_still_a_grid` |
 | 被覆盖区间的右端少留空一格 | `test_on_the_whole_sheet_a_panel_leaves_out_exactly_its_own_rows` |
 | finding 用留空前的整条线 | `test_on_the_whole_sheet_a_panel_holding_both_lines_leaves_out_only_its_own_positions` |
-| 留空后的可用性判断放到扣预算之后（放在预算检查之前或之后各一次） | `test_on_the_whole_sheet_a_pair_with_nothing_left_costs_nothing` |
+| 留空后的可用性判断放到扣预算之后（放在预算检查之前或之后各一次） | `test_on_the_whole_sheet_a_pair_left_with_a_grid_costs_nothing` |
 | 去掉“两侧都有值的格少于 `_LOCAL_RUN_MIN_FINITE` 就跳过”，或把门槛降到 3，或把这道判断放到扣预算之后 | `test_a_pair_whose_lines_never_meet_costs_nothing` |
 | 这道门槛升到 5 | `test_four_cells_with_both_values_can_hold_a_stretch_and_its_outside` |
 | 不看 `_LOCAL_RUN_MAX_ROWS` | `test_a_block_taller_than_the_row_limit_is_compared_by_columns_only` |
@@ -2341,7 +2363,7 @@ Expected: `test_a_scan_reports_the_stretch_in_the_relations_group` 与 `test_a_s
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 133 passed.
+Expected: 134 passed.
 
 - [ ] **Step 5: 跑全套测试，看有没有别处被带动**
 
@@ -2471,7 +2493,7 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
 - [ ] **Step 6: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 137 passed.
+Expected: 138 passed.
 
 - [ ] **Step 6b: 跑全套测试**（本任务改了共用的 `_profiles.py` 与 `benign_reason`）
 
