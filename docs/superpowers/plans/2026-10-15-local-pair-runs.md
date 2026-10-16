@@ -2382,7 +2382,7 @@ git commit -m "feat(detect): run the local-run pass on every block"
 
 审查发现，新 finding 并入 `relations` / `row_relations` 以后，会与其它 finding 一起经过两道按条数计的输出闸门，而这两道闸门不认识它：
 
-- 每块的 finding 上限 `_cap_block_findings` 只按严重度稳定排序，`relations` 组排在前面。一个所有列在同一段上互成比例的块，最多可给出 C(n,2) 条局部发现；审查构造的 20 列块上，它们占满了上限，把同一块里其它检测器的 high 发现挤掉；
+- 每块的 finding 上限 `_cap_block_findings` 只按严重度稳定排序，`relations` 组排在前面。一个所有列在同一段上互成比例的块，列方向最多可给出 C(n,2) 条局部发现；审查构造的 20 列块上，它们占满了上限，把同一块里其它检测器的 high 发现挤掉；
 - 整表的 dense 判定 `_demote_dense_relations` 让它投票。一张整列关系条数恰好等于上限的表，多出一条 `n` 够得上下限的局部发现，就会被判为 dense，整列关系全部降为 low。
 
 两处都改为把新类型当作后来者。另外三件事一起改：Step 1 的三个端到端测试只守住了接线里的少数决定，补七个；Step 3 的注释有两句不成立；`isinstance(..., int)` 会静默漏掉 numpy 整数。
@@ -2662,6 +2662,112 @@ git add src/paperconan/_audit.py tests/test_local_pair_runs.py
 git commit -m "fix(detect): let the local-run kinds give way at the shared output gates"
 ```
 
+- [ ] **Step 8: 复审后的修正**
+
+复审发现，两道闸门只用 `local_ratio_run` 钉住：把 `_LOCAL_RUN_KINDS` 改成只含 `local_ratio_run`，全套测试照样通过，而上一轮的问题对 offset 段原样回来。唯一用到 `local_offset_run` 的闸门测试，构造的是整列关系自己就超过上限的情形，局部发现归哪一类结果都一样。另外，`_local_run_finding` 里的 kind 是字符串字面量，没有引用这个常数，改名也会静默脱节。
+
+修法：四个闸门测试按两个 kind 的字面量参数化，不从 `_LOCAL_RUN_KINDS` 取值；再加一个测试，用两种关系各一个夹具跑检测器，断言它实际输出的 kind 恰好就是这两个名字，也恰好等于常数。顺手补一个原有的缺口：整列关系自己就判为 dense 时，短等式随之降为 low，这一分支原本就没被钉住（同样的变异放在原函数上，`test_relations_flood.py`、`test_column_pair_floor.py` 都不变红）。
+
+(a) `tests/test_local_pair_runs.py`：从 `def test_over_the_block_cap_a_local_run_gives_way_to_other_findings_of_its_severity():` 到文件末尾（Step 7 (e) 的最后四个测试），整段替换为：
+
+```python
+# The gates are tested against the two names as written, not against `_LOCAL_RUN_KINDS`: a test
+# reading its kinds from the constant would test only the kinds the constant already holds.
+_BOTH_LOCAL_KINDS = ["local_ratio_run", "local_offset_run"]
+
+
+def test_the_gates_know_every_kind_the_detector_emits():
+    import paperconan._audit as audit_module
+    ratio = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    offset = [round(x + 3.517, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, math.nan]
+    emitted = set()
+    for b in (ratio, offset):
+        sheet, header = _block([A10, b])
+        emitted |= {f["kind"] for f in detect_local_pair_runs(sheet, 1, 11, 0, 2, header)}
+    assert emitted == set(_BOTH_LOCAL_KINDS) == audit_module._LOCAL_RUN_KINDS
+
+
+@pytest.mark.parametrize("kind", _BOTH_LOCAL_KINDS)
+def test_over_the_block_cap_a_local_run_gives_way_to_other_findings_of_its_severity(kind):
+    import paperconan._audit as audit_module
+    local = [dict(kind=kind, severity="high") for _ in range(5)]
+    whole = [dict(kind="constant_ratio", severity="high"), dict(kind="partial_constant_offset", severity="medium")]
+    rows = [dict(kind="constant_ratio_row", severity="high") for _ in range(3)]
+    groups = dict(relations=local + whole, row_relations=list(rows))
+    assert audit_module._cap_block_findings(groups, 6) == 4
+    assert groups["row_relations"] == rows
+    # only among findings of its own severity: the medium one still gives way to a local high
+    assert [f["kind"] for f in groups["relations"]] == [kind] * 2 + ["constant_ratio"]
+
+
+@pytest.mark.parametrize("kind", _BOTH_LOCAL_KINDS)
+def test_a_local_run_does_not_vote_a_sheet_dense(kind):
+    import paperconan._audit as audit_module
+    n = audit_module._COLUMN_PAIR_MIN_ROWS + 20
+    whole = [dict(kind="constant_ratio", n=n, severity="high") for _ in range(audit_module.RELATION_FLOOD_CAP)]
+    local = dict(kind=kind, n=n, severity="high")
+    audit_module._demote_dense_relations(whole + [local])
+    assert {f["severity"] for f in whole} == {"high"}
+    assert local["severity"] == "low" and local["dense_block"]   # it carries the crowding it adds
+
+
+@pytest.mark.parametrize("kind", _BOTH_LOCAL_KINDS)
+def test_a_sheet_dense_without_its_local_runs_demotes_them_too(kind):
+    import paperconan._audit as audit_module
+    n = audit_module._COLUMN_PAIR_MIN_ROWS + 20
+    whole = [dict(kind="constant_ratio", n=n, severity="high") for _ in range(audit_module.RELATION_FLOOD_CAP + 1)]
+    local = dict(kind=kind, n=n, severity="high")
+    audit_module._demote_dense_relations(whole + [local])
+    assert {f["severity"] for f in whole + [local]} == {"low"}
+
+
+@pytest.mark.parametrize("kind", _BOTH_LOCAL_KINDS)
+def test_local_runs_do_not_crowd_the_short_relations_into_low(kind):
+    import paperconan._audit as audit_module
+    cap, floor = audit_module.RELATION_FLOOD_CAP, audit_module._COLUMN_PAIR_MIN_ROWS
+    whole = [dict(kind="constant_ratio", n=floor + 20, severity="high") for _ in range(cap - 10)]
+    short = [dict(kind="identical_column", n=floor - 1, severity="high") for _ in range(5)]
+    local = [dict(kind=kind, n=floor + 20, severity="high") for _ in range(10)]
+    audit_module._demote_dense_relations(whole + short + local)
+    assert {f["severity"] for f in whole + short} == {"high"}
+    assert {f["severity"] for f in local} == {"low"}
+```
+
+(b) `tests/test_relations_flood.py`：追加到文件末尾：
+
+```python
+def test_a_dense_sheet_takes_its_short_relations_down_with_it():
+    """Dense on the ordinary relations alone: a short relation beside them goes low with them."""
+    from paperconan._audit import _COLUMN_PAIR_MIN_ROWS
+    rels = _synthetic_relations(RELATION_FLOOD_CAP + 1)
+    short = dict(kind="identical_column", col_a="s0", col_b="s1", n=_COLUMN_PAIR_MIN_ROWS - 1,
+                 severity="high", rule="col[90] == col[91]")
+    _demote_dense_relations(rels + [short])
+    assert short["severity"] == "low" and short["dense_block"]
+```
+
+Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
+Expected: 150 passed.
+
+逐条核对“删掉即变红”（做法同 Step 7；跑 `tests/test_local_pair_runs.py`、`tests/test_relations_flood.py`、`tests/test_column_pair_floor.py`）：
+
+| 变异 | 应变红的测试 |
+|---|---|
+| `_LOCAL_RUN_KINDS` 只含 `local_ratio_run` | `test_the_gates_know_every_kind_the_detector_emits`，以及三个闸门测试的 `[local_offset_run]` |
+| `_LOCAL_RUN_KINDS` 只含 `local_offset_run` | `test_the_gates_know_every_kind_the_detector_emits`，以及三个闸门测试的 `[local_ratio_run]` |
+| `_local_run_finding` 里差值臂的 kind 改名 | `test_the_gates_know_every_kind_the_detector_emits`、`test_an_offset_stretch_is_reported_as_one` |
+| 块上限的排序键写死 `== "local_ratio_run"` | `test_over_the_block_cap_a_local_run_gives_way_to_other_findings_of_its_severity[local_offset_run]` |
+| dense 判定写死 `== "local_ratio_run"` | `test_a_local_run_does_not_vote_a_sheet_dense[local_offset_run]`、`test_local_runs_do_not_crowd_the_short_relations_into_low[local_offset_run]` |
+| 整列关系判为 dense 时放过短等式 | `test_a_dense_sheet_takes_its_short_relations_down_with_it` |
+
+Run: `.venv/bin/python -m pytest tests -q -p no:cacheprovider -k "not bench_baseline"`（不接管道，读汇总行）
+Expected: 汇总行无 failed，比 Step 7 多 6 个通过。
+
+```bash
+git add tests/test_local_pair_runs.py tests/test_relations_flood.py
+git commit -m "test(detect): pin both local-run kinds at the shared output gates"
+```
+
 ---
 ### Task 8: 良性控制：派生关系、表头分流与良性说明
 
@@ -2778,7 +2884,7 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
 - [ ] **Step 6: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 149 passed.
+Expected: 154 passed.
 
 - [ ] **Step 6b: 跑全套测试**（本任务改了共用的 `_profiles.py` 与 `benign_reason`）
 
@@ -3595,7 +3701,8 @@ cp -r recheck/benchmarks/paperconan_eval/curation_20260912/eval_scope/runs/v1_61
 
 再记四项（Task 7 审查要求）：
 
-- **现有 finding 是否保持**：逐篇对齐本分支与 main 的 `scan.json` 里两个新类型以外的 finding（按 file、sheet、block、kind、rule 对齐），记两个数：main 有而本分支没有的条数，严重度变了的条数。块内上限只让新 finding 挤掉严重度比它低的，dense 判定不让新类型影响前两类，所以这两种变化只应来自两处：同块里严重度更高的新 finding；被新 finding 先占用的全局 finding 预算（`PAPERCONAN_MAX_TOTAL_FINDINGS`）。上限挤掉一部分 finding 以后，按条数降级的闸门（如 within-col 洪泛）可能不再触发，这种连带的严重度变化也归到挤出那一处。逐条归因；归不进这两处的是缺陷，先查清再往下走。
+- **现有 finding 是否保持**：逐篇对齐本分支与 main 的 `scan.json` 里两个新类型以外的 finding（按 file、sheet、block、kind、rule 对齐），记两个数：main 有而本分支没有的条数，严重度变了的条数。块内上限只让新 finding 挤掉严重度比它低的，dense 判定不让新类型影响前两类，所以这两种变化只应来自三处：同块里严重度更高的新 finding；被新 finding 先占用的全局 finding 预算（`PAPERCONAN_MAX_TOTAL_FINDINGS`）；报告块上限（`PAPERCONAN_MAX_REPORT_BLOCKS`），即原本没有 finding 的块有了局部发现，就会占掉一个报告块名额。上限挤掉一部分 finding 以后，按条数降级的闸门（如 within-col 洪泛）可能不再触发，这种连带的严重度变化也归到挤出那一处。逐条归因；归不进这三处的是缺陷，先查清再往下走。
+- **workflow 的 route packet**：`start_workflow` 只给出前 `DEFAULT_BUDGET["clusters"]`（默认 8）个 cluster，这一层不经过 overview 的 panel 合并。逐篇数有多少现有 cluster 被新 cluster 挤出这一层；不量就在评估记录里写明它不在范围内。
 - **扫描耗时**：逐篇记录本分支与 main 的扫描墙钟时间，只比两边都跑完的论文；排序，看增量集中在哪几篇、这些篇的块是什么形状。审查在合成的高块上量到，新增耗时主要来自行对，而预算按格计，不计每对线的固定开销。增量可观时，把每对线的固定开销计入预算，或调低 `PAPERCONAN_LOCAL_RUN_MAX_ROWS`，重跑 Step 3–4。
 - **覆盖由 complete 变为 partial**：数有多少篇只因 `detect_local_pair_runs` / `detector_row_limit` 而从 complete 变为 partial。
 - **已知代价形态再加三种**：审查在合成数据上见到、按构造是良性的三种形态——按批次对照归一的百分比、按板校准的 ddCt、各组 n 不同的 SEM = SD/√n。表头分流改不了首屏排名（首屏按 `raw_severity` 排，那是分流之前的值），所以这几种在首屏上的代价只能在这里量。
