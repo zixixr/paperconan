@@ -2368,8 +2368,8 @@ Expected: 134 passed.
 
 - [ ] **Step 5: 跑全套测试，看有没有别处被带动**
 
-Run: `.venv/bin/python -m pytest tests -q -p no:cacheprovider 2>&1 | tail -15`
-Expected: 只有新加的测试是新增通过。若 golden 或其它检测器的测试失败，**不要更新 golden**：先看失败的 finding 是不是新检测器在 golden 数据上报出的。是的话，在 Task 12 的评估里记下它（这是本检测器在真实形态数据上的行为，要逐条判断是否属于误报），再决定是否更新 golden；更新 golden 必须单独提交，并在提交信息里说明每一条新增 finding 的性质。
+Run: `.venv/bin/python -m pytest tests -q -p no:cacheprovider -k "not bench_baseline"`（不接管道：管道会吞掉退出码，读汇总行）
+Expected: 汇总行无 failed，只有新加的测试是新增通过。若 golden 或其它检测器的测试失败，**不要更新 golden**：先看失败的 finding 是不是新检测器在 golden 数据上报出的。是的话，在 Task 12 的评估里记下它（这是本检测器在真实形态数据上的行为，要逐条判断是否属于误报），再决定是否更新 golden；更新 golden 必须单独提交，并在提交信息里说明每一条新增 finding 的性质。
 
 - [ ] **Step 6: 提交**
 
