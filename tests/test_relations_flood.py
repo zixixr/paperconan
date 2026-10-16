@@ -59,3 +59,13 @@ def test_separate_sheets_each_below_cap_keep_high():
     _demote_dense_sheets(blocks, cap=4)
     flat = [r for b in blocks for r in b["relations"]]
     assert all(r["severity"] == "high" for r in flat)
+
+
+def test_a_dense_sheet_takes_its_short_relations_down_with_it():
+    """Dense on the ordinary relations alone: a short relation beside them goes low with them."""
+    from paperconan._audit import _COLUMN_PAIR_MIN_ROWS
+    rels = _synthetic_relations(RELATION_FLOOD_CAP + 1)
+    short = dict(kind="identical_column", col_a="s0", col_b="s1", n=_COLUMN_PAIR_MIN_ROWS - 1,
+                 severity="high", rule="col[90] == col[91]")
+    _demote_dense_relations(rels + [short])
+    assert short["severity"] == "low" and short["dense_block"]

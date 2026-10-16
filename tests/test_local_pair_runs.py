@@ -1339,43 +1339,63 @@ def test_the_same_block_within_the_width_limit_reports_the_stretch(tmp_path):
     assert len(_found(_scan(tmp_path, _three_columns_with_a_stretch()), "relations", "local_ratio_run")) == 1
 
 
-def test_over_the_block_cap_a_local_run_gives_way_to_other_findings_of_its_severity():
+# The gates are tested against the two names as written, not against `_LOCAL_RUN_KINDS`: a test
+# reading its kinds from the constant would test only the kinds the constant already holds.
+_BOTH_LOCAL_KINDS = ["local_ratio_run", "local_offset_run"]
+
+
+def test_the_gates_know_every_kind_the_detector_emits():
     import paperconan._audit as audit_module
-    local = [dict(kind="local_ratio_run", severity="high") for _ in range(5)]
+    ratio = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    offset = [round(x + 3.517, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, math.nan]
+    emitted = set()
+    for b in (ratio, offset):
+        sheet, header = _block([A10, b])
+        emitted |= {f["kind"] for f in detect_local_pair_runs(sheet, 1, 11, 0, 2, header)}
+    assert emitted == set(_BOTH_LOCAL_KINDS) == audit_module._LOCAL_RUN_KINDS
+
+
+@pytest.mark.parametrize("kind", _BOTH_LOCAL_KINDS)
+def test_over_the_block_cap_a_local_run_gives_way_to_other_findings_of_its_severity(kind):
+    import paperconan._audit as audit_module
+    local = [dict(kind=kind, severity="high") for _ in range(5)]
     whole = [dict(kind="constant_ratio", severity="high"), dict(kind="partial_constant_offset", severity="medium")]
     rows = [dict(kind="constant_ratio_row", severity="high") for _ in range(3)]
     groups = dict(relations=local + whole, row_relations=list(rows))
     assert audit_module._cap_block_findings(groups, 6) == 4
     assert groups["row_relations"] == rows
     # only among findings of its own severity: the medium one still gives way to a local high
-    assert [f["kind"] for f in groups["relations"]] == ["local_ratio_run"] * 2 + ["constant_ratio"]
+    assert [f["kind"] for f in groups["relations"]] == [kind] * 2 + ["constant_ratio"]
 
 
-def test_a_local_run_does_not_vote_a_sheet_dense():
+@pytest.mark.parametrize("kind", _BOTH_LOCAL_KINDS)
+def test_a_local_run_does_not_vote_a_sheet_dense(kind):
     import paperconan._audit as audit_module
     n = audit_module._COLUMN_PAIR_MIN_ROWS + 20
     whole = [dict(kind="constant_ratio", n=n, severity="high") for _ in range(audit_module.RELATION_FLOOD_CAP)]
-    local = dict(kind="local_ratio_run", n=n, severity="high")
+    local = dict(kind=kind, n=n, severity="high")
     audit_module._demote_dense_relations(whole + [local])
     assert {f["severity"] for f in whole} == {"high"}
     assert local["severity"] == "low" and local["dense_block"]   # it carries the crowding it adds
 
 
-def test_a_sheet_dense_without_its_local_runs_demotes_them_too():
+@pytest.mark.parametrize("kind", _BOTH_LOCAL_KINDS)
+def test_a_sheet_dense_without_its_local_runs_demotes_them_too(kind):
     import paperconan._audit as audit_module
     n = audit_module._COLUMN_PAIR_MIN_ROWS + 20
     whole = [dict(kind="constant_ratio", n=n, severity="high") for _ in range(audit_module.RELATION_FLOOD_CAP + 1)]
-    local = dict(kind="local_offset_run", n=n, severity="high")
+    local = dict(kind=kind, n=n, severity="high")
     audit_module._demote_dense_relations(whole + [local])
     assert {f["severity"] for f in whole + [local]} == {"low"}
 
 
-def test_local_runs_do_not_crowd_the_short_relations_into_low():
+@pytest.mark.parametrize("kind", _BOTH_LOCAL_KINDS)
+def test_local_runs_do_not_crowd_the_short_relations_into_low(kind):
     import paperconan._audit as audit_module
     cap, floor = audit_module.RELATION_FLOOD_CAP, audit_module._COLUMN_PAIR_MIN_ROWS
     whole = [dict(kind="constant_ratio", n=floor + 20, severity="high") for _ in range(cap - 10)]
     short = [dict(kind="identical_column", n=floor - 1, severity="high") for _ in range(5)]
-    local = [dict(kind="local_ratio_run", n=floor + 20, severity="high") for _ in range(10)]
+    local = [dict(kind=kind, n=floor + 20, severity="high") for _ in range(10)]
     audit_module._demote_dense_relations(whole + short + local)
     assert {f["severity"] for f in whole + short} == {"high"}
     assert {f["severity"] for f in local} == {"low"}
