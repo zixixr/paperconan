@@ -1226,3 +1226,41 @@ def test_a_pair_whose_scan_spends_the_budget_exactly_is_scanned(monkeypatch):
     monkeypatch.setattr(audit_module, "_LOCAL_RUN_BUDGET", 10)     # the scan, and no run to pay for
     cov = _Coverage()
     assert detect_local_pair_runs(sheet, 1, 11, 0, 2, header, coverage=cov) == [] and not cov.calls
+
+
+# --- the scan ---------------------------------------------------------------------------
+
+_C = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+_D = [12.6, 5.2, 18.4, 9.9, 14.1, 6.6, 11.3, 16.8, 7.4, 13.5]
+
+
+def _scan(tmp_path, rows):
+    import csv
+    from paperconan._audit import scan_dir
+    with open(tmp_path / "panels.csv", "w", newline="") as fh:
+        csv.writer(fh).writerows(rows)
+    return scan_dir(str(tmp_path), str(tmp_path / "out"), write_md=False, write_html=False)
+
+
+def _kinds(scan, kind):
+    return [f for blk in scan["relations_blocks"] for f in blk.get("relations", []) if f["kind"] == kind]
+
+
+def test_a_scan_reports_the_stretch_in_the_relations_group(tmp_path):
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    scan = _scan(tmp_path, [["Group A", "Group B"], *zip(A10, b)])
+    (f,) = _kinds(scan, "local_ratio_run")
+    assert f["evidence"]["highlight_rows"] == [2, 3, 4, 5, 6, 7]
+    assert f["severity"] == "high" and f.get("profile_action") == "kept"
+
+
+def test_a_stretch_inside_one_of_two_panels_is_reported_once(tmp_path):
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    scan = _scan(tmp_path, [["Group A", "Group B"], *zip(A10, b), [], ["Group C", "Group D"], *zip(_C, _D)])
+    assert len(_kinds(scan, "local_ratio_run")) == 1
+
+
+def test_a_relation_over_one_whole_panel_is_not_a_stretch_of_the_sheet(tmp_path):
+    b = [round(x * 1.137, 3) for x in A10]
+    scan = _scan(tmp_path, [["Group A", "Group B"], *zip(A10, b), [], ["Group C", "Group D"], *zip(_C, _D)])
+    assert _kinds(scan, "local_ratio_run") == []

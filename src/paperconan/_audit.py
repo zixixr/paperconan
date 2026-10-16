@@ -7216,6 +7216,8 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             })
             blocks_analyzed_here = 0
             sheet_first_index = len(report_blocks)
+            # the whole-sheet extent `find_numeric_blocks` appended, if any; its panels are the rest
+            extent = _whole_sheet_extent(sheet) if len(blocks) > 1 else None
             for (r0, r1, c0, c1) in blocks:
                 if len(report_blocks) >= _MAX_REPORT_BLOCKS:   # output budget reached; stop collecting
                     break
@@ -7239,6 +7241,20 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 # layouts are exactly the wide blocks the column detectors skip, and this is
                 # where a "row B = row A * k" relationship lives. Self-gates on rows/cols.
                 rr = detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=coverage)
+                # Pairs related on one stretch only; the whole-line detectors above report the
+                # rest, so the pairs they already hold are passed in and skipped. On the
+                # whole-sheet extent the other blocks are its panels: a pair lying together inside
+                # one of them was compared there. Column pairs follow `wide` like the column
+                # detectors; row pairs always run.
+                already = {("cols", f["col_a_idx"], f["col_b_idx"]) for f in rel
+                           if isinstance(f.get("col_a_idx"), int) and isinstance(f.get("col_b_idx"), int)}
+                already |= {("rows", f["row_a_idx"], f["row_b_idx"]) for f in rr
+                            if isinstance(f.get("row_a_idx"), int) and isinstance(f.get("row_b_idx"), int)}
+                panels = [b for b in blocks if b != (r0, r1, c0, c1)] if (r0, r1, c0, c1) == extent else []
+                local = detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=already,
+                                               coverage=coverage, skip_columns=bool(wide), panels=panels)
+                rel = rel + [f for f in local if f["orientation"] == "cols"]
+                rr = rr + [f for f in local if f["orientation"] == "rows"]
                 wc = detect_within_column_patterns(sheet, r0, r1, c0, c1, header)
                 wc = wc + detect_dispersed_repeats(sheet, r0, r1, c0, c1, header)
                 # Block-scoped (not column-scoped): its own group so the packet
