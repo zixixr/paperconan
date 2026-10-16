@@ -1603,6 +1603,7 @@ git commit -m "feat(detect): decide whether a pair of lines holds a constant on 
 - Modify: `src/paperconan/_audit.py`
 - Modify: `tests/test_local_pair_runs.py`
 - Modify: `skills/paperconan/SKILL.md`（coverage 一节加一条 `detector_row_limit` 的引用）
+- Modify: `tests/test_detector_cap_coverage.py`（引用行的 fixture 加这一条）
 
 - [ ] **Step 1: 写测试**（导入行加入 `_LOCAL_RUN_MAX_EXAMPLE_POSITIONS, _stretch_text, detect_local_pair_runs`）
 
@@ -1898,6 +1899,18 @@ def test_a_pair_whose_lines_never_meet_costs_nothing(monkeypatch):
     cov = _Coverage()
     found = detect_local_pair_runs(sheet, 1, 22, 0, 2, ["Group A", "Group B"], coverage=cov, panels=[(12, 22, 0, 2)])
     assert found == [] and not cov.calls
+    # and the pair after it gets the whole budget: a third column holds a stretch of the first,
+    # and the budget is that pair's cost and no more
+    a = A10[:6] + [None] * 4
+    b = [None] * 6 + c[6:]
+    e = [round(x * 1.137, 3) for x in A10[:5]] + [11.9] + [5.5, 13.2, 8.1, 16.4]
+    sheet = Sheet.from_rows([["Group A", "Group B", "Group E"]] + [[x, y, z] for x, y, z in zip(a, b, e)])
+    a_line, e_line = sheet.numeric[1:11, 0].astype(float), sheet.numeric[1:11, 2].astype(float)
+    spent = [10 ** 9]
+    _best_local_group(a_line, e_line, _effective_line_quantums(a_line), _effective_line_quantums(e_line), 1, spent)
+    monkeypatch.setattr(audit_module, "_LOCAL_RUN_BUDGET", 10 + (10 ** 9 - spent[0]))
+    found = detect_local_pair_runs(sheet, 1, 11, 0, 3, ["Group A", "Group B", "Group E"])
+    assert [(f["col_a_idx"], f["col_b_idx"]) for f in found] == [(0, 2)]
 
 
 def test_four_cells_with_both_values_can_hold_a_stretch_and_its_outside():
@@ -2195,7 +2208,7 @@ Expected: 130 passed.
 | 被覆盖区间的右端少留空一格 | `test_on_the_whole_sheet_a_panel_leaves_out_exactly_its_own_rows` |
 | finding 用留空前的整条线 | `test_on_the_whole_sheet_a_panel_holding_both_lines_leaves_out_only_its_own_positions` |
 | 留空后的可用性判断放到扣预算之后（放在预算检查之前或之后各一次） | `test_on_the_whole_sheet_a_pair_with_nothing_left_costs_nothing` |
-| 去掉“两侧都有值的格少于 `_LOCAL_RUN_MIN_FINITE` 就跳过”，或把门槛降到 3 | `test_a_pair_whose_lines_never_meet_costs_nothing` |
+| 去掉“两侧都有值的格少于 `_LOCAL_RUN_MIN_FINITE` 就跳过”，或把门槛降到 3，或把这道判断放到扣预算之后 | `test_a_pair_whose_lines_never_meet_costs_nothing` |
 | 这道门槛升到 5 | `test_four_cells_with_both_values_can_hold_a_stretch_and_its_outside` |
 | 不看 `_LOCAL_RUN_MAX_ROWS` | `test_a_block_taller_than_the_row_limit_is_compared_by_columns_only` |
 | `already` 里的线对先扣预算再跳过 | `test_a_pair_already_reported_costs_nothing` |
@@ -2215,13 +2228,20 @@ Expected: 130 passed.
     columns were.
 ```
 
+反方向也有一条检查：`test_every_scan_line_quoted_in_the_skill_is_one_the_code_can_emit` 要求 `SKILL.md` 引用的每一行都由它的 fixture 产生。在 `tests/test_detector_cap_coverage.py` 那条测试里，紧接 `detector_compute_budget_limit` 那一行之后加入：
+
+```python
+    coverage.add_limitation("detector", "detector_row_limit",
+                            detector="detect_local_pair_runs")
+```
+
 Run: `.venv/bin/python -m pytest tests -q -p no:cacheprovider -k "not bench_baseline"`
 Expected: 汇总行无 failed。只跑本任务的测试文件看不到这类跨文件的约束。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-git add src/paperconan/_audit.py tests/test_local_pair_runs.py skills/paperconan/SKILL.md
+git add src/paperconan/_audit.py tests/test_local_pair_runs.py skills/paperconan/SKILL.md tests/test_detector_cap_coverage.py
 git commit -m "feat(detect): report a pair of rows or columns related on one stretch only"
 ```
 
