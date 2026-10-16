@@ -1103,6 +1103,28 @@ def test_four_cells_with_both_values_can_hold_a_stretch_and_its_outside():
     assert f["segments"] == [[2, 4]] and f["line_length"] == 4
 
 
+def test_on_the_whole_sheet_a_pair_left_with_a_grid_costs_nothing(monkeypatch):
+    import paperconan._audit as audit_module
+    # three one-column panels above a full-width one: over the rows left, the first column is a
+    # dilution series again, so its pairs are skipped before they are charged and the last pair,
+    # holding a stretch, gets a budget of exactly its own cost
+    ladder = [round(100.0 / 2 ** i, 4) for i in range(10)]
+    x = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    y = [round(v * 1.137, 3) for v in x[:6]] + [11.9, 9.1, 18.7, 6.2]
+    rng = random.Random(20261027)
+    below = [[round(rng.uniform(5.0, 20.0), 3) for _ in range(3)] for _ in range(10)]
+    rows = [["Dose", "Group X", "Group Y"]] + [list(r) for r in zip(ladder, x, y)] + [[None] * 3] + below
+    sheet = Sheet.from_rows(rows)
+    x_line = np.array(x + [math.nan] * 11)
+    y_line = np.array(y + [math.nan] * 11)
+    spent = [10 ** 9]
+    _best_local_group(x_line, y_line, _effective_line_quantums(x_line), _effective_line_quantums(y_line), 1, spent)
+    monkeypatch.setattr(audit_module, "_LOCAL_RUN_BUDGET", 21 + (10 ** 9 - spent[0]))
+    panels = [(1, 11, 0, 1), (1, 11, 1, 2), (1, 11, 2, 3), (12, 22, 0, 3)]
+    found = detect_local_pair_runs(sheet, 1, 22, 0, 3, ["Dose", "Group X", "Group Y"], panels=panels)
+    assert [(f["col_a_idx"], f["col_b_idx"]) for f in found] == [(1, 2)]
+
+
 def test_a_block_taller_than_the_row_limit_is_compared_by_columns_only(monkeypatch):
     import paperconan._audit as audit_module
     monkeypatch.setattr(audit_module, "_LOCAL_RUN_MAX_ROWS", 5)
