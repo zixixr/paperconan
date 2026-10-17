@@ -2990,6 +2990,169 @@ git add src/paperconan/_profiles.py src/paperconan/_audit.py tests/test_local_pa
 git commit -m "feat(profiles): judge a stretch by the rules its whole-line counterpart gets"
 ```
 
+- [ ] **Step 8: 审查后的修正**
+
+审查结论：对现有类型零差异（随机比对），三种良性形态都被分流，两个真阳性保持 kept/high。要修的：
+
+- 检测器改名时，没有测试提醒 `_profiles` 的表跟着改（只改检测器和测试，分流会静默失效）；
+- packet 在 `_distill_relations` 里按 finding 自己的类型重算表头分流，局部段没有按对应类型判：forensic 下同一对标签，整列关系判 drop、局部段判 keep；
+- 列方向差值段的对应类型错成 `identical_column` 时，测试不变红（ddCt 那一例的 qPCR 规则不看类型）；
+- 良性说明里的 `--` 与同函数其它说明的 `—` 不一致。
+
+另有三项记为已知代价，不在本分支修，见设计 §6，Task 12 Step 4 加一项 packet 层的测量：列方向没有同名保护、差值段的分流随方向不对称、通用说明挡住更具体的分流理由。
+
+(a) `src/paperconan/packet.py`：导入行
+
+```python
+from ._profiles import _is_axis_finding
+```
+
+改为
+
+```python
+from ._profiles import _is_axis_finding, _rules_kind
+```
+
+`_distill_relations` 里，
+
+```python
+        for r in relations:
+            if str(r.get("severity")).lower() != "high":
+                continue
+            findings.append(_relation_finding(
+                r.get("kind"),
+                r.get("col_a"),
+```
+
+改为
+
+```python
+        for r in relations:
+            if str(r.get("severity")).lower() != "high":
+                continue
+            # A column stretch is filtered by its whole-column counterpart's rules, and keeps
+            # its own name in the packet.
+            finding = _relation_finding(
+                _rules_kind(r),
+                r.get("col_a"),
+```
+
+同一调用的结尾，
+
+```python
+                slope=r.get("slope"),
+                intercept=r.get("intercept"),
+            ))
+    return findings
+
+
+def _distill_within_col(```
+
+改为
+
+```python
+                slope=r.get("slope"),
+                intercept=r.get("intercept"),
+            )
+            finding["kind"] = r.get("kind")
+            findings.append(finding)
+    return findings
+
+
+def _distill_within_col(```
+
+(b) `src/paperconan/_audit.py` 的 `benign_reason`：
+
+```python
+        return ("part of a line computed from another -- a normalisation, a unit conversion or a "
+                "shared control applied to some positions only -- has this same shape; check whether "
+```
+
+改为
+
+```python
+        return ("part of a line computed from another — a normalisation, a unit conversion or a "
+                "shared control applied to some positions only — has this same shape; check whether "
+```
+
+(c) `tests/test_local_pair_runs.py`：表头分流测试的参数表末尾，
+
+```python
+    ("local_offset_run", "constant_offset", "Ct target", "ddCt", [round(x - 18.2, 3) for x in _WEIGHTS]),
+])
+```
+
+改为
+
+```python
+    ("local_offset_run", "constant_offset", "Ct target", "ddCt", [round(x - 18.2, 3) for x in _WEIGHTS]),
+    # decided differently for `identical_column`, so a wrong counterpart for the offset shows
+    ("local_offset_run", "constant_offset", "Mean WT", "Mean KO", [round(x + 2.4, 3) for x in _WEIGHTS]),
+])
+```
+
+再在文件末尾追加：
+
+```python
+
+def test_the_counterpart_table_and_the_benign_reason_cover_every_kind_the_detector_emits():
+    import paperconan._audit as audit_module
+    from paperconan._profiles import _LOCAL_RUN_COUNTERPART
+    assert {k for k, _ in _LOCAL_RUN_COUNTERPART} == audit_module._LOCAL_RUN_KINDS
+    assert {o for _, o in _LOCAL_RUN_COUNTERPART} == {"cols", "rows"} and len(_LOCAL_RUN_COUNTERPART) == 4
+    assert all(audit_module.benign_reason(dict(kind=k)) for k in audit_module._LOCAL_RUN_KINDS)
+
+
+def test_a_scan_routes_a_stretch_by_its_headers(tmp_path):
+    rng = np.random.default_rng(11)
+    rows = [["Condition", "Mean", "SD", "SEM", "n"]]
+    for g in range(40):
+        n = 3 if g < 20 else 5
+        sd = rng.uniform(0.5, 6)
+        rows.append([f"C{g + 1}", f"{rng.uniform(5, 50):.2f}", f"{sd:.2f}", f"{sd / math.sqrt(n):.2f}", str(n)])
+    found = _found(_scan(tmp_path, rows), "relations", "local_ratio_run")
+    assert {(f["col_a"], f["col_b"]) for f in found} == {("SD", "SEM")}
+    assert {(f["raw_severity"], f["severity"], f["profile_action"]) for f in found} == {("high", "low", "demoted")}
+
+
+def test_the_packet_filters_a_column_stretch_by_its_counterparts_rules():
+    from paperconan.packet import _distill_relations
+    f = dict(kind="local_ratio_run", orientation="cols", severity="high", col_a="Absorbance",
+             col_b="Absorbance corrected", n=6, rule="col[1] = col[0] * 0.92 on rows 2-7",
+             col_a_sample=list(_WEIGHTS), col_b_sample=[round(x * 0.92, 3) for x in _WEIGHTS])
+
+    def distilled(g):
+        (out,) = _distill_relations({"relations_blocks": [{"file": "s.csv", "sheet": "s", "relations": [g]}]})
+        return out
+
+    want = distilled(dict(f, kind="constant_ratio"))
+    assert want["prefilter"] == "drop"                        # a pair the counterpart's rules decide
+    got = distilled(dict(f))
+    assert got["kind"] == "local_ratio_run" and dict(got, kind="constant_ratio") == want
+```
+
+Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
+Expected: 161 passed.
+
+逐条核对“删掉即变红”（做法同 Task 7 Step 7）：
+
+| 变异 | 应变红的测试 |
+|---|---|
+| packet 按 finding 自己的类型过表头分流 | `test_the_packet_filters_a_column_stretch_by_its_counterparts_rules` |
+| packet 不恢复原类型名 | 同上 |
+| 列方向差值段对应成 `identical_column` | `test_a_column_stretch_is_routed_like_its_whole_column_counterpart[…Mean WT-Mean KO…]` |
+| 表里去掉 `("local_offset_run", "rows")` | `test_the_counterpart_table_and_the_benign_reason_cover_every_kind_the_detector_emits` 等 |
+| 查表读的方向字段改名 | `test_a_scan_routes_a_stretch_by_its_headers`、packet 测试，以及按对应类型判的各条 |
+| 良性说明缺 `local_offset_run` | `test_the_counterpart_table_and_the_benign_reason_cover_every_kind_the_detector_emits`、`test_both_kinds_carry_a_benign_reason` |
+
+Run: `.venv/bin/python -m pytest tests -q -p no:cacheprovider -k "not bench_baseline"`（不接管道，读汇总行）
+Expected: 汇总行无 failed，比 Step 6b 多 4 个通过。
+
+```bash
+git add src/paperconan/packet.py src/paperconan/_audit.py tests/test_local_pair_runs.py
+git commit -m "fix(packet): filter a column stretch by its whole-column counterpart's rules"
+```
+
 ---
 ### Task 9: 台架
 
@@ -3797,6 +3960,7 @@ cp -r recheck/benchmarks/paperconan_eval/curation_20260912/eval_scope/runs/v1_61
 - **workflow 的 route packet**：`start_workflow` 只给出前 `DEFAULT_BUDGET["clusters"]`（默认 8）个 cluster，这一层既不做 overview 的 panel 合并，也不做 family 轮转。逐篇数有多少现有 cluster 被挤出这一层：挤它的可能是新 cluster，也可能是多了局部 high 的现有 cluster（排序看最强严重度和 high 数），两种都算。不量就在评估记录里写明它不在范围内。
 - **扫描耗时**：逐篇记录本分支与 main 的扫描墙钟时间，只比两边都跑完的论文；排序，看增量集中在哪几篇、这些篇的块是什么形状。审查在合成的高块上量到，新增耗时主要来自行对，而预算按格计，不计每对线的固定开销。增量可观时，把每对线的固定开销计入预算，或调低 `PAPERCONAN_LOCAL_RUN_MAX_ROWS`，重跑 Step 3–4。
 - **覆盖由 complete 变为 partial**：数有多少篇只因 `detect_local_pair_runs` / `detector_row_limit` 而从 complete 变为 partial。
+- **packet 层的分流代价**：落在参考卡目标上的局部发现里，有多少被 profile 降为 low（因而不进 packet、triage 下在 HTML 里隐藏），按原因分列：同名列的 `same_label_replicate`、标签里的单位词判为派生、其它表头分流理由。设计 §6 记着列方向的对应类型没有同名保护；这一项数量可观时，再单独评估给列关系加同名保护（会同时改变整列关系，要另行测量）。
 - **已知代价形态再加三种**：审查在合成数据上见到、按构造是良性的三种形态——按批次对照归一的百分比、按板校准的 ddCt、各组 n 不同的 SEM = SD/√n。表头分流改不了首屏排名（首屏按 `raw_severity` 排，那是分流之前的值），所以这几种在首屏上的代价只能在这里量。
 
 - [ ] **Step 5: 合并门槛**（设计 §8）
