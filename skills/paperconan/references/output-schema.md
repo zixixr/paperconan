@@ -35,11 +35,11 @@ essentials; this file is the complete reference (it travels in the skill bundle)
       "findings_omitted": 0,           // findings this block dropped to stay under the finding caps
                                        // (PAPERCONAN_MAX_FINDINGS_PER_BLOCK / PAPERCONAN_MAX_TOTAL_FINDINGS;
                                        // highest severity kept first — never a silent truncation)
-      "relations": [...],              // cross-column relations
+      "relations": [...],              // cross-column relations (incl. local_ratio_run / local_offset_run with orientation "cols")
       "progressions": [...],           // arithmetic progressions
       "equal_pairs": [...],            // pairs of columns with many equal rows
       "row_pairs": [...],              // pairs of rows with suspicious low-digit coupling
-      "row_relations": [...],          // within-block row-to-row relations (constant_ratio_row / identical_row)
+      "row_relations": [...],          // within-block row-to-row relations (constant_ratio_row / identical_row; local_*_run with orientation "rows")
       "within_col": [...],             // within-column anomalies
       "identical_after_rounding": [...], // cells matching after rounding
       "grim": [...],                   // GRIM/GRIMMER: reported mean/SD inconsistent for integer data
