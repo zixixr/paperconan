@@ -3213,8 +3213,8 @@ imported rather than copied so the three benches stay about the same data -- plu
 
 Verdicts, not counts (CLAUDE.md "Freeze a verdict, not a count"): each stratum is the band
 of the column-pair bench's `_verdict` -- silent / partial / pervasive -- over its draws. A
-stratum whose rate sits at a band edge is frozen as either of the two bands it straddles
-(NEAR_GATE below).
+stratum observed to change band at a neighbouring seed is frozen as either of the two bands it
+straddles (NEAR_GATE below).
 
 WHAT THIS BENCH CAN SEE is written at TEETH below, as measured; read it before arguing a
 change to one of the detector's gates here.
@@ -3246,9 +3246,10 @@ ROW_SHEETS = REPEATS
 
 
 def _local(sheet, skip_columns=False):
-    """Every local-run finding the detector makes on a sheet, block by block: an upper bound on
-    what the pipeline reports, which also passes the pairs the whole-line detectors already hold
-    and, on a whole-sheet extent, its panels."""
+    """Every local-run finding the detector makes on a sheet, block by block. The pipeline also
+    passes the pairs the whole-line detectors already hold, and on a whole-sheet extent leaves
+    out the positions a panel holding both lines covers; on this bench's layouts, where every
+    panel spans whole lines, that makes this an upper bound on what the pipeline reports."""
     out = []
     for r0, r1, c0, c1 in find_numeric_blocks(sheet):
         header = [sheet.cell(r0 - 1, c) if r0 > 0 else None for c in range(c0, c1)]
@@ -3541,6 +3542,8 @@ def _measure_planted_rows(relation, decimals, segment):
 #   1 refused among the powers of ten
 #   edge gate at 0                                    one curve stratum at this seed, not at most
 #                                                     neighbouring ones: a coincidence, not a guard
+#   identity steps raised (to 30)                     SANDWICH and PARALLEL (0, 1.0) silent: where a
+#                                                     fix for the overcredit (spec section 9) shows
 
 # --- frozen tables ----------------------------------------------------------------------------
 # RECORDED, NOT ENDORSED. Regenerate with `python -m tests.test_local_run_bench_baseline` and
@@ -3772,11 +3775,13 @@ def _tables():
 
 
 # Strata observed to change band at a neighbouring seed (SEED and CV.SEED moved together over
-# -5..+5; no other stratum changed band there), each with the two bands it straddles. Its rate sits at a band edge, so a flip between
-# those two is a coin toss rather than a movement, and no number of draws makes it otherwise;
-# falling outside them still fails. The planted-row one misses where the information gate
-# refuses four cells on a flat part of a curve; the planted-column ones are offsets found on all
-# but a few draws. Re-measure over the neighbourhood before adding or removing one.
+# -5..+5; no other stratum changed band there), each with the two bands it straddles. Its rate
+# lies close to a band edge, so a flip between those two is a coin toss rather than a movement;
+# more draws would narrow it, at a running time not worth paying. Falling outside them still
+# fails. The planted-row one's misses are the information gate refusing four cells, most of them
+# at a flat end of a curve; the planted-column ones are offsets found on all but a few draws.
+# Other strata lie close to an edge too without having changed band there. Re-measure over the
+# neighbourhood before adding or removing one.
 NEAR_GATE = {
     "PLANTED_ROWS_BASELINE": {("offset", 3, 4): ("partial", "pervasive")},
     "PLANTED_COLUMNS_BASELINE": {("offset", 4, 4): ("partial", "pervasive"),
@@ -3926,7 +3931,7 @@ done
 
 Expected: 三行都有 `failed`。第一行是良性层变吵（放松局部性闸）；第二行是所有不静默的层都变静默（收紧信息闸）；第三行只有真阳性层找得更多（放松信息闸），良性层与代价层不动。
 
-边缘、连续性、离开恒等、不同源值数和 10 的整数次幂这几道闸，改动时台架上没有层会动（台架文件的 TEETH 一节记着实测）：它们由 `tests/test_local_pair_runs.py` 的单元测试守，改它们不能拿这个台架论证。不要把“边缘闸为 0 时台架变红”当作牙齿：在提交时的种子上它只动了一个曲线层，相邻种子上多数不动，是巧合。
+边缘、连续性、离开恒等、不同源值数和 10 的整数次幂这几道闸，放松到 TEETH 一节所列的值时台架上没有层会动：放松它们只有 `tests/test_local_pair_runs.py` 的单元测试守，不能拿这个台架论证。收紧离开恒等（到 30）时夹心层和一个平行趋势层变静默，设计 §9 给精度变化高估提的修法可以在夹心层上量。不要把“边缘闸为 0 时台架变红”当作牙齿：在提交时的种子上它只动了一个曲线层，相邻种子上多数不动，是巧合。
 
 - [ ] **Step 4: 提交**
 
@@ -3940,20 +3945,31 @@ git commit -m "test(detect): a frozen bench for local runs on the other benches'
 第一次提交（3cdf243）用的是审查前的台架。Step 1 的全文已是修正后的版本，改动如下：
 
 - **行真阳性层每层 200 张表**（原来是曲线台架的 20 张）：20 张时，找到率约九成的层换一个相邻种子就会换档。只看行方向的结果，跳过列方向。随机流按 (小数位, 段长, 关系, 表) 各取一条：原来的种子公式让一个层的第 s 张表与另一个层的第 s−1 张表共用一条流。
-- **`NEAR_GATE`**：SEED 与 CV.SEED 一起在 −5..+5 移动时实测翻过档的层，冻结为它跨着的两档之一；掉出这两档仍然失败。行真阳性层里 3 位小数、4 格的差值段，报出率就压在 pervasive 的门槛上，漏掉的都是信息闸拒绝了落在曲线平坦处的四格。三个列真阳性差值层，偶尔有一个种子落到 partial。其余层在这十个相邻种子上都没有换档。
+- **`NEAR_GATE`**：SEED 与 CV.SEED 一起在 −5..+5 移动时实测翻过档的层，冻结为它跨着的两档之一；掉出这两档仍然失败。行真阳性层里 3 位小数、4 格的差值段，报出率贴着 pervasive 的门槛，漏掉的都是信息闸拒绝的四格，多数落在曲线两端的平坦处。三个列真阳性差值层，偶尔有一个种子落到 partial。其余层在这十个相邻种子上都没有换档。
 - **找到 = 一段覆盖整个植入段**：原来只看植入段的第一格是否落在某一段里，把位置检查和类型检查删掉，台架照样通过。
 - **新增两层**：平行趋势层加一档噪声远小于一个舍入步长的 `(0, 0.2)`，保留差值读法时静默、去掉时变为 partial，与直线真阳性层一起，让差值读法的两侧都可见；夹心层（`SANDWICH`）把设计 §9 的精度变化高估冻结为代价。
 - **说明按实测改写**：剂量层的 3 倍稀释由局部性闸挡下，不是刻度；精度变化层的现有布局不触发那项高估；已知代价层是测出来的，不是“按构造”；表头分流改不了首屏，台架的表头是中性的；曲线层的种子来自 CV.SEED；`_local` 是流水线结果的上界。台架能看见什么，写在 TEETH 一节。
 - **“有牙齿”测试**改名为 `test_the_frozen_tables_still_have_teeth`。它只读冻结表，守的是“从已经不报的检测器重新生成表”：所有列真阳性层，以及记录在案的缺口（1、2 位小数的四格）以外的所有行真阳性层，都必须不静默。
 - 参数化加 `ids=str`，可以用 `-k` 选中某一层。
 
-3cdf243 的提交信息有两处与实测不符，在 PR 描述里更正：“放松 `_LOCAL_RUN_MIN_BITS` 或 `_LOCAL_RUN_MIN_EDGE_STEPS` 会让台架变红”——`_LOCAL_RUN_MIN_BITS=1e9` 是收紧，边缘闸那次是种子巧合；以及把剂量、衰减、精度变化几层算作已知代价——它们是静默的良性层。
+3cdf243 的提交信息有两处要在 PR 描述里更正。一是“放松 `_LOCAL_RUN_MIN_BITS` 或 `_LOCAL_RUN_MIN_EDGE_STEPS` 会让台架变红”：放松信息闸确会让台架变红（降到 10 时真阳性层找得更多），但当时用来验证的 `_LOCAL_RUN_MIN_BITS=1e9` 是收紧；边缘闸那次是种子巧合。二是把剂量、衰减、精度变化几层算作已知代价：它们是静默的良性层。61bfdb5 的提交信息说这两处“都不成立”，也不准，一并更正。45c3332 的提交信息说 `_local` 是流水线结果的上界，只对本台架的布局成立（每个面板都横跨整条线）。
 
 用 Step 1 的全文替换 `tests/test_local_run_bench_baseline.py`，按 Step 2、Step 3 重跑，再跑一次全套测试（`-k "not bench_baseline"`，不接管道，读汇总行），然后提交：
 
 ```bash
 git add tests/test_local_run_bench_baseline.py
 git commit -m "test(detect): make the local-run bench's bands survive reseeding, and see both sides of the grid reading"
+```
+
+- [ ] **Step 6: 复审后的文字修正**
+
+复审确认台架代码无误，并在 ±6 两个种子上补测，没有层离开冻结档位；剩下的问题都在文字里。Step 1 的全文已含这一轮修正，改的只是注释和 docstring：`NEAR_GATE` 的规则写成“实测翻过档”，不再写成“报出率在边上”，也不再说“抽样再多也不行”；漏检原因写成“多数落在曲线两端”；`_local` 写明“上界”只对本台架的布局成立；TEETH 加一行收紧离开恒等的实测。
+
+用 Step 1 的全文替换文件，然后核对：去掉 docstring 后，新旧两版的 AST 完全相同（只改了注释和 docstring，不必重跑整个台架）；再跑 `-k "every_stratum or teeth"` 的两个快测。提交：
+
+```bash
+git add tests/test_local_run_bench_baseline.py
+git commit -m "test(detect): say what the local-run bench's near-gate rule and upper bound rest on"
 ```
 
 ---
