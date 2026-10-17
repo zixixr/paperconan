@@ -3960,7 +3960,10 @@ cp -r recheck/benchmarks/paperconan_eval/curation_20260912/eval_scope/runs/v1_61
 - **workflow 的 route packet**：`start_workflow` 只给出前 `DEFAULT_BUDGET["clusters"]`（默认 8）个 cluster，这一层既不做 overview 的 panel 合并，也不做 family 轮转。逐篇数有多少现有 cluster 被挤出这一层：挤它的可能是新 cluster，也可能是多了局部 high 的现有 cluster（排序看最强严重度和 high 数），两种都算。不量就在评估记录里写明它不在范围内。
 - **扫描耗时**：逐篇记录本分支与 main 的扫描墙钟时间，只比两边都跑完的论文；排序，看增量集中在哪几篇、这些篇的块是什么形状。审查在合成的高块上量到，新增耗时主要来自行对，而预算按格计，不计每对线的固定开销。增量可观时，把每对线的固定开销计入预算，或调低 `PAPERCONAN_LOCAL_RUN_MAX_ROWS`，重跑 Step 3–4。
 - **覆盖由 complete 变为 partial**：数有多少篇只因 `detect_local_pair_runs` / `detector_row_limit` 而从 complete 变为 partial。
-- **packet 层的分流代价**：落在参考卡目标上的局部发现里，有多少被 profile 降为 low（因而不进 packet、triage 下在 HTML 里隐藏），按原因分列：同名列的 `same_label_replicate`、标签里的单位词判为派生、其它表头分流理由。设计 §6 记着列方向的对应类型没有同名保护；这一项数量可观时，再单独评估给列关系加同名保护（会同时改变整列关系，要另行测量）。
+- **packet 层的分流代价**：只看落在参考卡目标上的局部发现，按三项交叉计数：方向（cols / rows）× 两条线的标签是否相同（去掉多余空白、不分大小写后比较）× 降级原因（`false_positive_context` 与 `prefilter_reason`；没有降级的记为 kept）。被 profile 降为 low 的不进 packet，triage 下在 HTML 里隐藏。
+  - profile 记下的 `derived_or_unit_conversion` 不区分单位词与其它派生词（mean、sd、%、fold 等）。另用一个只含单位词的正则，在两条线的标签上重新匹配，把这一格拆成两份；用的正则写进评估记录。
+  - 每一格同时给出参考卡目标上仍为 high 的局部发现数，作为比较的基数。“同名且被降级”的格相对这个基数可观时，再单独评估同名保护：给列关系一律加，会连带改变整列关系，要另行测量；只对局部段加，不改整列关系，但背离按对应类型判的原则。
+  - 设计 §6 记下的第二项代价（差值段的分流随方向不对称）在同一张表的行方向上读出。
 - **已知代价形态再加三种**：审查在合成数据上见到、按构造是良性的三种形态——按批次对照归一的百分比、按板校准的 ddCt、各组 n 不同的 SEM = SD/√n。表头分流改不了首屏排名（首屏按 `raw_severity` 排，那是分流之前的值），所以这几种在首屏上的代价只能在这里量。
 
 - [ ] **Step 5: 合并门槛**（设计 §8）

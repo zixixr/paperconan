@@ -132,11 +132,11 @@ paperconan 输出的是待解释的数据不一致，不是结论。本检测器
 
 - **按整线对应类型判**：局部段按“关系沿整条线成立时整线检测器会报的类型”来判，`_profiles` 里查表：列方向的比例段对应 `constant_ratio`，差值段对应 `constant_offset`；行方向的比例段对应 `constant_ratio_row`，差值段对应 `offset_row_reuse`（整行没有差值类型，用短行复用检测器的差值类型代替）。
 - **派生关系**：`_profiles._is_derived_relation` 按对应类型判。三种对应类型在它的类型集合里，列方向的差值段不在，与整列 `constant_offset` 相同。行方向套用同名行规则：同名行之间的关系不因单位词而豁免。
-- **列方向的表头标签分流**：`_profiles._relation_prefilter` 按对应类型判，列方向的两种段分别当作 `constant_ratio`、`constant_offset`；行方向的对应类型不在它认的类型里，不走这一步。 packet 在 `_distill_relations` 里重算表头分流时也按对应类型判，输出里保留局部段自己的类型名。
+- **列方向的表头标签分流**：`_profiles._relation_prefilter` 按对应类型判，列方向的两种段分别当作 `constant_ratio`、`constant_offset`；行方向的对应类型不在它认的类型里，不走这一步。派生列、轴、计数、公式或单位换算 → 降权或丢弃，与整列关系同等对待。packet 在 `_distill_relations` 里重算表头分流时也按对应类型判，输出里保留局部段自己的类型名。
 - **按对应类型判的已知代价**（Task 8 的审查在合成数据上实测；首屏不受影响，影响的是 severity、packet 和 HTML）：
-  - **列方向没有同名保护**：并排面板沿用同一套表头时，同名两列之间的局部段会被降级。两列都叫 `x` 时，表头分流判为 `same_label_replicate`（downweight）；两列都带单位词时（如 `TNF (pg/mL)`），被判为派生。整列 `constant_ratio` / `constant_offset` 本来就这样，`_is_derived_relation` 的同名保护只对行生效。跨面板在同名列上复制一段，正是本检测器要找的形态，所以这是 packet 和 HTML 这一层的召回代价。给列关系加同名保护会连带改变整列关系，要单独测量，不在本分支做；Task 12 量这一层的代价。
+  - **列方向没有同名保护**：并排面板沿用同一套表头时，同名两列之间的局部段会被降级。两列都叫 `x` 时，表头分流判为 `same_label_replicate`（downweight）；两列都带单位词时（如 `TNF (pg/mL)`），比例段被判为派生，差值段按 `same_label_replicate` 降权。整列 `constant_ratio` / `constant_offset` 本来就这样，`_is_derived_relation` 的同名保护只对行生效。跨面板在同名列上复制一段，正是本检测器要找的形态，所以这是 packet 和 HTML 这一层的召回代价。给列关系一律加同名保护会连带改变整列关系，要单独测量；另一种做法是只对局部段加，不改整列关系，但背离按对应类型判的原则。两种都不在本分支做；Task 12 量这一层的代价。
   - **差值段的分流随方向不对称**：行方向的差值段对应 `offset_row_reuse`。标签带单位词时（如 `IL-6 (pg/mL)` / `TNF (pg/mL)`），`_DERIVED_RE` 把它判为派生而降级，同一对标签在列方向保持 high。两条线同名时反过来：列方向按 `same_label_replicate` 降级，行方向因同名行规则保持 high。按行排列的 dCt/ddCt 表上，行方向的差值段保持 high，因为 qPCR 规则只在列方向的表头分流里。
-  - **通用说明挡住更具体的理由**：良性说明在 profile 之前写入 `likely_benign`，而 profile 不覆盖已有的说明，所以局部段在 HTML 里显示的是这句通用说明，不显示表头分流给出的具体理由；`explain` 仍会列出 `prefilter_reason`。整数步长的等差数列也是这样。改这一点会影响所有类型，留作后续。派生列、轴、计数、公式或单位换算 → 降权或丢弃，与整列关系同等对待。
+  - **通用说明挡住更具体的理由**：良性说明在 profile 之前写入 `likely_benign`，而 profile 不覆盖已有的说明，所以局部段在 HTML 里显示的是这句通用说明，不显示表头分流给出的具体理由；`explain` 仍会列出 `prefilter_reason`。整数步长的等差数列也是这样。在共用的写入顺序上改（`_attach_benign` 在前、`_add_context` 不覆盖已有说明）会影响所有类型；只对局部类型改，例如在 profile 之后才补写它们的说明，则不会。留作后续。
 - **说明文字**：`_audit.py` 里按类型给出的良性说明，加一句“请核对图注是否说明这一段为换算、归一或共用数据”。
 - **文档**：`skills/paperconan/references/detectors.md` 增加两个条目，`output-schema.md` 同步字段。
 
