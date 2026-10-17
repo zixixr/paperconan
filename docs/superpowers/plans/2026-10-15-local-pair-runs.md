@@ -21,7 +21,7 @@
 | 文件 | 动作 | 职责 |
 |---|---|---|
 | `src/paperconan/_audit.py` | 修改 | 新增一节“local pair runs”（常数、步长推断、对称区间、段与组、判据、驱动）；块循环里接入；`benign_reason` 加两种类型 |
-| `src/paperconan/_profiles.py` | 修改 | `_is_derived_relation` 认新类型（行方向套同名行规则）；`_relation_prefilter` 对列方向按别名接入 |
+| `src/paperconan/_profiles.py` | 修改 | 局部段按整线对应类型查表，`_is_derived_relation` 与 `_relation_prefilter` 都按对应类型判 |
 | `tests/test_local_pair_runs.py` | 新建 | 单元测试与端到端测试（合成数据） |
 | `tests/test_local_run_bench_baseline.py` | 新建 | 台架：在两个现有台架的良性数据上跑本检测器，另有已知代价层与真阳性层，冻结档位 |
 | `skills/paperconan/references/detectors.md` | 修改 | 两种类型的说明 |
@@ -2769,38 +2769,63 @@ git commit -m "test(detect): pin both local-run kinds at the shared output gates
 ```
 
 ---
-### Task 8: 良性控制：派生关系、表头分流与良性说明
+### Task 8: 良性控制：按整线对应类型判派生关系与表头分流，加良性说明
 
 **Files:**
 - Modify: `src/paperconan/_profiles.py`
 - Modify: `src/paperconan/_audit.py`（`benign_reason`）
 - Modify: `tests/test_local_pair_runs.py`
 
+局部段按它的整线对应类型判：假如关系沿整条线成立，整线检测器会报出的那个类型。四种组合各有一个对应类型：
+
+| 局部段 | 对应类型 | 派生规则 | 表头分流 |
+|---|---|---|---|
+| `local_ratio_run`，列 | `constant_ratio` | 适用 | 适用 |
+| `local_offset_run`，列 | `constant_offset` | 不适用 | 适用 |
+| `local_ratio_run`，行 | `constant_ratio_row` | 适用，含同名行规则 | 不适用 |
+| `local_offset_run`，行 | `offset_row_reuse` | 适用，含同名行规则 | 不适用 |
+
+整行没有差值类型，行方向的差值段用短行复用检测器的差值类型 `offset_row_reuse` 代替。本计划先前的写法把两个新类型在两个方向上都加进派生规则的类型集合，这会让列方向的差值段多出一条整列 `constant_offset` 没有的规则，所以改为查表。
+
 - [ ] **Step 1: 写测试**（追加到测试文件末尾）
 
 ```python
+# --- benign control -----------------------------------------------------------------------
 
-def test_a_column_stretch_is_routed_like_a_whole_column_ratio():
+_WEIGHTS = [21.3, 22.8, 20.9, 23.4, 19.7, 24.1]
+
+
+@pytest.mark.parametrize("kind, counterpart, col_a, col_b, col_b_sample", [
+    ("local_ratio_run", "constant_ratio", "Body weight (g)", "Body weight (kg)", [x / 1000 for x in _WEIGHTS]),
+    ("local_offset_run", "constant_offset", "Ct target", "ddCt", [round(x - 18.2, 3) for x in _WEIGHTS]),
+])
+def test_a_column_stretch_is_routed_like_its_whole_column_counterpart(kind, counterpart, col_a, col_b, col_b_sample):
     from paperconan._profiles import _relation_prefilter
-    f = dict(kind="local_ratio_run", orientation="cols", col_a="Body weight (g)",
-             col_b="Body weight (kg)", n=6, rule="r",
-             col_a_sample=[21.3, 22.8, 20.9, 23.4], col_b_sample=[0.0213, 0.0228, 0.0209, 0.0234])
-    g = dict(f, kind="constant_ratio")
-    assert _relation_prefilter(dict(f)) == _relation_prefilter(dict(g))
+    f = dict(kind=kind, orientation="cols", col_a=col_a, col_b=col_b, n=6, rule="col[1] = col[0] on rows 2-7",
+             col_a_sample=list(_WEIGHTS), col_b_sample=col_b_sample)
+    want = _relation_prefilter(dict(f, kind=counterpart))
+    assert want is not None                                   # a pair the header rules decide
+    assert _relation_prefilter(dict(f)) == want
+    # the column prefilter reads column labels; a row stretch is not sent to it
+    assert _relation_prefilter(dict(f, orientation="rows")) is None
 
 
-def test_a_row_stretch_is_not_sent_to_the_column_prefilter():
-    from paperconan._profiles import _relation_prefilter
-    assert _relation_prefilter(dict(kind="local_ratio_run", orientation="rows", row_a="a", row_b="b", n=6)) is None
-
-
-def test_a_row_stretch_between_same_named_rows_is_not_excused_as_derived():
+@pytest.mark.parametrize("kind, orientation, counterpart", [
+    ("local_ratio_run", "cols", "constant_ratio"),
+    ("local_offset_run", "cols", "constant_offset"),
+    ("local_ratio_run", "rows", "constant_ratio_row"),
+    ("local_offset_run", "rows", "offset_row_reuse"),
+])
+def test_a_stretch_is_judged_derived_as_its_whole_line_counterpart_is(kind, orientation, counterpart):
     from paperconan._profiles import _is_derived_relation
-    same = dict(kind="local_ratio_run", orientation="rows", row_a="TNF (pg/mL)", row_b="TNF (pg/mL)")
-    assert _is_derived_relation(same) is False
-    derived = dict(kind="local_ratio_run", orientation="rows", row_a="TNF (pg/mL)", row_b="TNF normalised")
-    other = dict(derived, kind="constant_ratio_row")
-    assert _is_derived_relation(derived) == _is_derived_relation(other)
+    labels = (("TNF (pg/mL)", "TNF normalised"), ("TNF (pg/mL)", "TNF (pg/mL)"), ("Ctrl", "Treated"))
+    for a, b in labels:
+        f = dict(kind=kind, orientation=orientation, col_a=a, col_b=b, row_a=a, row_b=b)
+        assert _is_derived_relation(dict(f)) == _is_derived_relation(dict(f, kind=counterpart)), (a, b)
+    # what makes the equality above say something: the counterparts disagree on a derived label,
+    # since the whole-column offset is not one of the kinds the derivation rule applies to
+    derived = dict(col_a=labels[0][0], col_b=labels[0][1], row_a=labels[0][0], row_b=labels[0][1])
+    assert _is_derived_relation(dict(derived, kind=counterpart)) == (counterpart != "constant_offset")
 
 
 def test_both_kinds_carry_a_benign_reason():
@@ -2812,84 +2837,151 @@ def test_both_kinds_carry_a_benign_reason():
 - [ ] **Step 2: 运行，确认失败**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 后两条以外的若干条失败（别名未接入、类型未登记、`benign_reason` 返回 None）。
+Expected: 6 failed：两条表头分流、派生规则的 `[local_ratio_run-cols-…]`、`[local_ratio_run-rows-…]`、`[local_offset_run-rows-…]`，以及良性说明。派生规则的 `[local_offset_run-cols-constant_offset]` 这时已经通过：对应类型本来就不在派生规则里，这一条守的是“不要把它加进去”。
 
-- [ ] **Step 3: `_profiles.py` 的 `_is_derived_relation`**
-
-把开头的类型集合与同名行规则改为：
+- [ ] **Step 3: `_profiles.py`：对应类型表与 `_is_derived_relation`**
 
 ```python
-_LOCAL_RUN_KINDS = {"local_ratio_run", "local_offset_run"}
+def _is_derived_relation(f: dict) -> bool:
+    if f.get("kind") not in {"constant_ratio", "exact_linear", "sum_constant",
+                             "constant_ratio_row", "scaled_row_reuse", "offset_row_reuse"}:
+        return False
+```
+
+改为
+
+```python
+# A stretch is judged by the rules its whole-line counterpart gets: the kind the whole-line
+# detectors would have emitted had the relation held along the line. There is no whole-row offset
+# kind; the row-reuse detector's offset kind stands in for it.
+_LOCAL_RUN_COUNTERPART = {
+    ("local_ratio_run", "cols"): "constant_ratio",
+    ("local_offset_run", "cols"): "constant_offset",
+    ("local_ratio_run", "rows"): "constant_ratio_row",
+    ("local_offset_run", "rows"): "offset_row_reuse",
+}
+
+
+def _rules_kind(f: dict):
+    """The kind whose rules judge `f`: a stretch's whole-line counterpart, else its own."""
+    return _LOCAL_RUN_COUNTERPART.get((f.get("kind"), f.get("orientation")), f.get("kind"))
 
 
 def _is_derived_relation(f: dict) -> bool:
-    if f.get("kind") not in {"constant_ratio", "exact_linear", "sum_constant",
-                             "constant_ratio_row", "scaled_row_reuse", "offset_row_reuse",
-                             *_LOCAL_RUN_KINDS}:
+    kind = _rules_kind(f)
+    if kind not in {"constant_ratio", "exact_linear", "sum_constant",
+                    "constant_ratio_row", "scaled_row_reuse", "offset_row_reuse"}:
         return False
-    # Two rows carrying the SAME label related by an arbitrary scalar or offset is a duplicate,
-    # not a unit/normalization derivation: a real unit conversion or %-restatement RELABELS the
-    # row (e.g. "ng/mL" -> "µg/mL"). A unit token in a shared label (e.g. "TNF-α (pg/mL)" in two
-    # panels) must not be read as evidence of derivation and must not downgrade the finding.
-    row_pair = (f.get("kind") in {"constant_ratio_row", "scaled_row_reuse", "offset_row_reuse"}
-                or (f.get("kind") in _LOCAL_RUN_KINDS and f.get("orientation") == "rows"))
-    if row_pair:
-        a = " ".join(str(f.get("row_a") or "").split()).casefold()
-        b = " ".join(str(f.get("row_b") or "").split()).casefold()
-        if a and a == b:
-            return False
 ```
 
-函数其余部分（折叠矩形的判断与最后的 `_DERIVED_RE`）保持不变。
+同一函数里的同名行规则，
+
+```python
+    if f.get("kind") in {"constant_ratio_row", "scaled_row_reuse", "offset_row_reuse"}:
+        a = " ".join(str(f.get("row_a") or "").split()).casefold()
+```
+
+改为
+
+```python
+    if kind in {"constant_ratio_row", "scaled_row_reuse", "offset_row_reuse"}:
+        a = " ".join(str(f.get("row_a") or "").split()).casefold()
+```
+
+函数其余部分（折叠矩形的判断与最后的 `_DERIVED_RE`）不变。
 
 - [ ] **Step 4: `_profiles.py` 的 `_relation_prefilter`**
 
-函数开头改为按别名取类型，并把后文用到类型的两处改成这个变量：
+开头，
 
 ```python
-# A column stretch is judged by the header rules its whole-column counterpart gets.
-_LOCAL_RUN_PREFILTER_ALIAS = {"local_ratio_run": "constant_ratio", "local_offset_run": "constant_offset"}
-
-
 def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
-    kind = f.get("kind")
-    if kind in _LOCAL_RUN_PREFILTER_ALIAS:
-        if f.get("orientation") != "cols":
-            return None
-        kind = _LOCAL_RUN_PREFILTER_ALIAS[kind]
-    if kind not in {
-        "identical_column",
-        "constant_offset",
-        "constant_ratio",
-        "exact_linear",
-        "sum_constant",
-        "many_equal_pairs",
-    }:
-        return None
+    if f.get("kind") not in {
 ```
 
-再把 `pf = _make_relation_prefilter_finding(f.get("kind"), ...)` 的第一个参数改为 `kind`。`if f.get("kind") == "many_equal_pairs"` 那一行不用改（别名不会产生它）。
+改为
+
+```python
+def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
+    kind = _rules_kind(f)
+    if kind not in {
+```
+
+后文的两处，
+
+```python
+    if f.get("kind") == "many_equal_pairs" and n:
+```
+
+改为
+
+```python
+    if kind == "many_equal_pairs" and n:
+```
+
+以及
+
+```python
+    pf = _make_relation_prefilter_finding(
+        f.get("kind"),
+```
+
+改为
+
+```python
+    pf = _make_relation_prefilter_finding(
+        kind,
+```
+
+行方向的局部段查到 `constant_ratio_row` / `offset_row_reuse`，不在这个函数认的类型里，直接返回 `None`；不需要另判方向。
 
 - [ ] **Step 5: `_audit.py` 的 `benign_reason`**
 
-在函数末尾的 `return None` 之前加入：
+函数末尾，
 
 ```python
+        return ("GRIM/GRIMMER assume the statistic is a mean of integer-valued "
+                "items (counts/scores); verify the measure is integer-granular "
+                "before acting")
+    return None
+```
+
+改为
+
+```python
+        return ("GRIM/GRIMMER assume the statistic is a mean of integer-valued "
+                "items (counts/scores); verify the measure is integer-granular "
+                "before acting")
     if kind in ("local_ratio_run", "local_offset_run"):
         return ("part of a line computed from another -- a normalisation, a unit conversion or a "
                 "shared control applied to some positions only -- has this same shape; check whether "
                 "the legend or Methods says so for these positions")
+    return None
 ```
 
 - [ ] **Step 6: 运行，确认通过**
 
 Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
-Expected: 154 passed.
+Expected: 157 passed.
+
+- [ ] **Step 6a: 逐条核对“删掉即变红”**（做法同 Task 7 Step 7）
+
+| 变异 | 应变红的测试 |
+|---|---|
+| 表里去掉 `("local_offset_run", "cols")` | `test_a_column_stretch_is_routed_like_its_whole_column_counterpart[local_offset_run-…]` |
+| `("local_offset_run", "cols")` 对应成 `constant_ratio` | `test_a_stretch_is_judged_derived_as_its_whole_line_counterpart_is[local_offset_run-cols-…]` |
+| 表里去掉 `("local_ratio_run", "rows")` | `…_is[local_ratio_run-rows-…]` |
+| 表里去掉 `("local_offset_run", "rows")` | `…_is[local_offset_run-rows-…]` |
+| 先前的写法：两个新类型在两个方向上都进派生规则 | `…_is[local_offset_run-cols-…]` |
+| 同名行规则读 `f.get("kind")` 而不是 `kind` | `…_is[local_ratio_run-rows-…]`、`…_is[local_offset_run-rows-…]` |
+| `_make_relation_prefilter_finding` 收到 `f.get("kind")` | `test_a_column_stretch_is_routed_like_its_whole_column_counterpart[local_ratio_run-…]` |
+| 查表不看方向（一律按列查） | 两条表头分流，以及派生规则的两条行方向 |
+| 良性说明只给 `local_ratio_run` | `test_both_kinds_carry_a_benign_reason` |
 
 - [ ] **Step 6b: 跑全套测试**（本任务改了共用的 `_profiles.py` 与 `benign_reason`）
 
-Run: `.venv/bin/python -m pytest tests -q -p no:cacheprovider -k "not bench_baseline"`
-Expected: 汇总行无 failed。
+Run: `.venv/bin/python -m pytest tests -q -p no:cacheprovider -k "not bench_baseline"`（不接管道，读汇总行）
+Expected: 汇总行无 failed，比 Task 7 Step 8 多 7 个通过。
 
 - [ ] **Step 7: 提交**
 
@@ -3702,7 +3794,7 @@ cp -r recheck/benchmarks/paperconan_eval/curation_20260912/eval_scope/runs/v1_61
 再记四项（Task 7 审查要求）：
 
 - **现有 finding 是否保持**：逐篇对齐本分支与 main 的 `scan.json` 里两个新类型以外的 finding（按 file、sheet、block、kind、rule 对齐），记两个数：main 有而本分支没有的条数，严重度变了的条数。块内上限只让新 finding 挤掉严重度比它低的，dense 判定不让新类型影响前两类，所以这两种变化只应来自三处：同块里严重度更高的新 finding；被新 finding 先占用的全局 finding 预算（`PAPERCONAN_MAX_TOTAL_FINDINGS`）；报告块上限（`PAPERCONAN_MAX_REPORT_BLOCKS`），即原本没有 finding 的块有了局部发现，就会占掉一个报告块名额。上限挤掉一部分 finding 以后，按条数降级的闸门（如 within-col 洪泛）可能不再触发，这种连带的严重度变化也归到挤出那一处。逐条归因；归不进这三处的是缺陷，先查清再往下走。
-- **workflow 的 route packet**：`start_workflow` 只给出前 `DEFAULT_BUDGET["clusters"]`（默认 8）个 cluster，这一层不经过 overview 的 panel 合并。逐篇数有多少现有 cluster 被新 cluster 挤出这一层；不量就在评估记录里写明它不在范围内。
+- **workflow 的 route packet**：`start_workflow` 只给出前 `DEFAULT_BUDGET["clusters"]`（默认 8）个 cluster，这一层既不做 overview 的 panel 合并，也不做 family 轮转。逐篇数有多少现有 cluster 被挤出这一层：挤它的可能是新 cluster，也可能是多了局部 high 的现有 cluster（排序看最强严重度和 high 数），两种都算。不量就在评估记录里写明它不在范围内。
 - **扫描耗时**：逐篇记录本分支与 main 的扫描墙钟时间，只比两边都跑完的论文；排序，看增量集中在哪几篇、这些篇的块是什么形状。审查在合成的高块上量到，新增耗时主要来自行对，而预算按格计，不计每对线的固定开销。增量可观时，把每对线的固定开销计入预算，或调低 `PAPERCONAN_LOCAL_RUN_MAX_ROWS`，重跑 Step 3–4。
 - **覆盖由 complete 变为 partial**：数有多少篇只因 `detect_local_pair_runs` / `detector_row_limit` 而从 complete 变为 partial。
 - **已知代价形态再加三种**：审查在合成数据上见到、按构造是良性的三种形态——按批次对照归一的百分比、按板校准的 ddCt、各组 n 不同的 SEM = SD/√n。表头分流改不了首屏排名（首屏按 `raw_severity` 排，那是分流之前的值），所以这几种在首屏上的代价只能在这里量。
