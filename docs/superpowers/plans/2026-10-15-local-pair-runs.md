@@ -3249,7 +3249,8 @@ def _local(sheet, skip_columns=False):
     """Every local-run finding the detector makes on a sheet, block by block. The pipeline also
     passes the pairs the whole-line detectors already hold, and on a whole-sheet extent leaves
     out the positions a panel holding both lines covers; on this bench's layouts, where every
-    panel spans whole lines, that makes this an upper bound on what the pipeline reports."""
+    panel spans whole rows and together the panels cover every column, that makes this an upper
+    bound on what the pipeline reports."""
     out = []
     for r0, r1, c0, c1 in find_numeric_blocks(sheet):
         header = [sheet.cell(r0 - 1, c) if r0 > 0 else None for c in range(c0, c1)]
@@ -3542,8 +3543,10 @@ def _measure_planted_rows(relation, decimals, segment):
 #   1 refused among the powers of ten
 #   edge gate at 0                                    one curve stratum at this seed, not at most
 #                                                     neighbouring ones: a coincidence, not a guard
-#   identity steps raised (to 30)                     SANDWICH and PARALLEL (0, 1.0) silent: where a
-#                                                     fix for the overcredit (spec section 9) shows
+#   identity steps raised (to 30)                     SANDWICH, PARALLEL (0, 1.0) and the planted-row
+#                                                     ('offset', 1, 6) silent: a fix for the overcredit
+#                                                     (spec section 9) shows on SANDWICH, and what it
+#                                                     costs shows on the planted side
 
 # --- frozen tables ----------------------------------------------------------------------------
 # RECORDED, NOT ENDORSED. Regenerate with `python -m tests.test_local_run_bench_baseline` and
@@ -3931,7 +3934,7 @@ done
 
 Expected: 三行都有 `failed`。第一行是良性层变吵（放松局部性闸）；第二行是所有不静默的层都变静默（收紧信息闸）；第三行只有真阳性层找得更多（放松信息闸），良性层与代价层不动。
 
-边缘、连续性、离开恒等、不同源值数和 10 的整数次幂这几道闸，放松到 TEETH 一节所列的值时台架上没有层会动：放松它们只有 `tests/test_local_pair_runs.py` 的单元测试守，不能拿这个台架论证。收紧离开恒等（到 30）时夹心层和一个平行趋势层变静默，设计 §9 给精度变化高估提的修法可以在夹心层上量。不要把“边缘闸为 0 时台架变红”当作牙齿：在提交时的种子上它只动了一个曲线层，相邻种子上多数不动，是巧合。
+边缘、连续性、离开恒等、不同源值数和 10 的整数次幂这几道闸，放松到 TEETH 一节所列的值时台架上没有层会动：放松它们只有 `tests/test_local_pair_runs.py` 的单元测试守，不能拿这个台架论证。收紧离开恒等（到 30）时，夹心层、一个平行趋势层和一个行真阳性层（1 位小数、6 格的差值段）变静默：设计 §9 给精度变化高估提的修法可以在夹心层上量，它的代价也会在真阳性一侧看到。不要把“边缘闸为 0 时台架变红”当作牙齿：在提交时的种子上它只动了一个曲线层，相邻种子上多数不动，是巧合。
 
 - [ ] **Step 4: 提交**
 
@@ -3952,7 +3955,7 @@ git commit -m "test(detect): a frozen bench for local runs on the other benches'
 - **“有牙齿”测试**改名为 `test_the_frozen_tables_still_have_teeth`。它只读冻结表，守的是“从已经不报的检测器重新生成表”：所有列真阳性层，以及记录在案的缺口（1、2 位小数的四格）以外的所有行真阳性层，都必须不静默。
 - 参数化加 `ids=str`，可以用 `-k` 选中某一层。
 
-3cdf243 的提交信息有两处要在 PR 描述里更正。一是“放松 `_LOCAL_RUN_MIN_BITS` 或 `_LOCAL_RUN_MIN_EDGE_STEPS` 会让台架变红”：放松信息闸确会让台架变红（降到 10 时真阳性层找得更多），但当时用来验证的 `_LOCAL_RUN_MIN_BITS=1e9` 是收紧；边缘闸那次是种子巧合。二是把剂量、衰减、精度变化几层算作已知代价：它们是静默的良性层。61bfdb5 的提交信息说这两处“都不成立”，也不准，一并更正。45c3332 的提交信息说 `_local` 是流水线结果的上界，只对本台架的布局成立（每个面板都横跨整条线）。
+3cdf243 的提交信息有两处要在 PR 描述里更正。一是“放松 `_LOCAL_RUN_MIN_BITS` 或 `_LOCAL_RUN_MIN_EDGE_STEPS` 会让台架变红”：放松信息闸确会让台架变红（降到 10 时真阳性层找得更多），但当时用来验证的 `_LOCAL_RUN_MIN_BITS=1e9` 是收紧；边缘闸那次是种子巧合。二是把剂量、衰减、精度变化几层算作已知代价：它们是静默的良性层。61bfdb5 的提交信息说这两处“都不成立”，也不准，一并更正。45c3332 的提交信息说 `_local` 是流水线结果的上界，只对本台架的布局成立（面板横跨整行，合起来覆盖每一列）。
 
 用 Step 1 的全文替换 `tests/test_local_run_bench_baseline.py`，按 Step 2、Step 3 重跑，再跑一次全套测试（`-k "not bench_baseline"`，不接管道，读汇总行），然后提交：
 
@@ -3972,6 +3975,15 @@ git add tests/test_local_run_bench_baseline.py
 git commit -m "test(detect): say what the local-run bench's near-gate rule and upper bound rest on"
 ```
 
+- [ ] **Step 7: 第二次文字修正**
+
+再次复审指出两句：TEETH 里收紧离开恒等的那一行，当时测时排除了行真阳性层，漏了真阳性一侧的代价（整表重测：夹心层两档、平行趋势层 `(0, 1.0)`、行真阳性层 `('offset', 1, 6)` 变静默）；`_local` 的“每个面板横跨整条线”只对行成立，改为“面板横跨整行，合起来覆盖每一列”。Step 1 的全文已含这两处，只改注释和 docstring。核对与 Step 6 相同（去掉 docstring 后 AST 相同，跑两个快测），然后提交：
+
+```bash
+git add tests/test_local_run_bench_baseline.py
+git commit -m "test(detect): list the planted-side cost of a tighter identity gate in the bench's teeth"
+```
+
 ---
 ### Task 10: 文档
 
@@ -3983,10 +3995,11 @@ git commit -m "test(detect): say what the local-run bench's near-gate rule and u
 
 ```markdown
 ### `local_ratio_run` / `local_offset_run`
-- **原理**：**同一 block 内**两列（`orientation = "cols"`）或两行（`"rows"`）只在**一段连续位置**上成恒定比例（B = k·A）或恒定差值（B = A + c），段外不成立。两侧都按各自记录的舍入步长求区间，整条线按固定小数位或固定有效数字推断步长。要同时满足：一个常数预测这一段的压缩得分过门槛；段外偏离（扣除舍入）的中位数大于 5%（比例按这对线 |B| 的中位数计，差值按 |c| 计）；最长一段至少占该常数相容位置的一半；常数离开恒等（比例离 1、差值离 0）至少 10 个舍入步长；比例的可能区间不含 10 的整数次幂（单位换算）；段两端外第一个能检验的格（跳过空格和组内位置）偏离至少 3 个舍入步长。整条线都成立的关系不在这里报（交给 `constant_ratio` / `constant_ratio_row` 等）；`detect_relations` / `detect_row_relations` 已报出的线对，无论报的是哪种类型，都不再报。行方向只比不超过 `PAPERCONAN_LOCAL_RUN_MAX_ROWS` 行的块；更高的块跳过行方向，块里至少有两行能比时在 coverage 里登记。
+- **原理**：**同一 block 内**两列（`orientation = "cols"`）或两行（`"rows"`）只在**一段连续位置**上成恒定比例（B = k·A）或恒定差值（B = A + c），段外不成立。两侧都按各自记录的舍入步长求区间，整条线按固定小数位或固定有效数字推断步长。要同时满足：一个常数预测这一段的压缩得分过门槛；段外偏离（扣除舍入）的中位数大于 5%（比例按这对线 |B| 的中位数计，差值按 |c| 计）；最长一段至少占该常数相容位置的一半；段内 A 侧至少 3 个不同的值；常数离开恒等（比例离 1、差值离 0）至少 10 个舍入步长；比例的可能区间不含 10 的整数次幂（单位换算）；段两端外第一个能检验的格（跳过空格和组内位置）偏离至少 3 个舍入步长，段贴着线首或线尾时只检验另一端。一对线只报得分最高的一组（一个常数、一种关系）。
+- **不报的情形**：有限值少于 4 个的线、行标签像轴的行，以及本身是一条刻度的线（时间或剂量轴、稀释梯度、常数线，也包括在舍入范围内是直线的数据线）不参与比较。整条线都成立的关系不在这里报；`detect_relations` / `detect_row_relations` 已报出的线对，无论报的是哪种类型（例如一段平移可能先被报成 `partial_constant_offset`），都不再报。行方向只比不超过 `PAPERCONAN_LOCAL_RUN_MAX_ROWS` 行的块，更高的块在至少两行能比时登记 coverage；列方向在超过 `PAPERCONAN_MAX_BLOCK_COLS` 列的宽块上跳过，与整列检测器一样不单独登记；运算预算用完时登记 `detector_compute_budget_limit`。所以“这里没有报出”不等于这些线已经检验过。
 - **典型命中**：一组数中的一段由另一组复制后乘一个系数或加一个常数而来，其余位置是独立数据（如合成例：10 个值中前 6 个 B = A × 1.137，后 4 个无此关系）。
-- **常见误报**：同一列里只有一段由另一列换算、归一或共用对照得来——数值形态与复制一段相同，靠表头与行标签（派生词、单位换算、同名行规则）和图注区分。profile 按这条线的整线对应类型（`constant_ratio` / `constant_offset` / `constant_ratio_row` / `offset_row_reuse`）套用表头规则；它改的是 `severity`，不改首屏排序。列方向没有同名保护：并排面板沿用同一套表头时，同名两列之间的段也会被降级，而跨面板在同名列上复制一段正是这一类要找的形态——这种降级不等于已有良性解释。
-- **解读时**：看 `segments`（段在 sheet 上的行号或列号）、`k` / `offset`、`outside_departure`、`prediction_bits`、`n`（关系真正检验过的格数）；`example_cells` 列出段内的格。段较长时，证据窗口可能只落在段内，看不到这一段在哪里断开，用 `explain --full` 看整条线。确认这一段在图注或 Methods 里是否说明为换算、归一或共用数据。
+- **常见误报**：同一列里只有一段由另一列换算、归一或共用对照得来——数值形态与复制一段相同，靠表头、行标签和图注区分。profile 按整线对应类型判，两个方向不一样：列方向走表头分流（当作 `constant_ratio` / `constant_offset`），比例段另走派生规则；行方向不走表头分流，只走派生规则（当作 `constant_ratio_row` / `offset_row_reuse`），读的是行标签，同名行不降。所以同一形态在两个方向上的降级不对称，例如按行排列的 dCt/ddCt 不会被分流。降级改的是 `severity`：finding 离开 packet，triage 下在 HTML 里隐藏，但首屏仍按 `raw_severity` 排。列方向没有同名保护：并排面板沿用同一套表头时，同名两列之间的段也会被降级（`prefilter_reason` 为 `same_label_replicate`），而跨面板在同名列上复制一段正是这一类要找的形态——这种降级不等于已有良性解释。
+- **解读时**：看 `segments`（段在 sheet 上的行号或列号，从 1 起；`col_a_idx` 与 `rule` 里的 `col[N]` 从 0 起，`row[N]` 从 1 起）、`k` / `offset`、`outside_departure`、`prediction_bits`、`n`（关系真正检验过的格数）；`example_cells` 列出段内的格。段较长时，证据窗口可能只落在段内，看不到这一段在哪里断开；同一对线上用别的常数的另一段也不会出现在这条 finding 里。用 `explain --full` 看整条线（它也有行数与单元格上限，见 SKILL.md）。确认这一段在图注或 Methods 里是否说明为换算、归一或共用数据。
 ```
 
 - [ ] **Step 2: `output-schema.md`**：把 `relations` 与 `row_relations` 两行注释改为：
@@ -4008,6 +4021,24 @@ Expected: 汇总行无 failed。
 ```bash
 git add skills/paperconan/references/detectors.md skills/paperconan/references/output-schema.md
 git commit -m "docs: describe the two local-run kinds"
+```
+
+- [ ] **Step 5: 审查后的修正**
+
+第一次提交（fb3e7e1）用的是审查前的条目。Step 1 的全文已是修正后的版本，审查指出、逐条核对过的改动：
+
+- 原写“profile 按四种对应类型套用表头规则”，对行方向不成立：行方向不走表头分流，只走派生规则，读的是行标签、同名行不降。改为分方向写，并点出由此而来的不对称（按行排列的 dCt/ddCt 不会被分流）。
+- 补“一对线只报得分最高的一组”：同一对线上用别的常数的另一段不会出现，“段外是独立数据”并没有检验过。
+- 新增“不报的情形”：线的可用性（少于 4 个有限值、轴标签、刻度线包括舍入范围内的直线）、已被整线检测器报出的线对、行上限、宽块跳过列方向、预算用完的登记。
+- 段内 A 侧至少 3 个不同的值；段贴着线首或线尾时只检验另一端的边缘。
+- 降级的后果写全：离开 packet、triage 下在 HTML 隐藏、首屏仍按 `raw_severity`；同名列的降级给出 `prefilter_reason`。这类局部段的 `likely_benign` 是检测器给的通用说明，不是表头分流的理由（设计 §6）。
+- `segments` 从 1 起，`col_a_idx` 与 `col[N]` 从 0 起，`row[N]` 从 1 起；`explain --full` 也有上限。
+
+用 Step 1 的块替换 `detectors.md` 里的这一条（从 `### \`local_ratio_run\` / \`local_offset_run\`` 到下一条标题之前），再跑 Step 3 与全套测试，提交：
+
+```bash
+git add skills/paperconan/references/detectors.md
+git commit -m "docs: say how each orientation of a local run is routed, and what is never compared"
 ```
 
 ---
