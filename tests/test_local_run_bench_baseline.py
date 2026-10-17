@@ -85,7 +85,8 @@ def _local(sheet, skip_columns=False):
     """Every local-run finding the detector makes on a sheet, block by block. The pipeline also
     passes the pairs the whole-line detectors already hold, and on a whole-sheet extent leaves
     out the positions a panel holding both lines covers; on this bench's layouts, where every
-    panel spans whole lines, that makes this an upper bound on what the pipeline reports."""
+    panel spans whole rows and together the panels cover every column, that makes this an upper
+    bound on what the pipeline reports."""
     out = []
     for r0, r1, c0, c1 in find_numeric_blocks(sheet):
         header = [sheet.cell(r0 - 1, c) if r0 > 0 else None for c in range(c0, c1)]
@@ -378,8 +379,10 @@ def _measure_planted_rows(relation, decimals, segment):
 #   1 refused among the powers of ten
 #   edge gate at 0                                    one curve stratum at this seed, not at most
 #                                                     neighbouring ones: a coincidence, not a guard
-#   identity steps raised (to 30)                     SANDWICH and PARALLEL (0, 1.0) silent: where a
-#                                                     fix for the overcredit (spec section 9) shows
+#   identity steps raised (to 30)                     SANDWICH, PARALLEL (0, 1.0) and the planted-row
+#                                                     ('offset', 1, 6) silent: a fix for the overcredit
+#                                                     (spec section 9) shows on SANDWICH, and what it
+#                                                     costs shows on the planted side
 
 # --- frozen tables ----------------------------------------------------------------------------
 # RECORDED, NOT ENDORSED. Regenerate with `python -m tests.test_local_run_bench_baseline` and
