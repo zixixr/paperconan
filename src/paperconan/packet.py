@@ -10,7 +10,7 @@ from typing import Any
 
 from ._finding_groups import BLOCK_FINDING_GROUPS
 from ._prefilter import evidence_confidence
-from ._profiles import _is_axis_finding
+from ._profiles import _is_axis_finding, _rules_kind
 from .detectors import prefilter_relation_finding
 
 # Groups distilled generically here (severity-only) = the canonical per-block groups MINUS the
@@ -71,8 +71,10 @@ def _distill_relations(scan: dict[str, Any]) -> list[dict[str, Any]]:
         for r in relations:
             if str(r.get("severity")).lower() != "high":
                 continue
-            findings.append(_relation_finding(
-                r.get("kind"),
+            # A column stretch is filtered by its whole-column counterpart's rules, and keeps
+            # its own name in the packet.
+            finding = _relation_finding(
+                _rules_kind(r),
                 r.get("col_a"),
                 r.get("col_b"),
                 int(r.get("n") or 0),
@@ -86,7 +88,9 @@ def _distill_relations(scan: dict[str, Any]) -> list[dict[str, Any]]:
                 headers=(r.get("evidence") or {}).get("headers"),
                 slope=r.get("slope"),
                 intercept=r.get("intercept"),
-            ))
+            )
+            finding["kind"] = r.get("kind")
+            findings.append(finding)
     return findings
 
 

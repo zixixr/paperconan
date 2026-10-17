@@ -1409,6 +1409,8 @@ _WEIGHTS = [21.3, 22.8, 20.9, 23.4, 19.7, 24.1]
 @pytest.mark.parametrize("kind, counterpart, col_a, col_b, col_b_sample", [
     ("local_ratio_run", "constant_ratio", "Body weight (g)", "Body weight (kg)", [x / 1000 for x in _WEIGHTS]),
     ("local_offset_run", "constant_offset", "Ct target", "ddCt", [round(x - 18.2, 3) for x in _WEIGHTS]),
+    # decided differently for `identical_column`, so a wrong counterpart for the offset shows
+    ("local_offset_run", "constant_offset", "Mean WT", "Mean KO", [round(x + 2.4, 3) for x in _WEIGHTS]),
 ])
 def test_a_column_stretch_is_routed_like_its_whole_column_counterpart(kind, counterpart, col_a, col_b, col_b_sample):
     from paperconan._profiles import _relation_prefilter
@@ -1443,3 +1445,39 @@ def test_both_kinds_carry_a_benign_reason():
     from paperconan._audit import benign_reason
     for kind in ("local_ratio_run", "local_offset_run"):
         assert "legend" in benign_reason(dict(kind=kind))
+
+
+def test_the_counterpart_table_and_the_benign_reason_cover_every_kind_the_detector_emits():
+    import paperconan._audit as audit_module
+    from paperconan._profiles import _LOCAL_RUN_COUNTERPART
+    assert {k for k, _ in _LOCAL_RUN_COUNTERPART} == audit_module._LOCAL_RUN_KINDS
+    assert {o for _, o in _LOCAL_RUN_COUNTERPART} == {"cols", "rows"} and len(_LOCAL_RUN_COUNTERPART) == 4
+    assert all(audit_module.benign_reason(dict(kind=k)) for k in audit_module._LOCAL_RUN_KINDS)
+
+
+def test_a_scan_routes_a_stretch_by_its_headers(tmp_path):
+    rng = np.random.default_rng(11)
+    rows = [["Condition", "Mean", "SD", "SEM", "n"]]
+    for g in range(40):
+        n = 3 if g < 20 else 5
+        sd = rng.uniform(0.5, 6)
+        rows.append([f"C{g + 1}", f"{rng.uniform(5, 50):.2f}", f"{sd:.2f}", f"{sd / math.sqrt(n):.2f}", str(n)])
+    found = _found(_scan(tmp_path, rows), "relations", "local_ratio_run")
+    assert {(f["col_a"], f["col_b"]) for f in found} == {("SD", "SEM")}
+    assert {(f["raw_severity"], f["severity"], f["profile_action"]) for f in found} == {("high", "low", "demoted")}
+
+
+def test_the_packet_filters_a_column_stretch_by_its_counterparts_rules():
+    from paperconan.packet import _distill_relations
+    f = dict(kind="local_ratio_run", orientation="cols", severity="high", col_a="Absorbance",
+             col_b="Absorbance corrected", n=6, rule="col[1] = col[0] * 0.92 on rows 2-7",
+             col_a_sample=list(_WEIGHTS), col_b_sample=[round(x * 0.92, 3) for x in _WEIGHTS])
+
+    def distilled(g):
+        (out,) = _distill_relations({"relations_blocks": [{"file": "s.csv", "sheet": "s", "relations": [g]}]})
+        return out
+
+    want = distilled(dict(f, kind="constant_ratio"))
+    assert want["prefilter"] == "drop"                        # a pair the counterpart's rules decide
+    got = distilled(dict(f))
+    assert got["kind"] == "local_ratio_run" and dict(got, kind="constant_ratio") == want

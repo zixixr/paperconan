@@ -739,8 +739,8 @@ def benign_reason(f):
                 "items (counts/scores); verify the measure is integer-granular "
                 "before acting")
     if kind in ("local_ratio_run", "local_offset_run"):
-        return ("part of a line computed from another -- a normalisation, a unit conversion or a "
-                "shared control applied to some positions only -- has this same shape; check whether "
+        return ("part of a line computed from another — a normalisation, a unit conversion or a "
+                "shared control applied to some positions only — has this same shape; check whether "
                 "the legend or Methods says so for these positions")
     return None
 
