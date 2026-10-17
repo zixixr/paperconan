@@ -3826,10 +3826,10 @@ git commit -m "test(detect): a frozen bench for local runs on the other benches'
 
 ```markdown
 ### `local_ratio_run` / `local_offset_run`
-- **原理**：**同一 block 内**两列（`orientation = "cols"`）或两行（`"rows"`）只在**一段连续位置**上成恒定比例（B = k·A）或恒定差值（B = A + c），段外不成立。两侧都按各自记录的舍入步长求区间，整条线按固定小数位或固定有效数字推断步长。要同时满足：一个常数预测这一段的压缩得分过门槛；段外偏离（扣除舍入）的中位数 > 5%；最长一段占该常数相容位置的一半以上；常数离开恒等（比例离 1、差值离 0）至少 10 个舍入步长；段两端外第一个有值的格偏离至少 3 个舍入步长。整条线都成立的关系不在这里报（交给 `constant_ratio` / `constant_ratio_row` 等）。
+- **原理**：**同一 block 内**两列（`orientation = "cols"`）或两行（`"rows"`）只在**一段连续位置**上成恒定比例（B = k·A）或恒定差值（B = A + c），段外不成立。两侧都按各自记录的舍入步长求区间，整条线按固定小数位或固定有效数字推断步长。要同时满足：一个常数预测这一段的压缩得分过门槛；段外偏离（扣除舍入）的中位数大于 5%（比例按这对线 |B| 的中位数计，差值按 |c| 计）；最长一段至少占该常数相容位置的一半；常数离开恒等（比例离 1、差值离 0）至少 10 个舍入步长；比例的可能区间不含 10 的整数次幂（单位换算）；段两端外第一个能检验的格（跳过空格和组内位置）偏离至少 3 个舍入步长。整条线都成立的关系不在这里报（交给 `constant_ratio` / `constant_ratio_row` 等）；`detect_relations` / `detect_row_relations` 已报出的线对，无论报的是哪种类型，都不再报。行方向只比不超过 `PAPERCONAN_LOCAL_RUN_MAX_ROWS` 行的块；更高的块跳过行方向，块里至少有两行能比时在 coverage 里登记。
 - **典型命中**：一组数中的一段由另一组复制后乘一个系数或加一个常数而来，其余位置是独立数据（如合成例：10 个值中前 6 个 B = A × 1.137，后 4 个无此关系）。
-- **常见误报**：同一列里只有一段由另一列换算、归一或共用对照得来——数值形态与复制一段相同，靠表头与行标签（派生词、单位换算、同名行规则）和图注区分。
-- **解读时**：看 `segments`（段在 sheet 上的行号或列号）、`k` / `offset`、`outside_departure`、`prediction_bits`；`example_cells` 列出段内的格。确认这一段在图注或 Methods 里是否说明为换算、归一或共用数据。
+- **常见误报**：同一列里只有一段由另一列换算、归一或共用对照得来——数值形态与复制一段相同，靠表头与行标签（派生词、单位换算、同名行规则）和图注区分。profile 按这条线的整线对应类型（`constant_ratio` / `constant_offset` / `constant_ratio_row` / `offset_row_reuse`）套用表头规则；它改的是 `severity`，不改首屏排序。列方向没有同名保护：并排面板沿用同一套表头时，同名两列之间的段也会被降级，而跨面板在同名列上复制一段正是这一类要找的形态——这种降级不等于已有良性解释。
+- **解读时**：看 `segments`（段在 sheet 上的行号或列号）、`k` / `offset`、`outside_departure`、`prediction_bits`、`n`（关系真正检验过的格数）；`example_cells` 列出段内的格。段较长时，证据窗口可能只落在段内，看不到这一段在哪里断开，用 `explain --full` 看整条线。确认这一段在图注或 Methods 里是否说明为换算、归一或共用数据。
 ```
 
 - [ ] **Step 2: `output-schema.md`**：把 `relations` 与 `row_relations` 两行注释改为：
