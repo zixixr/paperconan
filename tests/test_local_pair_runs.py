@@ -1399,3 +1399,47 @@ def test_local_runs_do_not_crowd_the_short_relations_into_low(kind):
     audit_module._demote_dense_relations(whole + short + local)
     assert {f["severity"] for f in whole + short} == {"high"}
     assert {f["severity"] for f in local} == {"low"}
+
+
+# --- benign control -----------------------------------------------------------------------
+
+_WEIGHTS = [21.3, 22.8, 20.9, 23.4, 19.7, 24.1]
+
+
+@pytest.mark.parametrize("kind, counterpart, col_a, col_b, col_b_sample", [
+    ("local_ratio_run", "constant_ratio", "Body weight (g)", "Body weight (kg)", [x / 1000 for x in _WEIGHTS]),
+    ("local_offset_run", "constant_offset", "Ct target", "ddCt", [round(x - 18.2, 3) for x in _WEIGHTS]),
+])
+def test_a_column_stretch_is_routed_like_its_whole_column_counterpart(kind, counterpart, col_a, col_b, col_b_sample):
+    from paperconan._profiles import _relation_prefilter
+    f = dict(kind=kind, orientation="cols", col_a=col_a, col_b=col_b, n=6, rule="col[1] = col[0] on rows 2-7",
+             col_a_sample=list(_WEIGHTS), col_b_sample=col_b_sample)
+    want = _relation_prefilter(dict(f, kind=counterpart))
+    assert want is not None                                   # a pair the header rules decide
+    assert _relation_prefilter(dict(f)) == want
+    # the column prefilter reads column labels; a row stretch is not sent to it
+    assert _relation_prefilter(dict(f, orientation="rows")) is None
+
+
+@pytest.mark.parametrize("kind, orientation, counterpart", [
+    ("local_ratio_run", "cols", "constant_ratio"),
+    ("local_offset_run", "cols", "constant_offset"),
+    ("local_ratio_run", "rows", "constant_ratio_row"),
+    ("local_offset_run", "rows", "offset_row_reuse"),
+])
+def test_a_stretch_is_judged_derived_as_its_whole_line_counterpart_is(kind, orientation, counterpart):
+    from paperconan._profiles import _is_derived_relation
+    labels = (("TNF (pg/mL)", "TNF normalised"), ("TNF (pg/mL)", "TNF (pg/mL)"), ("Ctrl", "Treated"))
+    for a, b in labels:
+        f = dict(kind=kind, orientation=orientation, col_a=a, col_b=b, row_a=a, row_b=b)
+        assert _is_derived_relation(dict(f)) == _is_derived_relation(dict(f, kind=counterpart)), (a, b)
+    # what makes the equality above say something: the counterparts disagree on a derived label,
+    # since the whole-column offset is not one of the kinds the derivation rule applies to
+    derived = dict(col_a=labels[0][0], col_b=labels[0][1], row_a=labels[0][0], row_b=labels[0][1])
+    assert _is_derived_relation(dict(derived, kind=counterpart)) == (counterpart != "constant_offset")
+
+
+def test_both_kinds_carry_a_benign_reason():
+    from paperconan._audit import benign_reason
+    for kind in ("local_ratio_run", "local_offset_run"):
+        assert "legend" in benign_reason(dict(kind=kind))
