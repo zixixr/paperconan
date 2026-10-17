@@ -49,8 +49,8 @@ imported rather than copied so the three benches stay about the same data -- plu
 
 Verdicts, not counts (CLAUDE.md "Freeze a verdict, not a count"): each stratum is the band
 of the column-pair bench's `_verdict` -- silent / partial / pervasive -- over its draws. A
-stratum whose rate sits at a band edge is frozen as either of the two bands it straddles
-(NEAR_GATE below).
+stratum observed to change band at a neighbouring seed is frozen as either of the two bands it
+straddles (NEAR_GATE below).
 
 WHAT THIS BENCH CAN SEE is written at TEETH below, as measured; read it before arguing a
 change to one of the detector's gates here.
@@ -82,9 +82,10 @@ ROW_SHEETS = REPEATS
 
 
 def _local(sheet, skip_columns=False):
-    """Every local-run finding the detector makes on a sheet, block by block: an upper bound on
-    what the pipeline reports, which also passes the pairs the whole-line detectors already hold
-    and, on a whole-sheet extent, its panels."""
+    """Every local-run finding the detector makes on a sheet, block by block. The pipeline also
+    passes the pairs the whole-line detectors already hold, and on a whole-sheet extent leaves
+    out the positions a panel holding both lines covers; on this bench's layouts, where every
+    panel spans whole lines, that makes this an upper bound on what the pipeline reports."""
     out = []
     for r0, r1, c0, c1 in find_numeric_blocks(sheet):
         header = [sheet.cell(r0 - 1, c) if r0 > 0 else None for c in range(c0, c1)]
@@ -377,6 +378,8 @@ def _measure_planted_rows(relation, decimals, segment):
 #   1 refused among the powers of ten
 #   edge gate at 0                                    one curve stratum at this seed, not at most
 #                                                     neighbouring ones: a coincidence, not a guard
+#   identity steps raised (to 30)                     SANDWICH and PARALLEL (0, 1.0) silent: where a
+#                                                     fix for the overcredit (spec section 9) shows
 
 # --- frozen tables ----------------------------------------------------------------------------
 # RECORDED, NOT ENDORSED. Regenerate with `python -m tests.test_local_run_bench_baseline` and
@@ -608,11 +611,13 @@ def _tables():
 
 
 # Strata observed to change band at a neighbouring seed (SEED and CV.SEED moved together over
-# -5..+5; no other stratum changed band there), each with the two bands it straddles. Its rate sits at a band edge, so a flip between
-# those two is a coin toss rather than a movement, and no number of draws makes it otherwise;
-# falling outside them still fails. The planted-row one misses where the information gate
-# refuses four cells on a flat part of a curve; the planted-column ones are offsets found on all
-# but a few draws. Re-measure over the neighbourhood before adding or removing one.
+# -5..+5; no other stratum changed band there), each with the two bands it straddles. Its rate
+# lies close to a band edge, so a flip between those two is a coin toss rather than a movement;
+# more draws would narrow it, at a running time not worth paying. Falling outside them still
+# fails. The planted-row one's misses are the information gate refusing four cells, most of them
+# at a flat end of a curve; the planted-column ones are offsets found on all but a few draws.
+# Other strata lie close to an edge too without having changed band there. Re-measure over the
+# neighbourhood before adding or removing one.
 NEAR_GATE = {
     "PLANTED_ROWS_BASELINE": {("offset", 3, 4): ("partial", "pervasive")},
     "PLANTED_COLUMNS_BASELINE": {("offset", 4, 4): ("partial", "pervasive"),
