@@ -14,7 +14,7 @@ proof about how the data were produced.
 
 1. Surface `scan_errors` before findings. A failed parse means the audit is incomplete.
 2. Review cross-sheet and cross-file reuse first. `cross_sheet_position_identical` with `delta.pattern: "value_tweaked"` is much stronger than a single-column digit pattern.
-3. Review local row/column transforms next: `identical_column`, `constant_offset`, `constant_ratio`, `exact_linear`, `sum_constant`, `many_equal_pairs`, and `row_pair_digit_coupling`.
+3. Review local row/column transforms next: `identical_column`, `constant_offset`, `constant_ratio`, `exact_linear`, `sum_constant`, `many_equal_pairs`, `row_pair_digit_coupling`, and the stretch kinds `local_ratio_run` / `local_offset_run`.
 4. Review summary-stat consistency separately. GRIM/GRIMMER can be hard evidence only when the measured quantity is truly integer-granular.
 5. Review `within_col_*` last. These are false-positive-heavy and need more context than the detector output alone.
 

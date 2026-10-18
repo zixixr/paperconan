@@ -4474,6 +4474,34 @@ def _effective_line_quantums(values):
     return out
 
 
+def _panelled_line_quantums(values, pieces):
+    """The recorded step of each cell of a line that crosses several panels.
+
+    On the whole-sheet extent one line runs through every panel stacked along it, and those
+    panels need not share an export. Read as one line, a panel recorded at one decimal above a
+    longer one at three has its cells floored at the finer step -- an interval too narrow for a
+    copy it holds, so a stretch copied across panels is not found. So each piece, (start, end)
+    offsets along the line for a panel holding it, is read on its own, as that panel reads it,
+    and the cells no panel holds are read together. A cell two panels hold takes the first.
+    With no pieces the line is read whole, as `_effective_line_quantums` reads it, which is how
+    every line off the extent is read.
+    """
+    if not pieces:
+        return _effective_line_quantums(values)
+    values = np.asarray(values, dtype=float)
+    out = [math.nan] * len(values)
+    held = [False] * len(values)
+    for s, e in pieces:
+        part = [i for i in range(max(0, s), min(len(values), e)) if not held[i]]
+        for i, q in zip(part, _effective_line_quantums(values[part]) if part else []):
+            out[i] = q
+            held[i] = True
+    rest = [i for i in range(len(values)) if not held[i]]
+    for i, q in zip(rest, _effective_line_quantums(values[rest]) if rest else []):
+        out[i] = q
+    return out
+
+
 def _symmetric_ratio_interval(a, b, q_a, q_b):
     """Which k could have written both cells, when EACH was rounded to its own step?
 
@@ -4953,7 +4981,8 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
     pair is read only over what no such panel covers, where the extent's longer line is the
     only place the two meet. What is left must itself be usable -- a dilution series is still a
     grid once another panel's cells are cut off it -- and a pair with too little left is skipped
-    before it is charged. `skip_columns` follows the `wide` flag the
+    before it is charged. On the extent each line's recorded steps are read panel by panel
+    (`_panelled_line_quantums`). `skip_columns` follows the `wide` flag the
     column detectors honour, and a block taller than `_LOCAL_RUN_MAX_ROWS` is not compared
     row by row.
 
@@ -4992,7 +5021,9 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
             usable = [r for r in idxs if _local_line_usable(lines[r], labels[r])]
             spans = [((p0, p1), (q0, q1)) for p0, p1, q0, q1 in panels]
         n_tests = max(1, len(usable) * (len(usable) - 1) // 2 * 2 * length)
-        quantums = {i: _effective_line_quantums(lines[i]) for i in usable}
+        quantums = {i: _panelled_line_quantums(lines[i], [(s0 - first, s1 - first)
+                                                          for (h0, h1), (s0, s1) in spans if h0 <= i < h1])
+                    for i in usable}
         for x, ia in enumerate(usable):
             for ib in usable[x + 1:]:
                 if (orientation, ia, ib) in already:

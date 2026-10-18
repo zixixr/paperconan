@@ -1481,3 +1481,73 @@ def test_the_packet_filters_a_column_stretch_by_its_counterparts_rules():
     assert want["prefilter"] == "drop"                        # a pair the counterpart's rules decide
     got = distilled(dict(f))
     assert got["kind"] == "local_ratio_run" and dict(got, kind="constant_ratio") == want
+
+# --- final review --------------------------------------------------------------------------
+
+def test_a_line_crossing_panels_is_read_panel_by_panel():
+    from paperconan._audit import _panelled_line_quantums
+    line = [12.3, 14.5, 11.2, math.nan, 1.234, 5.678, 2.468, 35.0]
+    got = _panelled_line_quantums(line, [(0, 3), (4, 7)])
+    assert got[:3] == pytest.approx([0.1] * 3) and math.isnan(got[3]) and got[4:7] == pytest.approx([0.001] * 3)
+    assert got[7] == pytest.approx(1.0)                          # held by no panel: read with the rest
+    # read whole, the three-decimal cells set the step of the one-decimal ones
+    assert _effective_line_quantums(line)[0] == pytest.approx(0.001)
+    assert _panelled_line_quantums(line, []) == _effective_line_quantums(line)
+
+
+def _two_panels_over_a_finer_one(split):
+    rng = random.Random(321)
+    a = [round(rng.uniform(10, 30), 1) for _ in range(12)]
+    k = rng.uniform(1.15, 2.4)
+    b = [round(x * k, 1) for x in a[:8]] + [round(rng.uniform(10, 30), 1) for _ in range(4)]
+    c, d = ([round(rng.uniform(10, 30), 1) for _ in range(12)] for _ in range(2))
+    rows = [["A", "C", None, "B", "D"]] + [[w, x, None, y, z] for w, x, y, z in zip(a, c, b, d)]
+    below = [[round(rng.uniform(1, 9), 3) for _ in range(5)] for _ in range(30)]
+    if split:                                 # two panels below, as above
+        below = [r[:2] + [None] + r[3:] for r in below]
+    return rows + [[None] * 5, ["P", "Q", "R", "S", "T"]] + below
+
+
+@pytest.mark.parametrize("split", [False, True], ids=["one panel below", "two panels below"])
+def test_a_stretch_copied_across_panels_is_found_above_a_finer_panel(tmp_path, split):
+    scan = _scan(tmp_path, _two_panels_over_a_finer_one(split))
+    assert any((f["col_a_idx"], f["col_b_idx"]) == (0, 3) and any(s <= 2 and 9 <= e for s, e in f["segments"])
+               for f in _found(scan, "relations", "local_ratio_run"))
+
+
+def test_over_the_block_cap_a_row_stretch_gives_way_too():
+    import paperconan._audit as audit_module
+    local = [dict(kind="local_offset_run", orientation="rows", severity="high") for _ in range(3)]
+    other = [dict(kind="within_col_value_duplication", severity="high")]
+    groups = dict(row_relations=list(local), within_col=list(other))
+    assert audit_module._cap_block_findings(groups, 3) == 1
+    assert groups["within_col"] == other and len(groups["row_relations"]) == 2
+
+
+def test_with_no_whole_sheet_pass_no_block_is_taken_for_the_extent(tmp_path, monkeypatch):
+    import paperconan._audit as audit_module
+    monkeypatch.setattr(audit_module, "_WHOLE_SHEET_MAX_ROWS", 0)
+    a = A10 + [10.051, 12.884, 9.447, 13.103, 11.774]
+    b = [round(x * 1.137, 3) for x in a[:6]] + [11.9, 9.1, 18.7, 6.2, 14.4, 8.8, 12.1, 16.3, 7.9]
+    x = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    rows = [["X", "Y", "Z"]] + [[None, p, q] for p, q in zip(a[:5], b[:5])]
+    rows += [[w, p, q] for w, p, q in zip(x, a[5:], b[5:])]
+    rules = [f["rule"] for f in _found(_scan(tmp_path, rows), "relations", "local_ratio_run")]
+    assert any(r.startswith("col[2] = col[1] * 1.13") and r.endswith("on rows 2-7") for r in rules)
+
+
+def test_a_row_stretch_reaches_the_packet_once():
+    from paperconan.packet import distill_findings_for_review
+    f = dict(kind="local_offset_run", orientation="rows", severity="high", row_a="ctrl", row_b="drug",
+             row_a_idx=1, row_b_idx=2, n=6, rule="row[3] = row[2] + 3.517 on columns 2-7",
+             row_a_sample=A10[:6], row_b_sample=[round(x + 3.517, 3) for x in A10[:6]])
+    scan = {"relations_blocks": [{"file": "s.csv", "sheet": "s", "block": {"rows": "2-3", "cols": "2-11"},
+                                  "relations": [], "row_relations": [f]}]}
+    assert sum(1 for e in distill_findings_for_review(scan) if e.get("kind") == "local_offset_run") == 1
+
+
+def test_the_rule_names_the_constant_and_the_stretch_only():
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    sheet, header = _block([A10, b])
+    (f,) = detect_local_pair_runs(sheet, 1, 11, 0, 2, header)
+    assert f["rule"] == f"col[1] = col[0] * {f['k']:.6g} on rows 2-7"
