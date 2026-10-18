@@ -4646,6 +4646,94 @@ git add tests/test_local_pair_runs.py
 git commit -m "test(detect): a zero piece with a blank and an unreadable value keeps the whole line's steps"
 ```
 
+- [ ] **Step 1g: 合并前审查后的修正**
+
+合并前审查（新代理，未参与前几轮）结论：代码无阻断项，PR 描述有两处行为写错（`constant_ratio_row` 并非整线检测器：它报至少 12 列的连续段，只在不超过 60 行的块里跑；轴标签的排除只对行生效，列表头不看），已在 PR 描述里改正。代码上：
+
+- **内存（I2）**：每条可用线的步长存成 Python 浮点数列表，每格约 32 字节，只受 `PAPERCONAN_MAX_CELLS` 封顶。改存 numpy 数组（每格 8 字节）。20,000×50 的块上，这一遍的分配峰值从 46 MB 降到 21 MB（tracemalloc，一次测量）。
+- **M7**：`_panelled_line_quantums` 的判断对 numpy 标量调 `round`，绝对值约 1.8e298 以上会报溢出告警；改为先转成 Python 浮点数。
+- **M4**：调用方“只切持有这条线的面板”的过滤没有测试守着；补一个监视传入 pieces 的测试。
+- **M8**：台架注释里“about nine sheets in ten”是没有测试支撑的数字，改成不带数字的说法。
+
+(a) `src/paperconan/_audit.py`：
+
+```python
+    def read(part):
+        if any(math.isfinite(values[i]) and round(abs(values[i]), _MAX_READ_DECIMALS) != 0.0 for i in part):
+            return _effective_line_quantums(values[part])```
+
+改为
+
+```python
+    plain = values.tolist()             # Python floats: `round` on numpy scalars overflows near 1e298
+
+    def read(part):
+        if any(math.isfinite(plain[i]) and round(abs(plain[i]), _MAX_READ_DECIMALS) != 0.0 for i in part):
+            return _effective_line_quantums(values[part])```
+
+```python
+        quantums = {i: _panelled_line_quantums(lines[i], [(s0 - first, s1 - first)
+                                                          for (h0, h1), (s0, s1) in spans if h0 <= i < h1])
+                    for i in usable}
+```
+
+改为
+
+```python
+        # one array per usable line: a list of Python floats costs four times the memory per cell,
+        # and a tall block holds a line of steps for every usable line at once
+        quantums = {i: np.asarray(_panelled_line_quantums(lines[i], [(s0 - first, s1 - first)
+                                                                     for (h0, h1), (s0, s1) in spans if h0 <= i < h1]),
+                                  dtype=float)
+                    for i in usable}
+```
+
+(b) `tests/test_local_run_bench_baseline.py` 的注释：
+
+```python
+# Sheets per planted-row stratum: as many as the other strata draw. With fewer, strata found on
+# about nine sheets in ten changed band with the seed or with the number of sheets. Each sheet
+# compares every row pair of a block, so these strata dominate the bench's running time.```
+
+改为
+
+```python
+# Sheets per planted-row stratum: as many as the other strata draw. With fewer, strata found on
+# most but not all sheets changed band with the seed or with the number of sheets. Each sheet
+# compares every row pair of a block, so these strata dominate the bench's running time.```
+
+(c) `tests/test_local_pair_runs.py`，追加到文件末尾：
+
+```python
+
+def test_a_panel_cuts_a_piece_only_from_the_lines_it_holds(monkeypatch):
+    import paperconan._audit as audit_module
+    calls, real = [], audit_module._panelled_line_quantums
+    monkeypatch.setattr(audit_module, "_panelled_line_quantums",
+                        lambda values, pieces: calls.append(pieces) or real(values, pieces))
+    sheet, header = _block([A10, _C, _D])
+    detect_local_pair_runs(sheet, 1, 11, 0, 3, header, panels=[(1, 6, 0, 1)])   # holds column 0 only
+    assert calls == [[(0, 5)], [], []]
+
+
+def test_extreme_magnitudes_are_read_without_a_numeric_warning():
+    import warnings
+    from paperconan._audit import _panelled_line_quantums
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _panelled_line_quantums([1e300, 2e300, 3e300, 0.0, 1.5], [(0, 3)])
+```
+
+Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
+Expected: 172 passed。去掉 `if h0 <= i < h1` 的变异体上 `test_a_panel_cuts_a_piece_only_from_the_lines_it_holds` 变红；改动前的代码上 `test_extreme_magnitudes_are_read_without_a_numeric_warning` 变红。
+
+步长改存数组不应改变任何输出：在评估集里取局部发现最多的 8 篇和耗时最长的另外 4 篇，分别用改动前后的代码扫描，`scan.json` 逐字节相同。再跑全套测试（含台架）。
+
+```bash
+git add src/paperconan/_audit.py tests/test_local_pair_runs.py tests/test_local_run_bench_baseline.py
+git commit -m "fix(detect): hold the local pass's steps as arrays, and read extreme values without a warning"
+```
+
 - [ ] **Step 1c: 用修正后的代码重做本地评估**
 
 I1 改变了 extent 上的行为，评估数字要按最终代码重算：按 Task 12 Step 3–4 重扫、两版计分、比较，并重跑现有 finding 的保持检查与首屏统计（单进程、最低优先级）。PR 描述里的数字以这一次为准。
