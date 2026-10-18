@@ -129,15 +129,32 @@ def _is_axis_finding(f: dict) -> bool:
     return bool(_AXIS_RE.search(_names_for(f)))
 
 
+# A stretch is judged by the rules its whole-line counterpart gets: the kind the whole-line
+# detectors would have emitted had the relation held along the line. There is no whole-row offset
+# kind; the row-reuse detector's offset kind stands in for it.
+_LOCAL_RUN_COUNTERPART = {
+    ("local_ratio_run", "cols"): "constant_ratio",
+    ("local_offset_run", "cols"): "constant_offset",
+    ("local_ratio_run", "rows"): "constant_ratio_row",
+    ("local_offset_run", "rows"): "offset_row_reuse",
+}
+
+
+def _rules_kind(f: dict):
+    """The kind whose rules judge `f`: a stretch's whole-line counterpart, else its own."""
+    return _LOCAL_RUN_COUNTERPART.get((f.get("kind"), f.get("orientation")), f.get("kind"))
+
+
 def _is_derived_relation(f: dict) -> bool:
-    if f.get("kind") not in {"constant_ratio", "exact_linear", "sum_constant",
-                             "constant_ratio_row", "scaled_row_reuse", "offset_row_reuse"}:
+    kind = _rules_kind(f)
+    if kind not in {"constant_ratio", "exact_linear", "sum_constant",
+                    "constant_ratio_row", "scaled_row_reuse", "offset_row_reuse"}:
         return False
     # Two rows carrying the SAME label related by an arbitrary scalar or offset is a duplicate,
     # not a unit/normalization derivation: a real unit conversion or %-restatement RELABELS the
     # row (e.g. "ng/mL" -> "µg/mL"). A unit token in a shared label (e.g. "TNF-α (pg/mL)" in two
     # panels) must not be read as evidence of derivation and must not downgrade the finding.
-    if f.get("kind") in {"constant_ratio_row", "scaled_row_reuse", "offset_row_reuse"}:
+    if kind in {"constant_ratio_row", "scaled_row_reuse", "offset_row_reuse"}:
         a = " ".join(str(f.get("row_a") or "").split()).casefold()
         b = " ".join(str(f.get("row_b") or "").split()).casefold()
         if a and a == b:
@@ -159,7 +176,8 @@ def _is_derived_relation(f: dict) -> bool:
 
 
 def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
-    if f.get("kind") not in {
+    kind = _rules_kind(f)
+    if kind not in {
         "identical_column",
         "constant_offset",
         "constant_ratio",
@@ -173,13 +191,13 @@ def _relation_prefilter(f: dict) -> tuple[str, str | None] | None:
     except (TypeError, ValueError):
         n = 0
     frac = None
-    if f.get("kind") == "many_equal_pairs" and n:
+    if kind == "many_equal_pairs" and n:
         try:
             frac = float(f.get("equal")) / n
         except (TypeError, ValueError):
             frac = None
     pf = _make_relation_prefilter_finding(
-        f.get("kind"),
+        kind,
         f.get("col_a"),
         f.get("col_b"),
         n,

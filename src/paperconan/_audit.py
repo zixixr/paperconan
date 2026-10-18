@@ -31,7 +31,7 @@ import os
 import re
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from fractions import Fraction
 from pathlib import Path
 
@@ -738,6 +738,10 @@ def benign_reason(f):
         return ("GRIM/GRIMMER assume the statistic is a mean of integer-valued "
                 "items (counts/scores); verify the measure is integer-granular "
                 "before acting")
+    if kind in ("local_ratio_run", "local_offset_run"):
+        return ("part of a line computed from another — a normalisation, a unit conversion or a "
+                "shared control applied to some positions only — has this same shape; check whether "
+                "the legend or Methods says so for these positions")
     return None
 
 
@@ -1445,18 +1449,29 @@ def _demote_dense_relations(relations, cap=RELATION_FLOOD_CAP):
     But they are not exempt from the crowding they cause. Judging each class against the
     full cap on its own left a sheet able to carry nearly twice it with nothing demoted at
     all, which is the flood this cap exists for arriving by a side door. So the short ones
-    go low once the sheet is crowded by any measure, while the ordinary ones answer only to
-    their own count. The newcomers carry what they add."""
-    ordinary = [r for r in relations if _relation_meets_ordinary_floor(r)]
-    short = [r for r in relations if not _relation_meets_ordinary_floor(r)]
-    flooded = []
-    if len(ordinary) > cap:
-        flooded = relations                      # a dense matrix, judged as it always was
-    elif len(relations) > cap:
-        flooded = short                          # crowded, and the newcomers carry it
-    for r in flooded:
-        r["severity"] = "low"
-        r["dense_block"] = True
+    go low once they and the ordinary ones together pass the cap, while the ordinary ones
+    answer only to their own count. The newcomers carry what they add.
+
+    The local-run kinds (`_LOCAL_RUN_KINDS`) arrived later still, whatever their length, and
+    the same rule extends to them as a third class: each class answers to its own count plus
+    the older classes', never a newer one's. Letting them vote turned a sheet holding one local
+    run beside a cap's worth of exact column relations dense, and demoted every one of those
+    relations to low; counting them into the short ones' crowding demoted short equalities
+    for runs that had nothing to do with them."""
+    def arrival(r):                      # 0 ordinary, 1 short, 2 local run
+        if r.get("kind") in _LOCAL_RUN_KINDS:
+            return 2
+        return 0 if _relation_meets_ordinary_floor(r) else 1
+    classes = [[r for r in relations if arrival(r) == c] for c in range(3)]
+    counted = 0
+    for c, members in enumerate(classes):
+        counted += len(members)
+        if counted > cap:                # this class is crowded: it and every newer one go low
+            for later in classes[c:]:
+                for r in later:
+                    r["severity"] = "low"
+                    r["dense_block"] = True
+            break
     return relations
 
 
@@ -4344,6 +4359,720 @@ def _ratio_prediction_bits(target_values, quantums, n_tests, *, informative=None
             "confirming": len(per_cell), "per_cell": per_cell}
 
 
+# ---------- local pair runs ----------
+# docs/superpowers/specs/2026-10-15-local-pair-runs-design.md
+#
+# Two lines of one block -- two rows or two columns -- related as B = k*A or B = A + c on
+# part of the line and departing from that constant elsewhere. A separate pass: it reads the
+# sheet and no detector's candidate pools, counters or budgets. It does share the short-row
+# detector's score bar (`_LOCAL_RUN_MIN_BITS` defaults to `_SHORT_ROW_MIN_PREDICTION_BITS`)
+# and, through `_ratio_prediction_bits`, its per-cell cap, so the two score alike.
+_LOCAL_RUN_MIN_BITS = float(os.environ.get(
+    "PAPERCONAN_LOCAL_RUN_MIN_BITS", str(_SHORT_ROW_MIN_PREDICTION_BITS)))
+# The median departure outside a stretch must exceed this: for a ratio as a share of the line's
+# median |b|, for an offset as a share of |c|. A relation holding across the whole line has no
+# outside and is left to the whole-line detectors.
+_LOCAL_RUN_OUT_DEV = float(os.environ.get("PAPERCONAN_LOCAL_RUN_OUT_DEV", "0.05"))
+# Cell operations per block; when spent the pass stops for that block and says so in coverage.
+_LOCAL_RUN_BUDGET = int(os.environ.get("PAPERCONAN_LOCAL_RUN_BUDGET", "4000000"))
+# Outside departures are capped here so a median stays finite and JSON-safe.
+_LOCAL_RUN_DEPARTURE_CAP = 1e3
+# Fewer distinct source values than this cannot tell one constant from a coincidence of rounding.
+_LOCAL_RUN_MIN_DISTINCT_SOURCE = 3
+# A STRETCH: the longest segment must hold at least this share of the positions one constant
+# accounts for. Consistency scattered along the line is what noise makes of a relation that
+# holds approximately everywhere (a curve family's proportional columns), not a copied stretch.
+_LOCAL_RUN_MIN_CONTIGUOUS_SHARE = 0.5
+# The constant must clear the identity -- an offset of 0, a ratio of 1 -- by this many rounding
+# steps. Within a few steps, rounding a slowly varying quantity makes a stretch "constant" that
+# no copy produced; and a small offset reads as a ratio near 1, so both arms ask it.
+_LOCAL_RUN_MIN_IDENTITY_STEPS = 10
+# A copied stretch ends abruptly. Walking outward from each end of the longest segment, past
+# blank cells, cells that confirm nothing (in the ratio arm, zero against zero) and the group's
+# own positions, the first cell with data must depart from the constant by at least this many
+# of its own rounding steps beyond rounding. A rounding plateau on a smooth trend, and the
+# noise exceptions of a relation holding approximately everywhere, depart by less.
+_LOCAL_RUN_MIN_EDGE_STEPS = float(os.environ.get("PAPERCONAN_LOCAL_RUN_MIN_EDGE_STEPS", "3"))
+# A line needs the distinct source values a stretch asks for, and one finite cell outside it.
+_LOCAL_RUN_MIN_FINITE = _LOCAL_RUN_MIN_DISTINCT_SOURCE + 1
+# example_cells lists both sides of each position; bounded like every other evidence list.
+_LOCAL_RUN_MAX_EXAMPLE_POSITIONS = 64
+
+# The kinds this pass emits. The pass adds to a block's findings, so the two output gates that
+# count findings treat these as the later arrivals: `_cap_block_findings` drops them first among
+# findings of one severity, and `_demote_dense_relations` does not let them vote a sheet dense.
+_LOCAL_RUN_KINDS = frozenset({"local_ratio_run", "local_offset_run"})
+
+
+def _effective_line_quantums(values):
+    """The step each cell of a line was RECORDED at, deciding per line between a
+    fixed-decimals export and a fixed-significant-figures one.
+
+    `_effective_row_quantums` assumes fixed decimals: a line's commonest decimal count is
+    every cell's floor. An export at fixed significant figures breaks that -- at seven
+    figures 123.4567 carries four decimals and 45.67891 five, and reading the first at
+    1e-5 makes its rounding interval ten times too narrow. So the line is read both ways
+    and the mode more cells match exactly decides; a tie keeps fixed decimals. Under fixed
+    decimals every cell that reads as non-zero gets what `_effective_row_quantums` gives it.
+
+    Only cells with a fractional part vote. A zero has no magnitude, and a whole number's
+    figure count is its digit count whatever it was written to (50 reads as two figures),
+    so neither is evidence for either reading. Between two equally common figure counts the
+    larger, i.e. the finer reading, is taken.
+
+    Under fixed significant figures a cell's step comes from its magnitude and is never
+    COARSER than the cell's own decimals, since a cell carrying more digits than the mode
+    has real extra precision (a whole number with trailing zeros is the exception: 98770 at
+    four figures is read at 1, not 10, which is the stricter direction). Magnitudes and
+    digit counts are both taken at `_MAX_READ_DECIMALS` read precision.
+
+    A cell that reads as zero at that precision -- a zero, or a value too small to register --
+    gets the finest step on its line, under either reading: at least as fine as its neighbours',
+    the stricter reading. Rounding to n figures never yields 0, and an export at fixed decimals
+    wrote its 0 no coarser than its neighbours; `_effective_row_quantums` instead lets zeros
+    vote, so a mostly-zero line reads them at 1, a rounding interval wide enough to pass for any
+    constant. Only when no cell of the line reads as non-zero does a zero keep the row
+    inference's step. Non-finite cells get NaN.
+    """
+    by_decimals = _effective_row_quantums(values)
+    cells = []
+    for v in values:
+        fv = float(v)
+        if not math.isfinite(fv) or fv == 0.0:
+            continue
+        sig, dec = _sigfigs_and_frac(fv)
+        dec = min(dec, _MAX_READ_DECIMALS)
+        if dec == 0:
+            continue
+        cells.append((sig, dec))
+    use_figures = False
+    if cells:
+        decimals = Counter(d for _, d in cells)
+        sigfigs = Counter(s for s, _ in cells)
+        sig_mode, sig_top = max(sigfigs.items(), key=lambda kv: (kv[1], kv[0]))
+        use_figures = sig_top > max(decimals.values())
+    out, unread = [], []
+    for i, (v, q) in enumerate(zip(values, by_decimals)):
+        fv = float(v)
+        if not math.isfinite(fv):
+            out.append(math.nan)
+            continue
+        read = round(abs(fv), _MAX_READ_DECIMALS)
+        if read == 0.0:
+            out.append(math.nan)
+            unread.append(i)
+            continue
+        if use_figures:
+            own = 10.0 ** -min(_sigfigs_and_frac(fv)[1], _MAX_READ_DECIMALS)
+            out.append(min(own, 10.0 ** (math.floor(math.log10(read)) - sig_mode + 1)))
+        else:
+            out.append(q)
+    steps = [x for x in out if not math.isnan(x)]      # unread cells are still NaN here
+    finest = min(steps) if steps else None
+    for i in unread:
+        out[i] = finest if finest is not None else by_decimals[i]
+    return out
+
+
+def _panelled_line_quantums(values, pieces):
+    """The recorded step of each cell of a line that crosses several panels.
+
+    On the whole-sheet extent one line runs through every panel stacked along it, and those
+    panels need not share an export. Read as one line, a panel recorded at one decimal above a
+    longer one at three has its cells floored at the finer step -- an interval too narrow for a
+    copy it holds, so a stretch copied across panels is not found. So each piece, (start, end)
+    offsets along the line for a panel holding it, is read on its own, and the cells no panel
+    holds are read together. A cell two panels hold goes to the first; the second reads only
+    the cells left to it. A piece with no cell that reads as non-zero has nothing to infer a
+    step from, so its cells keep the whole line's reading -- a zero there takes the finest step
+    on the line, as `_effective_line_quantums` gives it, rather than the row inference's 1.
+    With no pieces the line is read whole, which is how every line off the extent is read.
+    """
+    if not pieces:
+        return _effective_line_quantums(values)
+    values = np.asarray(values, dtype=float)
+    whole = []
+    out = [math.nan] * len(values)
+    held = [False] * len(values)
+
+    plain = values.tolist()             # Python floats: `round` on numpy scalars overflows near 1e298
+
+    def read(part):
+        if any(math.isfinite(plain[i]) and round(abs(plain[i]), _MAX_READ_DECIMALS) != 0.0 for i in part):
+            return _effective_line_quantums(values[part])
+        if not whole:
+            whole.extend(_effective_line_quantums(values))
+        return [whole[i] for i in part]
+
+    for s, e in pieces:
+        part = [i for i in range(max(0, s), min(len(values), e)) if not held[i]]
+        for i, q in zip(part, read(part) if part else []):
+            out[i] = q
+            held[i] = True
+    rest = [i for i in range(len(values)) if not held[i]]
+    for i, q in zip(rest, read(rest) if rest else []):
+        out[i] = q
+    return out
+
+
+def _symmetric_ratio_interval(a, b, q_a, q_b):
+    """Which k could have written both cells, when EACH was rounded to its own step?
+
+    `_directed_ratio_interval` takes the source as exact. Two lines rounded separately
+    from one higher-precision original break that: the source's rounding, multiplied
+    by k, can exceed half the target's step. Here both cells admit their rounding
+    interval and k ranges over the ratios of the corners.
+
+    Returns (lo, hi); (-inf, inf) when both cells are indistinguishable from zero --
+    compatible with every k, so it confirms nothing; None when a value or a step is not
+    finite, or when the source is indistinguishable from zero and the target is not: then
+    only a large enough |k| writes the pair, two rays that no interval holds (see
+    `_zero_source_miss`). None breaks a run.
+    """
+    av, bv, qa, qb = float(a), float(b), float(q_a), float(q_b)
+    if not all(math.isfinite(x) for x in (av, bv, qa, qb)):
+        return None
+    a_lo, a_hi = av - qa / 2.0, av + qa / 2.0
+    b_lo, b_hi = bv - qb / 2.0, bv + qb / 2.0
+    if a_lo <= 0.0 <= a_hi:
+        return (-math.inf, math.inf) if b_lo <= 0.0 <= b_hi else None
+    corners = (b_lo / a_lo, b_lo / a_hi, b_hi / a_lo, b_hi / a_hi)
+    return (min(corners), max(corners))
+
+
+def _symmetric_offset_interval(a, b, q_a, q_b):
+    """Which c could have written both cells as B = A + c, each rounded to its own step.
+    None when a value is not finite."""
+    av, bv, qa, qb = float(a), float(b), float(q_a), float(q_b)
+    if not all(math.isfinite(x) for x in (av, bv, qa, qb)):
+        return None
+    half = (qa + qb) / 2.0
+    return (bv - av - half, bv - av + half)
+
+
+def _zero_source_miss(b, q_a, q_b, k):
+    """For a source that reads as zero -- its value lies in [-q_a/2, q_a/2] -- by how much, in
+    units of B, the constant k falls short of writing `b`: 0 once |k|*q_a/2 reaches B's own
+    rounding interval. Such a pair is written by every k beyond a threshold in either
+    direction, two rays rather than an interval, so `_symmetric_ratio_interval` returns None
+    for it and the decision asks this instead, against a constant already found. A value,
+    step or constant that is not finite gives inf: a miss that cannot be measured never
+    reads as written."""
+    bv, qa, qb, kv = float(b), float(q_a), float(q_b), float(k)
+    if not all(math.isfinite(x) for x in (bv, qa, qb, kv)):
+        return math.inf
+    b_lo, b_hi = bv - qb / 2.0, bv + qb / 2.0
+    distance = 0.0 if b_lo <= 0.0 <= b_hi else min(abs(b_lo), abs(b_hi))
+    return max(0.0, distance - abs(kv) * qa / 2.0)
+
+
+def _scan_interval_runs(spans, source, min_informative=2, min_distinct_source=None):
+    """Maximal contiguous runs whose intervals share a point.
+
+    The run logic of `_scan_quantized_ratio_runs`, taking the intervals ready-made so the
+    ratio and the offset arm share it: `None` breaks a run, (-inf, inf) joins one without
+    informing it, a run needs `min_informative` informative cells and `min_distinct_source`
+    distinct source values among them (at the defaults the first never binds), and
+    a run inside another is dropped. Returns [{"start", "end", "lo", "hi"}] in order of start.
+    The distinct-source floor defaults to `_LOCAL_RUN_MIN_DISTINCT_SOURCE`, read at call time.
+
+    Linear in the line's length. What can join a run starting at s can join one starting
+    later, so the run's end only moves forward as its start does: one window slides along the
+    line, its bounds kept by two monotone queues. A run is then inside another exactly when the
+    run one start earlier reaches the same end.
+    """
+    if min_distinct_source is None:
+        min_distinct_source = _LOCAL_RUN_MIN_DISTINCT_SOURCE
+
+    def informing(span):
+        return math.isfinite(span[0]) and math.isfinite(span[1])
+
+    n = len(spans)
+    # indices whose lower (upper) bound can still be the window's largest (smallest)
+    los, his = deque(), deque()
+    values, informative = Counter(), 0
+    end, prev_end, out = -1, None, []
+    for start in range(n):
+        if start - 1 <= end and start > 0 and spans[start - 1] is not None and informing(spans[start - 1]):
+            informative -= 1
+            v = float(source[start - 1])
+            values[v] -= 1
+            if not values[v]:
+                del values[v]
+        end = max(end, start - 1)
+        for q in (los, his):
+            while q and q[0] < start:
+                q.popleft()
+        while end + 1 < n and spans[end + 1] is not None:
+            lo_j, hi_j = spans[end + 1]
+            lo = spans[los[0]][0] if los else -math.inf
+            hi = spans[his[0]][1] if his else math.inf
+            if max(lo, lo_j) > min(hi, hi_j):
+                break
+            end += 1
+            while los and spans[los[-1]][0] < lo_j:
+                los.pop()
+            los.append(end)
+            while his and spans[his[-1]][1] > hi_j:
+                his.pop()
+            his.append(end)
+            if informing(spans[end]):
+                informative += 1
+                values[float(source[end])] += 1
+        contained, prev_end = prev_end == end, end
+        if end < start or contained or informative < min_informative or len(values) < min_distinct_source:
+            continue
+        out.append({"start": start, "end": end,
+                    "lo": spans[los[0]][0] if los else -math.inf,
+                    "hi": spans[his[0]][1] if his else math.inf})
+    return out
+
+
+def _segments(positions):
+    """[[start, end], ...] of the contiguous stretches in a strictly increasing list of positions."""
+    out = []
+    for p in positions:
+        if out and p == out[-1][1] + 1:
+            out[-1][1] = p
+        else:
+            out.append([p, p])
+    return out
+
+
+def _confirms_nothing(span):
+    """A cell whose interval is unbounded: in practice zero against zero in the ratio arm,
+    which every constant writes."""
+    return span is not None and not (math.isfinite(span[0]) and math.isfinite(span[1]))
+
+
+def _group_constant_runs(runs, spans, admit=None):
+    """Gather the runs one constant accounts for.
+
+    Longest first, a run joins the first group whose interval it still intersects; the
+    group's interval narrows to the intersection. (Of runs `_scan_interval_runs` found over
+    these same spans, two that overlap in position never share a point -- the earlier would
+    have extended -- so a run never joins a group holding one it overlaps.) A group's
+    POSITIONS are then the cells whose interval meets the group's, in a run or not -- a lone
+    consistent cell between two runs is the same relation, not its outside -- less those
+    trimmed below. A cell with no interval (None) joins only if `admit(i, lo, hi)` says some
+    constant of the group writes it -- a source read as zero, which one interval cannot
+    describe. A cell that confirms nothing (`_confirms_nothing`) may sit inside a stretch but
+    never extends one: it is trimmed off both ends of every segment. Returns
+    [{"lo", "hi", "positions", "informative", "segments"}].
+    """
+    groups = []
+    for r in sorted(runs, key=lambda r: (-(r["end"] - r["start"]), r["start"])):
+        for g in groups:
+            lo, hi = max(g["lo"], r["lo"]), min(g["hi"], r["hi"])
+            if lo <= hi:
+                g["lo"], g["hi"] = lo, hi
+                break
+        else:
+            groups.append({"lo": r["lo"], "hi": r["hi"]})
+    out = []
+    for g in groups:
+        met = [i for i, s in enumerate(spans)
+               if (s is not None and s[0] <= g["hi"] and s[1] >= g["lo"])
+               or (s is None and admit is not None and admit(i, g["lo"], g["hi"]))]
+        positions = []
+        for start, end in _segments(met):
+            while start <= end and _confirms_nothing(spans[start]):
+                start += 1
+            while end >= start and _confirms_nothing(spans[end]):
+                end -= 1
+            positions.extend(range(start, end + 1))
+        # an admitted cell without an interval says only that |k| clears a threshold: not informative
+        informative = [i for i in positions if spans[i] is not None and not _confirms_nothing(spans[i])]
+        out.append({"lo": g["lo"], "hi": g["hi"], "positions": positions,
+                    "informative": informative, "segments": _segments(positions)})
+    return out
+
+
+def _outside_departure(a_line, b_line, q_a, q_b, group, spans, relation):
+    """Median departure from the group's constant at the line's other positions, beyond
+    what each cell's own rounding explains.
+
+    The gap is from the constant to the cell's interval, so rounding alone never counts.
+    Ratio: that gap as an amount of B (gap * |a|) over the pair's median |b| -- measured
+    against the line's scale, not the cell's, so additive noise on a near-zero cell is
+    not read as a departure (curve families leak through their smallest cell otherwise).
+    Offset: the gap over |c|. A source read as zero (no interval; ratio arm only, since offset
+    intervals always exist) departs by what the constant falls short of writing it
+    (`_zero_source_miss`), over the pair's median |b|. That median is read over the pair's
+    cells: those where both lines have values and that confirm something -- B against a blank
+    in A is not part of the pair, and zeros against zeros filling most of a line would
+    otherwise make it 0. When the median is 0 all the same -- B zero against non-zero A
+    across most of the pair's cells, inside the stretch or out -- every ratio departure is
+    recorded at the cap. Departures are capped at `_LOCAL_RUN_DEPARTURE_CAP`. None when
+    nothing outside the group can be measured -- the relation covers the whole line, or what
+    lies outside confirms nothing -- and for a constant of 0 or one that is not finite: a
+    stretch of zeros in B is not a ratio this pass looks for, and an offset of 0 is the
+    identity.
+    """
+    k = (group["lo"] + group["hi"]) / 2.0
+    if k == 0.0 or not math.isfinite(k):
+        return None
+    inside = set(group["positions"])
+    finite_b = [abs(float(b_line[i])) for i, s in enumerate(spans)
+                if math.isfinite(float(a_line[i])) and math.isfinite(float(b_line[i]))
+                and not _confirms_nothing(s)]
+    scale = float(np.median(finite_b)) if finite_b else 0.0
+    departures = []
+    for i, span in enumerate(spans):
+        if i in inside:
+            continue
+        a, b = float(a_line[i]), float(b_line[i])
+        if not (math.isfinite(a) and math.isfinite(b)):
+            continue
+        if span is None:                      # a source read as zero (ratio arm)
+            miss = _zero_source_miss(b, q_a[i], q_b[i], k)
+            departures.append(min(_LOCAL_RUN_DEPARTURE_CAP, miss / scale) if scale > 0
+                              else _LOCAL_RUN_DEPARTURE_CAP)
+            continue
+        lo, hi = span
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            continue
+        gap = lo - k if k < lo else (k - hi if k > hi else 0.0)
+        if relation == "ratio":
+            d = abs(gap) * abs(a) / scale if scale > 0 else _LOCAL_RUN_DEPARTURE_CAP
+        else:
+            d = abs(gap / k)
+        departures.append(min(_LOCAL_RUN_DEPARTURE_CAP, d))
+    return float(np.median(departures)) if departures else None
+
+
+def _identity_steps(spans, informative, constant, relation):
+    """How many rounding steps the constant lies from the identity -- 1 for a ratio, 0 for an
+    offset -- measured in the half-width of the group's own intervals (their median over the
+    informative cells). Read off the intervals, so no cell value is divided by. With no
+    informative cell there is no width to count in, and the constant is not refused here."""
+    if not informative:
+        return math.inf
+    half = float(np.median([(spans[i][1] - spans[i][0]) / 2.0 for i in informative]))
+    identity = 1.0 if relation == "ratio" else 0.0
+    return abs(constant - identity) / half if half > 0 else math.inf
+
+
+def _edge_steps(a_line, b_line, q_a, q_b, group, spans, relation):
+    """Departure, in the cell's own rounding steps and beyond rounding, of the first cell
+    past each end of the group's longest segment -- walking outward over blank cells (a
+    panel separator), cells that confirm nothing and the group's own positions, so the cell
+    judged is the data that actually adjoins the stretch. The longest segment is the one the
+    contiguity test calls longest, by informative cells; of two equally long, the earlier.
+    [] when nothing lies outside on either side. A source read as zero counts by what the
+    constant falls short of writing it, in B's steps."""
+    inside = set(group["positions"])
+    informing = {i for i in inside if spans[i] is not None and not _confirms_nothing(spans[i])}
+    start, end = max(group["segments"],
+                     key=lambda se: (sum(i in informing for i in range(se[0], se[1] + 1)), -se[0]))
+    k = (group["lo"] + group["hi"]) / 2.0
+    out = []
+    for i, stride in ((start - 1, -1), (end + 1, 1)):
+        while 0 <= i < len(spans) and (i in inside or _confirms_nothing(spans[i]) or not (
+                math.isfinite(float(a_line[i])) and math.isfinite(float(b_line[i])))):
+            i += stride
+        if not 0 <= i < len(spans):
+            continue
+        span = spans[i]
+        if span is None:                          # a source read as zero (ratio arm)
+            miss = _zero_source_miss(b_line[i], q_a[i], q_b[i], k)
+            out.append(miss / q_b[i] if q_b[i] > 0 else math.inf)
+            continue
+        lo, hi = span
+        gap = lo - k if k < lo else (k - hi if k > hi else 0.0)
+        if relation == "ratio":
+            out.append(abs(gap) * abs(float(a_line[i])) / q_b[i] if q_b[i] > 0 else math.inf)
+        else:
+            step = (q_a[i] + q_b[i]) / 2.0
+            out.append(abs(gap) / step if step > 0 else math.inf)
+    return out
+
+
+def _line_is_grid(values):
+    """Does one difference, or one ratio, write every step between consecutive cells with
+    values, within their rounding -- a time or dose axis, a dilution series, a constant line?
+
+    A line that repeats values is read a second time with each value at its first appearance
+    only, so a dose listed once per replicate, or a whole ladder listed twice, still reads as
+    its ladder. Zeros are left out of the ratio reading: a dilution series ends in its vehicle
+    at 0. The difference reading also takes a data line that is straight within its rounding;
+    a stretch copied into such a line is then not looked for -- the cost of keeping the
+    parallel, then diverging, straight trends of benign data out.
+    """
+    cells = [(float(v), q) for v, q in zip(values, _effective_line_quantums(values))
+             if math.isfinite(float(v))]
+    seen, first = set(), []
+    for c in cells:
+        if c[0] not in seen:
+            seen.add(c[0])
+            first.append(c)
+    for line in ([cells, first] if len(first) < len(cells) else [cells]):
+        for interval, steps in ((_symmetric_offset_interval, line),
+                                (_symmetric_ratio_interval, [c for c in line if c[0] != 0.0])):
+            if len(steps) < _LOCAL_RUN_MIN_FINITE:
+                continue
+            lo, hi = -math.inf, math.inf
+            for (x, q_x), (y, q_y) in zip(steps, steps[1:]):
+                span = interval(x, y, q_x, q_y)
+                if span is None:
+                    break
+                lo, hi = max(lo, span[0]), min(hi, span[1])
+                if lo > hi:
+                    break
+            else:
+                return True
+    return False
+
+
+def _local_line_usable(values, label=None):
+    """Enough finite cells for a stretch and an outside, not an axis by its row label, and
+    not itself a grid (`_line_is_grid`)."""
+    finite = values[np.isfinite(values)]
+    if finite.size < _LOCAL_RUN_MIN_FINITE:
+        return False
+    if label and _AXIS_CONTEXT_LABEL_RE.search(label):
+        return False
+    return not _line_is_grid(values)
+
+
+# Fixed-decimal steps put counts on a lattice: in the offset arm the identity and edge steps fall
+# on halves when both sides share a step (on a finer rational lattice otherwise), the outside
+# departure on round values, and prediction bits on whole numbers when a segment's spread is a
+# power-of-two multiple of its step and n_tests a power of two. At a lattice point float error,
+# not the data, decided which side of a threshold a count fell, so thresholds are compared
+# within this relative tolerance.
+_LOCAL_RUN_THRESHOLD_RTOL = 1e-9
+
+
+def _local_group_bits(a_line, b_line, q_a, q_b, group, n_tests):
+    """A group's prediction bits: each side scored as the target, keeping the lower, since
+    neither side is privileged when both were rounded. Only informative cells are scored.
+
+    Each segment is scored against its own spread, the segments' bits summed and the search
+    penalty, log2(n_tests), taken once. Scored over the whole group at once, positions
+    scattered along a sorted or smooth line would be credited with the whole group's spread,
+    up to the line's whole range, though each is predictable from its neighbours to within the
+    local spacing; two independently sorted columns then read as a stretch. Within a segment
+    the spread is local, and a cell alone in its segment only anchors it and earns nothing.
+    """
+    inside = set(group["informative"])
+    cells = [[i for i in range(s, e + 1) if i in inside] for s, e in group["segments"]]
+    penalty = math.log2(n_tests) if n_tests > 1 else 0.0
+
+    def side(line, q):
+        return sum(_ratio_prediction_bits([line[i] for i in c], [q[i] for i in c], 1)["raw_bits"]
+                   for c in cells if c) - penalty
+
+    return min(side(b_line, q_b), side(a_line, q_a))
+
+
+def _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget=None):
+    """The highest-scoring group on one pair of lines that passes the design's pairwise tests
+    (section 4; which lines take part, and which pairs are already reported, are the
+    caller's), as (relation, group, bits, departure), or None. Highest by bits; a tie keeps
+    the first found -- the ratio arm before the offset, and within an arm the group seeded by
+    the longest run, of equally long runs the earlier.
+
+    Each group costs a pass over the line, and a slowly drifting relation can hold many of
+    them. So when `budget` (a one-element list of remaining cell operations) is given, each
+    arm pays one line's length per run before grouping them -- the runs bound the groups --
+    and when it cannot, the pair is abandoned: None, with budget[0] below zero."""
+    rtol = _LOCAL_RUN_THRESHOLD_RTOL
+    best = None
+    for relation, interval in (("ratio", _symmetric_ratio_interval),
+                               ("offset", _symmetric_offset_interval)):
+        spans = [interval(a, b, x, y) for a, b, x, y in zip(a_line, b_line, q_a, q_b)]
+        admit = None
+        if relation == "ratio":
+            def admit(i, lo, hi):           # a non-finite b or step misses by inf; a non-finite a
+                # is read at a NaN step (`_effective_line_quantums`), so it misses too
+                return _zero_source_miss(b_line[i], q_a[i], q_b[i], max(abs(lo), abs(hi))) == 0.0
+        runs = _scan_interval_runs(spans, a_line)
+        if budget is not None:
+            budget[0] -= len(spans) * len(runs)
+            if budget[0] < 0:
+                return None
+        for g in _group_constant_runs(runs, spans, admit):
+            lo, hi = g["lo"], g["hi"]
+            # an interval holding the identity 1 holds 10^0: a unit restatement or the same values
+            if relation == "ratio" and _interval_holds_a_power_of_ten(lo, hi):
+                continue
+            if relation == "offset" and lo <= 0.0 <= hi:
+                continue
+            # every group holds a run, and `_scan_interval_runs` asked that run for
+            # `_LOCAL_RUN_MIN_DISTINCT_SOURCE` distinct source values among its informative cells
+            inf = g["informative"]
+            informing = set(inf)
+            # counted in informative cells: zeros against zeros, and sources read as zero that a
+            # large enough constant writes, neither lengthen a stretch nor add to what it accounts for
+            told = [sum(i in informing for i in range(s, e + 1)) for s, e in g["segments"]]
+            if max(told) < _LOCAL_RUN_MIN_CONTIGUOUS_SHARE * sum(told):
+                continue
+            if (_identity_steps(spans, inf, (lo + hi) / 2.0, relation)
+                    < _LOCAL_RUN_MIN_IDENTITY_STEPS * (1.0 - rtol)):
+                continue
+            bits = _local_group_bits(a_line, b_line, q_a, q_b, g, n_tests)
+            if bits < _LOCAL_RUN_MIN_BITS * (1.0 - rtol):
+                continue
+            departure = _outside_departure(a_line, b_line, q_a, q_b, g, spans, relation)
+            if departure is None or departure <= _LOCAL_RUN_OUT_DEV * (1.0 + rtol):
+                continue
+            if any(e < _LOCAL_RUN_MIN_EDGE_STEPS * (1.0 - rtol)
+                   for e in _edge_steps(a_line, b_line, q_a, q_b, g, spans, relation)):
+                continue
+            if best is None or bits > best[0]:
+                best = (bits, relation, g, bits, departure)
+    return None if best is None else best[1:]
+
+
+def _stretch_text(segments, shown=4):
+    """Where a stretch lies, for the rule: its runs of two or more positions (at most `shown`)
+    and a count of the lone positions the constant also writes."""
+    runs = [f"{s}-{e}" for s, e in segments if e > s]
+    lone = [str(s) for s, e in segments if e == s]
+    listed = runs or lone
+    text = ", ".join(listed[:shown]) + (f" and {len(listed) - shown} more" if len(listed) > shown else "")
+    return text + (f" (+{len(lone)} scattered)" if runs and lone else "")
+
+
+def _local_run_finding(orientation, ia, ib, labels, first, a_line, b_line,
+                       relation, group, bits, departure):
+    positions = group["positions"]
+    shown = positions[:_LOCAL_RUN_MAX_EXAMPLE_POSITIONS]
+    value = (group["lo"] + group["hi"]) / 2.0
+    paired = int((np.isfinite(a_line) & np.isfinite(b_line)).sum())
+    segments = [[first + s + 1, first + e + 1] for s, e in group["segments"]]
+    if orientation == "cols":
+        cells = [[first + p + 1, i + 1] for p in shown for i in (ia, ib)]
+        pair = dict(col_a=labels[ia], col_b=labels[ib], col_a_idx=ia, col_b_idx=ib,
+                    col_a_sample=_sample(a_line[positions]), col_b_sample=_sample(b_line[positions]))
+        # the block-relation group's own naming: col[N] 0-based, row[N] 1-based
+        names, where = (f"col[{ia}]", f"col[{ib}]"), "rows"
+    else:
+        cells = [[i + 1, first + p + 1] for p in shown for i in (ia, ib)]
+        pair = dict(row_a=labels[ia], row_b=labels[ib], row_a_idx=ia, row_b_idx=ib,
+                    row_a_sample=_sample(a_line[positions]), row_b_sample=_sample(b_line[positions]))
+        names, where = (f"row[{ia + 1}]", f"row[{ib + 1}]"), "columns"
+    if relation == "ratio":
+        kind = "local_ratio_run"
+        op = "*"
+        constant = dict(k=value, k_lo=group["lo"], k_hi=group["hi"])
+    else:
+        kind = "local_offset_run"
+        op = "+"
+        constant = dict(offset=value, offset_lo=group["lo"], offset_hi=group["hi"])
+    return dict(
+        kind=kind, orientation=orientation, **pair, **constant,
+        segments=segments, run_length=len(positions), n=len(group["informative"]), line_length=paired,
+        outside_departure=round(departure, 6), prediction_bits=round(bits, 2),
+        example_cells=cells, example_cells_truncated=len(shown) < len(positions),
+        severity="high",
+        # nothing here that depends on the block's extent: the same stretch read from an
+        # overlapping block must give the same rule, which is what de-duplication compares
+        rule=f"{names[1]} = {names[0]} {op} {value:.6g} on {where} {_stretch_text(segments)}")
+
+
+# Rows per block the row arm compares. Every pair of rows is a call: a tall block of short rows
+# -- a long table read across -- makes millions of pairs and spends the block's budget, and its
+# time, on them. Past it the row arm is skipped, as `detect_row_relations` skips a block past 60
+# rows, but coverage says so -- when the block has at least two rows a row could be compared on;
+# columns are still compared.
+_LOCAL_RUN_MAX_ROWS = int(os.environ.get("PAPERCONAN_LOCAL_RUN_MAX_ROWS", "400"))
+
+
+def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
+                           coverage=None, skip_columns=False, panels=()):
+    """Two rows or two columns of one block related as B = k*A or B = A + c over part of
+    the line only. docs/superpowers/specs/2026-10-15-local-pair-runs-design.md.
+
+    Signal, not verdict: a normalisation, a unit conversion or a shared control applied
+    to part of a line has the same shape. `already` holds (orientation, lower index,
+    higher index) pairs, in sheet coordinates, that the whole-line detectors reported in
+    this block. `panels` is the sheet's other blocks when this one is the whole-sheet
+    extent. A panel holding both lines of a pair had them to compare over its own span,
+    against its own outside; here those positions are left out -- values and steps -- and the
+    pair is read only over what no such panel covers, where the extent's longer line is the
+    only place the two meet. What is left must itself be usable -- a dilution series is still a
+    grid once another panel's cells are cut off it -- and a pair with too little left is skipped
+    before it is charged. On the extent the recorded steps a pair is compared at are read panel
+    by panel (`_panelled_line_quantums`); whether a line is usable is still judged on the whole
+    line. `skip_columns` follows the `wide` flag the
+    column detectors honour, and a block taller than `_LOCAL_RUN_MAX_ROWS` is not compared
+    row by row.
+
+    `n_tests` counts every pair of usable lines in the orientation, skipped ones too.
+    """
+    findings = []
+    budget = [_LOCAL_RUN_BUDGET]
+
+    def exhausted():
+        print(f"[paperconan] detect_local_pair_runs: budget exhausted on a "
+              f"{r1 - r0}x{c1 - c0} block — coverage bounded", file=sys.stderr)
+        _note_detector_cap(coverage, "detect_local_pair_runs", "detector_compute_budget_limit")
+        return findings
+
+    arms = ["rows"] if skip_columns else ["cols", "rows"]
+    if r1 - r0 > _LOCAL_RUN_MAX_ROWS:
+        arms.remove("rows")
+        rows_with_room = np.isfinite(sheet.numeric[r0:r1, c0:c1]).sum(axis=1) >= _LOCAL_RUN_MIN_FINITE
+        if int(rows_with_room.sum()) >= 2:
+            _note_detector_cap(coverage, "detect_local_pair_runs", "detector_row_limit")
+    for orientation in arms:
+        if orientation == "cols":
+            idxs = list(range(c0, c1))
+            lines = {c: sheet.numeric[r0:r1, c].astype(float) for c in idxs}
+            labels = {c: str(header[c - c0]) if c - c0 < len(header) and header[c - c0] is not None
+                      else "" for c in idxs}
+            first, length = r0, r1 - r0
+            usable = [c for c in idxs if _local_line_usable(lines[c])]
+            # (span holding the lines, span covered along them) for each panel
+            spans = [((q0, q1), (p0, p1)) for p0, p1, q0, q1 in panels]
+        else:
+            idxs = list(range(r0, r1))
+            lines = {r: sheet.numeric[r, c0:c1].astype(float) for r in idxs}
+            labels = {r: _row_label(sheet, r, c0) for r in idxs}
+            first, length = c0, c1 - c0
+            usable = [r for r in idxs if _local_line_usable(lines[r], labels[r])]
+            spans = [((p0, p1), (q0, q1)) for p0, p1, q0, q1 in panels]
+        n_tests = max(1, len(usable) * (len(usable) - 1) // 2 * 2 * length)
+        # one array per usable line: a list of Python floats costs four times the memory per cell,
+        # and a tall block holds a line of steps for every usable line at once
+        quantums = {i: np.asarray(_panelled_line_quantums(lines[i], [(s0 - first, s1 - first)
+                                                                     for (h0, h1), (s0, s1) in spans if h0 <= i < h1]),
+                                  dtype=float)
+                    for i in usable}
+        for x, ia in enumerate(usable):
+            for ib in usable[x + 1:]:
+                if (orientation, ia, ib) in already:
+                    continue
+                a_line, b_line, q_a, q_b = lines[ia], lines[ib], quantums[ia], quantums[ib]
+                covered = [cover for (h0, h1), cover in spans if h0 <= ia and ib < h1]
+                if covered:                      # blank what a panel holding both lines covered
+                    keep = np.ones(length, dtype=bool)
+                    for s0, s1 in covered:
+                        keep[max(0, s0 - first):max(0, s1 - first)] = False
+                    a_line, b_line = np.where(keep, a_line, np.nan), np.where(keep, b_line, np.nan)
+                    q_a = [q if k else math.nan for q, k in zip(q_a, keep)]
+                    q_b = [q if k else math.nan for q, k in zip(q_b, keep)]
+                    label = labels.get if orientation == "rows" else (lambda _i: None)
+                    if not (_local_line_usable(a_line, label(ia)) and _local_line_usable(b_line, label(ib))):
+                        continue
+                # a stretch needs three informative cells and its outside one more, each with both
+                # values: a pair with fewer such cells cannot hold one and is not worth a scan
+                if int((np.isfinite(a_line) & np.isfinite(b_line)).sum()) < _LOCAL_RUN_MIN_FINITE:
+                    continue
+                budget[0] -= length              # the scan; the call pays for its runs
+                if budget[0] < 0:
+                    return exhausted()
+                hit = _best_local_group(a_line, b_line, q_a, q_b, n_tests, budget)
+                if budget[0] < 0:                # abandoned part-way
+                    return exhausted()
+                if hit is not None:
+                    findings.append(_local_run_finding(orientation, ia, ib, labels, first,
+                                                       a_line, b_line, *hit))
+    return findings
+
+
 def _as_rectangular(matrix):
     """A finite 2-D float array, or None. Ragged input is rejected, never raised on.
 
@@ -6333,8 +7062,9 @@ def _cap_block_findings(groups, cap):
     """Trim a block's findings to at most `cap`, keeping the highest-severity ones.
 
     `groups` maps a BLOCK_FINDING_GROUPS key to its list of findings; each list is
-    trimmed IN PLACE. Selection is by severity (high > medium > low); ties keep the
-    original detector/emission order, so output stays deterministic. Returns the number
+    trimmed IN PLACE. Selection is by severity (high > medium > low); within a severity the
+    local-run kinds go last, and ties otherwise keep the original detector/emission order,
+    so output stays deterministic. Returns the number
     of findings dropped. `cap is None` means unlimited (no trimming); `cap == 0` drops all."""
     if cap is None:
         return 0
@@ -6345,8 +7075,11 @@ def _cap_block_findings(groups, cap):
     flat = [(name, idx, f)
             for name, lst in groups.items()
             for idx, f in enumerate(lst)]
-    # Stable sort by severity keeps original order within a severity band.
-    flat.sort(key=lambda t: _SEVERITY_RANK.get((t[2].get("severity") or "low").lower(), 3))
+    # Stable sort by severity keeps original order within a severity band; within a band the
+    # local-run kinds go last, so they take only what the block's other findings of their
+    # severity leave.
+    flat.sort(key=lambda t: (_SEVERITY_RANK.get((t[2].get("severity") or "low").lower(), 3),
+                             t[2].get("kind") in _LOCAL_RUN_KINDS))
     keep = {(name, idx) for name, idx, _ in flat[:cap]}
     omitted = 0
     for name, lst in groups.items():
@@ -6555,6 +7288,8 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             })
             blocks_analyzed_here = 0
             sheet_first_index = len(report_blocks)
+            # the whole-sheet extent `find_numeric_blocks` appended, if any; its panels are the rest
+            extent = _whole_sheet_extent(sheet) if len(blocks) > 1 else None
             for (r0, r1, c0, c1) in blocks:
                 if len(report_blocks) >= _MAX_REPORT_BLOCKS:   # output budget reached; stop collecting
                     break
@@ -6578,6 +7313,19 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 # layouts are exactly the wide blocks the column detectors skip, and this is
                 # where a "row B = row A * k" relationship lives. Self-gates on rows/cols.
                 rr = detect_row_relations(sheet, r0, r1, c0, c1, header, coverage=coverage)
+                # Pairs related on one stretch only. A pair `detect_relations` or
+                # `detect_row_relations` already reported, under any kind, is passed in and
+                # skipped. On the whole-sheet extent the other blocks are its panels: a pair lying
+                # together inside one of them was compared there. Column pairs follow `wide` like
+                # the column detectors; row pairs do not, and `detect_local_pair_runs` skips them
+                # instead on a block taller than `_LOCAL_RUN_MAX_ROWS`.
+                already = {("cols", f.get("col_a_idx"), f.get("col_b_idx")) for f in rel}
+                already |= {("rows", f.get("row_a_idx"), f.get("row_b_idx")) for f in rr}
+                panels = [b for b in blocks if b != (r0, r1, c0, c1)] if (r0, r1, c0, c1) == extent else []
+                local = detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=already,
+                                               coverage=coverage, skip_columns=bool(wide), panels=panels)
+                rel = rel + [f for f in local if f["orientation"] == "cols"]
+                rr = rr + [f for f in local if f["orientation"] == "rows"]
                 wc = detect_within_column_patterns(sheet, r0, r1, c0, c1, header)
                 wc = wc + detect_dispersed_repeats(sheet, r0, r1, c0, c1, header)
                 # Block-scoped (not column-scoped): its own group so the packet

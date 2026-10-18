@@ -54,6 +54,13 @@
 - **常见误报**：整数列按整十平移（无真小数尾）已被排除；恒定的整十偏移会先命中 `constant_offset`。
 - **解读时**：`n_shared_fraction` 是共享真小数尾的行数；确认两列确是独立测量而非派生。
 
+### `local_ratio_run` / `local_offset_run`
+- **原理**：**同一 block 内**两列（`orientation = "cols"`）或两行（`"rows"`）只在**一段连续位置**上成恒定比例（B = k·A）或恒定差值（B = A + c），段外不成立。两侧都按各自记录的舍入步长求区间，整条线按固定小数位或固定有效数字推断步长。要同时满足：一个常数预测这一段的压缩得分过门槛；段外偏离（扣除舍入）的中位数大于 5%（比例按这对线 |B| 的中位数计，差值按 |c| 计）；最长一段至少占该常数相容位置的一半；段内 A 侧至少 3 个不同的值；常数离开恒等（比例离 1、差值离 0）至少 10 个舍入步长；比例的可能区间不含 10 的整数次幂（单位换算）；段两端外第一个能检验的格（跳过空格和组内位置）偏离至少 3 个舍入步长，段贴着线首或线尾时只检验另一端。一对线只报得分最高的一组（一个常数、一种关系）。
+- **不报的情形**：有限值少于 4 个的线、行标签像轴的行，以及本身是一条刻度的线（时间或剂量轴、稀释梯度、常数线，也包括在舍入范围内是直线或等比的数据线）不参与比较。整条线都成立的关系不在这里报；`detect_relations` / `detect_row_relations` 已报出的线对，无论报的是哪种类型（例如一段平移可能先被报成 `partial_constant_offset`），都不再报。行方向只比不超过 `PAPERCONAN_LOCAL_RUN_MAX_ROWS` 行的块，更高的块在至少两行能比时登记 coverage；列方向在超过 `PAPERCONAN_MAX_BLOCK_COLS` 列的宽块上跳过，与整列检测器一样不单独登记；运算预算用完时登记 `detector_compute_budget_limit`。数量级上也有盲区：带尾零的大整数按步长 1 读，按有效数字舍入复制的段对不上；按 10 位小数的读出精度，绝对值低于 5e-11 的值读作 0，这样的线所有格都不提供信息，再大一些但只剩一两位有效数字的值（例如 1e-9 量级）区间很宽，段也难对上。所以“这里没有报出”不等于这些线已经检验过。
+- **典型命中**：一组数中的一段由另一组复制后乘一个系数或加一个常数而来，其余位置是独立数据（如合成例：10 个值中前 6 个 B = A × 1.137，后 4 个无此关系）。
+- **常见误报**：同一列里只有一段由另一列换算、归一或共用对照得来——数值形态与复制一段相同，靠表头、行标签和图注区分。profile 按整线对应类型判，两个方向不一样：列方向走表头分流（当作 `constant_ratio` / `constant_offset`），比例段另走派生规则；行方向不走表头分流，只走派生规则（当作 `constant_ratio_row` / `offset_row_reuse`），读的是行标签，同名行不降。所以同一形态在两个方向上的降级不对称，例如按行排列的 dCt/ddCt 不会被分流。降级改的是 `severity`：finding 离开 packet，triage 下在 HTML 里隐藏，但首屏仍按 `raw_severity` 排。列方向没有同名保护：并排面板沿用同一套表头时，同名两列之间的段也会被降级（`prefilter_reason` 为 `same_label_replicate`），而跨面板在同名列上复制一段正是这一类要找的形态——这种降级不等于已有良性解释。
+- **解读时**：看 `segments`（段在 sheet 上的行号或列号，从 1 起；`col_a_idx` / `row_a_idx` 与 `rule` 里的 `col[N]` 从 0 起，`row[N]` 从 1 起）、`k`（`k_lo`–`k_hi` 为可能区间）/ `offset`（`offset_lo`–`offset_hi`）、`outside_departure`、`prediction_bits`、`n`（关系真正检验过的格数）、`run_length`（组内位置数）、`line_length`（两侧都有值的位置数）；`example_cells` 列出组内各位置的两侧格（含段外的零散位置，最多 64 个位置，截断时 `example_cells_truncated` 为真）。段较长时，证据窗口可能只落在段内，看不到这一段在哪里断开；同一对线上用别的常数的另一段也不会出现在这条 finding 里。用 `explain --full` 看整条线（它也有行数与单元格上限，见 SKILL.md）。确认这一段在图注或 Methods 里是否说明为换算、归一或共用数据。
+
 ### `constant_ratio_row` / `identical_row`
 - **原理**：**同一 block 内两行**（而非两列）在最长连续列段上成精确比值（`row_b = row_a × k`, k≠1）或逐值完全相同。针对"实验条件在行、逐格测量在列"的布局——这类关系不落在任何列对上，列向 `detect_relations` 完全看不到。比值容差 1e-3（吸收 2–6 位有效数字舍入），段长 ≥12 列，且段内 ≥6 个不同值。
 - **典型命中**：两条**不同实验条件**的行逐列恰好差一个固定比例（`shUSP15-2+shPARP1-2` = `shUSP15-2+pPARP1` × 1.14，78 列全中）；或不同标签下一整行数据完全相同。
@@ -238,7 +245,7 @@
 |---|---|---|---|
 | `axis_or_scan_column` | `arithmetic_progression` | step 是整数，或列名像 day/time/dose/index/2θ 等扫描轴 | 确认这列确实是自变量轴而非测量值 |
 | `censoring_or_boundary_value` | `within_col_value_duplication` | 重复值是 0/1/-1/100 等边界（或 p 值列里的 1） | 边界值天然重复（截断/饱和/缺失计数/校正 p），但若重复的是普通测量值则降级不成立 |
-| `derived_or_unit_conversion` | `constant_ratio` / `exact_linear` / `sum_constant` / `constant_ratio_row` / `scaled_row_reuse` | 列名（或行名）含单位/比例/均值/归一等派生词 | 派生列本就和源列严格相关，合理；但要确认它确实是派生而非两次"独立"测量 |
+| `derived_or_unit_conversion` | `constant_ratio` / `exact_linear` / `sum_constant` / `constant_ratio_row` / `scaled_row_reuse`；`local_ratio_run` 两个方向、`local_offset_run` 行方向（按整线对应类型） | 列名（或行名）含单位/比例/均值/归一等派生词 | 派生列本就和源列严格相关，合理；但要确认它确实是派生而非两次"独立"测量 |
 | `same_data_replot_or_duplicate_upload` | `cross_sheet_position_identical` / `cross_sheet_value_overlap`（仅 `delta.pattern == perfect_dup`） | 同图号，或表名像 source data / 补充表 | 同一份数据多图重绘属预期；**注意只对 `perfect_dup` 生效——`value_tweaked` 不会被降级，那才是改一格指纹** |
 | `omics_or_large_matrix_boundary_flood` | `within_col_value_duplication` / `within_col_decimal_repetition` | sheet/列名像 gene/protein/padj/logFC 等大矩阵 | omics 大表里 0/1/padj/logFC 边界值海量重复属常态 |
 

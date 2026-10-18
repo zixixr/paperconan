@@ -877,6 +877,8 @@ def test_every_scan_line_quoted_in_the_skill_is_one_the_code_can_emit():
                             limit=audit._ROW_PAIR_MAX_FINDINGS_PER_BLOCK)
     coverage.add_limitation("detector", "detector_compute_budget_limit",
                             detector="detect_row_relations")
+    coverage.add_limitation("detector", "detector_row_limit",
+                            detector="detect_local_pair_runs")
     # Not a truncation: the within-row fold dropped candidates that also repeated
     # outside the finding that absorbed them. Quoted in the skill because it says
     # something an agent can act on -- read the row -- rather than "there may be more".
