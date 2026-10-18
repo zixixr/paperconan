@@ -4481,23 +4481,34 @@ def _panelled_line_quantums(values, pieces):
     panels need not share an export. Read as one line, a panel recorded at one decimal above a
     longer one at three has its cells floored at the finer step -- an interval too narrow for a
     copy it holds, so a stretch copied across panels is not found. So each piece, (start, end)
-    offsets along the line for a panel holding it, is read on its own, as that panel reads it,
-    and the cells no panel holds are read together. A cell two panels hold takes the first.
-    With no pieces the line is read whole, as `_effective_line_quantums` reads it, which is how
-    every line off the extent is read.
+    offsets along the line for a panel holding it, is read on its own, and the cells no panel
+    holds are read together. A cell two panels hold goes to the first; the second reads only
+    the cells left to it. A piece with no cell that reads as non-zero has nothing to infer a
+    step from, so its cells keep the whole line's reading -- a zero there takes the finest step
+    on the line, as `_effective_line_quantums` gives it, rather than the row inference's 1.
+    With no pieces the line is read whole, which is how every line off the extent is read.
     """
     if not pieces:
         return _effective_line_quantums(values)
     values = np.asarray(values, dtype=float)
+    whole = []
     out = [math.nan] * len(values)
     held = [False] * len(values)
+
+    def read(part):
+        if any(math.isfinite(values[i]) and round(abs(values[i]), _MAX_READ_DECIMALS) != 0.0 for i in part):
+            return _effective_line_quantums(values[part])
+        if not whole:
+            whole.extend(_effective_line_quantums(values))
+        return [whole[i] for i in part]
+
     for s, e in pieces:
         part = [i for i in range(max(0, s), min(len(values), e)) if not held[i]]
-        for i, q in zip(part, _effective_line_quantums(values[part]) if part else []):
+        for i, q in zip(part, read(part) if part else []):
             out[i] = q
             held[i] = True
     rest = [i for i in range(len(values)) if not held[i]]
-    for i, q in zip(rest, _effective_line_quantums(values[rest]) if rest else []):
+    for i, q in zip(rest, read(rest) if rest else []):
         out[i] = q
     return out
 
@@ -4981,8 +4992,9 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
     pair is read only over what no such panel covers, where the extent's longer line is the
     only place the two meet. What is left must itself be usable -- a dilution series is still a
     grid once another panel's cells are cut off it -- and a pair with too little left is skipped
-    before it is charged. On the extent each line's recorded steps are read panel by panel
-    (`_panelled_line_quantums`). `skip_columns` follows the `wide` flag the
+    before it is charged. On the extent the recorded steps a pair is compared at are read panel
+    by panel (`_panelled_line_quantums`); whether a line is usable is still judged on the whole
+    line. `skip_columns` follows the `wide` flag the
     column detectors honour, and a block taller than `_LOCAL_RUN_MAX_ROWS` is not compared
     row by row.
 

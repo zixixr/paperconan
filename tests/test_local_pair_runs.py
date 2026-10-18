@@ -1493,9 +1493,20 @@ def test_a_line_crossing_panels_is_read_panel_by_panel():
     # read whole, the three-decimal cells set the step of the one-decimal ones
     assert _effective_line_quantums(line)[0] == pytest.approx(0.001)
     assert _panelled_line_quantums(line, []) == _effective_line_quantums(line)
+    # the cells no panel holds are read together, not one by one
+    rest = _panelled_line_quantums([12.3, 1.234, 5.678, 9.9, 8.8, 7.7], [(3, 6)])
+    assert rest[0] == pytest.approx(0.001) and rest[3:] == pytest.approx([0.1] * 3)
 
 
-def _two_panels_over_a_finer_one(split):
+def test_a_piece_with_nothing_but_zeros_keeps_the_whole_lines_reading():
+    from paperconan._audit import _panelled_line_quantums
+    line = [0.0] * 5 + [math.nan] + [1.23, 4.56, 7.89, 2.34, 5.67]
+    got = _panelled_line_quantums(line, [(0, 5), (6, 11)])
+    assert got[:5] == pytest.approx(_effective_line_quantums(line)[:5])
+    assert got[:5] == pytest.approx([0.01] * 5)                  # not the row inference's 1
+
+
+def _two_panels_over_a_finer_one(split, title_rows=0):
     rng = random.Random(321)
     a = [round(rng.uniform(10, 30), 1) for _ in range(12)]
     k = rng.uniform(1.15, 2.4)
@@ -1505,13 +1516,16 @@ def _two_panels_over_a_finer_one(split):
     below = [[round(rng.uniform(1, 9), 3) for _ in range(5)] for _ in range(30)]
     if split:                                 # two panels below, as above
         below = [r[:2] + [None] + r[3:] for r in below]
-    return rows + [[None] * 5, ["P", "Q", "R", "S", "T"]] + below
+    title = [[f"note {i}", None, None, None, None] for i in range(title_rows)]   # the extent starts lower
+    return title + rows + [[None] * 5, ["P", "Q", "R", "S", "T"]] + below
 
 
-@pytest.mark.parametrize("split", [False, True], ids=["one panel below", "two panels below"])
-def test_a_stretch_copied_across_panels_is_found_above_a_finer_panel(tmp_path, split):
-    scan = _scan(tmp_path, _two_panels_over_a_finer_one(split))
-    assert any((f["col_a_idx"], f["col_b_idx"]) == (0, 3) and any(s <= 2 and 9 <= e for s, e in f["segments"])
+@pytest.mark.parametrize("split, title_rows", [(False, 0), (True, 0), (True, 30)],
+                         ids=["one panel below", "two panels below", "two panels below, 30 title rows"])
+def test_a_stretch_copied_across_panels_is_found_above_a_finer_panel(tmp_path, split, title_rows):
+    scan = _scan(tmp_path, _two_panels_over_a_finer_one(split, title_rows))
+    assert any((f["col_a_idx"], f["col_b_idx"]) == (0, 3)
+               and any(s <= 2 + title_rows and 9 + title_rows <= e for s, e in f["segments"])
                for f in _found(scan, "relations", "local_ratio_run"))
 
 
