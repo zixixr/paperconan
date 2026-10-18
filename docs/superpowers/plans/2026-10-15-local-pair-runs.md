@@ -4411,14 +4411,209 @@ Expected: 168 passed.
 | `rule` 里插入随块变化的计数 | `test_the_rule_names_the_constant_and_the_stretch_only` |
 
 Run: 全套测试（含台架）`nice -n 19 env PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests -q -p no:cacheprovider`（不接管道，读汇总行）
-Expected: 汇总行无 failed；台架档位不变（修正只改 extent 上精度不一的面板，台架的面板布局精度一致）。
+Expected: 汇总行无 failed；台架档位不变（实测）。按段读步长改变的不只是精度不一的面板，全零的一段、各段各自判断固定小数位还是固定有效数字，也可能与整条线不同；台架档位不变是测出来的，不是由此推出来的。
 
 ```bash
 git add src/paperconan/_audit.py tests/test_local_pair_runs.py skills/paperconan/references/detectors.md skills/paperconan/references/judgment-rubric.md
 git commit -m "fix(detect): read a line's steps panel by panel on the whole-sheet extent"
 ```
 
-未处理、记录在案：`n_tests` 计入被 `already` 跳过的线对，这条规则没有钉住（改动只让得分差零点几 bit）；全负的稀释梯度在比例读法里按 `!= 0` 取格，换成 `> 0` 的变异不会变红；`_scan_interval_runs` 的暴力 oracle（审查在 scratch 里随机比过）没有入库。
+未处理、记录在案：`n_tests` 计入被 `already` 跳过的线对，这条规则没有钉住（去掉它时得分差 log2(线对数 / (线对数 − 跳过的对数))，跳过的对越多差得越大；审查的探针里只差零点几 bit）；全负的稀释梯度在比例读法里按 `!= 0` 取格，换成 `> 0` 的变异不会变红；`_scan_interval_runs` 的暴力 oracle（审查在 scratch 里随机比过）没有入库。
+
+- [ ] **Step 1e: 复审后的修正**
+
+复审结论是改一句文档就可以开 PR，修法本身无误。另有一处新引入的行为变化，在这里一并修：按段读步长时，一段里没有非零格，0 会退回行推断的步长 1，等于在每一段上重新放开了整条线读法早已收紧的宽区间。审查构造的布局里结果没有变，但方向是让区间变宽，所以改为：这样的段沿用整条线的读法。其余是测试缺口与说过头的话：
+
+- 坐标换算 `- first` 没有钉住：数据从第 1 行开始时错一行看不出，上方有 30 行标题时变异的找到率从 100/100 降到 22/100；
+- “不属于任何面板的格合在一起读”没有被测到：原测试的输入合读、单读结果相同；
+- 数量级那句写错了：真正读作 0 的门槛是绝对值低于 5e-11（`_MAX_READ_DECIMALS` 为 10），1e-9 量级对不上是因为只剩一两位有效数字、区间太宽；
+- “as that panel reads it”对重叠面板中后到的那个不成立（已从 docstring 和 d28e285 的提交信息里去掉）；可用性判断仍按整条线读步长，docstring 的范围收窄。
+
+(a) `src/paperconan/_audit.py` 的 `_panelled_line_quantums`：
+
+```python
+    """The recorded step of each cell of a line that crosses several panels.
+
+    On the whole-sheet extent one line runs through every panel stacked along it, and those
+    panels need not share an export. Read as one line, a panel recorded at one decimal above a
+    longer one at three has its cells floored at the finer step -- an interval too narrow for a
+    copy it holds, so a stretch copied across panels is not found. So each piece, (start, end)
+    offsets along the line for a panel holding it, is read on its own, as that panel reads it,
+    and the cells no panel holds are read together. A cell two panels hold takes the first.
+    With no pieces the line is read whole, as `_effective_line_quantums` reads it, which is how
+    every line off the extent is read.
+    """
+    if not pieces:
+        return _effective_line_quantums(values)
+    values = np.asarray(values, dtype=float)
+    out = [math.nan] * len(values)
+    held = [False] * len(values)
+    for s, e in pieces:
+        part = [i for i in range(max(0, s), min(len(values), e)) if not held[i]]
+        for i, q in zip(part, _effective_line_quantums(values[part]) if part else []):
+            out[i] = q
+            held[i] = True
+    rest = [i for i in range(len(values)) if not held[i]]
+    for i, q in zip(rest, _effective_line_quantums(values[rest]) if rest else []):
+        out[i] = q
+    return out
+```
+
+改为
+
+```python
+    """The recorded step of each cell of a line that crosses several panels.
+
+    On the whole-sheet extent one line runs through every panel stacked along it, and those
+    panels need not share an export. Read as one line, a panel recorded at one decimal above a
+    longer one at three has its cells floored at the finer step -- an interval too narrow for a
+    copy it holds, so a stretch copied across panels is not found. So each piece, (start, end)
+    offsets along the line for a panel holding it, is read on its own, and the cells no panel
+    holds are read together. A cell two panels hold goes to the first; the second reads only
+    the cells left to it. A piece with no cell that reads as non-zero has nothing to infer a
+    step from, so its cells keep the whole line's reading -- a zero there takes the finest step
+    on the line, as `_effective_line_quantums` gives it, rather than the row inference's 1.
+    With no pieces the line is read whole, which is how every line off the extent is read.
+    """
+    if not pieces:
+        return _effective_line_quantums(values)
+    values = np.asarray(values, dtype=float)
+    whole = []
+    out = [math.nan] * len(values)
+    held = [False] * len(values)
+
+    def read(part):
+        if any(math.isfinite(values[i]) and round(abs(values[i]), _MAX_READ_DECIMALS) != 0.0 for i in part):
+            return _effective_line_quantums(values[part])
+        if not whole:
+            whole.extend(_effective_line_quantums(values))
+        return [whole[i] for i in part]
+
+    for s, e in pieces:
+        part = [i for i in range(max(0, s), min(len(values), e)) if not held[i]]
+        for i, q in zip(part, read(part) if part else []):
+            out[i] = q
+            held[i] = True
+    rest = [i for i in range(len(values)) if not held[i]]
+    for i, q in zip(rest, read(rest) if rest else []):
+        out[i] = q
+    return out
+```
+
+`detect_local_pair_runs` 的 docstring：
+
+```python
+    before it is charged. On the extent each line's recorded steps are read panel by panel
+    (`_panelled_line_quantums`). `skip_columns` follows the `wide` flag the```
+
+改为
+
+```python
+    before it is charged. On the extent the recorded steps a pair is compared at are read panel
+    by panel (`_panelled_line_quantums`); whether a line is usable is still judged on the whole
+    line. `skip_columns` follows the `wide` flag the```
+
+(b) `tests/test_local_pair_runs.py`：
+
+```python
+    assert _panelled_line_quantums(line, []) == _effective_line_quantums(line)
+
+
+def _two_panels_over_a_finer_one(split):```
+
+改为
+
+```python
+    assert _panelled_line_quantums(line, []) == _effective_line_quantums(line)
+    # the cells no panel holds are read together, not one by one
+    rest = _panelled_line_quantums([12.3, 1.234, 5.678, 9.9, 8.8, 7.7], [(3, 6)])
+    assert rest[0] == pytest.approx(0.001) and rest[3:] == pytest.approx([0.1] * 3)
+
+
+def test_a_piece_with_nothing_but_zeros_keeps_the_whole_lines_reading():
+    from paperconan._audit import _panelled_line_quantums
+    line = [0.0] * 5 + [math.nan] + [1.23, 4.56, 7.89, 2.34, 5.67]
+    got = _panelled_line_quantums(line, [(0, 5), (6, 11)])
+    assert got[:5] == pytest.approx(_effective_line_quantums(line)[:5])
+    assert got[:5] == pytest.approx([0.01] * 5)                  # not the row inference's 1
+
+
+def _two_panels_over_a_finer_one(split):```
+
+```python
+def _two_panels_over_a_finer_one(split):
+    rng = random.Random(321)```
+
+改为
+
+```python
+def _two_panels_over_a_finer_one(split, title_rows=0):
+    rng = random.Random(321)```
+
+```python
+    return rows + [[None] * 5, ["P", "Q", "R", "S", "T"]] + below
+
+
+@pytest.mark.parametrize("split", [False, True], ids=["one panel below", "two panels below"])
+def test_a_stretch_copied_across_panels_is_found_above_a_finer_panel(tmp_path, split):
+    scan = _scan(tmp_path, _two_panels_over_a_finer_one(split))```
+
+改为
+
+```python
+    title = [[f"note {i}", None, None, None, None] for i in range(title_rows)]   # the extent starts lower
+    return title + rows + [[None] * 5, ["P", "Q", "R", "S", "T"]] + below
+
+
+@pytest.mark.parametrize("split, title_rows", [(False, 0), (True, 0), (True, 30)],
+                         ids=["one panel below", "two panels below", "two panels below, 30 title rows"])
+def test_a_stretch_copied_across_panels_is_found_above_a_finer_panel(tmp_path, split, title_rows):
+    scan = _scan(tmp_path, _two_panels_over_a_finer_one(split, title_rows))```
+
+```python
+    assert any((f["col_a_idx"], f["col_b_idx"]) == (0, 3) and any(s <= 2 and 9 <= e for s, e in f["segments"])
+               for f in _found(scan, "relations", "local_ratio_run"))```
+
+改为
+
+```python
+    assert any((f["col_a_idx"], f["col_b_idx"]) == (0, 3)
+               and any(s <= 2 + title_rows and 9 + title_rows <= e for s, e in f["segments"])
+               for f in _found(scan, "relations", "local_ratio_run"))```
+
+(c) `skills/paperconan/references/detectors.md`：
+
+把
+
+```text
+数量级上也有盲区：带尾零的大整数按步长 1 读，按有效数字舍入复制的段对不上；绝对值小于约 1e-8 的值按读出精度读作 0，这样的线所有格都不提供信息。
+```
+
+改为
+
+```text
+数量级上也有盲区：带尾零的大整数按步长 1 读，按有效数字舍入复制的段对不上；按 10 位小数的读出精度，绝对值低于 5e-11 的值读作 0，这样的线所有格都不提供信息，再大一些但只剩一两位有效数字的值（例如 1e-9 量级）区间很宽，段也难对上。
+```
+
+Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
+Expected: 170 passed.
+
+逐条核对“删掉即变红”（做法同 Step 1b）：
+
+| 变异 | 应变红的测试 |
+|---|---|
+| 不属于任何面板的格逐格单读 | `test_a_line_crossing_panels_is_read_panel_by_panel` |
+| pieces 不减 `first`，直接用 sheet 坐标 | `test_a_stretch_copied_across_panels_is_found_above_a_finer_panel[two panels below, 30 title rows]` |
+| 全零段也按段读（0 取 1） | `test_a_piece_with_nothing_but_zeros_keeps_the_whole_lines_reading` |
+
+Run: 全套测试（含台架），不接管道，读汇总行。Expected: 无 failed，比 Step 1b 多 2 个通过。
+
+```bash
+git add src/paperconan/_audit.py tests/test_local_pair_runs.py skills/paperconan/references/detectors.md
+git commit -m "fix(detect): keep the whole line's steps for a panel's piece with no non-zero cell"
+```
+
+修正后按 Step 1c 再重扫一次本地评估集，PR 描述的数字以最终代码为准。重叠面板的两个变异（后到者覆盖先到者、不持有这条线的面板也切段）没有构造出能区分的输入，记为缺口。
 
 - [ ] **Step 1c: 用修正后的代码重做本地评估**
 
