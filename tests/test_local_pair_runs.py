@@ -1568,3 +1568,21 @@ def test_the_rule_names_the_constant_and_the_stretch_only():
     sheet, header = _block([A10, b])
     (f,) = detect_local_pair_runs(sheet, 1, 11, 0, 2, header)
     assert f["rule"] == f"col[1] = col[0] * {f['k']:.6g} on rows 2-7"
+
+
+def test_a_panel_cuts_a_piece_only_from_the_lines_it_holds(monkeypatch):
+    import paperconan._audit as audit_module
+    calls, real = [], audit_module._panelled_line_quantums
+    monkeypatch.setattr(audit_module, "_panelled_line_quantums",
+                        lambda values, pieces: calls.append(pieces) or real(values, pieces))
+    sheet, header = _block([A10, _C, _D])
+    detect_local_pair_runs(sheet, 1, 11, 0, 3, header, panels=[(1, 6, 0, 1)])   # holds column 0 only
+    assert calls == [[(0, 5)], [], []]
+
+
+def test_extreme_magnitudes_are_read_without_a_numeric_warning():
+    import warnings
+    from paperconan._audit import _panelled_line_quantums
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _panelled_line_quantums([1e300, 2e300, 3e300, 0.0, 1.5], [(0, 3)])

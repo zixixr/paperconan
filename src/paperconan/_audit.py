@@ -4495,8 +4495,10 @@ def _panelled_line_quantums(values, pieces):
     out = [math.nan] * len(values)
     held = [False] * len(values)
 
+    plain = values.tolist()             # Python floats: `round` on numpy scalars overflows near 1e298
+
     def read(part):
-        if any(math.isfinite(values[i]) and round(abs(values[i]), _MAX_READ_DECIMALS) != 0.0 for i in part):
+        if any(math.isfinite(plain[i]) and round(abs(plain[i]), _MAX_READ_DECIMALS) != 0.0 for i in part):
             return _effective_line_quantums(values[part])
         if not whole:
             whole.extend(_effective_line_quantums(values))
@@ -5033,8 +5035,11 @@ def detect_local_pair_runs(sheet, r0, r1, c0, c1, header, already=frozenset(),
             usable = [r for r in idxs if _local_line_usable(lines[r], labels[r])]
             spans = [((p0, p1), (q0, q1)) for p0, p1, q0, q1 in panels]
         n_tests = max(1, len(usable) * (len(usable) - 1) // 2 * 2 * length)
-        quantums = {i: _panelled_line_quantums(lines[i], [(s0 - first, s1 - first)
-                                                          for (h0, h1), (s0, s1) in spans if h0 <= i < h1])
+        # one array per usable line: a list of Python floats costs four times the memory per cell,
+        # and a tall block holds a line of steps for every usable line at once
+        quantums = {i: np.asarray(_panelled_line_quantums(lines[i], [(s0 - first, s1 - first)
+                                                                     for (h0, h1), (s0, s1) in spans if h0 <= i < h1]),
+                                  dtype=float)
                     for i in usable}
         for x, ia in enumerate(usable):
             for ib in usable[x + 1:]:

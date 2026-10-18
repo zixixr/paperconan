@@ -76,7 +76,7 @@ SEED = 20261015
 REPEATS = CP.REPEATS
 SEGMENTS = (4, 6)
 # Sheets per planted-row stratum: as many as the other strata draw. With fewer, strata found on
-# about nine sheets in ten changed band with the seed or with the number of sheets. Each sheet
+# most but not all sheets changed band with the seed or with the number of sheets. Each sheet
 # compares every row pair of a block, so these strata dominate the bench's running time.
 ROW_SHEETS = REPEATS
 
