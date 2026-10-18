@@ -4180,6 +4180,254 @@ cp -r recheck/benchmarks/paperconan_eval/curation_20260912/eval_scope/runs/v1_61
 
 派一个独立子代理审查本分支相对 main 的全部改动（代码、测试、台架、文档），要求：对照设计文档逐条核对判据是否实现一致；找能通过全部检查的错误实现（注入探针）；检查合成数据之外的输入（空块、单行块、全 NaN、负值、极大量级、有效数字与小数位混合导出）；检查新 finding 在 `paperconan drill` / `explain` / HTML 报告里的呈现。审查意见逐条处理，处理记录写进 PR 描述。
 
+- [ ] **Step 1b: 终审后的修正**
+
+终审结论是先修再开 PR：
+
+- **I1（行为）**：整表 extent 上，每条线的记录步长按整条线推断，线混着几个面板的格。精度粗的面板在下方精度细的面板之上时，会被读成细步长，区间过窄，跨面板复制的段几乎全部漏检，而且不登记 coverage。审查用 100 次抽样实测：下方是整宽一块时，找到率从 99/100 降到 2/100；下方分成左右两块时，降到 0/100。修法是每个面板那一段按它自己推断步长，不属于任何面板的格合在一起推断。修后两种布局都回到 98/100 以上；同样布局上的独立数据仍是 0 条。
+- **I2（测试缺口）**：块上限对行方向局部段的让位没有测试守着。行方向不进 dense 判定，块上限是它唯一的按条数计的闸门。
+- **Minor**：
+  - 补测试：extent 的身份（关掉整表那一遍后，两个重叠的块）、行方向局部段只进 packet 一次、`rule` 全文；
+  - 改文档：数量级盲区、解读时的字段、`example_cells` 的含义、judgment-rubric 的首轮列表、profile 映射表。
+
+(a) `src/paperconan/_audit.py`，在 `def _symmetric_ratio_interval(` 之前加入 `_panelled_line_quantums`：
+
+```python
+def _symmetric_ratio_interval(```
+
+改为
+
+```python
+def _panelled_line_quantums(values, pieces):
+    """The recorded step of each cell of a line that crosses several panels.
+
+    On the whole-sheet extent one line runs through every panel stacked along it, and those
+    panels need not share an export. Read as one line, a panel recorded at one decimal above a
+    longer one at three has its cells floored at the finer step -- an interval too narrow for a
+    copy it holds, so a stretch copied across panels is not found. So each piece, (start, end)
+    offsets along the line for a panel holding it, is read on its own, as that panel reads it,
+    and the cells no panel holds are read together. A cell two panels hold takes the first.
+    With no pieces the line is read whole, as `_effective_line_quantums` reads it, which is how
+    every line off the extent is read.
+    """
+    if not pieces:
+        return _effective_line_quantums(values)
+    values = np.asarray(values, dtype=float)
+    out = [math.nan] * len(values)
+    held = [False] * len(values)
+    for s, e in pieces:
+        part = [i for i in range(max(0, s), min(len(values), e)) if not held[i]]
+        for i, q in zip(part, _effective_line_quantums(values[part]) if part else []):
+            out[i] = q
+            held[i] = True
+    rest = [i for i in range(len(values)) if not held[i]]
+    for i, q in zip(rest, _effective_line_quantums(values[rest]) if rest else []):
+        out[i] = q
+    return out
+
+
+def _symmetric_ratio_interval(```
+
+`detect_local_pair_runs` 的 docstring：
+
+```python
+    grid once another panel's cells are cut off it -- and a pair with too little left is skipped
+    before it is charged. `skip_columns` follows the `wide` flag the```
+
+改为
+
+```python
+    grid once another panel's cells are cut off it -- and a pair with too little left is skipped
+    before it is charged. On the extent each line's recorded steps are read panel by panel
+    (`_panelled_line_quantums`). `skip_columns` follows the `wide` flag the```
+
+步长的计算：
+
+```python
+        quantums = {i: _effective_line_quantums(lines[i]) for i in usable}
+```
+
+改为
+
+```python
+        quantums = {i: _panelled_line_quantums(lines[i], [(s0 - first, s1 - first)
+                                                          for (h0, h1), (s0, s1) in spans if h0 <= i < h1])
+                    for i in usable}
+```
+
+(b) `tests/test_local_pair_runs.py`，追加到文件末尾：
+
+```python
+
+# --- final review --------------------------------------------------------------------------
+
+def test_a_line_crossing_panels_is_read_panel_by_panel():
+    from paperconan._audit import _panelled_line_quantums
+    line = [12.3, 14.5, 11.2, math.nan, 1.234, 5.678, 2.468, 35.0]
+    got = _panelled_line_quantums(line, [(0, 3), (4, 7)])
+    assert got[:3] == pytest.approx([0.1] * 3) and math.isnan(got[3]) and got[4:7] == pytest.approx([0.001] * 3)
+    assert got[7] == pytest.approx(1.0)                          # held by no panel: read with the rest
+    # read whole, the three-decimal cells set the step of the one-decimal ones
+    assert _effective_line_quantums(line)[0] == pytest.approx(0.001)
+    assert _panelled_line_quantums(line, []) == _effective_line_quantums(line)
+
+
+def _two_panels_over_a_finer_one(split):
+    rng = random.Random(321)
+    a = [round(rng.uniform(10, 30), 1) for _ in range(12)]
+    k = rng.uniform(1.15, 2.4)
+    b = [round(x * k, 1) for x in a[:8]] + [round(rng.uniform(10, 30), 1) for _ in range(4)]
+    c, d = ([round(rng.uniform(10, 30), 1) for _ in range(12)] for _ in range(2))
+    rows = [["A", "C", None, "B", "D"]] + [[w, x, None, y, z] for w, x, y, z in zip(a, c, b, d)]
+    below = [[round(rng.uniform(1, 9), 3) for _ in range(5)] for _ in range(30)]
+    if split:                                 # two panels below, as above
+        below = [r[:2] + [None] + r[3:] for r in below]
+    return rows + [[None] * 5, ["P", "Q", "R", "S", "T"]] + below
+
+
+@pytest.mark.parametrize("split", [False, True], ids=["one panel below", "two panels below"])
+def test_a_stretch_copied_across_panels_is_found_above_a_finer_panel(tmp_path, split):
+    scan = _scan(tmp_path, _two_panels_over_a_finer_one(split))
+    assert any((f["col_a_idx"], f["col_b_idx"]) == (0, 3) and any(s <= 2 and 9 <= e for s, e in f["segments"])
+               for f in _found(scan, "relations", "local_ratio_run"))
+
+
+def test_over_the_block_cap_a_row_stretch_gives_way_too():
+    import paperconan._audit as audit_module
+    local = [dict(kind="local_offset_run", orientation="rows", severity="high") for _ in range(3)]
+    other = [dict(kind="within_col_value_duplication", severity="high")]
+    groups = dict(row_relations=list(local), within_col=list(other))
+    assert audit_module._cap_block_findings(groups, 3) == 1
+    assert groups["within_col"] == other and len(groups["row_relations"]) == 2
+
+
+def test_with_no_whole_sheet_pass_no_block_is_taken_for_the_extent(tmp_path, monkeypatch):
+    import paperconan._audit as audit_module
+    monkeypatch.setattr(audit_module, "_WHOLE_SHEET_MAX_ROWS", 0)
+    a = A10 + [10.051, 12.884, 9.447, 13.103, 11.774]
+    b = [round(x * 1.137, 3) for x in a[:6]] + [11.9, 9.1, 18.7, 6.2, 14.4, 8.8, 12.1, 16.3, 7.9]
+    x = [3.3, 17.1, 6.4, 12.2, 8.8, 15.5, 4.1, 19.6, 10.3, 7.7]
+    rows = [["X", "Y", "Z"]] + [[None, p, q] for p, q in zip(a[:5], b[:5])]
+    rows += [[w, p, q] for w, p, q in zip(x, a[5:], b[5:])]
+    rules = [f["rule"] for f in _found(_scan(tmp_path, rows), "relations", "local_ratio_run")]
+    assert any(r.startswith("col[2] = col[1] * 1.13") and r.endswith("on rows 2-7") for r in rules)
+
+
+def test_a_row_stretch_reaches_the_packet_once():
+    from paperconan.packet import distill_findings_for_review
+    f = dict(kind="local_offset_run", orientation="rows", severity="high", row_a="ctrl", row_b="drug",
+             row_a_idx=1, row_b_idx=2, n=6, rule="row[3] = row[2] + 3.517 on columns 2-7",
+             row_a_sample=A10[:6], row_b_sample=[round(x + 3.517, 3) for x in A10[:6]])
+    scan = {"relations_blocks": [{"file": "s.csv", "sheet": "s", "block": {"rows": "2-3", "cols": "2-11"},
+                                  "relations": [], "row_relations": [f]}]}
+    assert sum(1 for e in distill_findings_for_review(scan) if e.get("kind") == "local_offset_run") == 1
+
+
+def test_the_rule_names_the_constant_and_the_stretch_only():
+    b = [round(x * 1.137, 3) for x in A10[:6]] + [11.9, 9.1, 18.7, 6.2]
+    sheet, header = _block([A10, b])
+    (f,) = detect_local_pair_runs(sheet, 1, 11, 0, 2, header)
+    assert f["rule"] == f"col[1] = col[0] * {f['k']:.6g} on rows 2-7"
+```
+
+(c) skill 文档：
+
+`skills/paperconan/references/judgment-rubric.md`：
+
+把
+
+```text
+3. Review local row/column transforms next: `identical_column`, `constant_offset`, `constant_ratio`, `exact_linear`, `sum_constant`, `many_equal_pairs`, and `row_pair_digit_coupling`.
+```
+
+改为
+
+```text
+3. Review local row/column transforms next: `identical_column`, `constant_offset`, `constant_ratio`, `exact_linear`, `sum_constant`, `many_equal_pairs`, `row_pair_digit_coupling`, and the stretch kinds `local_ratio_run` / `local_offset_run`.
+```
+
+`skills/paperconan/references/detectors.md`：
+
+把
+
+```text
+| `derived_or_unit_conversion` | `constant_ratio` / `exact_linear` / `sum_constant` / `constant_ratio_row` / `scaled_row_reuse` |
+```
+
+改为
+
+```text
+| `derived_or_unit_conversion` | `constant_ratio` / `exact_linear` / `sum_constant` / `constant_ratio_row` / `scaled_row_reuse`；`local_ratio_run` 两个方向、`local_offset_run` 行方向（按整线对应类型） |
+```
+
+把
+
+```text
+也包括在舍入范围内是直线的数据线）不参与比较。
+```
+
+改为
+
+```text
+也包括在舍入范围内是直线或等比的数据线）不参与比较。
+```
+
+把
+
+```text
+所以“这里没有报出”不等于这些线已经检验过。
+```
+
+改为
+
+```text
+数量级上也有盲区：带尾零的大整数按步长 1 读，按有效数字舍入复制的段对不上；绝对值小于约 1e-8 的值按读出精度读作 0，这样的线所有格都不提供信息。所以“这里没有报出”不等于这些线已经检验过。
+```
+
+把
+
+```text
+- **解读时**：看 `segments`（段在 sheet 上的行号或列号，从 1 起；`col_a_idx` 与 `rule` 里的 `col[N]` 从 0 起，`row[N]` 从 1 起）、`k` / `offset`、`outside_departure`、`prediction_bits`、`n`（关系真正检验过的格数）；`example_cells` 列出段内的格。
+```
+
+改为
+
+```text
+- **解读时**：看 `segments`（段在 sheet 上的行号或列号，从 1 起；`col_a_idx` / `row_a_idx` 与 `rule` 里的 `col[N]` 从 0 起，`row[N]` 从 1 起）、`k`（`k_lo`–`k_hi` 为可能区间）/ `offset`（`offset_lo`–`offset_hi`）、`outside_departure`、`prediction_bits`、`n`（关系真正检验过的格数）、`run_length`（组内位置数）、`line_length`（两侧都有值的位置数）；`example_cells` 列出组内各位置的两侧格（含段外的零散位置，最多 64 个位置，截断时 `example_cells_truncated` 为真）。
+```
+
+Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
+Expected: 168 passed.
+
+逐条核对“删掉即变红”（每个变异体独立副本，PYTHONPATH 指向它，确认 `__file__` 在副本内）：
+
+| 变异 | 应变红的测试 |
+|---|---|
+| 步长仍按整条线推断 | `test_a_stretch_copied_across_panels_is_found_above_a_finer_panel` 两条 |
+| 不属于任何面板的格不读 | `test_a_line_crossing_panels_is_read_panel_by_panel` |
+| 块上限只对 `relations` 组让位 | `test_over_the_block_cap_a_row_stretch_gives_way_too` |
+| extent 取 `blocks[-1]` | `test_with_no_whole_sheet_pass_no_block_is_taken_for_the_extent` |
+| 行方向局部段也塞进 `_distill_relations` | `test_a_row_stretch_reaches_the_packet_once` |
+| `rule` 里插入随块变化的计数 | `test_the_rule_names_the_constant_and_the_stretch_only` |
+
+Run: 全套测试（含台架）`nice -n 19 env PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests -q -p no:cacheprovider`（不接管道，读汇总行）
+Expected: 汇总行无 failed；台架档位不变（修正只改 extent 上精度不一的面板，台架的面板布局精度一致）。
+
+```bash
+git add src/paperconan/_audit.py tests/test_local_pair_runs.py skills/paperconan/references/detectors.md skills/paperconan/references/judgment-rubric.md
+git commit -m "fix(detect): read a line's steps panel by panel on the whole-sheet extent"
+```
+
+未处理、记录在案：`n_tests` 计入被 `already` 跳过的线对，这条规则没有钉住（改动只让得分差零点几 bit）；全负的稀释梯度在比例读法里按 `!= 0` 取格，换成 `> 0` 的变异不会变红；`_scan_interval_runs` 的暴力 oracle（审查在 scratch 里随机比过）没有入库。
+
+- [ ] **Step 1c: 用修正后的代码重做本地评估**
+
+I1 改变了 extent 上的行为，评估数字要按最终代码重算：按 Task 12 Step 3–4 重扫、两版计分、比较，并重跑现有 finding 的保持检查与首屏统计（单进程、最低优先级）。PR 描述里的数字以这一次为准。
+
+- [ ] **Step 1d: 修正后的复审**
+
+把 Step 1b 的修正与 Step 1c 的结果交给终审代理复核，无阻断项再开 PR。
+
 - [ ] **Step 2: 推送并开 PR**
 
 ```bash
