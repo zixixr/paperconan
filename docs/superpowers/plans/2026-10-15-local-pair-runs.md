@@ -4073,17 +4073,26 @@ v1 已冻结（`FREEZE_v1.json`），不改它的任何文件。v2 只在家族�
 - [ ] **Step 1: v2 命中范围**（`build_scope_v2.py`）
 
 ```python
-"""Hit scope v2 = v1 plus the two local-run kinds in the ratio and difference families. Targets unchanged."""
-import importlib.util, json, sys
+"""Hit scope v2 = v1 plus the two local-run kinds, in the ratio and difference families only. Targets unchanged.
+
+The kinds go into the RATIO and DIFF sets themselves, so exactly the operations whose family IS one of those sets take
+them (ratio, ratio_with_explicit_exception, offset). Families built as unions of those sets (INTDIFF) or that merely
+share a member with them (linear's exact_linear, STEP's small_diff_set) do not: a stretch states a narrower relation
+than theirs, and a family lists the kinds stating the same relation or a more general one. (The planned version added
+them to every family intersecting RATIO or DIFF, which would have taken in linear, integer_difference,
+paired_difference and multiple_difference too.)
+"""
+import importlib.util
+import json
 from pathlib import Path
+
 E = Path("recheck/benchmarks/paperconan_eval/curation_20260912/eval_scope")
 spec = importlib.util.spec_from_file_location("build_scope", E / "build_scope.py")
-m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-for op, fam in m.FAMILIES.items():
-    if fam & m.RATIO:
-        fam.add("local_ratio_run")
-    if fam & m.DIFF:
-        fam.add("local_offset_run")
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.RATIO.add("local_ratio_run")
+m.DIFF.add("local_offset_run")
+print("operations taking a local kind:", sorted(op for op, fam in m.FAMILIES.items() if fam & {"local_ratio_run", "local_offset_run"}))
 out = m.payload()
 (E / "eval_scope_v2.jsonl").write_text(out["eval_scope_v1.jsonl"])
 (E / "build_report_v2.json").write_text(out["build_report.json"])
@@ -4092,6 +4101,8 @@ print(json.loads(out["build_report.json"])["counts"])
 
 Run: `.venv/bin/python recheck/benchmarks/paperconan_eval/curation_20260912/eval_scope/build_scope_v2.py`
 Expected: 计数与 v1 相同（130 张卡、264 个目标对）。再确认 `eval_scope_v2.jsonl` 与 v1 只差 `family` 字段。
+
+新类型只加进 `RATIO`、`DIFF` 这两个集合本身。本计划先前的写法给每个与它们有交集的家族都加，会把 `linear`、`integer_difference`、`paired_difference`、`multiple_difference` 也带进来；这些家族陈述的关系比局部段更一般，不该接受它。
 
 - [ ] **Step 2: v2 匹配器**（`match_scope_v2.py`：读 v2 范围，并把两个新类型加入 `PARTIAL`——它们按定义只在部分位置成立）
 
@@ -4115,11 +4126,13 @@ m.main()
 
 ```bash
 B=$(git rev-parse --short HEAD)
-.venv/bin/python recheck/benchmarks/paperconan_eval/curation_20260912/eval_scope/run_scans.py v1_localruns_$B --workers 3
+nice -n 19 .venv/bin/python recheck/benchmarks/paperconan_eval/curation_20260912/eval_scope/run_scans.py v1_localruns_$B --workers 1
 .venv/bin/python recheck/benchmarks/paperconan_eval/curation_20260912/eval_scope/match_scope.py v1_localruns_$B      # v1 口径
 cp -r recheck/benchmarks/paperconan_eval/curation_20260912/eval_scope/runs/v1_localruns_$B recheck/benchmarks/paperconan_eval/curation_20260912/eval_scope/runs/v2_localruns_$B
 .venv/bin/python recheck/benchmarks/paperconan_eval/curation_20260912/eval_scope/match_scope_v2.py v2_localruns_$B   # v2 口径
 ```
+
+单进程、最低优先级：用户的机器在并行扫描下会卡。基线的扫描在 `dev_610c276`；它的 `match.jsonl` 是旧版匹配器的格式（`best` 不按层分），`compare_runs.py` 读不了，所以先用当前的 `match_scope.py` 给它重打分，放进 `v1_610c276`（只拷 `manifest.json`，`scans`、`inputs` 用符号链接，不重扫）。v2 口径同样只拷 manifest、链接扫描结果，不必复制几百 MB 的扫描目录。
 
 基线也要按 v2 口径计一次（main 的扫描不变，只换范围）：
 
@@ -4156,7 +4169,7 @@ cp -r recheck/benchmarks/paperconan_eval/curation_20260912/eval_scope/runs/v1_61
 
 - [ ] **Step 5: 合并门槛**（设计 §8）
 
-三条都满足才进入 Task 13：两个台架良性层不动（Task 9 通过）；本地评估集首屏上补回的卡多于挤出的卡；审查无未处理的阻断项（Task 13）。首屏代价过高时，先把严重度改为 medium、重跑 Step 3–4 再判断，并把两次结果都记下。
+三条都满足才进入 Task 13：两个台架良性层不动（Task 9 通过）；本地评估集首屏上补回的卡多于挤出的卡；审查无未处理的阻断项（Task 13）。首屏代价过高时，先把严重度改为 medium、重跑 Step 3–4 再判断，并把两次结果都记下。若含局部发现的块都没有撞上每块的 finding 上限，严重度只影响排序，可以直接把扫描结果里局部发现的严重度改写为 medium 再打分，与重扫等价；先核对这个前提。medium 的取舍不只在首屏：packet 只收 high，报 medium 时局部发现全部离开 packet，这一点与首屏的数字一起交给用户决定。
 
 ---
 ### Task 13: 独立审查与 PR
