@@ -4615,6 +4615,37 @@ git commit -m "fix(detect): keep the whole line's steps for a panel's piece with
 
 修正后按 Step 1c 再重扫一次本地评估集，PR 描述的数字以最终代码为准。重叠面板的两个变异（后到者覆盖先到者、不持有这条线的面板也切段）没有构造出能区分的输入，记为缺口。
 
+- [ ] **Step 1f: 确认轮的测试补充**
+
+确认轮结论是可以开 PR；剩一个测试缺口：判断“一段里有没有非零格”的条件换成 `values[i] != 0.0`（空格与读不出的值也算非零）时，测试不变红。全零段里夹一个空格在真实数据里常见。`test_a_piece_with_nothing_but_zeros_keeps_the_whole_lines_reading` 的输入改为夹一个空格和一个 1e-12：
+
+```python
+    line = [0.0] * 5 + [math.nan] + [1.23, 4.56, 7.89, 2.34, 5.67]
+    got = _panelled_line_quantums(line, [(0, 5), (6, 11)])
+    assert got[:5] == pytest.approx(_effective_line_quantums(line)[:5])
+    assert got[:5] == pytest.approx([0.01] * 5)                  # not the row inference's 1
+```
+
+改为
+
+```python
+    # zeros, a blank and a value too small to register: nothing in the piece reads as non-zero
+    line = [0.0, 0.0, math.nan, 1e-12, 0.0] + [math.nan] + [1.23, 4.56, 7.89, 2.34, 5.67]
+    got = _panelled_line_quantums(line, [(0, 5), (6, 11)])
+    whole = _effective_line_quantums(line)
+    assert math.isnan(got[2]) and math.isnan(whole[2])
+    assert [got[i] for i in (0, 1, 3, 4)] == pytest.approx([whole[i] for i in (0, 1, 3, 4)])
+    assert [got[i] for i in (0, 1, 3, 4)] == pytest.approx([0.01] * 4)   # not the row inference's 1
+```
+
+Run: `.venv/bin/python -m pytest tests/test_local_pair_runs.py -q`
+Expected: 170 passed；把条件换成 `values[i] != 0.0` 的变异体上这条变红。只改测试，评估数字不受影响。
+
+```bash
+git add tests/test_local_pair_runs.py
+git commit -m "test(detect): a zero piece with a blank and an unreadable value keeps the whole line's steps"
+```
+
 - [ ] **Step 1c: 用修正后的代码重做本地评估**
 
 I1 改变了 extent 上的行为，评估数字要按最终代码重算：按 Task 12 Step 3–4 重扫、两版计分、比较，并重跑现有 finding 的保持检查与首屏统计（单进程、最低优先级）。PR 描述里的数字以这一次为准。
