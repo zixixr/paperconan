@@ -1500,10 +1500,13 @@ def test_a_line_crossing_panels_is_read_panel_by_panel():
 
 def test_a_piece_with_nothing_but_zeros_keeps_the_whole_lines_reading():
     from paperconan._audit import _panelled_line_quantums
-    line = [0.0] * 5 + [math.nan] + [1.23, 4.56, 7.89, 2.34, 5.67]
+    # zeros, a blank and a value too small to register: nothing in the piece reads as non-zero
+    line = [0.0, 0.0, math.nan, 1e-12, 0.0] + [math.nan] + [1.23, 4.56, 7.89, 2.34, 5.67]
     got = _panelled_line_quantums(line, [(0, 5), (6, 11)])
-    assert got[:5] == pytest.approx(_effective_line_quantums(line)[:5])
-    assert got[:5] == pytest.approx([0.01] * 5)                  # not the row inference's 1
+    whole = _effective_line_quantums(line)
+    assert math.isnan(got[2]) and math.isnan(whole[2])
+    assert [got[i] for i in (0, 1, 3, 4)] == pytest.approx([whole[i] for i in (0, 1, 3, 4)])
+    assert [got[i] for i in (0, 1, 3, 4)] == pytest.approx([0.01] * 4)   # not the row inference's 1
 
 
 def _two_panels_over_a_finer_one(split, title_rows=0):
