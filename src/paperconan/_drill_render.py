@@ -88,6 +88,12 @@ def render_overview(view: dict[str, Any]) -> str:
         more = len(loc["families"]) - len(families)
         suffix = f", … {more} more" if more > 0 else ""
         out.append(f"      {', '.join(families)}{suffix}")
+        # Said here because the page is where the choice to open a location is
+        # made. It reports the prefilter's verdict, which explain lets the reader judge.
+        if loc["signals"] and loc.get("matched_drop_rule") == loc["signals"]:
+            n = loc["signals"]
+            out.append(f"      filter: {n}/{n} matched a prefilter drop rule — "
+                       "reasons in explain")
     # Branch on the scan, not on this page: with --max-locations 0 the page is
     # empty while the scan is not, and the all-clear text would contradict both
     # the header and the coverage line on the same screen.
@@ -257,9 +263,11 @@ def render_explain(view: dict[str, Any]) -> str:
         f"  severity:  detector={sev['raw']}  displayed={sev['effective']}"
         f"  ({sev['profile_action']})",
     ]
-    if sev["raw"] != sev["effective"]:
+    if sev["raw"] != sev["effective"] or sev.get("profile_action", "kept") != "kept":
         # A demotion is a judgement the reviewer may want to overturn, so the
         # reason has to travel with it rather than being implied by the number.
+        # A finding the detector already rated low can still have been demoted,
+        # and overview's filter line sends the reader here for that reason.
         out.append("  down-weighted because:")
         for reason in sev["context"] or ["(no reason recorded)"]:
             out.append(f"      · {reason}")
